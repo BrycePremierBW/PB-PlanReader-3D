@@ -1,0 +1,30 @@
+PREMIER BRUSHWORKS PLAN READER & 3D TAKE-OFF — TEST REPORT
+==========================================================
+
+Version: 1.0.0
+Test date: 2026-07-15
+
+PASSED
+- Python source compilation.
+- Local PlanReader SQLite database creation.
+- Standalone workspace creation.
+- Sample PDF page extraction with PyMuPDF.
+- Drawing page classification as Floor Plan.
+- Take-off row calculations.
+- Excel workbook generation (17,527 bytes in smoke test).
+- Complete ZIP package generation (26,471 bytes in smoke test).
+- Rectangular OBJ geometry generation.
+- Interactive Plotly 3D figure generation.
+- JobHub SQLite job register read.
+- JobHub SHA-256 username/password authentication.
+- Linked JobHub document discovery and import.
+- Streamlit server startup.
+- Streamlit /_stcore/health returned: ok.
+
+NOT LIVE-TESTED
+- The user's production Render/PostgreSQL database and its exact document tables.
+- OpenAI API billing/key access.
+- Large multi-hundred-page plan sets.
+- Object-storage URLs requiring custom authentication headers.
+
+The linked-document importer is schema-adaptive and searches common table and column names. Production document access still depends on the actual database schema and whether the file bytes or URLs are reachable by the separate PlanReader service.
