@@ -1,3 +1,0 @@
-Branch: fix/pb-takeoff-jobhub-sync
-Target: main
-Purpose: Premier Brushworks quantity take-off behaviour + JobHub take-off recognition fix.
