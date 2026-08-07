@@ -13,6 +13,12 @@ services:
         sync: false
       - key: OPENAI_MODEL
         value: gpt-5.6
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: AI_PROVIDER
+        value: OpenAI
     disk:
       name: planreader-data
       mountPath: /var/data

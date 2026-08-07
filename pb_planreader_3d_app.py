@@ -103,6 +103,9 @@ WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 JOBHUB_DATABASE_URL = os.environ.get("JOBHUB_DATABASE_URL") or os.environ.get("DATABASE_URL") or ""
 JOBHUB_DB_PATH = os.environ.get("JOBHUB_DB_PATH", "")
 DEFAULT_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6")
+DEFAULT_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+DEFAULT_AI_PROVIDER = os.environ.get("AI_PROVIDER", "OpenAI")
+AI_PROVIDERS = ["OpenAI", "Google Gemini"]
 
 TAKEOFF_COLUMNS = [
     "section",
@@ -1345,6 +1348,43 @@ def resolve_openai_key(session_key: str = "") -> str:
     return os.environ.get("OPENAI_API_KEY", "")
 
 
+def resolve_gemini_key(session_key: str = "") -> str:
+    if session_key.strip():
+        return session_key.strip()
+    try:
+        secret = st.secrets.get("GEMINI_API_KEY", "")
+        if secret:
+            return str(secret)
+    except Exception:
+        pass
+    return os.environ.get("GEMINI_API_KEY", "")
+
+
+def resolve_ai_provider(session_provider: str = "") -> str:
+    if session_provider and session_provider in AI_PROVIDERS:
+        return session_provider
+    try:
+        secret = st.secrets.get("AI_PROVIDER", "")
+        if secret and secret in AI_PROVIDERS:
+            return str(secret)
+    except Exception:
+        pass
+    configured = os.environ.get("AI_PROVIDER", "")
+    return configured if configured in AI_PROVIDERS else DEFAULT_AI_PROVIDER
+
+
+def resolve_ai_key(provider: str, session_key: str = "") -> str:
+    if provider == "Google Gemini":
+        return resolve_gemini_key(session_key)
+    return resolve_openai_key(session_key)
+
+
+def default_ai_model(provider: str) -> str:
+    if provider == "Google Gemini":
+        return DEFAULT_GEMINI_MODEL
+    return DEFAULT_OPENAI_MODEL
+
+
 def image_data_url(path: Path) -> str:
     mime = mimetypes.guess_type(path.name)[0] or "image/png"
     data = base64.b64encode(path.read_bytes()).decode("ascii")
@@ -1435,19 +1475,83 @@ def ai_schema() -> Dict[str, Any]:
     }
 
 
-def run_ai_plan_read(workspace_id: int, page_ids: Sequence[int], api_key: str, model: str) -> Dict[str, Any]:
+def _openai_generate(api_key: str, model: str, prompt: str, blocks: List[Tuple[str, str]], schema: Dict[str, Any], schema_name: str) -> Dict[str, Any]:
     if OpenAI is None:
         raise RuntimeError("The openai Python package is not installed.")
     if not api_key:
         raise RuntimeError("OpenAI API key is not configured.")
+    client = OpenAI(api_key=api_key)
+    content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    for kind, value in blocks:
+        if kind == "text":
+            content.append({"type": "input_text", "text": value})
+        else:
+            content.append({"type": "input_image", "image_url": image_data_url(Path(value)), "detail": "high"})
+    try:
+        response = client.responses.create(
+            model=model,
+            input=[{"role": "user", "content": content}],
+            text={"format": {"type": "json_schema", "name": schema_name, "strict": True, "schema": schema}},
+        )
+        raw = response.output_text
+        data = json.loads(raw)
+    except Exception as structured_error:
+        fallback_prompt = prompt + "\nReturn valid JSON matching this schema exactly:\n" + json.dumps(schema)
+        fallback_content = [{"type": "input_text", "text": fallback_prompt}] + content[1:]
+        response = client.responses.create(model=model, input=[{"role": "user", "content": fallback_content}])
+        raw = response.output_text
+        match = re.search(r"\{.*\}", raw, re.S)
+        if not match:
+            raise RuntimeError(f"Structured output failed: {structured_error}; fallback did not return JSON.")
+        data = json.loads(match.group(0))
+    return data
+
+
+def _gemini_generate(api_key: str, model: str, prompt: str, blocks: List[Tuple[str, str]], schema: Dict[str, Any], schema_name: str) -> Dict[str, Any]:
+    if not api_key:
+        raise RuntimeError("Google Gemini API key is not configured.")
+    parts: List[Dict[str, Any]] = []
+    if prompt:
+        parts.append({"text": prompt})
+    for kind, value in blocks:
+        if kind == "text":
+            parts.append({"text": value})
+        else:
+            path = Path(value)
+            mime = mimetypes.guess_type(path.name)[0] or "image/png"
+            parts.append({"inline_data": {"mime_type": mime, "data": base64.b64encode(path.read_bytes()).decode("ascii")}})
+    parts.append({"text": "Return a single valid JSON object matching this schema exactly, with no prose:\n" + json.dumps(schema)})
+    body = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1, "maxOutputTokens": 8000},
+    }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    resp = requests.post(url, params={"key": api_key}, json=body, timeout=300)
+    resp.raise_for_status()
+    payload = resp.json()
+    try:
+        text = payload["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(f"Gemini returned no usable content: {str(payload)[:1000]}")
+    match = re.search(r"\{.*\}", text, re.S)
+    if not match:
+        raise RuntimeError("Gemini did not return JSON matching the requested schema.")
+    return json.loads(match.group(0))
+
+
+def run_ai_structured(provider: str, api_key: str, model: str, prompt: str, blocks: List[Tuple[str, str]], schema: Dict[str, Any], schema_name: str) -> Dict[str, Any]:
+    if provider == "Google Gemini":
+        return _gemini_generate(api_key, model, prompt, blocks, schema, schema_name)
+    return _openai_generate(api_key, model, prompt, blocks, schema, schema_name)
+
+
+def run_ai_plan_read(workspace_id: int, page_ids: Sequence[int], api_key: str, model: str, provider: str = "OpenAI") -> Dict[str, Any]:
     if not page_ids:
         raise RuntimeError("Select at least one page.")
     pages = lquery(
         f"SELECT p.*,d.file_name FROM pages p JOIN documents d ON d.id=p.document_id WHERE p.id IN ({','.join('?' for _ in page_ids)}) ORDER BY p.id",
         tuple(page_ids),
     )
-    client = OpenAI(api_key=api_key)
-    content: List[Dict[str, Any]] = []
     prompt = """
 You are a senior Australian commercial painting estimator and plan take-off reviewer.
 Read the supplied architectural drawing pages and extracted text using the Premier Brushworks subscription take-off method.
@@ -1464,40 +1568,18 @@ Required method:
 
 Return structured data only. References must name the drawing/page or visible note that supports each item.
 """
-    content.append({"type": "input_text", "text": prompt})
+    blocks: List[Tuple[str, str]] = []
     for page in pages:
         text_excerpt = str(page.get("extracted_text") or "")[:12000]
-        content.append(
-            {
-                "type": "input_text",
-                "text": f"SOURCE PAGE: {page.get('file_name')} · {page.get('page_label')} · page {page.get('page_no')} · classified {page.get('page_type')}\nEXTRACTED TEXT:\n{text_excerpt}",
-            }
-        )
+        blocks.append(("text", f"SOURCE PAGE: {page.get('file_name')} · {page.get('page_label')} · page {page.get('page_no')} · classified {page.get('page_type')}\nEXTRACTED TEXT:\n{text_excerpt}"))
         image_path = Path(str(page.get("image_path") or ""))
         if image_path.exists():
-            content.append({"type": "input_image", "image_url": image_data_url(image_path), "detail": "high"})
+            blocks.append(("image", str(image_path)))
     schema = ai_schema()
-    try:
-        response = client.responses.create(
-            model=model,
-            input=[{"role": "user", "content": content}],
-            text={"format": {"type": "json_schema", "name": "paint_takeoff_analysis", "strict": True, "schema": schema}},
-        )
-        raw = response.output_text
-        data = json.loads(raw)
-    except Exception as structured_error:
-        # Compatibility fallback for SDK/API changes: still demand strict JSON in the prompt.
-        fallback_prompt = prompt + "\nReturn valid JSON matching this schema exactly:\n" + json.dumps(schema)
-        fallback_content = [{"type": "input_text", "text": fallback_prompt}] + content[1:]
-        response = client.responses.create(model=model, input=[{"role": "user", "content": fallback_content}])
-        raw = response.output_text
-        match = re.search(r"\{.*\}", raw, re.S)
-        if not match:
-            raise RuntimeError(f"Structured output failed: {structured_error}; fallback did not return JSON.")
-        data = json.loads(match.group(0))
+    data = run_ai_structured(provider, api_key, model, prompt, blocks, schema, "paint_takeoff_analysis")
     lexecute(
         "INSERT INTO ai_runs(workspace_id,run_type,model,source_pages,status,response_json,error_message,created_at) VALUES(?,?,?,?,?,?,?,?)",
-        (workspace_id, "Plan take-off and 3D", model, json.dumps(list(page_ids)), "Completed", json.dumps(data), "", now_stamp()),
+        (workspace_id, "Plan take-off and 3D", f"{provider} · {model}", json.dumps(list(page_ids)), "Completed", json.dumps(data), "", now_stamp()),
     )
     return data
 
@@ -1570,25 +1652,19 @@ def render_ai_schema() -> Dict[str, Any]:
     }
 
 
-def run_ai_render_read(workspace_id: int, page_ids: Sequence[int], api_key: str, model: str) -> Dict[str, Any]:
+def run_ai_render_read(workspace_id: int, page_ids: Sequence[int], api_key: str, model: str, provider: str = "OpenAI") -> Dict[str, Any]:
     """Read render / artist's impression images and extract building form for the 3D model.
 
     Uses the render as a secondary evidence source: form, storeys, roof, per-facade
     material/colour and window/door placement. Dimensions from a render are treated as
     'Assumed' and always remain editable — the render never overrides measured plan data.
     """
-    if OpenAI is None:
-        raise RuntimeError("The openai Python package is not installed.")
-    if not api_key:
-        raise RuntimeError("OpenAI API key is not configured.")
     if not page_ids:
         raise RuntimeError("Select at least one render / artist's impression page.")
     pages = lquery(
         f"SELECT p.*,d.file_name FROM pages p JOIN documents d ON d.id=p.document_id WHERE p.id IN ({','.join('?' for _ in page_ids)}) ORDER BY p.id",
         tuple(page_ids),
     )
-    client = OpenAI(api_key=api_key)
-    content: List[Dict[str, Any]] = []
     prompt = """
 You are a senior Australian architectural estimator reviewing render / artist's impression images
 to inform a conceptual 3D building model for a painting take-off.
@@ -1617,38 +1693,17 @@ Required method:
 
 Return structured data only. References must name the render page that supports each item.
 """
-    content.append({"type": "input_text", "text": prompt})
+    blocks: List[Tuple[str, str]] = []
     for page in pages:
-        content.append(
-            {
-                "type": "input_text",
-                "text": f"RENDER PAGE: {page.get('file_name')} · {page.get('page_label')} · classified {page.get('page_type')}",
-            }
-        )
+        blocks.append(("text", f"RENDER PAGE: {page.get('file_name')} · {page.get('page_label')} · classified {page.get('page_type')}"))
         image_path = Path(str(page.get("image_path") or ""))
         if image_path.exists():
-            content.append({"type": "input_image", "image_url": image_data_url(image_path), "detail": "high"})
+            blocks.append(("image", str(image_path)))
     schema = render_ai_schema()
-    try:
-        response = client.responses.create(
-            model=model,
-            input=[{"role": "user", "content": content}],
-            text={"format": {"type": "json_schema", "name": "render_analysis", "strict": True, "schema": schema}},
-        )
-        raw = response.output_text
-        data = json.loads(raw)
-    except Exception as structured_error:
-        fallback_prompt = prompt + "\nReturn valid JSON matching this schema exactly:\n" + json.dumps(schema)
-        fallback_content = [{"type": "input_text", "text": fallback_prompt}] + content[1:]
-        response = client.responses.create(model=model, input=[{"role": "user", "content": fallback_content}])
-        raw = response.output_text
-        match = re.search(r"\{.*\}", raw, re.S)
-        if not match:
-            raise RuntimeError(f"Structured output failed: {structured_error}; fallback did not return JSON.")
-        data = json.loads(match.group(0))
+    data = run_ai_structured(provider, api_key, model, prompt, blocks, schema, "render_analysis")
     lexecute(
         "INSERT INTO ai_runs(workspace_id,run_type,model,source_pages,status,response_json,error_message,created_at) VALUES(?,?,?,?,?,?,?,?)",
-        (workspace_id, "Render / artist's impression", model, json.dumps(list(page_ids)), "Completed", json.dumps(data), "", now_stamp()),
+        (workspace_id, "Render / artist's impression", f"{provider} · {model}", json.dumps(list(page_ids)), "Completed", json.dumps(data), "", now_stamp()),
     )
     return data
 
@@ -2489,7 +2544,7 @@ def add_register_item_form(workspace_id:int, register_name:str, key_suffix:str="
         st.rerun()
 
 
-def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str) -> None:
+def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, ai_provider: str = "OpenAI") -> None:
     hero(workspace)
     tabs=st.tabs(["AI plan read","Take-off schedule","Scope registers","Door schedule","Source & basis"])
     with tabs[0]:
@@ -2500,12 +2555,12 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str) -
             options={f"#{int(r.id)} · {r.page_label} · {r.page_type}":int(r.id) for r in pages.itertuples()}
             default=[label for label,rid in options.items() if bool(pages.loc[pages['id'].eq(rid),'selected'].iloc[0])][:6]
             selected=st.multiselect("Pages to analyse",list(options.keys()),default=default)
-            model=st.text_input("OpenAI model",value=DEFAULT_OPENAI_MODEL)
+            model=st.text_input("Model",value=default_ai_model(ai_provider),help="OpenAI uses the Responses API; Google Gemini uses the free-tier generateContent endpoint.")
             st.markdown("<div class='pb-note'>AI is used to organise evidence and draft quantities. It is instructed not to invent dimensions. Every result remains editable and requires estimator review.</div>",unsafe_allow_html=True)
-            if st.button("Run subscription-method plan read",type="primary",disabled=not bool(resolve_openai_key(session_api_key))):
+            if st.button("Run subscription-method plan read",type="primary",disabled=not bool(resolve_ai_key(ai_provider,session_api_key))):
                 with st.spinner("Reading drawings and building the take-off draft..."):
                     try:
-                        data=run_ai_plan_read(int(workspace["id"]),[options[x] for x in selected],resolve_openai_key(session_api_key),model.strip() or DEFAULT_OPENAI_MODEL)
+                        data=run_ai_plan_read(int(workspace["id"]),[options[x] for x in selected],resolve_ai_key(ai_provider,session_api_key),model.strip() or default_ai_model(ai_provider),ai_provider)
                         st.session_state["latest_ai_result"]=data
                         st.success("AI plan read completed. Review the preview, then import it.")
                     except Exception as exc:
@@ -2519,8 +2574,8 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str) -
                     st.success(f"Imported {counts['takeoff']} take-off rows, {counts['registers']} register items, {counts['masses']} masses and {counts['openings']} openings.")
                     st.session_state.pop("latest_ai_result",None)
                     st.rerun()
-            if not resolve_openai_key(session_api_key):
-                st.warning("Configure OPENAI_API_KEY or enter a session key in the sidebar to enable AI plan reading. Manual mapping and 3D modelling still work without it.")
+            if not resolve_ai_key(ai_provider,session_api_key):
+                st.warning("Configure the AI API key (OPENAI_API_KEY or GEMINI_API_KEY) or enter a session key in the sidebar to enable AI plan reading. Manual mapping and 3D modelling still work without it.")
     with tabs[1]:
         takeoff=ldf("SELECT * FROM takeoff_rows WHERE workspace_id=? ORDER BY id",(workspace["id"],))
         editor_cols=["id"]+TAKEOFF_COLUMNS
@@ -2721,7 +2776,7 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
                 st.rerun()
 
 
-def model_3d_page(workspace:Dict[str,Any]) -> None:
+def model_3d_page(workspace:Dict[str,Any], session_api_key: str = "", ai_provider: str = "OpenAI") -> None:
     hero(workspace)
     tabs=st.tabs(["Interactive model","Building masses","Doors & windows","Render / artist's impression","Model exports"])
     with tabs[0]:
@@ -2782,11 +2837,11 @@ def model_3d_page(workspace:Dict[str,Any]) -> None:
         else:
             options={f"#{int(r.id)} · {r.page_label}":int(r.id) for r in render_pages.itertuples()}
             selected=st.multiselect("Render pages to read",list(options.keys()),default=list(options.keys()),help="Artist's impressions and renders supply building form, storeys, roof and facade material/colour. Dimensions from a render are always treated as assumed and never override measured plan data.")
-            model=st.text_input("OpenAI model",value=DEFAULT_OPENAI_MODEL,help="Vision-capable model used to interpret the render images.")
-            if st.button("Read render into 3D model",type="primary",disabled=not bool(resolve_openai_key(session_api_key)) or not selected):
+            model=st.text_input("Model",value=default_ai_model(ai_provider),help="Vision-capable model used to interpret the render images.")
+            if st.button("Read render into 3D model",type="primary",disabled=not bool(resolve_ai_key(ai_provider,session_api_key)) or not selected):
                 with st.spinner("Interpreting render images..."):
                     try:
-                        data=run_ai_render_read(int(workspace["id"]),[options[x] for x in selected],resolve_openai_key(session_api_key),model.strip() or DEFAULT_OPENAI_MODEL)
+                        data=run_ai_render_read(int(workspace["id"]),[options[x] for x in selected],resolve_ai_key(ai_provider,session_api_key),model.strip() or default_ai_model(ai_provider),ai_provider)
                         st.session_state["latest_render_result"]=data
                         st.success("Render read completed. Review the preview, then apply it.")
                     except Exception as exc:
@@ -2801,8 +2856,8 @@ def model_3d_page(workspace:Dict[str,Any]) -> None:
                     st.success(f"Applied render: {counts['masses']} masses, {counts['openings']} openings.")
                     st.session_state.pop("latest_render_result",None)
                     st.rerun()
-            if not resolve_openai_key(session_api_key):
-                st.warning("Configure OPENAI_API_KEY or enter a session key in the sidebar to read renders with AI.")
+            if not resolve_ai_key(ai_provider,session_api_key):
+                st.warning("Configure the AI API key (OPENAI_API_KEY or GEMINI_API_KEY) or enter a session key in the sidebar to read renders with AI.")
     with tabs[4]:
         obj=generate_obj(int(workspace["id"]))
         geometry=json.dumps({"masses":lquery("SELECT * FROM model_masses WHERE workspace_id=?",(workspace["id"],)),"openings":lquery("SELECT * FROM model_openings WHERE workspace_id=?",(workspace["id"],))},indent=2,default=str)
@@ -2870,13 +2925,15 @@ def export_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],user:Dict[
     st.markdown("</div>",unsafe_allow_html=True)
 
 
-def settings_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],session_api_key:str) -> None:
+def settings_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],session_api_key:str,ai_provider:str="OpenAI") -> None:
     hero(workspace)
     st.write(f"App version: `{APP_VERSION}`")
     st.write(f"PlanReader data folder: `{DATA_DIR}`")
     st.write(f"Workspace folder: `{workspace_path(int(workspace['id']))}`")
     st.write(f"Drawing canvas: `{'available' if CANVAS_AVAILABLE else 'manual coordinate fallback'}`")
+    st.write(f"AI provider: `{ai_provider}`")
     st.write(f"OpenAI key: `{'configured' if resolve_openai_key(session_api_key) else 'not configured'}`")
+    st.write(f"Gemini key: `{'configured' if resolve_gemini_key(session_api_key) else 'not configured'}`")
     st.write(f"JobHub bridge: `{'connected' if bridge else 'not configured'}`")
     if bridge:
         try:
@@ -2902,8 +2959,9 @@ def main() -> None:
     if not user:
         login_screen(bridge)
     workspace_id=sidebar_workspace_selector(bridge)
-    session_api_key=st.sidebar.text_input("OpenAI API key (session only)",type="password",help="Leave blank when OPENAI_API_KEY is configured in Render or Windows.")
-    if resolve_openai_key(session_api_key):
+    ai_provider=st.sidebar.selectbox("AI provider",AI_PROVIDERS,index=AI_PROVIDERS.index(resolve_ai_provider()) if resolve_ai_provider() in AI_PROVIDERS else 0,help="OpenAI is pay-per-use. Google Gemini has a generous free tier and needs a GEMINI_API_KEY from AI Studio.")
+    session_api_key=st.sidebar.text_input("AI API key (session only)",type="password",help="Leave blank when OPENAI_API_KEY or GEMINI_API_KEY is configured in Render or Windows.")
+    if resolve_ai_key(ai_provider,session_api_key):
         st.sidebar.success("AI plan reading ready")
     else:
         st.sidebar.caption("Manual take-off and 3D modelling work without AI.")
@@ -2919,12 +2977,12 @@ def main() -> None:
     if menu=="Dashboard": dashboard_page(workspace)
     elif menu=="Job & Documents": project_documents_page(workspace,bridge,user)
     elif menu=="Drawing Register": drawing_register_page(workspace)
-    elif menu=="Subscription Take-off": subscription_takeoff_page(workspace,session_api_key)
+    elif menu=="Subscription Take-off": subscription_takeoff_page(workspace,session_api_key,ai_provider)
     elif menu=="Plan Mapper": plan_mapper_page(workspace)
-    elif menu=="3D Building Model": model_3d_page(workspace)
+    elif menu=="3D Building Model": model_3d_page(workspace,session_api_key,ai_provider)
     elif menu=="Quantity Schedule": quantity_schedule_page(workspace)
     elif menu=="Export / JobHub": export_page(workspace,bridge,user)
-    else: settings_page(workspace,bridge,session_api_key)
+    else: settings_page(workspace,bridge,session_api_key,ai_provider)
 
 
 if __name__ == "__main__":
