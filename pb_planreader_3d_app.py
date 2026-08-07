@@ -1545,6 +1545,20 @@ def run_ai_structured(provider: str, api_key: str, model: str, prompt: str, bloc
     return _openai_generate(api_key, model, prompt, blocks, schema, schema_name)
 
 
+def _ai_error_hint(exc: Exception) -> str:
+    msg = str(exc)
+    low = msg.lower()
+    if "api key" in low or "invalid_api_key" in low or "401" in msg or "403" in msg or "permission" in low:
+        return ("The AI provider rejected the API key. In Render go to your service and set OPENAI_API_KEY "
+                "(or set AI_PROVIDER to 'Google Gemini' with a GEMINI_API_KEY from aistudio.google.com for the free tier), "
+                "then redeploy. You can also paste a working key in the sidebar session key box.")
+    if "quota" in low or "rate limit" in low or "429" in msg or "insufficient" in low:
+        return "The AI provider is out of quota or rate-limited. Wait a moment, or switch providers in the sidebar."
+    if "connection" in low or "timeout" in low or "max retries" in low or "dns" in low or "resolve" in low:
+        return "Could not reach the AI provider from this server. Check network/outbound access and try again."
+    return msg
+
+
 def run_ai_plan_read(workspace_id: int, page_ids: Sequence[int], api_key: str, model: str, provider: str = "OpenAI") -> Dict[str, Any]:
     if not page_ids:
         raise RuntimeError("Select at least one page.")
@@ -1872,6 +1886,163 @@ def dataframe_for_takeoff(workspace_id: int) -> pd.DataFrame:
     df["labour_hours"] = [labour_hours(to_float(r.quantity), str(r.unit), to_float(r.productivity_m2_per_hour, 8)) for r in df.itertuples()]
     df["value_ex_gst"] = [row_value(to_float(r.quantity), to_float(r.rate_per_unit)) for r in df.itertuples()]
     return df
+
+
+_TAKEOFF_HEADER_SYNONYMS = {
+    "section": ["section", "division", "category", "part", "area type", "trade"],
+    "element": ["element", "item", "scope", "work", "work item", "description", "task", "component"],
+    "location": ["location", "area", "room", "zone", "floor", "site", "location/area", "area/location", "level"],
+    "substrate": ["substrate", "surface", "material", "background", "base material", "substrate/surface"],
+    "finish_system": ["finish system", "finish", "system", "paint system", "spec", "coating", "finish spec"],
+    "quantity": ["quantity", "qty", "qty (m2)", "area m2", "area", "m2", "sqm", "sq m", "amount", "count", "quantity (m2)", "qty (no.)", "qty (no)"],
+    "unit": ["unit", "uom", "units", "unit of measure", "measure"],
+    "quantity_status": ["quantity status", "status", "measurement status", "qty status", "takeoff status"],
+    "source_page": ["source page", "page", "drawing", "sheet", "plan no", "drawing no", "ref page"],
+    "source_reference": ["source reference", "reference", "ref", "source", "doc ref", "item ref"],
+    "inclusion_status": ["inclusion status", "inclusion", "inc/exc", "inc exc", "include/exclude"],
+    "coats": ["coats", "coat", "no. coats", "number of coats", "coats no"],
+    "coverage_m2_per_litre": ["coverage m2 per litre", "coverage", "m2/l", "m2/litre", "sqm/l", "spread rate"],
+    "productivity_m2_per_hour": ["productivity m2 per hour", "productivity", "m2/hr", "m2/hour", "labour rate", "production rate"],
+    "rate_per_unit": ["rate per unit", "rate", "unit rate", "$/m2", "$ per m2", "price", "rate ($)", "value"],
+    "confidence": ["confidence", "basis", "measurement basis"],
+    "notes": ["notes", "note", "comments", "remarks", "comment"],
+}
+
+_NORMALISED_HEADERS: Dict[str, str] = {}
+for _target, _words in _TAKEOFF_HEADER_SYNONYMS.items():
+    for _word in _words:
+        _NORMALISED_HEADERS[re.sub(r"[^a-z0-9]+", "", str(_word).lower())] = _target
+
+
+def _match_takeoff_header(header: str) -> Optional[str]:
+    key = re.sub(r"[^a-z0-9]+", "", str(header).lower())
+    if key in _NORMALISED_HEADERS:
+        return _NORMALISED_HEADERS[key]
+    best_target: Optional[str] = None
+    best_score = 0
+    for target, words in _TAKEOFF_HEADER_SYNONYMS.items():
+        score = 0
+        for word in words:
+            norm_word = re.sub(r"[^a-z0-9]+", "", str(word).lower())
+            if norm_word and norm_word in key:
+                score += len(norm_word)
+        if score > best_score:
+            best_score = score
+            best_target = target
+    return best_target if best_score >= 4 else None
+
+
+def _normalise_unit(raw: Any) -> str:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return ""
+    if text in {"m2", "sqm", "sq m", "m²", "square metres", "square meter", "square metres"} or "m2" in text or "m²" in text:
+        return "m²"
+    if text in {"lm", "m", "lin m", "lineal", "lin m", "linear metre", "metre"} or "lm" == text:
+        return "lm"
+    if text in {"no", "no.", "nos", "ea", "each", "count", "each (no.)"}:
+        return "No."
+    if text in {"l", "litre", "litres", "ltr", "lt"}:
+        return "L"
+    if "item" in text:
+        return "item"
+    if "allow" in text:
+        return "allowance"
+    return text.title()
+
+
+def _parse_qty(raw: Any) -> float:
+    text = str(raw or "").strip()
+    if not text:
+        return 0.0
+    cleaned = re.sub(r"[^0-9.\-]", "", text)
+    return to_float(cleaned, 0.0)
+
+
+def parse_takeoff_file(upload: Any) -> Tuple[pd.DataFrame, List[str]]:
+    """Read an uploaded .xlsx/.xls/.csv take-off file and map its columns to take-off rows.
+
+    Returns (rows DataFrame, warnings). Header is auto-detected from the row that
+    contains the most recognised take-off column names.
+    """
+    name = str(getattr(upload, "name", "") or "takeoff")
+    data = upload.getvalue()
+    suffix = Path(name).suffix.lower()
+    warnings: List[str] = []
+    try:
+        if suffix == ".csv":
+            df = pd.read_csv(io.BytesIO(data), header=None, encoding_errors="ignore")
+        else:
+            df = pd.read_excel(io.BytesIO(data), sheet_name=0, header=None)
+    except Exception as exc:
+        raise RuntimeError(f"Could not read take-off file: {exc}")
+
+    if df.empty or df.shape[1] == 0:
+        raise RuntimeError("The take-off file is empty.")
+
+    header_row: Optional[int] = None
+    best_score = 0
+    for i in range(min(30, len(df))):
+        row = [str(v) for v in df.iloc[i].tolist()]
+        score = sum(1 for cell in row if _match_takeoff_header(cell))
+        if score > best_score:
+            best_score = score
+            header_row = i
+
+    if header_row is None or best_score < 2:
+        raise RuntimeError(
+            "No take-off header row found. The file needs columns such as Element, Location, "
+            "Substrate, Finish system, Quantity, Unit and Rate per unit."
+        )
+
+    raw_headers = [str(v).strip() for v in df.iloc[header_row].tolist()]
+    mapping: Dict[int, str] = {}
+    used: List[str] = []
+    for idx, h in enumerate(raw_headers):
+        target = _match_takeoff_header(h)
+        if target and target not in used:
+            mapping[idx] = target
+            used.append(target)
+
+    body = df.iloc[header_row + 1:].reset_index(drop=True)
+    rows: List[Dict[str, Any]] = []
+    for _, line in body.iterrows():
+        row: Dict[str, Any] = {c: "" for c in TAKEOFF_COLUMNS}
+        for idx, target in mapping.items():
+            value = line.iloc[idx]
+            if target == "quantity":
+                row["quantity"] = _parse_qty(value)
+            elif target == "unit":
+                row["unit"] = _normalise_unit(value)
+            elif target in {"coats", "coverage_m2_per_litre", "productivity_m2_per_hour", "rate_per_unit"}:
+                row[target] = to_float(value)
+            else:
+                row[target] = str(value or "").strip()
+        text_signature = " ".join(str(row.get(c) or "") for c in ["element", "location", "section", "source_reference"]).strip()
+        if not text_signature:
+            continue
+        if not row.get("unit"):
+            qty_header = next((raw_headers[i] for i, t in mapping.items() if t == "quantity"), "")
+            if qty_header and "no" in qty_header.lower():
+                row["unit"] = "No."
+            elif qty_header and ("m2" in qty_header.lower() or "sq" in qty_header.lower() or "area" in qty_header.lower()):
+                row["unit"] = "m²"
+            elif qty_header and "lm" in qty_header.lower():
+                row["unit"] = "lm"
+            else:
+                row["unit"] = "m²"
+        row["quantity_status"] = row["quantity_status"] or ("Measured" if to_float(row["quantity"]) > 0 else "To measure")
+        row["inclusion_status"] = row["inclusion_status"] or "INCLUSION"
+        row["source_reference"] = row["source_reference"] or name
+        rows.append(row)
+
+    if not rows:
+        raise RuntimeError("No take-off lines were found under the detected header row.")
+
+    if len(mapping) < 4:
+        warnings.append("Only a few columns were recognised — review the imported rows before relying on the quantities.")
+
+    return pd.DataFrame(rows, columns=TAKEOFF_COLUMNS), warnings
 
 
 def register_df(workspace_id: int, name: str) -> pd.DataFrame:
@@ -2565,7 +2736,7 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
                         st.success("AI plan read completed. Review the preview, then import it.")
                     except Exception as exc:
                         lexecute("INSERT INTO ai_runs(workspace_id,run_type,model,source_pages,status,response_json,error_message,created_at) VALUES(?,?,?,?,?,?,?,?)",(workspace["id"],"Plan take-off and 3D",model,json.dumps([options[x] for x in selected]),"Failed","",str(exc),now_stamp()))
-                        st.exception(exc)
+                        st.error(_ai_error_hint(exc))
             data=st.session_state.get("latest_ai_result")
             if data:
                 st.json(data,expanded=False)
@@ -2577,6 +2748,31 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
             if not resolve_ai_key(ai_provider,session_api_key):
                 st.warning("Configure the AI API key (OPENAI_API_KEY or GEMINI_API_KEY) or enter a session key in the sidebar to enable AI plan reading. Manual mapping and 3D modelling still work without it.")
     with tabs[1]:
+        with st.expander("Import a take-off from an Excel or CSV file"):
+            up=st.file_uploader("Take-off file (.xlsx, .xls, .csv)",type=["xlsx","xls","csv"],key="takeoff_import_file")
+            if up is not None:
+                parsed_takeoff=None
+                try:
+                    parsed_takeoff,import_warnings=parse_takeoff_file(up)
+                except Exception as exc:
+                    st.error(f"Could not read that file as a take-off: {exc}")
+                if parsed_takeoff is not None:
+                    for warning in import_warnings:
+                        st.warning(warning)
+                    st.dataframe(parsed_takeoff,use_container_width=True,hide_index=True)
+                    if st.button(f"Import {len(parsed_takeoff)} rows into the take-off schedule",type="primary",key="takeoff_import_button"):
+                        imported=0
+                        for row in parsed_takeoff.to_dict("records"):
+                            if not any(str(row.get(c) or "").strip() for c in ["section","element","location","source_reference"]):
+                                continue
+                            if not to_float(row.get("rate_per_unit")):
+                                row["rate_per_unit"]=default_rate_for(row.get("substrate"),row.get("element"),row.get("finish_system"),row.get("unit"))
+                            values=[row.get(col,"") for col in TAKEOFF_COLUMNS]
+                            lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(workspace["id"],*values,now_stamp(),now_stamp()))
+                            imported+=1
+                        st.success(f"Imported {imported} take-off rows. Review and save from the schedule below.")
+                        st.session_state.pop("takeoff_import_file",None)
+                        st.rerun()
         takeoff=ldf("SELECT * FROM takeoff_rows WHERE workspace_id=? ORDER BY id",(workspace["id"],))
         editor_cols=["id"]+TAKEOFF_COLUMNS
         if takeoff.empty:
@@ -2846,7 +3042,7 @@ def model_3d_page(workspace:Dict[str,Any], session_api_key: str = "", ai_provide
                         st.success("Render read completed. Review the preview, then apply it.")
                     except Exception as exc:
                         lexecute("INSERT INTO ai_runs(workspace_id,run_type,model,source_pages,status,response_json,error_message,created_at) VALUES(?,?,?,?,?,?,?,?)",(workspace["id"],"Render / artist's impression",model,json.dumps([options[x] for x in selected]),"Failed","",str(exc),now_stamp()))
-                        st.exception(exc)
+                        st.error(_ai_error_hint(exc))
             data=st.session_state.get("latest_render_result")
             if data:
                 st.json(data,expanded=False)
