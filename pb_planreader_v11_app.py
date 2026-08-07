@@ -1,18 +1,19 @@
-"""Production entry point for Premier Brushworks PlanReader v1.1."""
+"""Production entry point for Premier Brushworks PlanReader v1.2."""
 import pb_planreader_3d_app as app
-from pb_takeoff_v11 import apply
+from pb_takeoff_v11 import apply as apply_v11
+from pb_takeoff_v12 import apply as apply_v12
 
-apply(app)
-app.APP_VERSION = "1.1.1"
+apply_v11(app)
+apply_v12(app)
+app.APP_VERSION = "1.2.0"
 
 # The base app intentionally makes sidebar labels white on the dark PB sidebar,
-# but Streamlit text inputs/selects use light controls. The broad sidebar rule
-# also made the typed value white, so it was effectively invisible. Keep labels
-# white while forcing control values/placeholders back to dark text.
+# but Streamlit text inputs/selects use light controls. Keep labels white while
+# forcing control values/placeholders back to dark text.
 _base_app_css = app.app_css
 
 
-def _v11_app_css() -> None:
+def _v12_app_css() -> None:
     _base_app_css()
     app.st.markdown(
         """
@@ -40,7 +41,7 @@ def _v11_app_css() -> None:
             color: #171717 !important;
             -webkit-text-fill-color: #171717 !important;
         }
-        .pb-v11-live {
+        .pb-v12-live {
             margin: 0.35rem 0 0.75rem 0;
             padding: 0.55rem 0.7rem;
             border: 1px solid #D7A21B;
@@ -51,27 +52,27 @@ def _v11_app_css() -> None:
             font-size: 0.82rem;
             line-height: 1.25rem;
         }
-        .pb-v11-live strong { color: #F4C84B !important; }
+        .pb-v12-live strong { color: #F4C84B !important; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-app.app_css = _v11_app_css
+app.app_css = _v12_app_css
 
 _base_sidebar_workspace_selector = app.sidebar_workspace_selector
 
 
-def _v11_sidebar_workspace_selector(bridge):
+def _v12_sidebar_workspace_selector(bridge):
     app.st.sidebar.markdown(
-        "<div class='pb-v11-live'><strong>PB TAKE-OFF v1.1 ACTIVE</strong><br>Premier Brushworks estimating + JobHub sync</div>",
+        "<div class='pb-v12-live'><strong>PB TAKE-OFF v1.2 ACTIVE</strong><br>PB/JobHub multi-line importer + estimating sync</div>",
         unsafe_allow_html=True,
     )
     return _base_sidebar_workspace_selector(bridge)
 
 
-app.sidebar_workspace_selector = _v11_sidebar_workspace_selector
+app.sidebar_workspace_selector = _v12_sidebar_workspace_selector
 
 if __name__ == "__main__":
     app.main()
