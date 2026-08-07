@@ -204,6 +204,28 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def verify_password(password: str, stored_hash: Any) -> bool:
+    """Verify a JobHub password hash (PBKDF2-SHA256, with legacy SHA-256 fallback)."""
+    import hmac as _hmac
+    stored_hash = str(stored_hash or "")
+    if not stored_hash or not password:
+        return False
+    if stored_hash.startswith("pbkdf2_sha256$"):
+        try:
+            _, iterations_text, salt_hex, expected = stored_hash.split("$", 3)
+            actual = hashlib.pbkdf2_hmac(
+                "sha256",
+                str(password).encode("utf-8"),
+                bytes.fromhex(salt_hex),
+                int(iterations_text),
+            ).hex()
+            return _hmac.compare_digest(actual, expected)
+        except (ValueError, TypeError):
+            return False
+    legacy = hashlib.sha256(str(password).encode("utf-8")).hexdigest()
+    return _hmac.compare_digest(legacy, stored_hash)
+
+
 def to_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
@@ -603,7 +625,7 @@ def authenticate_jobhub_user(bridge: JobHubBridge, username: str, password: str)
     if not rows:
         return None
     user = rows[0]
-    if str(user.get("password_hash", "")) != sha256_text(password):
+    if not verify_password(password, user.get("password_hash", "")):
         return None
     return user
 
@@ -643,6 +665,7 @@ def ensure_planreader_document_table(bridge: JobHubBridge) -> None:
 def discover_jobhub_document_records(bridge: JobHubBridge, job_id: int) -> List[Dict[str, Any]]:
     candidates = [
         "planreader_documents",
+        "job_document_blobs",
         "job_documents",
         "documents",
         "job_files",
@@ -664,7 +687,7 @@ def discover_jobhub_document_records(bridge: JobHubBridge, job_id: int) -> List[
         mime_col = next((c for c in ["mime_type", "content_type", "file_type"] if c in cols), None)
         path_col = next((c for c in ["storage_path", "file_path", "path", "local_path"] if c in cols), None)
         url_col = next((c for c in ["download_url", "file_url", "url", "public_url"] if c in cols), None)
-        blob_col = next((c for c in ["file_data", "content", "data", "blob", "bytes"] if c in cols), None)
+        blob_col = next((c for c in ["blob_data", "file_data", "content", "data", "blob", "bytes"] if c in cols), None)
         date_col = next((c for c in ["uploaded_at", "created_at", "date_uploaded"] if c in cols), None)
         select_parts = [f"{id_col} AS record_id" if id_col else "NULL AS record_id"]
         select_parts.append(f"{name_col} AS file_name" if name_col else "'' AS file_name")
@@ -693,7 +716,12 @@ def copy_jobhub_document_to_workspace(record: Dict[str, Any], workspace_id: int)
     blob = record.get("file_blob")
     try:
         if blob is not None:
-            data = bytes(blob)
+            if isinstance(blob, (bytes, bytearray, memoryview)):
+                data = bytes(blob)
+            elif str(record.get("source_table") or "") == "job_document_blobs":
+                data = base64.b64decode(str(blob))
+            else:
+                data = str(blob).encode("utf-8", errors="ignore")
         elif source_url.startswith("http://") or source_url.startswith("https://"):
             response = requests.get(source_url, timeout=30)
             response.raise_for_status()
@@ -1023,6 +1051,95 @@ def row_value(quantity: float, rate: float) -> float:
     return max(0.0, quantity * rate)
 
 
+DEFAULT_RATES_M2 = {
+    "Plasterboard": 28.0,
+    "Wet-area plasterboard": 30.0,
+    "Fibre cement": 42.0,
+    "Precast concrete": 48.0,
+    "Masonry / blockwork": 42.0,
+    "Timber door": 220.0,
+    "Timber trim / joinery": 15.0,
+    "Structural steel": 95.0,
+    "Metalwork": 40.0,
+    "Concrete floor": 55.0,
+    "Soffit": 45.0,
+    "Previously painted substrate": 32.0,
+    "Other": 25.0,
+}
+
+
+def default_rate_for(substrate: Any, element: Any, finish_system: Any, unit: Any) -> float:
+    """Return an editable default $/unit rate for a take-off row.
+
+    The AI is instructed not to invent rates. This library applies Premier
+    Brushworks' own default estimating rates so a take-off is always priced,
+    with every figure remaining editable in the schedule.
+    """
+    sub = str(substrate or "").strip().lower()
+    el = str(element or "").strip().lower()
+    fin = str(finish_system or "").strip().lower()
+    unit_s = str(unit or "").strip()
+
+    if "door" in el or "door" in sub:
+        if unit_s in {"No.", "item", "each"}:
+            if "entry" in el or "front" in el or "feature" in el:
+                return 650.0
+            if "double" in el or "pair" in el:
+                return 900.0
+            if "fire" in el:
+                return 500.0
+            return 220.0
+        return 220.0
+    if "architrave" in el or "skirting" in el or "dado" in el or "chair rail" in el or "trim" in el or "timber trim" in sub:
+        return 15.0
+    if "handrail" in el or "balustrade" in el or "balcony rail" in el:
+        return 115.0
+    if "fascia" in el:
+        return 20.0
+    if "gutter" in el:
+        return 18.0
+    if "downpipe" in el:
+        return 32.0
+    if "window" in el:
+        if unit_s in {"No.", "item", "each"}:
+            return 280.0
+        return 280.0
+    if "stair" in el:
+        return 2000.0
+    if "floor" in el or "balcony" in el or "deck" in el:
+        if "epoxy" in fin:
+            return 95.0
+        if "seal" in fin or "clear" in fin:
+            return 42.0
+        return 55.0
+    if "ceiling" in el or "soffit" in el or "ceiling flat" in fin:
+        if "fibre" in sub or "soffit" in sub:
+            return 38.0
+        return 25.0
+    if "steel" in sub or "metal" in sub:
+        if unit_s in {"lm", "m"}:
+            return 38.0
+        return 95.0
+    if "render" in sub or "brick" in sub or "block" in sub or "masonry" in sub:
+        return 42.0
+    if "previously painted" in sub:
+        return 32.0
+    if "fibre cement" in sub:
+        return 42.0
+    if "plasterboard" in sub:
+        return 28.0
+    if "concrete" in sub:
+        return 48.0
+    if "timber" in sub:
+        if unit_s in {"lm", "m"}:
+            return 15.0
+        return 55.0
+    for key, rate in DEFAULT_RATES_M2.items():
+        if key.lower() in sub:
+            return rate
+    return 0.0
+
+
 def polygon_area(points: Sequence[Sequence[float]]) -> float:
     if len(points) < 3:
         return 0.0
@@ -1307,7 +1424,7 @@ Required method:
 4. Create measurable painting take-off rows for internal walls, ceilings, doors, frames, joinery, external walls/cladding, soffits, steel, concrete coatings and specialist coatings only when supported.
 5. Never invent dimensions. If a quantity cannot be measured from the supplied evidence, use quantity=0 and quantity_status='To measure'.
 6. For model geometry, only create rectangular building masses where width/depth/height are supported. Use confidence='Measured' only for clear dimensions, 'Derived' for calculated dimensions, and 'Assumed' for placeholders.
-7. Keep rates at zero. Use practical default coats, coverage and productivity only as editable estimating defaults, and explain them in notes.
+7. Leave rate_per_unit at zero; the PlanReader default estimating rate library is applied automatically for every row on import. Use practical default coats, coverage and productivity only as editable estimating defaults, and explain them in notes.
 8. Surface areas must be net or clearly marked gross/provisional. Identify exclusions such as glazing, tiles, prefinished metal, signage, roofing and specialist systems.
 
 Return structured data only. References must name the drawing/page or visible note that supports each item.
@@ -1355,6 +1472,11 @@ def import_ai_result(workspace_id: int, data: Dict[str, Any]) -> Dict[str, int]:
     if data.get("executive_summary"):
         lexecute("UPDATE workspaces SET executive_summary=?,drawing_issue=?,updated_at=? WHERE id=?", (str(data.get("executive_summary")), str(data.get("drawing_issue") or ""), now_stamp(), workspace_id))
     for row in data.get("takeoff_rows", []):
+        row = dict(row)
+        if not to_float(row.get("rate_per_unit")):
+            row["rate_per_unit"] = default_rate_for(
+                row.get("substrate"), row.get("element"), row.get("finish_system"), row.get("unit")
+            )
         values = [row.get(col, "") for col in TAKEOFF_COLUMNS]
         lexecute(
             """
@@ -1628,6 +1750,99 @@ def push_takeoff_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: 
         )
         line_count += 1
     return int(package_id), line_count
+
+
+def pull_takeoff_from_jobhub(workspace_id: int, bridge: JobHubBridge) -> int:
+    """Import take-off rows from JobHub's ``job_takeoff_rows`` into this workspace."""
+    workspace = lquery("SELECT * FROM workspaces WHERE id=?", (workspace_id,))[0]
+    job_id = workspace.get("jobhub_job_id")
+    if not job_id:
+        raise RuntimeError("This workspace is not linked to a JobHub job.")
+    tables = set(bridge.table_names())
+    if "job_takeoff_rows" not in tables:
+        raise RuntimeError("No take-off rows exist in JobHub for linked jobs.")
+    cols = set(bridge.columns("job_takeoff_rows"))
+    selectable = [c for c in
+                  ["id", "internal_external", "area_location", "substrate", "labour_category",
+                   "qty_m2", "lineal_m", "count", "coats", "rate_ex_gst", "labour_hours",
+                   "paint_litres", "value_ex_gst", "source_note", "confidence", "updated_at"]
+                  if c in cols]
+    rows = bridge.query(
+        f"SELECT {', '.join(selectable)} FROM job_takeoff_rows WHERE job_id=? ORDER BY id",
+        (int(job_id),),
+    )
+    if not rows:
+        return 0
+    # Replace any rows previously pulled from JobHub so re-imports stay in sync.
+    lexecute(
+        "DELETE FROM takeoff_rows WHERE workspace_id=? AND source_page='JobHub import'",
+        (workspace_id,),
+    )
+    created = 0
+    for row in rows:
+        location = str(row.get("area_location") or "").strip()
+        substrate = str(row.get("substrate") or "").strip()
+        if not location or not substrate:
+            continue
+        qty_m2 = to_float(row.get("qty_m2"))
+        lineal_m = to_float(row.get("lineal_m"))
+        count = to_float(row.get("count"))
+        if qty_m2 > 0:
+            quantity, unit = qty_m2, "m²"
+        elif lineal_m > 0:
+            quantity, unit = lineal_m, "lm"
+        elif count > 0:
+            quantity, unit = count, "No."
+        else:
+            quantity, unit = 0.0, "m²"
+        internal_external = str(row.get("internal_external") or "Internal")
+        section = {
+            "internal": "Internal walls and ceilings",
+            "exterior": "Exterior walls and cladding",
+            "external": "Exterior walls and cladding",
+        }.get(internal_external.strip().lower(), "Internal walls and ceilings")
+        rate = to_float(row.get("rate_ex_gst"))
+        if rate <= 0:
+            rate = default_rate_for(str(row.get("substrate") or ""), str(row.get("labour_category") or ""), "", unit)
+        lexecute(
+            """
+            INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,
+                quantity,unit,quantity_status,source_page,source_reference,inclusion_status,
+                coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                workspace_id,
+                section,
+                str(row.get("labour_category") or ""),
+                location,
+                substrate,
+                "",
+                quantity,
+                unit,
+                "Measured" if quantity > 0 else "To measure",
+                "JobHub import",
+                str(row.get("source_note") or ""),
+                "",
+                to_float(row.get("coats"), 1),
+                12.0,
+                8.0,
+                rate,
+                str(row.get("confidence") or ""),
+                (f"Imported from JobHub · labour {to_float(row.get('labour_hours')):.1f} hrs · "
+                 f"paint {to_float(row.get('paint_litres')):.1f} L · value {to_float(row.get('value_ex_gst')):.2f}")
+                if any(v is not None for v in [row.get("labour_hours"), row.get("paint_litres"), row.get("value_ex_gst")])
+                else "Imported from JobHub",
+                now_stamp(),
+                now_stamp(),
+            ),
+        )
+        created += 1
+    lexecute(
+        "UPDATE workspaces SET status='Draft', updated_at=? WHERE id=?",
+        (now_stamp(), workspace_id),
+    )
+    return created
 
 
 # -----------------------------------------------------------------------------
@@ -1961,17 +2176,28 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str) -
             for row in edited.to_dict("records"):
                 if not any(str(row.get(c) or "").strip() for c in ["section","element","location","source_reference"]):
                     continue
+                if not to_float(row.get("rate_per_unit")):
+                    row["rate_per_unit"] = default_rate_for(row.get("substrate"),row.get("element"),row.get("finish_system"),row.get("unit"))
                 values=[row.get(col,"") for col in TAKEOFF_COLUMNS]
                 lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(workspace["id"],*values,now_stamp(),now_stamp()))
             st.success("Take-off schedule saved.")
             st.rerun()
+        if c2.button("Apply default rates to all rows",use_container_width=True):
+            rows=ldf("SELECT id,substrate,element,finish_system,unit,rate_per_unit FROM takeoff_rows WHERE workspace_id=?",(workspace["id"],))
+            for r in rows.itertuples():
+                if to_float(r.rate_per_unit)>0:
+                    continue
+                rate=default_rate_for(r.substrate,r.element,r.finish_system,r.unit)
+                lexecute("UPDATE takeoff_rows SET rate_per_unit=?,updated_at=? WHERE id=?",(rate,now_stamp(),r.id))
+            st.success("Default rates applied. Values are editable in the schedule.")
+            st.rerun()
         if c2.button("Add standard empty scope rows",use_container_width=True):
             seeds=[
-                ("Internal","Walls","All internal areas","Plasterboard","Low sheen wall system",0,"m²","To measure","","","INCLUSION",3,12,8,0,"To review","Net of tiles, glazing and joinery."),
-                ("Internal","Ceilings","Flushset ceilings","Plasterboard","Ceiling flat",0,"m²","To measure","","","INCLUSION",3,12,10,0,"To review","Exclude grid ceiling tiles."),
-                ("Internal","Doors","Painted door leaves","Timber door","Semi-gloss / enamel",0,"No.","To measure","","","INCLUSION",3,10,1,0,"To review","Confirm leaf and frame finishes."),
-                ("External","External walls / cladding","All elevations","Fibre cement","Exterior acrylic",0,"m²","To measure","","","INCLUSION",3,10,6,0,"To review","Net of glazing, signage and prefinished cladding."),
-                ("External","Steel / columns","Canopies and exposed steel","Structural steel","Metal primer + topcoats",0,"m²","To measure","","","PROVISIONAL",3,9,4,0,"To review","Confirm site-painted versus factory finish."),
+                ("Internal","Walls","All internal areas","Plasterboard","Low sheen wall system",0,"m²","To measure","","","INCLUSION",3,12,8,default_rate_for("Plasterboard","Walls","Low sheen wall system","m²"),"To review","Net of tiles, glazing and joinery."),
+                ("Internal","Ceilings","Flushset ceilings","Plasterboard","Ceiling flat",0,"m²","To measure","","","INCLUSION",3,12,10,default_rate_for("Plasterboard","Ceilings","Ceiling flat","m²"),"To review","Exclude grid ceiling tiles."),
+                ("Internal","Doors","Painted door leaves","Timber door","Semi-gloss / enamel",0,"No.","To measure","","","INCLUSION",3,10,1,default_rate_for("Timber door","Doors","Semi-gloss / enamel","No."),"To review","Confirm leaf and frame finishes."),
+                ("External","External walls / cladding","All elevations","Fibre cement","Exterior acrylic",0,"m²","To measure","","","INCLUSION",3,10,6,default_rate_for("Fibre cement","External walls / cladding","Exterior acrylic","m²"),"To review","Net of glazing, signage and prefinished cladding."),
+                ("External","Steel / columns","Canopies and exposed steel","Structural steel","Metal primer + topcoats",0,"m²","To measure","","","PROVISIONAL",3,9,4,default_rate_for("Structural steel","Steel / columns","Metal primer + topcoats","m²"),"To review","Confirm site-painted versus factory finish."),
             ]
             for seed in seeds:
                 lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(workspace["id"],*seed,now_stamp(),now_stamp()))
@@ -2105,7 +2331,7 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
             if selected and c1.button("Add selected zones to take-off"):
                 for label in selected:
                     z=lquery("SELECT * FROM mapped_zones WHERE id=?",(choices[label],))[0]
-                    lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(workspace["id"],"Mapped drawing","Mapped zone",z.get("name",""),z.get("substrate",""),z.get("finish_system",""),z.get("area_m2",0),"m²",z.get("quantity_status","Measured"),page.get("page_label",""),z.get("source_reference",""),"INCLUSION",3,12,8,0,"Measured" if pxpm>0 else "To review","Rectangle mapped in PlanReader.",now_stamp(),now_stamp()))
+                    lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(workspace["id"],"Mapped drawing","Mapped zone",z.get("name",""),z.get("substrate",""),z.get("finish_system",""),z.get("area_m2",0),"m²",z.get("quantity_status","Measured"),page.get("page_label",""),z.get("source_reference",""),"INCLUSION",3,12,8,default_rate_for(z.get("substrate",""),"Mapped zone",z.get("finish_system",""),"m²"),"Measured" if pxpm>0 else "To review","Rectangle mapped in PlanReader.",now_stamp(),now_stamp()))
                 st.success("Take-off rows added.")
             if selected and c2.button("Create conceptual 3D masses from selected zones"):
                 for label in selected:
@@ -2222,6 +2448,20 @@ def export_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],user:Dict[
             try:
                 package_id,line_count=push_takeoff_to_jobhub(int(workspace["id"]),bridge,str(user.get("username") or "PlanReader"))
                 st.success(f"Created JobHub take-off package #{package_id} with {line_count} lines.")
+            except Exception as exc:
+                st.exception(exc)
+    st.markdown("</div>",unsafe_allow_html=True)
+    st.markdown("<div class='pb-card'>",unsafe_allow_html=True)
+    st.subheader("Import take-off from JobHub")
+    if not bridge or not workspace.get("jobhub_job_id"):
+        st.info("Link this workspace to a JobHub job to pull take-off rows already stored in JobHub.")
+    else:
+        st.markdown("<div class='pb-note'>Pulls the job's take-off rows from the shared JobHub database. Imported rows are tagged and replaced on re-import; existing rows created here are kept.</div>",unsafe_allow_html=True)
+        if st.button("Pull take-off rows from JobHub",type="primary"):
+            try:
+                n=pull_takeoff_from_jobhub(int(workspace["id"]),bridge)
+                st.success(f"Imported {n} take-off row(s) from JobHub." if n else "JobHub has no take-off rows for this job.")
+                st.rerun()
             except Exception as exc:
                 st.exception(exc)
     st.markdown("</div>",unsafe_allow_html=True)
