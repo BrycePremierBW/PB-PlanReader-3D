@@ -17,6 +17,7 @@ import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -2243,6 +2244,94 @@ def dashboard_page(workspace: Dict[str, Any]) -> None:
         st.plotly_chart(build_3d_figure(int(workspace["id"])), use_container_width=True)
 
 
+def page_thumbnail_bytes(path: str, max_w: int = 320) -> Optional[bytes]:
+    try:
+        p = Path(path)
+        if not p.exists():
+            return None
+        img = Image.open(p)
+        img = img.convert("RGB")
+        ratio = max_w / float(img.width)
+        if ratio < 1:
+            img = img.resize((max_w, max(1, int(img.height * ratio))))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def page_thumbnail(path: str, max_w: int = 320) -> Optional[bytes]:
+    try:
+        mtime = Path(path).stat().st_mtime
+    except Exception:
+        return None
+    return _page_thumb(path, mtime, max_w)
+
+
+@lru_cache(maxsize=512)
+def _page_thumb(path: str, mtime: float, max_w: int) -> Optional[bytes]:
+    try:
+        p = Path(path)
+        if not p.exists():
+            return None
+        img = Image.open(p)
+        img = img.convert("RGB")
+        ratio = max_w / float(img.width)
+        if ratio < 1:
+            img = img.resize((max_w, max(1, int(img.height * ratio))))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def page_preview_picker(workspace_id: int, doc_ids: Sequence[int]) -> None:
+    pages = lquery(
+        "SELECT p.id,p.page_no,p.page_label,p.page_type,p.image_path,p.selected,d.file_name "
+        "FROM pages p JOIN documents d ON d.id=p.document_id "
+        f"WHERE p.workspace_id=? AND p.document_id IN ({','.join('?' for _ in doc_ids)}) ORDER BY d.id,p.page_no",
+        (workspace_id, *doc_ids),
+    )
+    if not pages:
+        st.info("No rendered pages to preview yet.")
+        return
+    st.markdown("#### Preview & select pages to use")
+    st.caption("Tick the pages you want to use in the take-off and 3D model, then save your selection.")
+    ncols = 4
+    cols = st.columns(ncols)
+    keys: List[Tuple[int, str]] = []
+    for i, pg in enumerate(pages):
+        with cols[i % ncols]:
+            thumb = page_thumbnail(str(pg.get("image_path") or ""))
+            if thumb:
+                st.image(thumb, use_container_width=True)
+            else:
+                st.caption("(no preview)")
+            st.caption(f"p{int(pg['page_no'])} · {pg.get('page_type')}")
+            key = f"use_page_{int(pg['id'])}"
+            keys.append((int(pg["id"]), key))
+            st.checkbox("Use this page", value=bool(pg.get("selected")), key=key)
+    c1, c2, c3, c4 = st.columns(4)
+    if c1.button("Save page selection", type="primary"):
+        for pid, key in keys:
+            lexecute("UPDATE pages SET selected=? WHERE id=?", (1 if st.session_state.get(key) else 0, pid))
+        st.success("Page selection saved.")
+        st.rerun()
+    if c2.button("Select all"):
+        for pid, key in keys:
+            st.session_state[key] = True
+        st.rerun()
+    if c3.button("Deselect all"):
+        for pid, key in keys:
+            st.session_state[key] = False
+        st.rerun()
+    if c4.button("Done"):
+        st.session_state.pop("preview_doc_ids", None)
+        st.rerun()
+
+
 def project_documents_page(workspace: Dict[str, Any], bridge: Optional[JobHubBridge], user: Dict[str, Any]) -> None:
     hero(workspace)
     tabs = st.tabs(["Project details", "Linked documents", "Upload", "Process files", "File manager"])
@@ -2290,6 +2379,7 @@ def project_documents_page(workspace: Dict[str, Any], bridge: Optional[JobHubBri
             added=0
             if bridge and mirror and workspace.get("jobhub_job_id"):
                 ensure_planreader_document_table(bridge)
+            new_ids=[]
             for upload in uploads:
                 data = upload.getvalue()
                 digest=sha256_bytes(data)
@@ -2297,12 +2387,27 @@ def project_documents_page(workspace: Dict[str, Any], bridge: Optional[JobHubBri
                     continue
                 target=workspace_path(int(workspace["id"])) / "documents" / f"{digest[:12]}_{safe_name(upload.name)}"
                 target.write_bytes(data)
-                lexecute("""INSERT INTO documents(workspace_id,source_type,jobhub_table,jobhub_record_id,file_name,mime_type,path,sha256,category,page_count,extracted_text,uploaded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (workspace["id"],"PlanReader upload","","",upload.name,upload.type or mimetypes.guess_type(upload.name)[0] or "application/octet-stream",str(target),digest,category,0,"",now_stamp()))
+                doc_id=lexecute("""INSERT INTO documents(workspace_id,source_type,jobhub_table,jobhub_record_id,file_name,mime_type,path,sha256,category,page_count,extracted_text,uploaded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (workspace["id"],"PlanReader upload","","",upload.name,upload.type or mimetypes.guess_type(upload.name)[0] or "application/octet-stream",str(target),digest,category,0,"",now_stamp()))
                 if bridge and mirror and workspace.get("jobhub_job_id"):
                     bridge.execute("INSERT INTO planreader_documents(job_id,file_name,mime_type,storage_path,source_app,uploaded_by,uploaded_at,notes) VALUES(?,?,?,?,?,?,?,?)", (workspace["jobhub_job_id"],upload.name,upload.type or "",str(target),"PlanReader",user.get("username",""),now_stamp(),"Stored on PlanReader service; metadata linked in JobHub database."))
+                new_ids.append(doc_id)
                 added+=1
+            with st.spinner("Rendering page previews..."):
+                messages=[]
+                for doc_id in new_ids:
+                    try:
+                        count,msg=process_document(doc_id)
+                        messages.append(f"#{doc_id}: {count} page(s) — {msg}")
+                    except Exception as exc:
+                        messages.append(f"#{doc_id}: ERROR — {exc}")
+                if messages:
+                    st.code("\n".join(messages))
             st.success(f"Saved {added} new document(s).")
+            if new_ids:
+                st.session_state["preview_doc_ids"]=new_ids
             st.rerun()
+        if st.session_state.get("preview_doc_ids"):
+            page_preview_picker(int(workspace["id"]), st.session_state["preview_doc_ids"])
     with tabs[3]:
         docs=ldf("SELECT id,file_name,category,page_count,source_type FROM documents WHERE workspace_id=? ORDER BY id", (workspace["id"],))
         if docs.empty:
