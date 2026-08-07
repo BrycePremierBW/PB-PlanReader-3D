@@ -144,6 +144,7 @@ PAGE_TYPES = [
     "Roof Plan",
     "Elevation",
     "Section",
+    "Render / Artist's Impression",
     "Door / Window Schedule",
     "Finishes Schedule",
     "Specification",
@@ -827,6 +828,7 @@ def classify_page(text: str, file_name: str, page_no: int) -> Tuple[str, str]:
         ("Floor Plan", ["floor plan", "proposed plan", "general arrangement"]),
         ("Roof Plan", ["roof plan"]),
         ("Elevation", ["elevation", "north elev", "south elev", "east elev", "west elev"]),
+        ("Render / Artist's Impression", ["artist's impression", "artists impression", "artists rendering", "artist rendering", "3d view", "3d render", "concept image", "perspective render", "concept render", "visualisation", "visualization", "render", "impression"]),
         ("Section", ["section", "cross section"]),
         ("Door / Window Schedule", ["door schedule", "window schedule", "door elevations"]),
         ("Finishes Schedule", ["finish schedule", "finishes schedule", "colour schedule", "paint schedule"]),
@@ -1151,7 +1153,37 @@ def polygon_area(points: Sequence[Sequence[float]]) -> float:
     return abs(area) / 2.0
 
 
-def add_cuboid(fig: go.Figure, x: float, y: float, z: float, w: float, d: float, h: float, name: str, opacity: float = 0.65, hover: str = "") -> None:
+def finish_to_colour(finish: Any) -> str:
+    """Map a free-text finish/colour description to a plotly-friendly hex colour."""
+    text = str(finish or "").lower()
+    pairs = [
+        ("charcoal", "#3A3A3C"), ("graphite", "#4A4A4C"), ("black", "#222222"),
+        ("white", "#F2F0EB"), ("off-white", "#EDE9E0"), ("cream", "#E8E1CC"),
+        ("ivory", "#F4F0E3"), ("grey", "#9A9A96"), ("gray", "#9A9A96"),
+        ("silver", "#C6C6C2"), ("zinc", "#8E8E8A"), ("aluminium", "#B8B8B4"),
+        ("colorbond", "#6E7B6E"), ("weathered", "#8A8578"), ("zincalume", "#A8ACAE"),
+        ("timber", "#9A6A3A"), ("wood", "#9A6A3A"), ("cedar", "#A3703C"),
+        ("oak", "#B58348"), ("stained", "#6E4B2C"), ("birch", "#C9A97A"),
+        ("brick", "#9A4B32"), ("red brick", "#A24A33"), ("render", "#D8CFBE"),
+        ("dune", "#CFC3AC"), ("beige", "#CBB79A"), ("sand", "#C9B79C"),
+        ("buff", "#C9B48F"), ("clay", "#B5653C"), ("terracotta", "#B9653A"),
+        ("brown", "#7A5230"), ("cocoa", "#6E4B33"), ("espresso", "#4A3424"),
+        ("blue", "#4A74A4"), ("navy", "#2C4058"), ("teal", "#3E7A70"),
+        ("green", "#4F7A4F"), ("sage", "#8A9378"), ("olive", "#6E7238"),
+        ("red", "#A04444"), ("crimson", "#8E2E2E"), ("burgundy", "#6E2E3C"),
+        ("rust", "#9A4B2E"), ("orange", "#C07830"), ("ochre", "#C09A3C"),
+        ("yellow", "#C9B93C"), ("gold", "#B89A2E"), ("bronze", "#8E6E2E"),
+        ("purple", "#6E4A8E"), ("pink", "#C48A96"), ("tan", "#B49A74"),
+        ("dark", "#4A4A48"), ("light", "#E6E2D8"), ("prefinished", "#B8B4A8"),
+        ("powdercoat", "#B0ACA2"),
+    ]
+    for key, color in pairs:
+        if key in text:
+            return color
+    return "#C9BFA6"
+
+
+def add_cuboid(fig: go.Figure, x: float, y: float, z: float, w: float, d: float, h: float, name: str, opacity: float = 0.65, hover: str = "", color: str = "") -> None:
     xs = [x, x+w, x+w, x, x, x+w, x+w, x]
     ys = [y, y, y+d, y+d, y, y, y+d, y+d]
     zs = [z, z, z, z, z+h, z+h, z+h, z+h]
@@ -1172,6 +1204,7 @@ def add_cuboid(fig: go.Figure, x: float, y: float, z: float, w: float, d: float,
             hoverinfo="text",
             flatshading=True,
             showscale=False,
+            **({"color": color} if color else {}),
         )
     )
 
@@ -1198,6 +1231,7 @@ def build_3d_figure(workspace_id: int) -> go.Figure:
             str(mass.get("label") or "Building mass"),
             0.72 if str(mass.get("confidence") or "").lower() in {"measured", "verified"} else 0.42,
             f"{mass.get('label')}<br>{mass.get('width')} × {mass.get('depth')} × {mass.get('height')} m<br>{mass.get('confidence')}<br>{mass.get('source_reference')}",
+            finish_to_colour(mass.get("finish")),
         )
     if not masses:
         # Plan zones become conceptual room/building masses.
@@ -1465,6 +1499,231 @@ Return structured data only. References must name the drawing/page or visible no
         (workspace_id, "Plan take-off and 3D", model, json.dumps(list(page_ids)), "Completed", json.dumps(data), "", now_stamp()),
     )
     return data
+
+
+def render_ai_schema() -> Dict[str, Any]:
+    facade_props = {
+        "face": {"type": "string"},
+        "main_material": {"type": "string"},
+        "colour_description": {"type": "string"},
+        "colour_hex": {"type": "string"},
+        "window_count": {"type": "integer"},
+        "door_count": {"type": "integer"},
+        "notes": {"type": "string"},
+    }
+    mass_props = {
+        "label": {"type": "string"},
+        "width": {"type": "number"},
+        "depth": {"type": "number"},
+        "height": {"type": "number"},
+        "finish": {"type": "string"},
+        "confidence": {"type": "string"},
+        "source_reference": {"type": "string"},
+        "notes": {"type": "string"},
+    }
+    opening_props = {
+        "mass_label": {"type": "string"},
+        "label": {"type": "string"},
+        "opening_type": {"type": "string"},
+        "face": {"type": "string"},
+        "offset_x": {"type": "number"},
+        "offset_z": {"type": "number"},
+        "width": {"type": "number"},
+        "height": {"type": "number"},
+        "count": {"type": "integer"},
+        "notes": {"type": "string"},
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "executive_summary": {"type": "string"},
+            "building_form": {
+                "type": "object",
+                "properties": {
+                    "storeys": {"type": "integer"},
+                    "roof_style": {"type": "string"},
+                    "roof_material": {"type": "string"},
+                    "roof_colour": {"type": "string"},
+                    "overall_height_m": {"type": "number"},
+                    "notes": {"type": "string"},
+                },
+                "required": ["storeys", "roof_style", "roof_material", "roof_colour", "overall_height_m", "notes"],
+                "additionalProperties": False,
+            },
+            "facades": {
+                "type": "array",
+                "items": {"type": "object", "properties": facade_props, "required": list(facade_props), "additionalProperties": False},
+            },
+            "model_masses": {
+                "type": "array",
+                "items": {"type": "object", "properties": mass_props, "required": list(mass_props), "additionalProperties": False},
+            },
+            "model_openings": {
+                "type": "array",
+                "items": {"type": "object", "properties": opening_props, "required": list(opening_props), "additionalProperties": False},
+            },
+            "unknowns": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["executive_summary", "building_form", "facades", "model_masses", "model_openings", "unknowns"],
+        "additionalProperties": False,
+    }
+
+
+def run_ai_render_read(workspace_id: int, page_ids: Sequence[int], api_key: str, model: str) -> Dict[str, Any]:
+    """Read render / artist's impression images and extract building form for the 3D model.
+
+    Uses the render as a secondary evidence source: form, storeys, roof, per-facade
+    material/colour and window/door placement. Dimensions from a render are treated as
+    'Assumed' and always remain editable — the render never overrides measured plan data.
+    """
+    if OpenAI is None:
+        raise RuntimeError("The openai Python package is not installed.")
+    if not api_key:
+        raise RuntimeError("OpenAI API key is not configured.")
+    if not page_ids:
+        raise RuntimeError("Select at least one render / artist's impression page.")
+    pages = lquery(
+        f"SELECT p.*,d.file_name FROM pages p JOIN documents d ON d.id=p.document_id WHERE p.id IN ({','.join('?' for _ in page_ids)}) ORDER BY p.id",
+        tuple(page_ids),
+    )
+    client = OpenAI(api_key=api_key)
+    content: List[Dict[str, Any]] = []
+    prompt = """
+You are a senior Australian architectural estimator reviewing render / artist's impression images
+to inform a conceptual 3D building model for a painting take-off.
+
+The supplied images are architectural renders or artist's impressions, NOT dimensioned drawings.
+Use them only as secondary evidence for building FORM and APPEARANCE.
+
+Required method:
+1. Describe the building form: number of storeys, roof style, roof material and roof colour.
+2. For each visible facade (front/south, back/north, left/west, right/east), describe the main
+   material (e.g. render, weatherboard, brick, fibre cement, metal cladding, timber), the
+   colour/colour description, and estimate the number of windows and doors on that face.
+3. Create a single rectangular building mass (or clearly separate masses for distinct wings)
+   using ASSUMED dimensions only. Prefer a height derived from the storey count using an
+   approximate 3.0 m per storey (2.7 m floor-to-ceiling plus floor/roof allowance) unless the
+   render shows a clear scale reference. Width/depth should reflect the render's visible
+   proportions. Use confidence='Assumed' and explain the basis in notes.
+4. Create model openings (windows, doors, garage doors) on the appropriate faces to match the
+   render. Use ASSUMED standard sizes unless a scale reference is visible: windows 1.8 m wide
+   x 1.2 m high at 0.9 m sill, doors 0.9 m x 2.1 m, garage door 4.8 m x 2.2 m. Offset each
+   opening along the face so the pattern resembles the render (centres/columns evenly spaced).
+5. Set model_masses finish to the dominant external finish + colour (e.g. 'White render',
+   'Charcoal Colorbond cladding') so the 3D view is colour-coded.
+6. Never invent measured dimensions. Everything from a render is 'Assumed' until verified against
+   a dimensioned plan. List any uncertainties.
+
+Return structured data only. References must name the render page that supports each item.
+"""
+    content.append({"type": "input_text", "text": prompt})
+    for page in pages:
+        content.append(
+            {
+                "type": "input_text",
+                "text": f"RENDER PAGE: {page.get('file_name')} · {page.get('page_label')} · classified {page.get('page_type')}",
+            }
+        )
+        image_path = Path(str(page.get("image_path") or ""))
+        if image_path.exists():
+            content.append({"type": "input_image", "image_url": image_data_url(image_path), "detail": "high"})
+    schema = render_ai_schema()
+    try:
+        response = client.responses.create(
+            model=model,
+            input=[{"role": "user", "content": content}],
+            text={"format": {"type": "json_schema", "name": "render_analysis", "strict": True, "schema": schema}},
+        )
+        raw = response.output_text
+        data = json.loads(raw)
+    except Exception as structured_error:
+        fallback_prompt = prompt + "\nReturn valid JSON matching this schema exactly:\n" + json.dumps(schema)
+        fallback_content = [{"type": "input_text", "text": fallback_prompt}] + content[1:]
+        response = client.responses.create(model=model, input=[{"role": "user", "content": fallback_content}])
+        raw = response.output_text
+        match = re.search(r"\{.*\}", raw, re.S)
+        if not match:
+            raise RuntimeError(f"Structured output failed: {structured_error}; fallback did not return JSON.")
+        data = json.loads(match.group(0))
+    lexecute(
+        "INSERT INTO ai_runs(workspace_id,run_type,model,source_pages,status,response_json,error_message,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        (workspace_id, "Render / artist's impression", model, json.dumps(list(page_ids)), "Completed", json.dumps(data), "", now_stamp()),
+    )
+    return data
+
+
+def apply_render_to_model(workspace_id: int, data: Dict[str, Any], mode: str = "merge") -> Dict[str, int]:
+    """Apply a render analysis to the 3D model.
+
+    mode='merge' keeps any existing measured masses and only adds missing pieces.
+    mode='replace' replaces assumed masses (never measured ones) with the render-derived form.
+    Never overrides a mass whose confidence is 'Measured' or 'Verified'.
+    """
+    counts = {"masses": 0, "openings": 0}
+    building_form = data.get("building_form") or {}
+    exec_summary = str(data.get("executive_summary") or "")
+    if exec_summary:
+        lexecute("UPDATE workspaces SET executive_summary=?, updated_at=? WHERE id=?", (exec_summary, now_stamp(), workspace_id))
+    existing = lquery("SELECT * FROM model_masses WHERE workspace_id=? ORDER BY id", (workspace_id,))
+    measured_existing = {int(m["id"]): m for m in existing if str(m.get("confidence") or "").lower() in {"measured", "verified"}}
+
+    if mode == "replace":
+        for m in existing:
+            if str(m.get("confidence") or "").lower() not in {"measured", "verified"}:
+                lexecute("DELETE FROM model_openings WHERE mass_id=?", (m["id"],))
+                lexecute("DELETE FROM model_masses WHERE id=?", (m["id"],))
+        existing = lquery("SELECT * FROM model_masses WHERE workspace_id=? ORDER BY id", (workspace_id,))
+        measured_existing = {int(m["id"]): m for m in existing if str(m.get("confidence") or "").lower() in {"measured", "verified"}}
+
+    mass_id_by_label: Dict[str, int] = {}
+    for row in data.get("model_masses", []):
+        label = str(row.get("label") or "Building mass").strip() or "Building mass"
+        finish = str(row.get("finish") or "").strip()
+        confidence = str(row.get("confidence") or "Assumed").capitalize()
+        if confidence.lower() not in {"assumed", "derived"}:
+            confidence = "Assumed"
+        match = next((m for m in existing if str(m.get("label") or "").strip() == label), None)
+        if match and str(match.get("confidence") or "").lower() in {"measured", "verified"}:
+            mass_id_by_label[label] = int(match["id"])
+            if finish:
+                lexecute("UPDATE model_masses SET finish=? WHERE id=?", (finish, match["id"]))
+            continue
+        if match:
+            lexecute(
+                "UPDATE model_masses SET width=?,depth=?,height=?,finish=?,confidence=?,source_reference=?,notes=? WHERE id=?",
+                (to_float(row.get("width"), 1), to_float(row.get("depth"), 1), to_float(row.get("height"), 2.7),
+                 finish, confidence, str(row.get("source_reference") or "Render / artist's impression"),
+                 str(row.get("notes") or ""), match["id"]),
+            )
+            mass_id_by_label[label] = int(match["id"])
+        else:
+            new_id = lexecute(
+                """INSERT INTO model_masses(workspace_id,label,level_name,x,y,z,width,depth,height,finish,source_reference,confidence,notes,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (workspace_id, label, "Ground", 0, 0, 0, to_float(row.get("width"), 1), to_float(row.get("depth"), 1),
+                 to_float(row.get("height"), 2.7), finish, str(row.get("source_reference") or "Render / artist's impression"),
+                 confidence, str(row.get("notes") or ""), now_stamp()),
+            )
+            mass_id_by_label[label] = int(new_id)
+            counts["masses"] += 1
+
+    for opening in data.get("model_openings", []):
+        label = str(opening.get("mass_label") or "").strip()
+        mass_id = mass_id_by_label.get(label) or (next(iter(measured_existing.keys())) if measured_existing else None)
+        if mass_id is None:
+            continue
+        lexecute(
+            """INSERT INTO model_openings(workspace_id,mass_id,label,opening_type,face,offset_x,offset_z,width,height,count,notes,source_reference,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (workspace_id, mass_id, str(opening.get("label") or opening.get("opening_type") or "Opening"),
+             str(opening.get("opening_type") or "Window"), str(opening.get("face") or "Front"),
+             to_float(opening.get("offset_x")), to_float(opening.get("offset_z")),
+             max(0.05, to_float(opening.get("width"), 0.9)), max(0.05, to_float(opening.get("height"), 2.1)),
+             max(1, to_int(opening.get("count"), 1)), str(opening.get("notes") or ""),
+             f"Render / artist's impression · {str(opening.get('notes') or '').strip() or 'assumed from render'}", now_stamp()),
+        )
+        counts["openings"] += 1
+    return counts
 
 
 def import_ai_result(workspace_id: int, data: Dict[str, Any]) -> Dict[str, int]:
@@ -2297,14 +2556,23 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
                     dx,dy,dw,dh=drawn_rect
                 else:
                     dx,dy,dw,dh=0.0,0.0,min(500.0,float(img.width)),min(300.0,float(img.height))
-                x=st.number_input("X pixels",min_value=0.0,value=float(dx),step=1.0)
-                y=st.number_input("Y pixels",min_value=0.0,value=float(dy),step=1.0)
-                w=st.number_input("Width pixels",min_value=1.0,value=max(1.0,float(dw)),step=1.0)
-                h=st.number_input("Height pixels",min_value=1.0,value=max(1.0,float(dh)),step=1.0)
-                wall_height=st.number_input("Wall / extrusion height (m)",min_value=.1,value=2.7,step=.1)
-                substrate=st.selectbox("Substrate",SUBSTRATES)
-                finish=st.selectbox("Finish system",FINISH_SYSTEMS)
-                qstatus=st.selectbox("Quantity status",STATUS_OPTIONS,index=0 if pxpm>0 else 2)
+                if pxpm>0:
+                    xm=st.number_input("X position (m)",min_value=0.0,value=float(dx/pxpm),step=0.1,help="Distance in real metres from the page's left edge to the rectangle's left edge, converted from the calibrated scale.")
+                    ym=st.number_input("Y position (m)",min_value=0.0,value=float(dy/pxpm),step=0.1,help="Distance in real metres from the top of the page to the rectangle's top edge.")
+                    wm=st.number_input("Width (m)",min_value=0.01,value=max(0.01,float(dw/pxpm)),step=0.1,help="Rectangle width in real metres.")
+                    hm=st.number_input("Height (m)",min_value=0.01,value=max(0.01,float(dh/pxpm)),step=0.1,help="Rectangle height in real metres.")
+                    x,y,w,h=xm*pxpm,ym*pxpm,wm*pxpm,hm*pxpm
+                    st.caption("Entered in real metres using the saved page calibration. Raw image pixels are stored internally.")
+                else:
+                    x=st.number_input("X position (pixels)",min_value=0.0,value=float(dx),step=1.0,help="Horizontal position in raw image pixels. Calibrate the scale (tab 1) to enter real metres instead.")
+                    y=st.number_input("Y position (pixels)",min_value=0.0,value=float(dy),step=1.0,help="Vertical position in raw image pixels. Calibrate the scale (tab 1) to enter real metres instead.")
+                    w=st.number_input("Width (pixels)",min_value=1.0,value=max(1.0,float(dw)),step=1.0,help="Rectangle width in raw image pixels.")
+                    h=st.number_input("Height (pixels)",min_value=1.0,value=max(1.0,float(dh)),step=1.0,help="Rectangle height in raw image pixels.")
+                    st.caption("Calibrate the page scale (tab 1) to enter and save mapped zones in real metres.")
+                wall_height=st.number_input("Wall / extrusion height (m)",min_value=.1,value=2.7,step=.1,help="Height used to extrude this zone into a 3D building mass.")
+                substrate=st.selectbox("Substrate",SUBSTRATES,help="Surface being painted; drives the default painting rate.")
+                finish=st.selectbox("Finish system",FINISH_SYSTEMS,help="Coating system (render finish, etc.); used with substrate to pick the default rate.")
+                qstatus=st.selectbox("Quantity status",STATUS_OPTIONS,index=0 if pxpm>0 else 2,help="Measured (calibrated scale), Estimated, or To review before it enters the take-off.")
                 source=st.text_input("Source reference",value=f"{page.get('page_label')} · {page.get('page_type')}")
                 if pxpm>0:
                     if view_type in {"Building footprint","Room footprint","Floor plan"}:
@@ -2322,6 +2590,8 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
     with tab3:
         frame=ldf("SELECT id,name,view_type,area_m2,wall_height_m,substrate,finish_system,quantity_status,source_reference FROM mapped_zones WHERE page_id=? ORDER BY id",(page["id"],))
         st.dataframe(frame,use_container_width=True,hide_index=True)
+        if pxpm>0:
+            st.caption("Area shown in m² from the saved page calibration. Zone positions are stored internally in pixels and converted to metres automatically for take-off and 3D masses.")
         overlay=overlay_image(page,zones)
         if overlay: st.image(overlay,use_container_width=True)
         if not frame.empty:
@@ -2348,7 +2618,7 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
 
 def model_3d_page(workspace:Dict[str,Any]) -> None:
     hero(workspace)
-    tabs=st.tabs(["Interactive model","Building masses","Doors & windows","Model exports"])
+    tabs=st.tabs(["Interactive model","Building masses","Doors & windows","Render / artist's impression","Model exports"])
     with tabs[0]:
         masses=ldf("SELECT * FROM model_masses WHERE workspace_id=?",(workspace["id"],))
         zones=ldf("SELECT * FROM mapped_zones WHERE workspace_id=?",(workspace["id"],))
@@ -2382,16 +2652,16 @@ def model_3d_page(workspace:Dict[str,Any]) -> None:
         st.dataframe(openings,use_container_width=True,hide_index=True)
         if masses:
             with st.form("opening_form"):
-                mass_label=st.selectbox("Building mass",list(mass_options.keys()))
+                mass_label=st.selectbox("Building mass",list(mass_options.keys()),help="The mass the opening is fixed to. Position is measured from this mass's front-left corner.")
                 c1,c2=st.columns(2)
                 label=c1.text_input("Opening label",value="Door D01")
-                opening_type=c2.selectbox("Type",["Door","Window","Glazed opening","Roller door","Louvre","Other"])
-                face=c1.selectbox("Face",["Front","Back","Left","Right","North","South","East","West"])
-                offset_x=c2.number_input("Offset along face (m)",value=0.0,step=.1)
-                offset_z=c1.number_input("Sill / base height (m)",value=0.0,step=.1)
-                width=c2.number_input("Width (m)",value=.9,min_value=.05,step=.05)
-                height=c1.number_input("Height (m)",value=2.1,min_value=.05,step=.05)
-                count=c2.number_input("Count",value=1,min_value=1,step=1)
+                opening_type=c2.selectbox("Type",["Door","Window","Glazed opening","Roller door","Louvre","Other"],help="Door and window count toward the take-off schedule when linked to a location.")
+                face=c1.selectbox("Face",["Front","Back","Left","Right","North","South","East","West"],help="Which side of the mass the opening sits on.")
+                offset_x=c2.number_input("Offset along face (m)",value=0.0,step=.1,help="Horizontal distance from the face's left edge to the opening's left edge.")
+                offset_z=c1.number_input("Sill / base height (m)",value=0.0,step=.1,help="Height of the opening's bottom edge above ground / floor level.")
+                width=c2.number_input("Width (m)",value=.9,min_value=.05,step=.05,help="Width of the opening.")
+                height=c1.number_input("Height (m)",value=2.1,min_value=.05,step=.05,help="Height of the opening.")
+                count=c2.number_input("Count",value=1,min_value=1,step=1,help="Repeats (e.g. a bank of identical windows).")
                 source=c1.text_input("Source reference")
                 notes=st.text_area("Notes")
                 save=st.form_submit_button("Add opening")
@@ -2401,6 +2671,34 @@ def model_3d_page(workspace:Dict[str,Any]) -> None:
         else:
             st.info("Add at least one building mass first.")
     with tabs[3]:
+        render_pages=ldf("SELECT id,page_label,image_path FROM pages WHERE workspace_id=? AND page_type=? ORDER BY id",(workspace["id"],"Render / artist's impression"))
+        if render_pages.empty:
+            st.info("No render or artist's impression pages found. Add one in the document processor (page type \u201cRender / artist's impression\u201d) first.")
+        else:
+            options={f"#{int(r.id)} · {r.page_label}":int(r.id) for r in render_pages.itertuples()}
+            selected=st.multiselect("Render pages to read",list(options.keys()),default=list(options.keys()),help="Artist's impressions and renders supply building form, storeys, roof and facade material/colour. Dimensions from a render are always treated as assumed and never override measured plan data.")
+            model=st.text_input("OpenAI model",value=DEFAULT_OPENAI_MODEL,help="Vision-capable model used to interpret the render images.")
+            if st.button("Read render into 3D model",type="primary",disabled=not bool(resolve_openai_key(session_api_key)) or not selected):
+                with st.spinner("Interpreting render images..."):
+                    try:
+                        data=run_ai_render_read(int(workspace["id"]),[options[x] for x in selected],resolve_openai_key(session_api_key),model.strip() or DEFAULT_OPENAI_MODEL)
+                        st.session_state["latest_render_result"]=data
+                        st.success("Render read completed. Review the preview, then apply it.")
+                    except Exception as exc:
+                        lexecute("INSERT INTO ai_runs(workspace_id,run_type,model,source_pages,status,response_json,error_message,created_at) VALUES(?,?,?,?,?,?,?,?)",(workspace["id"],"Render / artist's impression",model,json.dumps([options[x] for x in selected]),"Failed","",str(exc),now_stamp()))
+                        st.exception(exc)
+            data=st.session_state.get("latest_render_result")
+            if data:
+                st.json(data,expanded=False)
+                mode=st.radio("Apply mode",["Merge with existing model","Replace assumed masses"],index=0,help="Merge keeps existing masses and adds/updates from the render. Replace deletes non-measured masses first, keeping measured/verified masses untouched.")
+                if st.button("Apply render to 3D model",type="primary"):
+                    counts=apply_render_to_model(int(workspace["id"]),data,mode="replace" if "Replace" in mode else "merge")
+                    st.success(f"Applied render: {counts['masses']} masses, {counts['openings']} openings.")
+                    st.session_state.pop("latest_render_result",None)
+                    st.rerun()
+            if not resolve_openai_key(session_api_key):
+                st.warning("Configure OPENAI_API_KEY or enter a session key in the sidebar to read renders with AI.")
+    with tabs[4]:
         obj=generate_obj(int(workspace["id"]))
         geometry=json.dumps({"masses":lquery("SELECT * FROM model_masses WHERE workspace_id=?",(workspace["id"],)),"openings":lquery("SELECT * FROM model_openings WHERE workspace_id=?",(workspace["id"],))},indent=2,default=str)
         interactive_html=build_3d_figure(int(workspace["id"])).to_html(full_html=True,include_plotlyjs=True)
