@@ -3,7 +3,7 @@ services:
     name: premier-brushworks-planreader-3d
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: streamlit run pb_planreader_3d_app.py --server.address 0.0.0.0 --server.port $PORT
+    startCommand: streamlit run pb_planreader_v11_app.py --server.address 0.0.0.0 --server.port $PORT
     envVars:
       - key: PLANREADER_DATA_DIR
         value: /var/data/planreader
