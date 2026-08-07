@@ -1,13 +1,15 @@
-"""Production entry point for Premier Brushworks PlanReader v1.2.2."""
+"""Production entry point for Premier Brushworks PlanReader v1.2.3."""
 import pb_planreader_3d_app as app
 from pb_takeoff_v11 import apply as apply_v11
 from pb_takeoff_v12 import apply as apply_v12
 from pb_jobhub_connection_v122 import apply as apply_jobhub_v122
+from pb_jobhub_stability_v123 import apply as apply_jobhub_v123
 
 apply_v11(app)
 apply_v12(app)
 apply_jobhub_v122(app)
-app.APP_VERSION = "1.2.2"
+apply_jobhub_v123(app)
+app.APP_VERSION = "1.2.3"
 
 # Streamlit reruns this launcher while imported modules may stay cached. Preserve
 # originals once so reruns are idempotent instead of wrapping wrappers forever.
@@ -100,7 +102,7 @@ app.app_css = _v121_app_css
 
 def _v121_sidebar_workspace_selector(bridge):
     app.st.sidebar.markdown(
-        "<div class='pb-v12-live'><strong>PB TAKE-OFF v1.2.2 ACTIVE</strong><br>PB/JobHub multi-line importer + estimating sync</div>",
+        "<div class='pb-v12-live'><strong>PB TAKE-OFF v1.2.3 ACTIVE</strong><br>PB/JobHub stable connection + multi-line importer</div>",
         unsafe_allow_html=True,
     )
 
@@ -121,6 +123,7 @@ def _v121_sidebar_workspace_selector(bridge):
             unsafe_allow_html=True,
         )
         if app.st.session_state.get("jobhub_database_url"):
+            app.st.sidebar.caption("Session connection active. Add JOBHUB_DATABASE_URL in Render to keep JobHub connected through app restarts.")
             if app.st.sidebar.button("Clear session JobHub connection", use_container_width=True):
                 app.st.session_state.pop("jobhub_database_url", None)
                 app.st.rerun()
@@ -133,7 +136,7 @@ def _v121_sidebar_workspace_selector(bridge):
         if connection_error:
             app.st.sidebar.error(f"JobHub connection error: {connection_error}")
         with app.st.sidebar.expander("Connect JobHub"):
-            app.st.caption("For a permanent Render connection, set JOBHUB_DATABASE_URL to the same PostgreSQL DATABASE_URL used by JobHub. You can also test it for this browser session here.")
+            app.st.caption("For a permanent Render connection, set JOBHUB_DATABASE_URL to the same PostgreSQL database URL used by JobHub. You can also test it for this browser session here.")
             session_url = app.st.text_input(
                 "JobHub PostgreSQL URL (session only)",
                 type="password",
