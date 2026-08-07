@@ -37,7 +37,35 @@ try:
 except Exception:
     DocxDocument = None
 
+def _patch_image_to_url_compat() -> bool:
+    """Re-add ``streamlit.elements.image.image_to_url`` for the canvas package.
+
+    ``streamlit-drawable-canvas`` 0.9.3 calls the legacy
+    ``st_image.image_to_url(image, width, clamp, channels, output_format,
+    image_id)`` signature. Modern Streamlit moved ``image_to_url`` into
+    ``streamlit.elements.lib.image_utils`` and replaced the ``width`` argument
+    with a ``LayoutConfig``, so the attribute no longer exists on the public
+    module. This shim re-adds the legacy signature and forwards it to the
+    current implementation.
+    """
+    try:
+        import streamlit.elements.image as st_image_module
+        from streamlit.elements.lib.image_utils import image_to_url as _modern_image_to_url
+        from streamlit.elements.lib.layout_utils import LayoutConfig
+
+        def _image_to_url(image, width, clamp, channels, output_format, image_id):
+            return _modern_image_to_url(
+                image, LayoutConfig(width=width), clamp, channels, output_format, image_id
+            )
+
+        st_image_module.image_to_url = _image_to_url
+        return True
+    except Exception:
+        return False
+
+
 try:
+    _patch_image_to_url_compat()
     from streamlit_drawable_canvas import st_canvas
     CANVAS_AVAILABLE = True
 except Exception:
