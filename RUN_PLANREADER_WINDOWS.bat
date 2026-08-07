@@ -11,7 +11,7 @@ py -m pip install -r requirements.txt
 if %ERRORLEVEL% NEQ 0 python -m pip install -r requirements.txt
 
 echo.
-echo Starting PlanReader...
-py -m streamlit run pb_planreader_3d_app.py
-if %ERRORLEVEL% NEQ 0 python -m streamlit run pb_planreader_3d_app.py
+echo Starting PlanReader v1.1...
+py -m streamlit run pb_planreader_v11_app.py
+if %ERRORLEVEL% NEQ 0 python -m streamlit run pb_planreader_v11_app.py
 pause
