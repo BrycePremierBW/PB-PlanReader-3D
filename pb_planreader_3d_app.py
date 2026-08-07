@@ -1888,22 +1888,26 @@ def dataframe_for_takeoff(workspace_id: int) -> pd.DataFrame:
     return df
 
 
+def _norm_key(text: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(text).lower().replace("²", "2").replace("³", "3"))
+
+
 _TAKEOFF_HEADER_SYNONYMS = {
     "section": ["section", "division", "category", "part", "area type", "trade"],
     "element": ["element", "item", "scope", "work", "work item", "description", "task", "component"],
-    "location": ["location", "area", "room", "zone", "floor", "site", "location/area", "area/location", "level"],
-    "substrate": ["substrate", "surface", "material", "background", "base material", "substrate/surface"],
-    "finish_system": ["finish system", "finish", "system", "paint system", "spec", "coating", "finish spec"],
-    "quantity": ["quantity", "qty", "qty (m2)", "area m2", "area", "m2", "sqm", "sq m", "amount", "count", "quantity (m2)", "qty (no.)", "qty (no)"],
+    "location": ["location", "room", "zone", "floor", "level", "site", "location/area", "area/location"],
+    "substrate": ["substrate", "surface", "material", "background", "base material", "substrate/surface", "wall type", "surface type"],
+    "finish_system": ["finish system", "finish", "system", "paint system", "spec", "coating", "finish spec", "paint type"],
+    "quantity": ["quantity", "qty", "quantity (m2)", "qty (m2)", "quantity m2", "qty m2", "area m2", "area (m2)", "amount", "count", "qty (no.)", "qty (no)", "quantity (no.)"],
     "unit": ["unit", "uom", "units", "unit of measure", "measure"],
     "quantity_status": ["quantity status", "status", "measurement status", "qty status", "takeoff status"],
     "source_page": ["source page", "page", "drawing", "sheet", "plan no", "drawing no", "ref page"],
     "source_reference": ["source reference", "reference", "ref", "source", "doc ref", "item ref"],
     "inclusion_status": ["inclusion status", "inclusion", "inc/exc", "inc exc", "include/exclude"],
-    "coats": ["coats", "coat", "no. coats", "number of coats", "coats no"],
-    "coverage_m2_per_litre": ["coverage m2 per litre", "coverage", "m2/l", "m2/litre", "sqm/l", "spread rate"],
-    "productivity_m2_per_hour": ["productivity m2 per hour", "productivity", "m2/hr", "m2/hour", "labour rate", "production rate"],
-    "rate_per_unit": ["rate per unit", "rate", "unit rate", "$/m2", "$ per m2", "price", "rate ($)", "value"],
+    "coats": ["coats", "coat", "no coats", "number of coats", "coats no"],
+    "coverage_m2_per_litre": ["coverage m2 per litre", "coverage", "m2 per litre", "m2/l", "m2/litre", "sqm/l", "spread rate"],
+    "productivity_m2_per_hour": ["productivity m2 per hour", "productivity", "m2 per hour", "m2/hr", "m2/hour", "labour rate", "labour", "labor", "production rate"],
+    "rate_per_unit": ["rate per unit", "rate", "unit rate", "rate per m2", "price", "rate ($)", "value"],
     "confidence": ["confidence", "basis", "measurement basis"],
     "notes": ["notes", "note", "comments", "remarks", "comment"],
 }
@@ -1911,19 +1915,30 @@ _TAKEOFF_HEADER_SYNONYMS = {
 _NORMALISED_HEADERS: Dict[str, str] = {}
 for _target, _words in _TAKEOFF_HEADER_SYNONYMS.items():
     for _word in _words:
-        _NORMALISED_HEADERS[re.sub(r"[^a-z0-9]+", "", str(_word).lower())] = _target
+        _NORMALISED_HEADERS[_norm_key(_word)] = _target
 
 
-def _match_takeoff_header(header: str) -> Optional[str]:
-    key = re.sub(r"[^a-z0-9]+", "", str(header).lower())
+def _match_takeoff_header(header: Any) -> Optional[str]:
+    raw_lower = str(header or "").strip().lower()
+    if not raw_lower:
+        return None
+    if "$" in raw_lower and _norm_key(raw_lower) in {"m2", "m", "sqm"}:
+        return "rate_per_unit"
+    key = _norm_key(raw_lower)
     if key in _NORMALISED_HEADERS:
         return _NORMALISED_HEADERS[key]
+    if key in {"m2", "sqm", "sqmt", "area"}:
+        return "quantity"
+    if key in {"m2l", "sqml"}:
+        return "coverage_m2_per_litre"
+    if key in {"m2h", "m2hr", "sqmh"}:
+        return "productivity_m2_per_hour"
     best_target: Optional[str] = None
     best_score = 0
     for target, words in _TAKEOFF_HEADER_SYNONYMS.items():
         score = 0
         for word in words:
-            norm_word = re.sub(r"[^a-z0-9]+", "", str(word).lower())
+            norm_word = _norm_key(word)
             if norm_word and norm_word in key:
                 score += len(norm_word)
         if score > best_score:
@@ -1959,16 +1974,17 @@ def _parse_qty(raw: Any) -> float:
     return to_float(cleaned, 0.0)
 
 
-def parse_takeoff_file(upload: Any) -> Tuple[pd.DataFrame, List[str]]:
-    """Read an uploaded .xlsx/.xls/.csv take-off file and map its columns to take-off rows.
+def detect_takeoff_columns(upload: Any, header_row: Optional[int] = None) -> Tuple[List[str], List[List[Any]], int, int, int]:
+    """Read an uploaded .xlsx/.xls/.csv take-off file.
 
-    Returns (rows DataFrame, warnings). Header is auto-detected from the row that
-    contains the most recognised take-off column names.
+    Returns (raw column headers, body rows, detected header row index, match score,
+    total data rows). The header row is auto-detected from the row containing the
+    most recognised take-off column names; when nothing is recognised it falls back
+    to the first row so the caller can map columns manually.
     """
     name = str(getattr(upload, "name", "") or "takeoff")
     data = upload.getvalue()
     suffix = Path(name).suffix.lower()
-    warnings: List[str] = []
     try:
         if suffix == ".csv":
             df = pd.read_csv(io.BytesIO(data), header=None, encoding_errors="ignore")
@@ -1980,36 +1996,54 @@ def parse_takeoff_file(upload: Any) -> Tuple[pd.DataFrame, List[str]]:
     if df.empty or df.shape[1] == 0:
         raise RuntimeError("The take-off file is empty.")
 
-    header_row: Optional[int] = None
     best_score = 0
-    for i in range(min(30, len(df))):
-        row = [str(v) for v in df.iloc[i].tolist()]
-        score = sum(1 for cell in row if _match_takeoff_header(cell))
-        if score > best_score:
-            best_score = score
-            header_row = i
+    detected: Optional[int] = None
+    if header_row is None:
+        for i in range(min(30, len(df))):
+            row = [str(v) for v in df.iloc[i].tolist()]
+            score = sum(1 for cell in row if _match_takeoff_header(cell))
+            if score > best_score:
+                best_score = score
+                detected = i
+        if detected is None or best_score < 2:
+            detected = 0
+    else:
+        detected = header_row
 
-    if header_row is None or best_score < 2:
-        raise RuntimeError(
-            "No take-off header row found. The file needs columns such as Element, Location, "
-            "Substrate, Finish system, Quantity, Unit and Rate per unit."
-        )
+    detected = max(0, min(int(detected), len(df) - 1))
+    raw_headers = [str(v).strip() for v in df.iloc[detected].tolist()]
+    body = [list(line) for line in df.iloc[detected + 1:].astype(object).values.tolist()]
+    return raw_headers, body, detected, best_score, len(df)
 
-    raw_headers = [str(v).strip() for v in df.iloc[header_row].tolist()]
-    mapping: Dict[int, str] = {}
-    used: List[str] = []
-    for idx, h in enumerate(raw_headers):
-        target = _match_takeoff_header(h)
-        if target and target not in used:
-            mapping[idx] = target
-            used.append(target)
 
-    body = df.iloc[header_row + 1:].reset_index(drop=True)
+def parse_takeoff_file(upload: Any, mapping: Optional[Dict[int, str]] = None,
+                       raw_headers: Optional[List[str]] = None,
+                       body: Optional[List[List[Any]]] = None) -> Tuple[pd.DataFrame, List[str]]:
+    """Build take-off rows from an uploaded file.
+
+    mapping maps column index -> take-off field name. When None, columns are
+    matched automatically from the header text. Returns (rows DataFrame, warnings).
+    """
+    name = str(getattr(upload, "name", "") or "takeoff")
+    warnings: List[str] = []
+    if raw_headers is None or body is None:
+        raw_headers, body, _used, _score, _total = detect_takeoff_columns(upload)
+    if mapping is None:
+        mapping = {}
+        used: List[str] = []
+        for idx, h in enumerate(raw_headers):
+            target = _match_takeoff_header(h)
+            if target and target not in used:
+                mapping[idx] = target
+                used.append(target)
+
     rows: List[Dict[str, Any]] = []
-    for _, line in body.iterrows():
+    for line in body:
         row: Dict[str, Any] = {c: "" for c in TAKEOFF_COLUMNS}
         for idx, target in mapping.items():
-            value = line.iloc[idx]
+            if idx >= len(line):
+                continue
+            value = line[idx]
             if target == "quantity":
                 row["quantity"] = _parse_qty(value)
             elif target == "unit":
@@ -2023,11 +2057,12 @@ def parse_takeoff_file(upload: Any) -> Tuple[pd.DataFrame, List[str]]:
             continue
         if not row.get("unit"):
             qty_header = next((raw_headers[i] for i, t in mapping.items() if t == "quantity"), "")
-            if qty_header and "no" in qty_header.lower():
+            qty_lower = qty_header.lower()
+            if qty_header and "no" in qty_lower:
                 row["unit"] = "No."
-            elif qty_header and ("m2" in qty_header.lower() or "sq" in qty_header.lower() or "area" in qty_header.lower()):
+            elif qty_header and ("m2" in qty_lower or "m²" in qty_lower or "sq" in qty_lower or "area" in qty_lower):
                 row["unit"] = "m²"
-            elif qty_header and "lm" in qty_header.lower():
+            elif qty_header and "lm" in qty_lower:
                 row["unit"] = "lm"
             else:
                 row["unit"] = "m²"
@@ -2040,7 +2075,7 @@ def parse_takeoff_file(upload: Any) -> Tuple[pd.DataFrame, List[str]]:
         raise RuntimeError("No take-off lines were found under the detected header row.")
 
     if len(mapping) < 4:
-        warnings.append("Only a few columns were recognised — review the imported rows before relying on the quantities.")
+        warnings.append("Only a few columns were recognised — map them manually below or review the imported rows.")
 
     return pd.DataFrame(rows, columns=TAKEOFF_COLUMNS), warnings
 
@@ -2751,28 +2786,62 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
         with st.expander("Import a take-off from an Excel or CSV file"):
             up=st.file_uploader("Take-off file (.xlsx, .xls, .csv)",type=["xlsx","xls","csv"],key="takeoff_import_file")
             if up is not None:
-                parsed_takeoff=None
                 try:
-                    parsed_takeoff,import_warnings=parse_takeoff_file(up)
+                    raw_headers,body,used_row,best_score,total_rows=detect_takeoff_columns(up)
                 except Exception as exc:
                     st.error(f"Could not read that file as a take-off: {exc}")
-                if parsed_takeoff is not None:
-                    for warning in import_warnings:
-                        st.warning(warning)
-                    st.dataframe(parsed_takeoff,use_container_width=True,hide_index=True)
-                    if st.button(f"Import {len(parsed_takeoff)} rows into the take-off schedule",type="primary",key="takeoff_import_button"):
-                        imported=0
-                        for row in parsed_takeoff.to_dict("records"):
-                            if not any(str(row.get(c) or "").strip() for c in ["section","element","location","source_reference"]):
-                                continue
-                            if not to_float(row.get("rate_per_unit")):
-                                row["rate_per_unit"]=default_rate_for(row.get("substrate"),row.get("element"),row.get("finish_system"),row.get("unit"))
-                            values=[row.get(col,"") for col in TAKEOFF_COLUMNS]
-                            lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(workspace["id"],*values,now_stamp(),now_stamp()))
-                            imported+=1
-                        st.success(f"Imported {imported} take-off rows. Review and save from the schedule below.")
-                        st.session_state.pop("takeoff_import_file",None)
-                        st.rerun()
+                else:
+                    hrow=st.number_input("Header row (1-based)",min_value=1,max_value=max(1,total_rows),value=int(used_row)+1,key="takeoff_header_row")
+                    if int(hrow)!=used_row+1:
+                        try:
+                            raw_headers,body,used_row,best_score,total_rows=detect_takeoff_columns(up,header_row=int(hrow)-1)
+                        except Exception as exc:
+                            st.error(f"Could not read that file as a take-off: {exc}")
+                            raw_headers=[]; body=[]
+                    if raw_headers:
+                        if best_score<2:
+                            st.info("No standard take-off column names were recognised in this file — set the header row above, then map the columns below.")
+                        cols=[h if str(h).strip() else f"Column {i+1}" for i,h in enumerate(raw_headers)]
+                        sig=f"{up.name}:{getattr(up,'size','')}:{used_row}"
+                        if st.session_state.get("takeoff_import_sig")!=sig:
+                            st.session_state["takeoff_import_sig"]=sig
+                            auto={i:_match_takeoff_header(h) for i,h in enumerate(raw_headers)}
+                            st.session_state["takeoff_import_map"]=pd.DataFrame({"Column":cols,"Maps to":[auto.get(i) or "" for i in range(len(cols))]})
+                            st.session_state.pop("takeoff_mapping_editor",None)
+                        map_df=st.data_editor(st.session_state["takeoff_import_map"],key="takeoff_mapping_editor",hide_index=True,use_container_width=True,
+                            column_config={"Column":st.column_config.TextColumn(disabled=True),"Maps to":st.column_config.SelectboxColumn(options=[""]+TAKEOFF_COLUMNS)})
+                        st.session_state["takeoff_import_map"]=map_df
+                        mapping={}
+                        for i,m in enumerate(map_df["Maps to"]):
+                            if str(m).strip():
+                                mapping[i]=str(m).strip()
+                        if len(mapping)<3:
+                            st.info("Use the 'Maps to' dropdowns above to map each column (at least an element/description, a quantity and a unit).")
+                        try:
+                            parsed_takeoff,import_warnings=parse_takeoff_file(up,mapping=mapping,raw_headers=raw_headers,body=body)
+                        except Exception as exc:
+                            st.error(f"Could not build take-off rows: {exc}")
+                        else:
+                            for warning in import_warnings:
+                                st.warning(warning)
+                            st.dataframe(parsed_takeoff,use_container_width=True,hide_index=True)
+                            if st.button(f"Import {len(parsed_takeoff)} rows into the take-off schedule",type="primary",key="takeoff_import_button"):
+                                imported=0
+                                for row in parsed_takeoff.to_dict("records"):
+                                    if not any(str(row.get(c) or "").strip() for c in ["section","element","location","source_reference"]):
+                                        continue
+                                    if not to_float(row.get("rate_per_unit")):
+                                        row["rate_per_unit"]=default_rate_for(row.get("substrate"),row.get("element"),row.get("finish_system"),row.get("unit"))
+                                    values=[row.get(col,"") for col in TAKEOFF_COLUMNS]
+                                    lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(workspace["id"],*values,now_stamp(),now_stamp()))
+                                    imported+=1
+                                st.success(f"Imported {imported} take-off rows. Review and save from the schedule below.")
+                                st.session_state.pop("takeoff_import_file",None)
+                                st.session_state.pop("takeoff_import_sig",None)
+                                st.session_state.pop("takeoff_import_map",None)
+                                st.session_state.pop("takeoff_mapping_editor",None)
+                                st.session_state.pop("takeoff_header_row",None)
+                                st.rerun()
         takeoff=ldf("SELECT * FROM takeoff_rows WHERE workspace_id=? ORDER BY id",(workspace["id"],))
         editor_cols=["id"]+TAKEOFF_COLUMNS
         if takeoff.empty:
