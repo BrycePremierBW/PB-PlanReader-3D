@@ -53,7 +53,7 @@ def apply(app) -> None:
                     user=user,
                     password=password,
                     sslmode="require",
-                    connect_timeout=10,
+                    connect_timeout=5,
                 )
             else:
                 # Keep libpq/DSN support for existing deployments that do not use a URL.
