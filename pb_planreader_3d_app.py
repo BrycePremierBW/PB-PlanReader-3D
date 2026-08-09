@@ -3300,9 +3300,10 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
                 st.rerun()
         elif not pxpm:
             st.warning("No scale for this page yet — calibrate it in the **Scale** tab (or confirm a detected scale above) so line lengths are measured in metres.")
-        lines_key=f"ml_{int(page['id'])}"
+        store_key=f"ml_store_{int(page['id'])}"
+        widget_key=f"ml_{int(page['id'])}"
         rev_key=f"mlrev_{int(page['id'])}"
-        pending=st.session_state.get(lines_key)
+        pending=st.session_state.get(store_key)
         if pending is None:
             pending=lquery("SELECT id,takeoff_row_id,label,unit,colour,x1,y1,x2,y2,length_m,quantity_status,moved,notes FROM measurement_lines WHERE page_id=? ORDER BY id",(int(page["id"]),))
             if pending:
@@ -3323,30 +3324,30 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
         c1,c2,c3=st.columns(3)
         if c1.button("Auto-map take-off measurements",type="primary",key=f"auto_{page['id']}",use_container_width=True):
             new_lines=auto_map_measurements(int(workspace["id"]),int(page["id"]),pxpm)
-            st.session_state[lines_key]=new_lines
+            st.session_state[store_key]=new_lines
             st.session_state[rev_key]=int(st.session_state.get(rev_key,0))+1
             st.rerun()
         if c2.button("Revert to auto-layout",key=f"revert_{page['id']}",use_container_width=True):
-            st.session_state.pop(lines_key,None)
+            st.session_state.pop(store_key,None)
             st.session_state[rev_key]=int(st.session_state.get(rev_key,0))+1
             st.rerun()
         if c3.button("Delete saved lines for this page",key=f"delsave_{page['id']}",use_container_width=True):
             lexecute("DELETE FROM measurement_lines WHERE page_id=?",(int(page["id"]),))
-            st.session_state.pop(lines_key,None)
+            st.session_state.pop(store_key,None)
             st.session_state[rev_key]=int(st.session_state.get(rev_key,0))+1
             st.rerun()
         if comp_lines:
             st.markdown("#### Drag to correct the measurement lines")
             path=Path(str(page.get("image_path") or ""))
             if plan_line_editor is not None and path.exists():
-                result=plan_line_editor(path.read_bytes(),comp_lines,pxpm,int(st.session_state.get(rev_key,0)),key=lines_key,height=760)
+                result=plan_line_editor(path.read_bytes(),comp_lines,pxpm,int(st.session_state.get(rev_key,0)),key=widget_key,height=760)
                 if result is not None:
-                    st.session_state[lines_key]=result
+                    st.session_state[store_key]=result
             else:
                 st.error("The interactive line editor is unavailable in this environment.")
             st.caption("Drag the whole line to move it; drag a round end point to change length/angle; select a line and use **Delete selected** to remove it. Line lengths are measured from the saved drawing scale.")
             if st.button("Save mapped measurement lines",type="primary"):
-                outcome=save_measurement_lines(int(workspace["id"]),int(page["id"]),st.session_state.get(lines_key) or comp_lines)
+                outcome=save_measurement_lines(int(workspace["id"]),int(page["id"]),st.session_state.get(store_key) or comp_lines)
                 st.success(f"Saved {outcome['saved']} measurement line(s); {outcome['synced']} lineal-metre take-off quantities updated to their mapped length.")
                 st.rerun()
             saved_lines=lquery("SELECT * FROM measurement_lines WHERE page_id=? ORDER BY id",(int(page["id"]),))
