@@ -2080,6 +2080,66 @@ def parse_takeoff_file(upload: Any, mapping: Optional[Dict[int, str]] = None,
     return pd.DataFrame(rows, columns=TAKEOFF_COLUMNS), warnings
 
 
+def takeoff_import_panel(workspace_id: int, widget_key: str = "takeoff_import") -> None:
+    """Render the take-off file import UI (header row picker, column mapping, preview, import)."""
+    with st.expander("Import a take-off from an Excel or CSV file"):
+        up = st.file_uploader("Take-off file (.xlsx, .xls, .csv)", type=["xlsx", "xls", "csv"], key=f"{widget_key}_file")
+        if up is None:
+            return
+        try:
+            raw_headers, body, used_row, best_score, total_rows = detect_takeoff_columns(up)
+        except Exception as exc:
+            st.error(f"Could not read that file as a take-off: {exc}")
+            return
+        hrow = st.number_input("Header row (1-based)", min_value=1, max_value=max(1, total_rows), value=int(used_row) + 1, key=f"{widget_key}_header_row")
+        if int(hrow) != used_row + 1:
+            try:
+                raw_headers, body, used_row, best_score, total_rows = detect_takeoff_columns(up, header_row=int(hrow) - 1)
+            except Exception as exc:
+                st.error(f"Could not read that file as a take-off: {exc}")
+                return
+        if best_score < 2:
+            st.info("No standard take-off column names were recognised in this file — set the header row above, then map the columns below.")
+        cols = [h if str(h).strip() else f"Column {i+1}" for i, h in enumerate(raw_headers)]
+        sig = f"{up.name}:{getattr(up, 'size', '')}:{used_row}"
+        if st.session_state.get(f"{widget_key}_sig") != sig:
+            st.session_state[f"{widget_key}_sig"] = sig
+            auto = {i: _match_takeoff_header(h) for i, h in enumerate(raw_headers)}
+            st.session_state[f"{widget_key}_map"] = pd.DataFrame({"Column": cols, "Maps to": [auto.get(i) or "" for i in range(len(cols))]})
+            st.session_state.pop(f"{widget_key}_editor", None)
+        map_df = st.data_editor(st.session_state[f"{widget_key}_map"], key=f"{widget_key}_editor", hide_index=True, use_container_width=True,
+            column_config={"Column": st.column_config.TextColumn(disabled=True), "Maps to": st.column_config.SelectboxColumn(options=[""] + TAKEOFF_COLUMNS)})
+        st.session_state[f"{widget_key}_map"] = map_df
+        mapping = {}
+        for i, m in enumerate(map_df["Maps to"]):
+            if str(m).strip():
+                mapping[i] = str(m).strip()
+        if len(mapping) < 3:
+            st.info("Use the 'Maps to' dropdowns above to map each column (at least an element/description, a quantity and a unit).")
+        try:
+            parsed_takeoff, import_warnings = parse_takeoff_file(up, mapping=mapping, raw_headers=raw_headers, body=body)
+        except Exception as exc:
+            st.error(f"Could not build take-off rows: {exc}")
+            return
+        for warning in import_warnings:
+            st.warning(warning)
+        st.dataframe(parsed_takeoff, use_container_width=True, hide_index=True)
+        if st.button(f"Import {len(parsed_takeoff)} rows into the take-off schedule", type="primary", key=f"{widget_key}_button"):
+            imported = 0
+            for row in parsed_takeoff.to_dict("records"):
+                if not any(str(row.get(c) or "").strip() for c in ["section", "element", "location", "source_reference"]):
+                    continue
+                if not to_float(row.get("rate_per_unit")):
+                    row["rate_per_unit"] = default_rate_for(row.get("substrate"), row.get("element"), row.get("finish_system"), row.get("unit"))
+                values = [row.get(col, "") for col in TAKEOFF_COLUMNS]
+                lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (workspace_id, *values, now_stamp(), now_stamp()))
+                imported += 1
+            st.success(f"Imported {imported} take-off rows. Open the Take-off schedule tab to review them.")
+            for k in (f"{widget_key}_file", f"{widget_key}_sig", f"{widget_key}_map", f"{widget_key}_editor", f"{widget_key}_header_row"):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+
 def register_df(workspace_id: int, name: str) -> pd.DataFrame:
     return ldf(
         "SELECT item_no,title,detail,priority,source_reference,status FROM register_items WHERE workspace_id=? AND register_name=? ORDER BY id",
@@ -2633,6 +2693,7 @@ def project_documents_page(workspace: Dict[str, Any], bridge: Optional[JobHubBri
             linked = ldf("SELECT file_name,jobhub_table,jobhub_record_id,mime_type,uploaded_at FROM documents WHERE workspace_id=? AND source_type='JobHub linked document' ORDER BY id DESC", (workspace["id"],))
             st.dataframe(linked, use_container_width=True, hide_index=True)
     with tabs[2]:
+        takeoff_import_panel(int(workspace["id"]), "doc_takeoff_import")
         uploads = st.file_uploader("Upload plans, specifications, schedules and images", type=["pdf","png","jpg","jpeg","webp","docx","xlsx","xls","csv","txt"], accept_multiple_files=True)
         category = st.selectbox("Document category", ["Plans","Specifications","Schedules","Addenda","Scope / tender documents","Site photos","Other"])
         mirror = st.checkbox("Record these uploads as linked PlanReader documents in the shared JobHub database", value=bool(bridge and workspace.get("jobhub_job_id")))
@@ -2783,65 +2844,7 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
             if not resolve_ai_key(ai_provider,session_api_key):
                 st.warning("Configure the AI API key (OPENAI_API_KEY or GEMINI_API_KEY) or enter a session key in the sidebar to enable AI plan reading. Manual mapping and 3D modelling still work without it.")
     with tabs[1]:
-        with st.expander("Import a take-off from an Excel or CSV file"):
-            up=st.file_uploader("Take-off file (.xlsx, .xls, .csv)",type=["xlsx","xls","csv"],key="takeoff_import_file")
-            if up is not None:
-                try:
-                    raw_headers,body,used_row,best_score,total_rows=detect_takeoff_columns(up)
-                except Exception as exc:
-                    st.error(f"Could not read that file as a take-off: {exc}")
-                else:
-                    hrow=st.number_input("Header row (1-based)",min_value=1,max_value=max(1,total_rows),value=int(used_row)+1,key="takeoff_header_row")
-                    if int(hrow)!=used_row+1:
-                        try:
-                            raw_headers,body,used_row,best_score,total_rows=detect_takeoff_columns(up,header_row=int(hrow)-1)
-                        except Exception as exc:
-                            st.error(f"Could not read that file as a take-off: {exc}")
-                            raw_headers=[]; body=[]
-                    if raw_headers:
-                        if best_score<2:
-                            st.info("No standard take-off column names were recognised in this file — set the header row above, then map the columns below.")
-                        cols=[h if str(h).strip() else f"Column {i+1}" for i,h in enumerate(raw_headers)]
-                        sig=f"{up.name}:{getattr(up,'size','')}:{used_row}"
-                        if st.session_state.get("takeoff_import_sig")!=sig:
-                            st.session_state["takeoff_import_sig"]=sig
-                            auto={i:_match_takeoff_header(h) for i,h in enumerate(raw_headers)}
-                            st.session_state["takeoff_import_map"]=pd.DataFrame({"Column":cols,"Maps to":[auto.get(i) or "" for i in range(len(cols))]})
-                            st.session_state.pop("takeoff_mapping_editor",None)
-                        map_df=st.data_editor(st.session_state["takeoff_import_map"],key="takeoff_mapping_editor",hide_index=True,use_container_width=True,
-                            column_config={"Column":st.column_config.TextColumn(disabled=True),"Maps to":st.column_config.SelectboxColumn(options=[""]+TAKEOFF_COLUMNS)})
-                        st.session_state["takeoff_import_map"]=map_df
-                        mapping={}
-                        for i,m in enumerate(map_df["Maps to"]):
-                            if str(m).strip():
-                                mapping[i]=str(m).strip()
-                        if len(mapping)<3:
-                            st.info("Use the 'Maps to' dropdowns above to map each column (at least an element/description, a quantity and a unit).")
-                        try:
-                            parsed_takeoff,import_warnings=parse_takeoff_file(up,mapping=mapping,raw_headers=raw_headers,body=body)
-                        except Exception as exc:
-                            st.error(f"Could not build take-off rows: {exc}")
-                        else:
-                            for warning in import_warnings:
-                                st.warning(warning)
-                            st.dataframe(parsed_takeoff,use_container_width=True,hide_index=True)
-                            if st.button(f"Import {len(parsed_takeoff)} rows into the take-off schedule",type="primary",key="takeoff_import_button"):
-                                imported=0
-                                for row in parsed_takeoff.to_dict("records"):
-                                    if not any(str(row.get(c) or "").strip() for c in ["section","element","location","source_reference"]):
-                                        continue
-                                    if not to_float(row.get("rate_per_unit")):
-                                        row["rate_per_unit"]=default_rate_for(row.get("substrate"),row.get("element"),row.get("finish_system"),row.get("unit"))
-                                    values=[row.get(col,"") for col in TAKEOFF_COLUMNS]
-                                    lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(workspace["id"],*values,now_stamp(),now_stamp()))
-                                    imported+=1
-                                st.success(f"Imported {imported} take-off rows. Review and save from the schedule below.")
-                                st.session_state.pop("takeoff_import_file",None)
-                                st.session_state.pop("takeoff_import_sig",None)
-                                st.session_state.pop("takeoff_import_map",None)
-                                st.session_state.pop("takeoff_mapping_editor",None)
-                                st.session_state.pop("takeoff_header_row",None)
-                                st.rerun()
+        takeoff_import_panel(int(workspace["id"]))
         takeoff=ldf("SELECT * FROM takeoff_rows WHERE workspace_id=? ORDER BY id",(workspace["id"],))
         editor_cols=["id"]+TAKEOFF_COLUMNS
         if takeoff.empty:
