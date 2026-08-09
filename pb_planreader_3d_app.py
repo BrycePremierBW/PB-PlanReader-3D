@@ -75,6 +75,11 @@ except Exception:
     CANVAS_AVAILABLE = False
 
 try:
+    from planreader_line_mapper import plan_line_editor
+except Exception:
+    plan_line_editor = None
+
+try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
@@ -430,6 +435,27 @@ def init_local_db() -> None:
             notes TEXT,
             created_at TEXT,
             FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS measurement_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace_id INTEGER NOT NULL,
+            page_id INTEGER NOT NULL,
+            takeoff_row_id INTEGER,
+            label TEXT,
+            unit TEXT,
+            colour TEXT,
+            x1 REAL DEFAULT 0,
+            y1 REAL DEFAULT 0,
+            x2 REAL DEFAULT 0,
+            y2 REAL DEFAULT 0,
+            length_m REAL DEFAULT 0,
+            quantity_status TEXT,
+            moved INTEGER DEFAULT 0,
+            notes TEXT,
+            created_at TEXT,
+            FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+            FOREIGN KEY(page_id) REFERENCES pages(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS model_openings (
@@ -941,6 +967,230 @@ def placeholder_image(title: str, body: str, target: Path) -> Tuple[int, int]:
         y += 29
     img.save(target)
     return width, height
+
+
+# -----------------------------------------------------------------------------
+# Plan measurement mapping: auto-map take-off rows as draggable measurement lines
+# -----------------------------------------------------------------------------
+
+LINE_COLOUR_PALETTE = [
+    "#1f6fb2", "#1f7a4d", "#b33a3a", "#b26a00", "#7a3fb2",
+    "#0e7c86", "#a03b6f", "#5b7a1f", "#8a4b08", "#33477a",
+]
+
+_LINE_COLOUR_KEYWORDS = [
+    ("ceiling", "#1f6fb2"),
+    ("wall", "#1f7a4d"),
+    ("door", "#b26a00"),
+    ("skirt", "#7a3fb2"),
+    ("trim", "#7a3fb2"),
+    ("fascia", "#0e7c86"),
+    ("soffit", "#a03b6f"),
+    ("cladding", "#5b7a1f"),
+    ("fence", "#8a4b08"),
+    ("metal", "#33477a"),
+    ("steel", "#33477a"),
+]
+
+_LINEAR_UNITS = {
+    "lm", "m", "ml", "lin m", "lineal m", "linear metre", "lineal metre",
+    "mtr", "metres", "meters", "lf", "lfm",
+}
+
+_COUNT_UNITS = {"no", "no.", "ea", "each", "count", "1", "door", "doors"}
+
+
+def line_colour_for(section: Any, element: Any) -> str:
+    """Pick a stable colour for a take-off row's measurement line."""
+    key = f"{str(section or '')} {str(element or '')}".lower()
+    for word, colour in _LINE_COLOUR_KEYWORDS:
+        if word in key:
+            return colour
+    if "external" in str(section or "").lower():
+        return "#b33a3a"
+    if "internal" in str(section or "").lower():
+        return "#1f7a4d"
+    digest = hashlib.md5(key.encode("utf-8", "ignore")).digest()
+    return LINE_COLOUR_PALETTE[digest[0] % len(LINE_COLOUR_PALETTE)]
+
+
+def normalise_line_unit(unit: Any) -> str:
+    u = str(unit or "").strip().lower()
+    if not u:
+        return ""
+    if u in {"m2", "sqm", "sq m", "m²", "square metre", "square metres"}:
+        return "m2"
+    if u in _LINEAR_UNITS:
+        return "m"
+    if u in _COUNT_UNITS:
+        return "count"
+    return u
+
+
+_SCALE_RATIO_RE = re.compile(r"(?:^|[^\d])1\s*[:/]\s*(\d{2,4})(?![:\d])")
+_SCALE_IN_RE = re.compile(r"\b1\s*in\s*(\d{2,4})\b", re.IGNORECASE)
+
+
+def auto_detect_scale(page: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Estimate pixels-per-metre from a drawing scale annotation (e.g. 1:100).
+
+    Pages are rasterised from PDF points at 1.7x, so 1 px = 1/1.7 pt and
+    1 pt = 25.4/72 mm. At scale 1:N, 1 mm on the drawing equals N/1000 m real,
+    giving px_per_m = 1700 / (0.3528 * N). This is only a starting estimate -
+    the user confirms it in the mapper before measured quantities are trusted.
+    """
+    source = str(page.get("scale_text") or "")
+    text = str(page.get("extracted_text") or "")
+    match = _SCALE_RATIO_RE.search(source) or _SCALE_RATIO_RE.search(text) or _SCALE_IN_RE.search(text)
+    if not match:
+        return None
+    ratio = int(match.group(1))
+    if not (10 <= ratio <= 2000):
+        return None
+    px_per_m = 1700.0 / (0.352778 * ratio)
+    return {"ratio": ratio, "px_per_m": round(px_per_m, 3), "source": match.group(0).strip()}
+
+
+def _line_grid_positions(count: int) -> List[Tuple[float, float, float, float]]:
+    """Spread ``count`` horizontal line segments across the page in a grid."""
+    if count <= 0:
+        return []
+    cols = 2 if count <= 6 else (3 if count <= 12 else 4)
+    rows = max(1, math.ceil(count / cols))
+    margin = 6.0
+    cell_w = (100.0 - 2 * margin) / cols
+    cell_h = (100.0 - 2 * margin) / rows
+    out = []
+    for i in range(count):
+        col = i // rows
+        row = i % rows
+        cx = margin + col * cell_w + cell_w * 0.5
+        cy = margin + row * cell_h + cell_h * 0.5
+        width_pct = min(16.0, cell_w * 0.6)
+        out.append((max(0.0, cx - width_pct / 2), cy, min(100.0, cx + width_pct / 2), cy))
+    return out
+
+
+def auto_map_measurements(workspace_id: int, page_id: int, px_per_m: float) -> List[Dict[str, Any]]:
+    """Build a draggable measurement line for every take-off row on this page.
+
+    Line geometry is laid out in a grid across the drawing; the length encodes
+    the row's real quantity where possible (lineal metres 1:1, areas as a
+    representative side length). The user drags each line into place and saves.
+    """
+    rows = ldf("SELECT * FROM takeoff_rows WHERE workspace_id=? ORDER BY id", (workspace_id,))
+    pages = lquery("SELECT width_px,height_px FROM pages WHERE id=?", (page_id,))
+    img_w = int(pages[0].get("width_px") or 1000) if pages else 1000
+    lines: List[Dict[str, Any]] = []
+    positions = _line_grid_positions(len(rows))
+    pxpm = to_float(px_per_m)
+    for i, (r, (x1, y1, x2, y2)) in enumerate(zip(rows.itertuples(index=False), positions)):
+        unit = normalise_line_unit(r.unit)
+        qty = to_float(r.quantity)
+        length_m = 0.0
+        if unit == "m2":
+            length_m = math.sqrt(max(0.0, qty))
+        elif unit == "m":
+            length_m = qty
+        else:
+            length_m = 1.0
+        if pxpm > 0 and length_m > 0:
+            pct_len = min(70.0, max(2.0, length_m * pxpm / img_w * 100.0))
+            cx = (x1 + x2) / 2
+            x1 = max(0.0, cx - pct_len / 2)
+            x2 = min(100.0, cx + pct_len / 2)
+        label = f"{r.location or ''} · {r.element or ''}".strip(" ·")
+        lines.append({
+            "id": f"auto_{i}",
+            "takeoff_row_id": int(r.id),
+            "label": label,
+            "unit": unit,
+            "colour": line_colour_for(r.section, r.element),
+            "x1": round(x1, 3), "y1": round(y1, 3),
+            "x2": round(x2, 3), "y2": round(y2, 3),
+            "length_m": round(length_m, 3),
+            "quantity_status": "Auto-laid",
+            "moved": 0,
+            "notes": f"Auto-mapped from take-off row #{r.id}.",
+        })
+    return lines
+
+
+def save_measurement_lines(workspace_id: int, page_id: int, lines: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Persist corrected measurement lines; sync lineal-metre quantities.
+
+    Rows that were actually moved (``moved``) and have a lineal-metre unit get
+    their take-off quantity updated to the line's measured real length and are
+    marked as Mapped. Everything else keeps its original values.
+    """
+    lexecute("DELETE FROM measurement_lines WHERE page_id=?", (page_id,))
+    saved = 0
+    synced = 0
+    now = now_stamp()
+    for ln in lines or []:
+        moved = 1 if ln.get("moved") else 0
+        unit = normalise_line_unit(ln.get("unit"))
+        length_m = to_float(ln.get("length_m"))
+        row_id = ln.get("takeoff_row_id")
+        if row_id is not None:
+            try:
+                row_id = int(row_id)
+            except (TypeError, ValueError):
+                row_id = None
+            if row_id == 0:
+                row_id = None
+        lexecute(
+            """INSERT INTO measurement_lines(workspace_id,page_id,takeoff_row_id,label,unit,colour,x1,y1,x2,y2,length_m,quantity_status,moved,notes,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                workspace_id, page_id, row_id,
+                str(ln.get("label") or ""), unit, str(ln.get("colour") or ""),
+                to_float(ln.get("x1")), to_float(ln.get("y1")),
+                to_float(ln.get("x2")), to_float(ln.get("y2")),
+                length_m, str(ln.get("quantity_status") or "Mapped"), moved,
+                str(ln.get("notes") or ""), now,
+            ),
+        )
+        saved += 1
+        if moved and unit == "m" and row_id is not None and length_m > 0:
+            lexecute(
+                "UPDATE takeoff_rows SET quantity=?, quantity_status='Mapped', updated_at=? WHERE id=? AND workspace_id=?",
+                (round(length_m, 3), now, row_id, workspace_id),
+            )
+            synced += 1
+    return {"saved": saved, "synced": synced}
+
+
+def render_measurement_overlay(page: Dict[str, Any], lines: Sequence[Dict[str, Any]]) -> Optional[Image.Image]:
+    """Static PNG snapshot of the measurement lines drawn on the page."""
+    path = Path(str(page.get("image_path") or ""))
+    if not path.exists():
+        return None
+    img = Image.open(path).convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+    w, h = img.size
+    if hasattr(lines, "to_dict"):
+        lines = lines.to_dict("records")
+    for ln in lines or []:
+        x1 = to_float(ln.get("x1")) / 100 * w
+        y1 = to_float(ln.get("y1")) / 100 * h
+        x2 = to_float(ln.get("x2")) / 100 * w
+        y2 = to_float(ln.get("y2")) / 100 * h
+        colour = str(ln.get("colour") or "#1f6fb2")
+        hexc = colour.lstrip("#")
+        try:
+            rgb = tuple(int(hexc[i:i + 2], 16) for i in (0, 2, 4))
+        except Exception:
+            rgb = (31, 111, 178)
+        draw.line((x1, y1, x2, y2), fill=rgb + (255,), width=4)
+        r = 6
+        draw.ellipse((x1 - r, y1 - r, x1 + r, y1 + r), fill=rgb + (255,))
+        draw.ellipse((x2 - r, y2 - r, x2 + r, y2 + r), fill=rgb + (255,))
+        label = str(ln.get("label") or "")
+        if label:
+            draw.text((min(x1, x2) + 6, min(y1, y2) + 6), label, fill=(20, 20, 20, 255))
+    return Image.alpha_composite(img, overlay)
 
 
 def process_document(document_id: int, force: bool = False) -> Tuple[int, str]:
@@ -3032,7 +3282,81 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
     chosen=st.selectbox("Drawing page",labels)
     page=pages.iloc[labels.index(chosen)].to_dict()
     zones=lquery("SELECT * FROM mapped_zones WHERE page_id=? ORDER BY id",(int(page["id"]),))
-    tab1,tab2,tab3=st.tabs(["Scale","Map zone","Saved zones"])
+    tab0,tab1,tab2,tab3=st.tabs(["Auto-map measurements","Scale","Map zone","Saved zones"])
+    with tab0:
+        pxpm=to_float(page.get("px_per_m"))
+        st.markdown("### Auto-map take-off measurements")
+        st.caption("Every take-off row becomes a colour-coded measurement line laid out across the drawing. Drag a line to move it, drag either round end point to change its length or angle, or use **Add line** to draw a new one. Save stores the corrected geometry and re-measures lineal-metre quantities from the drawing.")
+        detected=auto_detect_scale(page)
+        if not pxpm and detected:
+            c1,c2=st.columns([.72,.28])
+            c1.write(f"Detected drawing scale **{detected['source']}** → ≈ **{detected['px_per_m']:.1f} px/m**.")
+            if c2.button("Use detected scale",key=f"det_scale_{page['id']}"):
+                lexecute("UPDATE pages SET px_per_m=? WHERE id=?",(detected["px_per_m"],page["id"]))
+                st.rerun()
+        elif not pxpm:
+            st.warning("No scale for this page yet — calibrate it in the **Scale** tab (or confirm a detected scale above) so line lengths are measured in metres.")
+        lines_key=f"ml_{int(page['id'])}"
+        rev_key=f"mlrev_{int(page['id'])}"
+        pending=st.session_state.get(lines_key)
+        if pending is None:
+            pending=lquery("SELECT id,takeoff_row_id,label,unit,colour,x1,y1,x2,y2,length_m,quantity_status,moved,notes FROM measurement_lines WHERE page_id=? ORDER BY id",(int(page["id"]),))
+            if pending:
+                pending=[dict(p) for p in pending]
+        comp_lines=[]
+        for i,ln in enumerate(pending or []):
+            comp_lines.append({
+                "id": str(ln.get("id") or f"ln{i}"),
+                "takeoff_row_id": ln.get("takeoff_row_id"),
+                "label": ln.get("label"), "unit": ln.get("unit"), "colour": ln.get("colour"),
+                "x1": ln.get("x1"), "y1": ln.get("y1"), "x2": ln.get("x2"), "y2": ln.get("y2"),
+                "length_m": ln.get("length_m"), "quantity_status": ln.get("quantity_status"),
+                "moved": ln.get("moved"), "notes": ln.get("notes"),
+            })
+        counts=ldf("SELECT unit, COUNT(*) AS n FROM takeoff_rows WHERE workspace_id=? GROUP BY unit",(workspace["id"],))
+        if not counts.empty:
+            st.caption("Take-off rows to map: " + "; ".join(f"{int(r.n)} × {r.unit}" for r in counts.itertuples()))
+        c1,c2,c3=st.columns(3)
+        if c1.button("Auto-map take-off measurements",type="primary",key=f"auto_{page['id']}",use_container_width=True):
+            new_lines=auto_map_measurements(int(workspace["id"]),int(page["id"]),pxpm)
+            st.session_state[lines_key]=new_lines
+            st.session_state[rev_key]=int(st.session_state.get(rev_key,0))+1
+            st.rerun()
+        if c2.button("Revert to auto-layout",key=f"revert_{page['id']}",use_container_width=True):
+            st.session_state.pop(lines_key,None)
+            st.session_state[rev_key]=int(st.session_state.get(rev_key,0))+1
+            st.rerun()
+        if c3.button("Delete saved lines for this page",key=f"delsave_{page['id']}",use_container_width=True):
+            lexecute("DELETE FROM measurement_lines WHERE page_id=?",(int(page["id"]),))
+            st.session_state.pop(lines_key,None)
+            st.session_state[rev_key]=int(st.session_state.get(rev_key,0))+1
+            st.rerun()
+        if comp_lines:
+            st.markdown("#### Drag to correct the measurement lines")
+            path=Path(str(page.get("image_path") or ""))
+            if plan_line_editor is not None and path.exists():
+                result=plan_line_editor(path.read_bytes(),comp_lines,pxpm,int(st.session_state.get(rev_key,0)),key=lines_key,height=760)
+                if result is not None:
+                    st.session_state[lines_key]=result
+            else:
+                st.error("The interactive line editor is unavailable in this environment.")
+            st.caption("Drag the whole line to move it; drag a round end point to change length/angle; select a line and use **Delete selected** to remove it. Line lengths are measured from the saved drawing scale.")
+            if st.button("Save mapped measurement lines",type="primary"):
+                outcome=save_measurement_lines(int(workspace["id"]),int(page["id"]),st.session_state.get(lines_key) or comp_lines)
+                st.success(f"Saved {outcome['saved']} measurement line(s); {outcome['synced']} lineal-metre take-off quantities updated to their mapped length.")
+                st.rerun()
+            saved_lines=lquery("SELECT * FROM measurement_lines WHERE page_id=? ORDER BY id",(int(page["id"]),))
+            if saved_lines:
+                overlay=render_measurement_overlay(page,saved_lines)
+                if overlay: st.image(overlay,use_container_width=True)
+            legend_lines=comp_lines[:12]
+            st.markdown("#### Legend")
+            lcols=st.columns(2)
+            for i,ln in enumerate(legend_lines):
+                with lcols[i%2]:
+                    st.markdown(f"<span style='display:inline-block;width:18px;height:4px;background:{ln.get('colour')};vertical-align:middle;margin-right:6px'></span>{ln.get('label') or 'Measurement'} · {ln.get('unit') or ''}",unsafe_allow_html=True)
+        else:
+            st.info("No measurement lines yet. Click **Auto-map take-off measurements** to lay out a draggable line for every take-off row.")
     with tab1:
         st.write(f"Drawing scale text: **{page.get('scale_text') or 'not entered'}**")
         c1,c2=st.columns(2)

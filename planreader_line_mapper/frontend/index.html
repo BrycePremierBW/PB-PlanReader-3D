@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PlanReader measurement line mapper</title>
+<style>
+  body { margin: 0; font-family: -apple-system, 'Segoe UI', Roboto, Arial, sans-serif; background: #fff; color: #1f1f1f; }
+  .hint { color: #5f574f; font-size: 13px; line-height: 1.5; }
+  .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+  .toolbar .tb-left { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .toolbar .tb-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .toolbar button { padding: 8px 12px; border-radius: 999px; border: 1px solid #8B6F47; background: #fff; cursor: pointer; font-size: 14px; font-weight: 600; }
+  .toolbar button.danger { color: #b42318; border-color: #e6b4ae; }
+  .toolbar button.active { background: #8B6F47; color: #fff; }
+  .scale-ok { color: #1f7a4d; font-weight: 600; font-size: 13px; }
+  .scale-none { color: #8a8277; font-size: 13px; }
+  .stage { position: relative; display: inline-block; line-height: 0; max-width: 100%; border: 1px solid #e3d8c6; border-radius: 8px; overflow: hidden; }
+  .stage canvas { max-width: 100%; display: block; cursor: crosshair; touch-action: none; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; font-size: 12px; color: #5f574f; }
+  .legend .swatch { display: inline-block; width: 18px; height: 4px; vertical-align: middle; margin-right: 6px; border-radius: 2px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+(function () {
+  var root = document.getElementById('root');
+  var state = {
+    imageKey: null, revision: -1, pxPerM: 0, lines: [],
+    selectedId: null, addMode: false, natW: 0, natH: 0,
+    cw: 0, ch: 0, imgEl: null, drag: null
+  };
+
+  function post(type, payload) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, payload), '*');
+  }
+  function postValue() {
+    var value = state.lines.map(function (ln) {
+      return {
+        id: ln.id, takeoff_row_id: ln.takeoff_row_id,
+        label: ln.label, unit: ln.unit, colour: ln.colour,
+        x1: ln.x1, y1: ln.y1, x2: ln.x2, y2: ln.y2,
+        length_m: ln.length_m, quantity_status: ln.quantity_status,
+        moved: ln.moved ? 1 : 0, notes: ln.notes
+      };
+    });
+    post('streamlit:setComponentValue', { value: value, dataType: 'json' });
+  }
+  function num(v, fallback) { var n = parseFloat(v); return isNaN(n) ? fallback : n; }
+  function r2(n) { return Math.round(num(n, 0) * 100) / 100; }
+  function clamp01(n) { return Math.max(0, Math.min(1, n)); }
+  function pctNum(n) { return Math.max(0, Math.min(100, num(n, 0))); }
+  function sanitize(ln) {
+    var id = String(ln.id || ('ln' + Math.random().toString(36).slice(2, 10)));
+    return {
+      id: id,
+      takeoff_row_id: (ln.takeoff_row_id === undefined || ln.takeoff_row_id === null || ln.takeoff_row_id === '') ? null : ln.takeoff_row_id,
+      label: String(ln.label || ''),
+      unit: String(ln.unit || ''),
+      colour: /^#[0-9a-fA-F]{6}$/.test(String(ln.colour || '')) ? ln.colour : '#1f6fb2',
+      x1: pctNum(ln.x1), y1: pctNum(ln.y1),
+      x2: pctNum(ln.x2), y2: pctNum(ln.y2),
+      length_m: num(ln.length_m, 0),
+      quantity_status: String(ln.quantity_status || 'Mapped'),
+      moved: ln.moved ? 1 : 0,
+      notes: String(ln.notes || '')
+    };
+  }
+  function lineById(id) {
+    for (var i = 0; i < state.lines.length; i++) if (state.lines[i].id === id) return state.lines[i];
+    return null;
+  }
+  function lineLengthM(ln) {
+    if (!(state.pxPerM > 0) || !state.natW || !state.natH) return null;
+    var dx = (ln.x2 - ln.x1) / 100 * state.natW;
+    var dy = (ln.y2 - ln.y1) / 100 * state.natH;
+    return Math.hypot(dx, dy) / state.pxPerM;
+  }
+  function liveLength(ln) {
+    var m = lineLengthM(ln);
+    return m === null ? null : r2(m);
+  }
+  function labelText(ln) {
+    var base = ln.label || 'Measurement';
+    var m = liveLength(ln);
+    if (m !== null) return base + ' · ' + m + ' m';
+    return base;
+  }
+
+  function canvasEl() { return document.getElementById('pr_canvas'); }
+
+  function fitDisplay(natW, natH) {
+    var maxW = 1150, maxH = 1500;
+    var s = Math.min(1, maxW / natW, maxH / natH);
+    return { w: Math.max(1, Math.round(natW * s)), h: Math.max(1, Math.round(natH * s)) };
+  }
+
+  function draw() {
+    var cv = canvasEl();
+    if (!cv || !state.imgEl) return;
+    var ctx = cv.getContext('2d');
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    if (state.natW && state.natH) {
+      ctx.drawImage(state.imgEl, 0, 0, cv.width, cv.height);
+    }
+    var w = cv.width, h = cv.height;
+    state.lines.forEach(function (ln) {
+      var x1 = ln.x1 / 100 * w, y1 = ln.y1 / 100 * h;
+      var x2 = ln.x2 / 100 * w, y2 = ln.y2 / 100 * h;
+      var selected = ln.id === state.selectedId;
+      var col = ln.colour;
+      ctx.save();
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = col;
+      ctx.lineWidth = selected ? 6 : 3.5;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+      ctx.fillStyle = '#ffffff';
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 2.5;
+      var r = selected ? 7 : 5;
+      ctx.beginPath(); ctx.arc(x1, y1, r, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+      ctx.beginPath(); ctx.arc(x2, y2, r, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+      ctx.restore();
+    });
+    state.lines.forEach(function (ln) {
+      var x1 = ln.x1 / 100 * w, y1 = ln.y1 / 100 * h;
+      var x2 = ln.x2 / 100 * w, y2 = ln.y2 / 100 * h;
+      var mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+      var text = labelText(ln);
+      ctx.save();
+      ctx.font = '600 13px -apple-system, "Segoe UI", Roboto, Arial, sans-serif';
+      var tw = ctx.measureText(text).width;
+      var bx = mx - tw / 2 - 5, by = my - 20;
+      bx = Math.max(2, Math.min(w - tw - 12, bx));
+      by = Math.max(2, by);
+      ctx.fillStyle = 'rgba(20,20,20,0.82)';
+      ctx.beginPath();
+      ctx.roundRect(bx, by, tw + 10, 19, 5);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(text, bx + 5, by + 14);
+      ctx.restore();
+    });
+  }
+
+  function toPct(ev) {
+    var cv = canvasEl();
+    var rect = cv.getBoundingClientRect();
+    return {
+      x: clamp01((ev.clientX - rect.left) / rect.width) * 100,
+      y: clamp01((ev.clientY - rect.top) / rect.height) * 100
+    };
+  }
+
+  function segDist(px, py, x1, y1, x2, y2) {
+    var dx = x2 - x1, dy = y2 - y1;
+    var len2 = dx * dx + dy * dy;
+    if (len2 < 0.0001) return Math.hypot(px - x1, py - y1);
+    var t = ((px - x1) * dx + (py - y1) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    var cx = x1 + t * dx, cy = y1 + t * dy;
+    return Math.hypot(px - cx, py - cy);
+  }
+
+  function hitTest(px, py) {
+    var cv = canvasEl();
+    var w = cv.width, h = cv.height;
+    var endThresh = 2.2 / 100 * Math.max(w, h);
+    var lineThresh = 1.6 / 100 * Math.max(w, h);
+    var best = null, bestD = Infinity;
+    for (var i = 0; i < state.lines.length; i++) {
+      var ln = state.lines[i];
+      var x1 = ln.x1 / 100 * w, y1 = ln.y1 / 100 * h;
+      var x2 = ln.x2 / 100 * w, y2 = ln.y2 / 100 * h;
+      var dEnd1 = Math.hypot(px - x1, py - y1);
+      var dEnd2 = Math.hypot(px - x2, py - y2);
+      if (dEnd1 < endThresh) return { ln: ln, kind: 'end', end: 1 };
+      if (dEnd2 < endThresh) return { ln: ln, kind: 'end', end: 2 };
+      var d = segDist(px, py, x1, y1, x2, y2);
+      if (d < lineThresh && d < bestD) { bestD = d; best = { ln: ln, kind: 'move' }; }
+    }
+    return best;
+  }
+
+  function pointerDown(ev) {
+    ev.preventDefault();
+    var p = toPct(ev);
+    if (state.addMode) {
+      state.drag = { kind: 'new', sx: p.x, sy: p.y, cx: p.x, cy: p.y };
+      canvasEl().setPointerCapture(ev.pointerId);
+      return;
+    }
+    var hit = hitTest(p.x, p.y);
+    if (hit) {
+      state.selectedId = hit.ln.id;
+      state.drag = {
+        kind: hit.kind, end: hit.end,
+        id: hit.ln.id,
+        start: { x1: hit.ln.x1, y1: hit.ln.y1, x2: hit.ln.x2, y2: hit.ln.y2 },
+        px: ev.clientX, py: ev.clientY
+      };
+      canvasEl().setPointerCapture(ev.pointerId);
+    } else {
+      state.selectedId = null;
+    }
+    draw();
+  }
+  function pointerMove(ev) {
+    if (!state.drag) return;
+    var p = toPct(ev);
+    var ln = state.drag.kind === 'new' ? null : lineById(state.drag.id);
+    if (state.drag.kind === 'new') {
+      state.drag.cx = p.x; state.drag.cy = p.y;
+    } else if (ln && state.drag.kind === 'move') {
+      var rect = canvasEl().getBoundingClientRect();
+      var dx = (ev.clientX - state.drag.px) / rect.width * 100;
+      var dy = (ev.clientY - state.drag.py) / rect.height * 100;
+      ln.x1 = pctNum(state.drag.start.x1 + dx);
+      ln.y1 = pctNum(state.drag.start.y1 + dy);
+      ln.x2 = pctNum(state.drag.start.x2 + dx);
+      ln.y2 = pctNum(state.drag.start.y2 + dy);
+    } else if (ln && state.drag.kind === 'end') {
+      if (state.drag.end === 1) { ln.x1 = p.x; ln.y1 = p.y; }
+      else { ln.x2 = p.x; ln.y2 = p.y; }
+    }
+    draw();
+  }
+  function pointerUp(ev) {
+    if (!state.drag) return;
+    var p = toPct(ev);
+    if (state.drag.kind === 'new') {
+      state.drag.cx = p.x; state.drag.cy = p.y;
+      var d = state.drag;
+      state.drag = null;
+      var dxLen = Math.abs((d.cx - d.sx) / 100 * (state.natW || 1));
+      var dyLen = Math.abs((d.cy - d.sy) / 100 * (state.natH || 1));
+      if (Math.hypot(dxLen, dyLen) < 4) { draw(); return; }
+      var line = sanitize({
+        id: 'n' + Math.random().toString(36).slice(2, 10),
+        label: 'New line', unit: 'm', colour: '#1f6fb2',
+        x1: d.sx, y1: d.sy, x2: d.cx, y2: d.cy,
+        length_m: 0, moved: 1, quantity_status: 'Drawn', takeoff_row_id: null
+      });
+      state.lines.push(line);
+      state.selectedId = line.id;
+    } else {
+      var ln = lineById(state.drag.id);
+      state.drag = null;
+      if (ln) {
+        ln.length_m = liveLength(ln) || 0;
+        ln.moved = 1;
+      }
+    }
+    postValue();
+    draw();
+  }
+
+  function render() {
+    root.innerHTML = '';
+    if (!state.imageKey) {
+      var h0 = document.createElement('div');
+      h0.className = 'hint';
+      h0.textContent = 'Loading plan image…';
+      root.appendChild(h0);
+      return;
+    }
+    var toolbar = document.createElement('div');
+    toolbar.className = 'toolbar';
+    var tbLeft = document.createElement('div');
+    tbLeft.className = 'tb-left';
+    var hint = document.createElement('div');
+    hint.className = 'hint';
+    hint.textContent = state.addMode
+      ? 'Draw mode — drag on the plan to create a new measurement line, then release. Click a line to select it: drag to move, drag its round end points to change length/angle.'
+      : 'Drag a line to move it; drag a round end point to change its length or angle; click a line to select it.';
+    tbLeft.appendChild(hint);
+    var scaleInfo = document.createElement('span');
+    scaleInfo.className = state.pxPerM > 0 ? 'scale-ok' : 'scale-none';
+    scaleInfo.textContent = state.pxPerM > 0 ? ('Scale set · ' + state.pxPerM + ' px/m') : 'Scale not calibrated — lengths shown unmeasured';
+    tbLeft.appendChild(scaleInfo);
+    toolbar.appendChild(tbLeft);
+
+    var btns = document.createElement('div');
+    btns.className = 'tb-btns';
+    var addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.textContent = state.addMode ? 'Cancel draw' : 'Add line';
+    addBtn.className = state.addMode ? 'active' : '';
+    addBtn.addEventListener('click', function () {
+      state.addMode = !state.addMode;
+      render();
+    });
+    btns.appendChild(addBtn);
+    var delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.className = 'danger';
+    delBtn.textContent = 'Delete selected';
+    delBtn.addEventListener('click', function () {
+      if (!state.selectedId) { alert('Click a line to select it first.'); return; }
+      state.lines = state.lines.filter(function (l) { return l.id !== state.selectedId; });
+      state.selectedId = null;
+      postValue();
+      draw();
+    });
+    btns.appendChild(delBtn);
+    var clearBtn = document.createElement('button');
+    clearBtn.type = 'button';
+    clearBtn.className = 'danger';
+    clearBtn.textContent = 'Clear all lines';
+    clearBtn.addEventListener('click', function () {
+      if (!state.lines.length) return;
+      if (!confirm('Remove every measurement line on this page?')) return;
+      state.lines = [];
+      state.selectedId = null;
+      postValue();
+      draw();
+    });
+    btns.appendChild(clearBtn);
+    toolbar.appendChild(btns);
+    root.appendChild(toolbar);
+
+    var stage = document.createElement('div');
+    stage.className = 'stage';
+    var cv = document.createElement('canvas');
+    cv.id = 'pr_canvas';
+    stage.appendChild(cv);
+    root.appendChild(stage);
+
+    var img = new Image();
+    img.onload = function () {
+      state.natW = img.naturalWidth || 0;
+      state.natH = img.naturalHeight || 0;
+      var fit = fitDisplay(state.natW, state.natH);
+      state.cw = fit.w; state.ch = fit.h;
+      cv.width = state.cw; cv.height = state.ch;
+      state.imgEl = img;
+      cv.addEventListener('pointerdown', pointerDown);
+      cv.addEventListener('pointermove', pointerMove);
+      cv.addEventListener('pointerup', pointerUp);
+      cv.addEventListener('pointercancel', function () { state.drag = null; draw(); });
+      draw();
+    };
+    img.src = state.imageKey;
+
+    var legend = document.createElement('div');
+    legend.className = 'legend';
+    var shown = {};
+    var count = 0;
+    for (var i = 0; i < state.lines.length && count < 10; i++) {
+      var ln = state.lines[i];
+      var key = ln.colour + '|' + ln.unit;
+      if (shown[key]) continue;
+      shown[key] = true;
+      count++;
+      var item = document.createElement('span');
+      var sw = document.createElement('span');
+      sw.className = 'swatch';
+      sw.style.background = ln.colour;
+      item.appendChild(sw);
+      item.appendChild(document.createTextNode((ln.label || 'Measurement') + ' · ' + (ln.unit || '')));
+      legend.appendChild(item);
+    }
+    if (state.lines.length) root.appendChild(legend);
+  }
+
+  window.addEventListener('message', function (event) {
+    var data = event.data;
+    if (!data || data.type !== 'streamlit:render') return;
+    var args = data.args || data;
+    var image = String(args.image || '');
+    var revision = num(args.revision, 0);
+    if (!state.imageKey || image !== state.imageKey || revision !== state.revision) {
+      state.imageKey = image;
+      state.revision = revision;
+      state.pxPerM = num(args.px_per_m, 0);
+      var next = (args.lines || []).map(sanitize);
+      var stillSelected = state.selectedId && next.some(function (l) { return l.id === state.selectedId; });
+      state.selectedId = stillSelected ? state.selectedId : (next.length ? next[0].id : null);
+      state.lines = next;
+      state.addMode = false;
+      state.drag = null;
+    }
+    render();
+  });
+
+  window.addEventListener('load', function () {
+    post('streamlit:componentReady', { apiVersion: 1 });
+  });
+})();
+</script>
+</body>
+</html>
