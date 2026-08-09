@@ -3415,6 +3415,9 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
                 st.rerun()
         elif not pxpm:
             st.warning("No scale for this page yet — calibrate it in the **Scale** tab (or confirm a detected scale above) so line lengths and areas are measured in real units.")
+        store_key=f"ml_store_{int(page['id'])}"
+        widget_key=f"ml_{int(page['id'])}"
+        rev_key=f"mlrev_{int(page['id'])}"
         with st.expander("Quick add a take-off row to draw (e.g. Floor plan by area)",expanded=False):
             qa_cols=st.columns([.28,.3,.22,.2])
             qa_element=qa_cols[0].selectbox("Element",["Floor plan","Walls","Ceilings","Skirtings","Doors","Frames","External walls / cladding","Steel / columns"],key=f"qa_el_{page['id']}")
@@ -3430,9 +3433,6 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
                 st.session_state[f"ml_active_{int(page['id'])}"]=int(new_id)
                 st.session_state[rev_key]=int(st.session_state.get(rev_key,0))+1
                 st.rerun()
-        store_key=f"ml_store_{int(page['id'])}"
-        widget_key=f"ml_{int(page['id'])}"
-        rev_key=f"mlrev_{int(page['id'])}"
         pending=st.session_state.get(store_key)
         if pending is None:
             pending=lquery("SELECT id,takeoff_row_id,label,unit,colour,kind,x1,y1,x2,y2,points,length_m,area_m2,perimeter_m,quantity_status,moved,notes FROM measurement_lines WHERE page_id=? ORDER BY id",(int(page["id"]),))
