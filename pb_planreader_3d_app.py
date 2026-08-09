@@ -2890,6 +2890,15 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
                 lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(workspace["id"],*seed,now_stamp(),now_stamp()))
             st.success("Standard rows added.")
             st.rerun()
+        c3, c4 = st.columns(2)
+        clear_confirm = c3.checkbox(
+            "I understand this deletes every take-off row (quantities, litres, hours) for this job",
+            key=f"clear_takeoff_confirm_{int(workspace['id'])}",
+        )
+        if c4.button("Clear take-off data", type="secondary", disabled=not clear_confirm, use_container_width=True):
+            lexecute("DELETE FROM takeoff_rows WHERE workspace_id=?", (workspace["id"],))
+            st.success("Take-off data cleared.")
+            st.rerun()
     with tabs[2]:
         names=["inclusions","exclusions","clarifications","assumptions","rfis","colour_finish_schedule","access_constraints","risks"]
         selected_reg=st.selectbox("Register",names,format_func=lambda x:x.replace("_"," ").title())
