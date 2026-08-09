@@ -518,7 +518,7 @@
       ? 'Line tool — click two points on the plan to draw a length (walls, doors, frames, skirting).'
       : (state.tool === 'polygon'
         ? 'Outline tool — click each corner, then double-click or press Close outline to finish (footprint, ceilings).'
-        : 'Select tool — click a drawn shape to select it, then Delete selected. Switch to Line or Outline to draw new measurements.');
+        : 'Select tool — click a drawn shape to select it, then Delete selected. Switch to Line or Outline to draw new measurements.'));
     tbLeft.appendChild(hint);
     var scaleInfo = document.createElement('span');
     var pxpm = finiteNum(state.pxPerM, 0);
