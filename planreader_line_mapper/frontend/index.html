@@ -21,8 +21,13 @@
   .chip.none { background: #8a8277; }
   .scale-ok { color: #1f7a4d; font-weight: 600; font-size: 13px; }
   .scale-none { color: #8a8277; font-size: 13px; }
-  .stage { position: relative; display: inline-block; line-height: 0; max-width: 100%; border: 1px solid #e3d8c6; border-radius: 8px; overflow: hidden; }
-  .stage canvas { max-width: 100%; display: block; cursor: crosshair; touch-action: none; }
+  .stage { position: relative; display: block; line-height: 0; max-width: 100%; max-height: 72vh; border: 1px solid #e3d8c6; border-radius: 8px; overflow: auto; }
+  .stage canvas { display: block; cursor: crosshair; touch-action: none; }
+  .zoombar { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .zoombar button { padding: 4px 12px; border-radius: 999px; border: 1px solid #8B6F47; background: #fff; cursor: pointer; font-size: 13px; font-weight: 600; }
+  .zoombar button.active { background: #8B6F47; color: #fff; }
+  .zoombar .zval { font-size: 13px; font-weight: 600; color: #1f1f1f; min-width: 54px; }
+  .zoombar .zhint { font-size: 12px; color: #8a8277; }
   .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; font-size: 12px; color: #5f574f; }
   .legend .swatch { display: inline-block; width: 18px; height: 4px; vertical-align: middle; margin-right: 6px; border-radius: 2px; }
   .legend .swatch.sq { width: 12px; height: 12px; border-radius: 3px; }
@@ -39,7 +44,8 @@
   var state = {
     imageKey: null, revision: -1, pxPerM: 0, lines: [], rows: [],
     activeRowId: null, tool: 'line', drawing: null,
-    selectedId: null, hover: null, natW: 0, natH: 0, cw: 0, ch: 0, imgEl: null, review: false
+    selectedId: null, hover: null, natW: 0, natH: 0, cw: 0, ch: 0, imgEl: null, review: false,
+    zoom: 1, fitW: 1100, labels: false, drag: null
   };
 
   function post(type, payload) {
@@ -143,9 +149,80 @@
   function canvasEl() { return document.getElementById('pr_canvas'); }
 
   function fitDisplay(natW, natH) {
-    var maxW = 1150, maxH = 1500;
-    var s = Math.min(1, maxW / natW, maxH / natH);
+    var maxSide = 3200;
+    var s = Math.min(1, maxSide / Math.max(natW, natH));
     return { w: Math.max(1, Math.round(natW * s)), h: Math.max(1, Math.round(natH * s)) };
+  }
+
+  function applyZoom() {
+    var cv = canvasEl();
+    if (!cv) return;
+    cv.style.width = Math.round((state.fitW || 1100) * (state.zoom || 1)) + 'px';
+    var zv = document.getElementById('pr_zval');
+    if (zv) zv.textContent = Math.round((state.zoom || 1) * 100) + '%';
+  }
+
+  function recomputeShape(ln) {
+    if (ln.kind === 'polygon') {
+      ln.area_m2 = polygonAreaM2(ln.points || []);
+      ln.perimeter_m = polygonPerimeterM(ln.points || []);
+    } else {
+      ln.length_m = lineLengthM(ln.x1, ln.y1, ln.x2, ln.y2);
+    }
+    ln.moved = 1;
+  }
+
+  function shapeRefPoint(ln) {
+    if (ln.kind === 'polygon') {
+      var p0 = (ln.points || [])[0] || [0, 0];
+      return { x: p0[0], y: p0[1] };
+    }
+    return { x: ln.x1, y: ln.y1 };
+  }
+
+  function vertexAt(px, py, ln) {
+    var cv = canvasEl();
+    var w = cv.width || 1, h = cv.height || 1;
+    var thresh = 3.5 / 100 * Math.max(w, h);
+    var pts = ln.kind === 'polygon' ? (ln.points || []) : [[ln.x1, ln.y1], [ln.x2, ln.y2]];
+    for (var i = 0; i < pts.length; i++) {
+      var x = pts[i][0] / 100 * w, y = pts[i][1] / 100 * h;
+      if (Math.hypot(px / 100 * w - x, py / 100 * h - y) < thresh) return i;
+    }
+    return -1;
+  }
+
+  function pointInPolygon(px, py, pts) {
+    var inside = false;
+    for (var i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      var xi = pts[i][0], yi = pts[i][1], xj = pts[j][0], yj = pts[j][1];
+      var intersect = ((yi > py) !== (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  function setVertex(ln, idx, x, y) {
+    if (ln.kind === 'polygon') {
+      if (ln.points && ln.points[idx]) ln.points[idx] = [pctNum(x), pctNum(y)];
+    } else if (idx === 0) {
+      ln.x1 = pctNum(x); ln.y1 = pctNum(y);
+    } else {
+      ln.x2 = pctNum(x); ln.y2 = pctNum(y);
+    }
+    recomputeShape(ln);
+  }
+
+  function translateShape(ln, dx, dy) {
+    if (ln.kind === 'polygon') {
+      ln.points = (ln.points || []).map(function (p) {
+        return [pctNum(p[0] + dx), pctNum(p[1] + dy)];
+      });
+    } else {
+      ln.x1 = pctNum(ln.x1 + dx); ln.y1 = pctNum(ln.y1 + dy);
+      ln.x2 = pctNum(ln.x2 + dx); ln.y2 = pctNum(ln.y2 + dy);
+    }
+    recomputeShape(ln);
   }
 
   function draw() {
@@ -200,33 +277,49 @@
       }
       ctx.restore();
     });
-    state.lines.forEach(function (ln) {
-      var text = shapeLabel(ln);
-      var cx, cy;
-      if (ln.kind === 'polygon') {
-        var pts = (ln.points || []).map(function (p) { return [p[0] / 100 * w, p[1] / 100 * h]; });
-        if (!pts.length) return;
-        var sx = 0, sy = 0;
-        pts.forEach(function (p) { sx += p[0]; sy += p[1]; });
-        cx = sx / pts.length; cy = sy / pts.length;
-      } else {
-        cx = (ln.x1 + ln.x2) / 2 / 100 * w;
-        cy = (ln.y1 + ln.y2) / 2 / 100 * h;
+    if (state.labels) {
+      state.lines.forEach(function (ln) {
+        var text = shapeLabel(ln);
+        var cx, cy;
+        if (ln.kind === 'polygon') {
+          var pts = (ln.points || []).map(function (p) { return [p[0] / 100 * w, p[1] / 100 * h]; });
+          if (!pts.length) return;
+          var sx = 0, sy = 0;
+          pts.forEach(function (p) { sx += p[0]; sy += p[1]; });
+          cx = sx / pts.length; cy = sy / pts.length;
+        } else {
+          cx = (ln.x1 + ln.x2) / 2 / 100 * w;
+          cy = (ln.y1 + ln.y2) / 2 / 100 * h;
+        }
+        ctx.save();
+        ctx.font = '600 12px -apple-system, "Segoe UI", Roboto, Arial, sans-serif';
+        var tw = ctx.measureText(text).width;
+        var bx = cx - tw / 2 - 4, by = cy - 18;
+        bx = Math.max(2, Math.min(w - tw - 8, bx));
+        by = Math.max(2, by);
+        ctx.fillStyle = 'rgba(20,20,20,0.7)';
+        ctx.beginPath();
+        ctx.roundRect(bx, by, tw + 8, 17, 5);
+        ctx.fill();
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(text, bx + 4, by + 13);
+        ctx.restore();
+      });
+    }
+    if (state.tool === 'select' && state.selectedId) {
+      var sel = lineById(state.selectedId);
+      if (sel) {
+        var handles = sel.kind === 'polygon' ? (sel.points || []) : [[sel.x1, sel.y1], [sel.x2, sel.y2]];
+        handles.forEach(function (hp) {
+          ctx.save();
+          ctx.fillStyle = '#ffffff';
+          ctx.strokeStyle = sel.colour;
+          ctx.lineWidth = 3;
+          ctx.beginPath(); ctx.arc(hp[0] / 100 * w, hp[1] / 100 * h, 7, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+          ctx.restore();
+        });
       }
-      ctx.save();
-      ctx.font = '600 13px -apple-system, "Segoe UI", Roboto, Arial, sans-serif';
-      var tw = ctx.measureText(text).width;
-      var bx = cx - tw / 2 - 5, by = cy - 20;
-      bx = Math.max(2, Math.min(w - tw - 12, bx));
-      by = Math.max(2, by);
-      ctx.fillStyle = 'rgba(20,20,20,0.82)';
-      ctx.beginPath();
-      ctx.roundRect(bx, by, tw + 10, 19, 5);
-      ctx.fill();
-      ctx.fillStyle = '#ffffff';
-      ctx.fillText(text, bx + 5, by + 14);
-      ctx.restore();
-    });
+    }
     if (state.drawing) {
       var live = state.drawing;
       var liveRow = rowById(live.rowId);
@@ -287,7 +380,7 @@
   function hitTest(px, py) {
     var cv = canvasEl();
     var w = cv.width, h = cv.height;
-    var thresh = 2.0 / 100 * Math.max(w, h);
+    var thresh = 3.0 / 100 * Math.max(w, h);
     var best = null, bestD = Infinity;
     for (var i = 0; i < state.lines.length; i++) {
       var ln = state.lines[i];
@@ -295,10 +388,14 @@
       if (ln.kind === 'polygon') {
         var pts = (ln.points || []).map(function (p) { return [p[0] / 100 * w, p[1] / 100 * h]; });
         if (pts.length >= 3) {
-          for (var k = 0; k < pts.length; k++) {
-            var a = pts[k], b = pts[(k + 1) % pts.length];
-            var dk = distToSeg(px, py, a[0], a[1], b[0], b[1]);
-            if (dk < d) d = dk;
+          if (pointInPolygon(px, py, ln.points)) {
+            d = 0;
+          } else {
+            for (var k = 0; k < pts.length; k++) {
+              var a = pts[k], b = pts[(k + 1) % pts.length];
+              var dk = distToSeg(px, py, a[0], a[1], b[0], b[1]);
+              if (dk < d) d = dk;
+            }
           }
         } else if (pts.length === 1) {
           d = Math.hypot(px - pts[0][0], py - pts[0][1]);
@@ -313,6 +410,7 @@
 
   function canvasClick(ev) {
     var p = toPct(ev);
+    if (state.tool === 'select') return;
     if (state.tool === 'line') {
       if (!state.drawing) {
         state.drawing = { type: 'line', p1: [p.x, p.y], rowId: state.activeRowId };
@@ -357,9 +455,51 @@
       draw();
       return;
     }
+  }
+
+  function canvasDown(ev) {
+    ev.preventDefault();
+    var p = toPct(ev);
+    if (state.tool !== 'select') return;
     var hit = hitTest(p.x, p.y);
     state.selectedId = hit ? hit.id : null;
+    if (hit) {
+      var vidx = vertexAt(p.x, p.y, hit);
+      var ref = shapeRefPoint(hit);
+      if (vidx >= 0) {
+        state.drag = { type: 'vertex', id: hit.id, idx: vidx };
+      } else {
+        state.drag = { type: 'move', id: hit.id, dx: p.x - ref.x, dy: p.y - ref.y };
+      }
+    }
+    updateLive();
     draw();
+  }
+
+  function canvasMove(ev) {
+    state.hover = toPct(ev);
+    if (state.drag) {
+      var ln = lineById(state.drag.id);
+      if (ln) {
+        if (state.drag.type === 'move') {
+          var ref = shapeRefPoint(ln);
+          translateShape(ln, state.hover.x - state.drag.dx - ref.x, state.hover.y - state.drag.dy - ref.y);
+        } else {
+          setVertex(ln, state.drag.idx, state.hover.x, state.hover.y);
+        }
+      }
+    }
+    updateLive();
+    draw();
+  }
+
+  function canvasUp(ev) {
+    if (state.drag) {
+      state.drag = null;
+      postValue();
+      updateLive();
+      draw();
+    }
   }
 
   function makeLine(x2, y2) {
@@ -444,8 +584,15 @@
         txt += (state.hover && live.pts.length >= 2 ? ' · double-click to close' : '');
       }
     } else {
-      var row2 = activeRow();
-      txt = row2 ? ('Drawing for · ' + (row2.label || 'row') + ' · ' + (row2.unit || '')) : 'Pick a take-off row to draw';
+      if (state.tool === 'select' && state.selectedId) {
+        var sLn = lineById(state.selectedId);
+        if (sLn) {
+          txt = 'Selected · ' + shapeLabel(sLn) + (state.drag ? ' — drag to adjust' : ' — drag a dot to resize, the shape to move');
+        }
+      } else {
+        var row2 = activeRow();
+        txt = row2 ? ('Drawing for · ' + (row2.label || 'row') + ' · ' + (row2.unit || '')) : 'Pick a take-off row to draw';
+      }
     }
     el.textContent = txt;
   }
@@ -518,7 +665,7 @@
       ? 'Line tool — click two points on the plan to draw a length (walls, doors, frames, skirting).'
       : (state.tool === 'polygon'
         ? 'Outline tool — click each corner, then double-click or press Close outline to finish (footprint, ceilings).'
-        : 'Select tool — click a drawn shape to select it, then Delete selected. Switch to Line or Outline to draw new measurements.'));
+        : 'Select tool — click a shape to select it. Drag a corner dot to resize/reshape, drag the middle to move the whole shape, then Delete selected to remove it. Switch to Line or Outline to draw new measurements.'));
     tbLeft.appendChild(hint);
     var scaleInfo = document.createElement('span');
     var pxpm = finiteNum(state.pxPerM, 0);
@@ -541,6 +688,12 @@
     reviewBtn.className = state.review ? 'active' : '';
     reviewBtn.addEventListener('click', function () { state.review = !state.review; draw(); render(); });
     btns.appendChild(reviewBtn);
+    var labelBtn = document.createElement('button');
+    labelBtn.type = 'button';
+    labelBtn.textContent = state.labels ? 'Labels: ON' : 'Labels';
+    labelBtn.className = state.labels ? 'active' : '';
+    labelBtn.addEventListener('click', function () { state.labels = !state.labels; draw(); render(); });
+    btns.appendChild(labelBtn);
     var lineBtn = document.createElement('button');
     lineBtn.type = 'button';
     lineBtn.textContent = 'Line';
@@ -594,6 +747,34 @@
     tbActions.appendChild(btns);
     toolbar.appendChild(tbActions);
 
+    var zbar = document.createElement('div');
+    zbar.className = 'zoombar';
+    var zminus = document.createElement('button');
+    zminus.type = 'button';
+    zminus.textContent = '−';
+    zminus.addEventListener('click', function () { state.zoom = Math.max(0.25, (state.zoom || 1) * 0.8); applyZoom(); });
+    zbar.appendChild(zminus);
+    var zplus = document.createElement('button');
+    zplus.type = 'button';
+    zplus.textContent = '+';
+    zplus.addEventListener('click', function () { state.zoom = Math.min(4, (state.zoom || 1) * 1.25); applyZoom(); });
+    zbar.appendChild(zplus);
+    var zfit = document.createElement('button');
+    zfit.type = 'button';
+    zfit.textContent = 'Fit';
+    zfit.addEventListener('click', function () { state.zoom = 1; applyZoom(); });
+    zbar.appendChild(zfit);
+    var zval = document.createElement('span');
+    zval.className = 'zval';
+    zval.id = 'pr_zval';
+    zval.textContent = Math.round((state.zoom || 1) * 100) + '%';
+    zbar.appendChild(zval);
+    var zhint = document.createElement('span');
+    zhint.className = 'zhint';
+    zhint.textContent = 'Zoom keeps the plan crisp — scroll inside the box to pan when zoomed.';
+    zbar.appendChild(zhint);
+    toolbar.appendChild(zbar);
+
     var live = document.createElement('div');
     live.className = 'live';
     live.id = 'pr_live';
@@ -617,8 +798,12 @@
       state.imgEl = img;
       cv.addEventListener('click', canvasClick);
       cv.addEventListener('dblclick', canvasDblClick);
+      cv.addEventListener('mousedown', canvasDown);
+      cv.addEventListener('mouseup', canvasUp);
       cv.addEventListener('mousemove', canvasMove);
       cv.addEventListener('mouseleave', function () { state.hover = null; updateLive(); draw(); });
+      state.fitW = Math.min(1100, state.cw);
+      applyZoom();
       updateChip();
       updateLive();
       draw();

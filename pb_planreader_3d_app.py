@@ -35,6 +35,11 @@ except Exception:
     fitz = None
 
 try:
+    import cv2  # opencv-python-headless for building-envelope detection
+except Exception:
+    cv2 = None
+
+try:
     from docx import Document as DocxDocument
 except Exception:
     DocxDocument = None
@@ -1244,9 +1249,15 @@ def save_measurement_lines(workspace_id: int, page_id: int, lines: Sequence[Dict
         if row_id is not None and (length_m > 0 or area_m2 > 0):
             unit = normalise_line_unit(ln.get("unit"))
             if unit == "m2" and area_m2 > 0:
+                value = round(area_m2, 3)
+                qty_for = ldf("SELECT section, element FROM takeoff_rows WHERE id=? AND workspace_id=?", (row_id, workspace_id))
+                if not qty_for.empty:
+                    el_key = f"{qty_for.iloc[0]['section'] or ''} {qty_for.iloc[0]['element'] or ''}".lower()
+                    if perimeter_m > 0 and ("external" in el_key or "cladding" in el_key or "render" in el_key):
+                        value = round(perimeter_m * WALL_HEIGHT_M, 3)
                 lexecute(
                     "UPDATE takeoff_rows SET quantity=?, quantity_status='Mapped', updated_at=? WHERE id=? AND workspace_id=?",
-                    (round(area_m2, 3), now, row_id, workspace_id),
+                    (value, now, row_id, workspace_id),
                 )
                 synced += 1
             elif unit == "m" and length_m > 0:
@@ -1256,6 +1267,150 @@ def save_measurement_lines(workspace_id: int, page_id: int, lines: Sequence[Dict
                 )
                 synced += 1
     return {"saved": saved, "synced": synced}
+
+
+# Assumed wall height (m) used to convert an external building-envelope outline
+# (a footprint polygon) into external wall/cladding area: perimeter * height.
+WALL_HEIGHT_M = 2.7
+
+
+def auto_detect_building_envelope(image_path: Any, min_area_pct: float = 0.4, max_contours: int = 3) -> List[Dict[str, Any]]:
+    """Detect the outer building envelope(s) on a plan page.
+
+    Plan drawings are light paper with dark wall lines. The image is thresholded
+    so drawn lines become white, gaps between wall dashes are closed with a
+    morphological close, and the external contours of the largest dark regions
+    are traced. Each detected outline is returned as a polygon in percentage
+    image coordinates (matching the mapper's coordinate space) with its area as
+    a percentage of the page, so the user can place measurement boxes around the
+    cladding / external substrate envelope and the floor area of each level.
+    """
+    if cv2 is None:
+        return []
+    path = Path(str(image_path or ""))
+    if not path.exists():
+        return []
+    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return []
+    h, w = img.shape
+    if w < 16 or h < 16:
+        return []
+    thr = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    kernel = np.ones((7, 7), np.uint8)
+    closed = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel)
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    area_thr = (min_area_pct / 100.0) * w * h
+    results: List[Dict[str, Any]] = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < area_thr:
+            continue
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.012 * peri, True)
+        pts = approx.reshape(-1, 2)
+        if len(pts) < 3:
+            continue
+        pct_pts = [[round(float(x) / w * 100.0, 3), round(float(y) / h * 100.0, 3)] for x, y in pts]
+        results.append({
+            "points": pct_pts,
+            "area_pct": round(area / (w * h) * 100.0, 2),
+            "perimeter_pct": round(peri / max(w, h) * 100.0, 2),
+        })
+    results.sort(key=lambda d: -d["area_pct"])
+    return results[:max_contours]
+
+
+def _polygon_px(shape: Dict[str, Any], width_px: int, height_px: int) -> List[Tuple[float, float]]:
+    pts = shape.get("points") or []
+    if isinstance(pts, str):
+        try:
+            pts = json.loads(pts)
+        except Exception:
+            pts = []
+    return [
+        (float(p[0]) / 100.0 * float(width_px or 1), float(p[1]) / 100.0 * float(height_px or 1))
+        for p in pts
+    ]
+
+
+def auto_detect_envelope_shapes(workspace_id: int, page: Dict[str, Any], px_per_m: float, level: str) -> List[Dict[str, Any]]:
+    """Create drawable measurement shapes for the detected building envelope.
+
+    For every detected outline a polygon is created for two take-off rows:
+
+    - **External walls / cladding** (External, m²) - the outer envelope the user
+      assigns to the real external substrate (render, brick, cladding, ...).
+    - **Floor plan** (Internal, m²) for ``level`` - the internal floor area, the
+      flat-rate basis for internal works including paint systems.
+
+    Rows are created on the fly when missing so drawing can start immediately.
+    """
+    detections = auto_detect_building_envelope(str(page.get("image_path") or ""))
+    if not detections:
+        return []
+    label_ext = " · ".join(x for x in [str(level or ""), "external envelope"] if str(x).strip())
+    label_flr = " · ".join(x for x in [str(level or ""), "floor area"] if str(x).strip())
+    ext_id = _ensure_mapper_row(
+        workspace_id, "External", "External walls / cladding", label_ext,
+        "Render", "Exterior acrylic", "m²", page.get("page_label", ""),
+    )
+    flr_id = _ensure_mapper_row(
+        workspace_id, "Internal", "Floor plan", label_flr,
+        "Concrete floor", "Interior coatings", "m²", page.get("page_label", ""),
+    )
+    pxpm = to_float(px_per_m)
+    w_px = int(page.get("width_px") or 1000)
+    h_px = int(page.get("height_px") or 1000)
+    shapes: List[Dict[str, Any]] = []
+    for i, det in enumerate(detections):
+        pts = det["points"]
+        px_pts = [(p[0] / 100.0 * w_px, p[1] / 100.0 * h_px) for p in pts]
+        area_m2 = polygon_area(px_pts) / (pxpm * pxpm) if pxpm > 0 else 0.0
+        perimeter_m = 0.0
+        if pxpm > 0:
+            perimeter_m = sum(
+                math.hypot(px_pts[j][0] - px_pts[(j + 1) % len(px_pts)][0], px_pts[j][1] - px_pts[(j + 1) % len(px_pts)][1])
+                for j in range(len(px_pts))
+            ) / pxpm
+        shapes.append({
+            "id": f"auto_ext_{i}", "takeoff_row_id": int(ext_id),
+            "label": f"External walls / cladding · {label_ext} (auto)", "unit": "m2",
+            "colour": line_colour_for("External", "External walls / cladding"),
+            "kind": "polygon", "points": pts,
+            "length_m": 0.0, "area_m2": round(area_m2, 3), "perimeter_m": round(perimeter_m, 3),
+            "quantity_status": "Detected", "moved": 1,
+            "notes": "Auto-detected envelope - drag corners or move to match the real plan, then pick the external substrate row for each face.",
+        })
+        shapes.append({
+            "id": f"auto_flr_{i}", "takeoff_row_id": int(flr_id),
+            "label": f"Floor plan · {label_flr} (auto)", "unit": "m2",
+            "colour": line_colour_for("Internal", "Floor plan"),
+            "kind": "polygon", "points": pts,
+            "length_m": 0.0, "area_m2": round(area_m2, 3), "perimeter_m": round(perimeter_m, 3),
+            "quantity_status": "Detected", "moved": 1,
+            "notes": "Auto-detected floor area - adjust to the real level footprint.",
+        })
+    return shapes
+
+
+def _ensure_mapper_row(workspace_id: int, section: str, element: str, location: str,
+                       substrate: str, finish_system: str, unit: str, source_page: str) -> int:
+    """Return an existing drawable take-off row or create it (used by auto-detect)."""
+    existing = ldf(
+        "SELECT id FROM takeoff_rows WHERE workspace_id=? AND section=? AND element=? AND location=? AND unit=? ORDER BY id",
+        (workspace_id, section, element, location, unit),
+    )
+    if not existing.empty:
+        return int(existing.iloc[0]["id"])
+    unit_norm = normalise_line_unit(unit)
+    rate = default_rate_for(substrate, element, finish_system, unit)
+    return lexecute(
+        """INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (workspace_id, section, element, location, substrate, finish_system, 0, unit_norm, "To measure", source_page, "", "INCLUSION",
+         3 if unit_norm == "m2" else 2, 12, 8, rate, "To review", f"Auto-detected from {source_page}.", now_stamp(), now_stamp()),
+    )
 
 
 def render_measurement_overlay(page: Dict[str, Any], lines: Sequence[Dict[str, Any]]) -> Optional[Image.Image]:
@@ -1564,6 +1719,8 @@ def default_rate_for(substrate: Any, element: Any, finish_system: Any, unit: Any
             return 38.0
         return 95.0
     if "render" in sub or "brick" in sub or "block" in sub or "masonry" in sub:
+        return 42.0
+    if "interior coatings" in fin or "paint" in fin:
         return 42.0
     if "previously painted" in sub:
         return 32.0
@@ -3419,11 +3576,12 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
         widget_key=f"ml_{int(page['id'])}"
         rev_key=f"mlrev_{int(page['id'])}"
         with st.expander("Quick add a take-off row to draw (e.g. Floor plan by area)",expanded=False):
-            qa_cols=st.columns([.28,.3,.22,.2])
-            qa_element=qa_cols[0].selectbox("Element",["Floor plan","Walls","Ceilings","Skirtings","Doors","Frames","External walls / cladding","Steel / columns"],key=f"qa_el_{page['id']}")
-            qa_loc=qa_cols[1].text_input("Location / description",value="All internal areas",key=f"qa_loc_{page['id']}")
-            qa_sub=qa_cols[2].selectbox("Substrate",SUBSTRATES,index=SUBSTRATES.index("Render") if "Render" in SUBSTRATES else 0,key=f"qa_sub_{page['id']}")
-            qa_fin=qa_cols[3].selectbox("Finish system",FINISH_SYSTEMS,index=0,key=f"qa_fin_{page['id']}")
+            qa_cols=st.columns([.2,.26,.22,.18,.14])
+            qa_level=qa_cols[0].selectbox("Level",["Level 1","Ground","Level 2","Level 3","Level 4","Roof"],key=f"qa_level_{page['id']}")
+            qa_element=qa_cols[1].selectbox("Element",["Floor plan","Walls","Ceilings","Skirtings","Doors","Frames","External walls / cladding","Steel / columns"],key=f"qa_el_{page['id']}")
+            qa_loc=qa_cols[2].text_input("Location / description",value=f"{qa_level} · all internal areas",key=f"qa_loc_{page['id']}")
+            qa_sub=qa_cols[3].selectbox("Substrate",SUBSTRATES,index=SUBSTRATES.index("Render") if "Render" in SUBSTRATES else 0,key=f"qa_sub_{page['id']}")
+            qa_fin=qa_cols[4].selectbox("Finish system",FINISH_SYSTEMS,index=0,key=f"qa_fin_{page['id']}")
             qa_unit = "m²" if qa_element in {"Floor plan","Walls","Ceilings","External walls / cladding"} else "lm"
             qa_section = "Internal" if qa_element not in {"External walls / cladding","Steel / columns"} else "External"
             qa_rate = default_rate_for(qa_sub,qa_element,qa_fin,qa_unit)
@@ -3455,7 +3613,7 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
             st.warning("No drawable take-off rows yet. Create take-off rows with a lineal (m) or area (m²) unit, then come back here to draw them on the plan.")
         else:
             st.caption(f"{len(mapper_rows)} drawable take-off rows: " + "; ".join(f"{r['label']} · {r['unit']}" for r in mapper_rows[:6]) + (" …" if len(mapper_rows) > 6 else ""))
-        c1,c2,c3=st.columns(3)
+        c1,c2,c3,c4=st.columns(4)
         if c1.button("Clear current drawing (un-saved)",key=f"cleardraw_{page['id']}",use_container_width=True):
             st.session_state.pop(store_key,None)
             st.session_state[rev_key]=int(st.session_state.get(rev_key,0))+1
@@ -3470,6 +3628,16 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
             st.session_state[store_key]=new_lines
             st.session_state[rev_key]=int(st.session_state.get(rev_key,0))+1
             st.rerun()
+        if c4.button("Auto-detect building envelope",key=f"autodet_{page['id']}",use_container_width=True):
+            det_level=st.session_state.get(f"qa_level_{int(page['id'])}","Level 1")
+            auto_lines=auto_detect_envelope_shapes(int(workspace["id"]),page,pxpm,str(det_level))
+            if auto_lines:
+                st.session_state[store_key]=auto_lines
+                st.session_state[rev_key]=int(st.session_state.get(rev_key,0))+1
+                st.rerun()
+            else:
+                st.warning("No building envelope could be detected on this page — draw the external outline manually, or check the page image.")
+        st.caption("**Auto-detect** outlines the outer building envelope on this page, creating an **External walls / cladding** box (area = perimeter × 2.7 m wall height) and a **Floor plan · {level}** box (internal floor area, the flat-rate basis for internal works incl. paint). Select a box, then drag a corner to reshape or drag the box to move it — no auto-detect is perfect, so adjust before saving.")
         path=Path(str(page.get("image_path") or ""))
         if plan_line_editor is not None and path.exists():
             active_row_id=st.session_state.get(f"ml_active_{int(page['id'])}")
