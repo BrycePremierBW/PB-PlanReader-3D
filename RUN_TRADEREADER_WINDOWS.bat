@@ -9,7 +9,7 @@ if %ERRORLEVEL% NEQ 0 python -m pip install -r requirements.txt
 if not defined PLANREADER_DATA_DIR set PLANREADER_DATA_DIR=%CD%\tradereader_data
 
 echo.
-echo Starting TradeReader 3D...
-py -m streamlit run tradereader_app.py
-if %ERRORLEVEL% NEQ 0 python -m streamlit run tradereader_app.py
+echo Starting TradeReader 3D v1.1...
+py -m streamlit run tradereader_v11_app.py
+if %ERRORLEVEL% NEQ 0 python -m streamlit run tradereader_v11_app.py
 pause
