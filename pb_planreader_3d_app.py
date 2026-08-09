@@ -13,6 +13,7 @@ import shutil
 import sqlite3
 import tempfile
 import textwrap
+import time
 import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -582,6 +583,81 @@ class JobHubBridge:
             conn.commit()
             return result
 
+    def discover_documents_for_job(self, job_id: int) -> List[Dict[str, Any]]:
+        """Scan the common JobHub document/attachment tables in a single connection.
+
+        Opening a separate connection per table used to spike connection counts
+        on shared Postgres (which can itself trigger SSL drops). One connection
+        also keeps the whole discovery fast and atomic.
+        """
+        candidates = [
+            "planreader_documents",
+            "job_document_blobs",
+            "job_documents",
+            "documents",
+            "job_files",
+            "job_attachments",
+            "attachments",
+            "files",
+        ]
+        records: List[Dict[str, Any]] = []
+        with self.connect() as conn:
+            if self.kind == "postgres":
+                cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")
+                tables = {str(r["table_name"]) for r in cur.fetchall()}
+                placeholder = "%s"
+            else:
+                cur = conn.cursor()
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = {str(r[0]) for r in cur.fetchall()}
+                placeholder = "?"
+            for table in candidates:
+                if table not in tables:
+                    continue
+                cols = self._columns_for_connection(cur, table)
+                job_col = next((c for c in ["job_id", "project_id", "jobhub_job_id"] if c in cols), None)
+                if not job_col:
+                    continue
+                id_col = "id" if "id" in cols else None
+                name_col = next((c for c in ["file_name", "filename", "name", "original_name", "title"] if c in cols), None)
+                mime_col = next((c for c in ["mime_type", "content_type", "file_type"] if c in cols), None)
+                path_col = next((c for c in ["storage_path", "file_path", "path", "local_path"] if c in cols), None)
+                url_col = next((c for c in ["download_url", "file_url", "url", "public_url"] if c in cols), None)
+                blob_col = next((c for c in ["blob_data", "file_data", "content", "data", "blob", "bytes"] if c in cols), None)
+                date_col = next((c for c in ["uploaded_at", "created_at", "date_uploaded"] if c in cols), None)
+                select_parts = [f"{id_col} AS record_id" if id_col else "NULL AS record_id"]
+                select_parts.append(f"{name_col} AS file_name" if name_col else "'' AS file_name")
+                select_parts.append(f"{mime_col} AS mime_type" if mime_col else "'' AS mime_type")
+                select_parts.append(f"{path_col} AS storage_path" if path_col else "'' AS storage_path")
+                select_parts.append(f"{url_col} AS file_url" if url_col else "'' AS file_url")
+                select_parts.append(f"{blob_col} AS file_blob" if blob_col else "NULL AS file_blob")
+                select_parts.append(f"{date_col} AS uploaded_at" if date_col else "'' AS uploaded_at")
+                try:
+                    cur.execute(
+                        f"SELECT {', '.join(select_parts)} FROM {table} WHERE {job_col}={placeholder}",
+                        (job_id,),
+                    )
+                    rows = cur.fetchall()
+                except Exception:
+                    continue
+                for row in rows:
+                    record = dict(row)
+                    record["source_table"] = table
+                    records.append(record)
+        return records
+
+    def _columns_for_connection(self, cur, table: str) -> List[str]:
+        safe = re.sub(r"[^A-Za-z0-9_]", "", table)
+        if self.kind == "postgres":
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=%s ORDER BY ordinal_position",
+                (safe,),
+            )
+            return [str(r["column_name"]) for r in cur.fetchall()]
+        cur.execute(f"PRAGMA table_info({safe})")
+        return [str(r[1]) for r in cur.fetchall()]
+
 
 def get_jobhub_bridge() -> Optional[JobHubBridge]:
     if JOBHUB_DATABASE_URL:
@@ -668,47 +744,18 @@ def ensure_planreader_document_table(bridge: JobHubBridge) -> None:
 
 
 def discover_jobhub_document_records(bridge: JobHubBridge, job_id: int) -> List[Dict[str, Any]]:
-    candidates = [
-        "planreader_documents",
-        "job_document_blobs",
-        "job_documents",
-        "documents",
-        "job_files",
-        "job_attachments",
-        "attachments",
-        "files",
-    ]
-    tables = set(bridge.table_names())
-    records: List[Dict[str, Any]] = []
-    for table in candidates:
-        if table not in tables:
-            continue
-        cols = set(bridge.columns(table))
-        job_col = next((c for c in ["job_id", "project_id", "jobhub_job_id"] if c in cols), None)
-        if not job_col:
-            continue
-        id_col = "id" if "id" in cols else None
-        name_col = next((c for c in ["file_name", "filename", "name", "original_name", "title"] if c in cols), None)
-        mime_col = next((c for c in ["mime_type", "content_type", "file_type"] if c in cols), None)
-        path_col = next((c for c in ["storage_path", "file_path", "path", "local_path"] if c in cols), None)
-        url_col = next((c for c in ["download_url", "file_url", "url", "public_url"] if c in cols), None)
-        blob_col = next((c for c in ["blob_data", "file_data", "content", "data", "blob", "bytes"] if c in cols), None)
-        date_col = next((c for c in ["uploaded_at", "created_at", "date_uploaded"] if c in cols), None)
-        select_parts = [f"{id_col} AS record_id" if id_col else "NULL AS record_id"]
-        select_parts.append(f"{name_col} AS file_name" if name_col else "'' AS file_name")
-        select_parts.append(f"{mime_col} AS mime_type" if mime_col else "'' AS mime_type")
-        select_parts.append(f"{path_col} AS storage_path" if path_col else "'' AS storage_path")
-        select_parts.append(f"{url_col} AS file_url" if url_col else "'' AS file_url")
-        select_parts.append(f"{blob_col} AS file_blob" if blob_col else "NULL AS file_blob")
-        select_parts.append(f"{date_col} AS uploaded_at" if date_col else "'' AS uploaded_at")
-        try:
-            rows = bridge.query(f"SELECT {', '.join(select_parts)} FROM {table} WHERE {job_col}=?", (job_id,))
-        except Exception:
-            continue
-        for row in rows:
-            row["source_table"] = table
-            records.append(row)
-    return records
+    """Discover JobHub document records in a single connection, retrying once.
+
+    The old implementation opened a new connection for the table probe plus one
+    per candidate table, which hammered the shared Render Postgres and let its
+    SSL layer drop connections. One connection keeps discovery fast and lets a
+    transient SSL drop be absorbed by a single retry.
+    """
+    try:
+        return bridge.discover_documents_for_job(job_id)
+    except Exception:
+        time.sleep(0.4)
+        return bridge.discover_documents_for_job(job_id)
 
 
 def copy_jobhub_document_to_workspace(record: Dict[str, Any], workspace_id: int) -> Tuple[bool, str]:
@@ -2678,10 +2725,12 @@ def project_documents_page(workspace: Dict[str, Any], bridge: Optional[JobHubBri
         else:
             st.markdown("<div class='pb-note'>This searches common JobHub document/attachment tables. Database blobs, public URLs and locally reachable paths can be imported. A local path stored on a different Render service is not reachable; use shared object storage or upload it here.</div>", unsafe_allow_html=True)
             if st.button("Find and import every linked JobHub document", type="primary"):
-                records = discover_jobhub_document_records(bridge, int(workspace["jobhub_job_id"]))
-                if not records:
-                    st.warning("No compatible linked-document records were found in the JobHub database.")
-                else:
+                try:
+                    records = discover_jobhub_document_records(bridge, int(workspace["jobhub_job_id"]))
+                except Exception as exc:
+                    records = None
+                    st.warning(f"JobHub is unreachable right now ({exc}). No linked documents were changed; it will retry automatically.")
+                if records:
                     messages=[]
                     success=0
                     for record in records:
@@ -2690,6 +2739,8 @@ def project_documents_page(workspace: Dict[str, Any], bridge: Optional[JobHubBri
                         success += int(ok)
                     st.success(f"Processed {len(records)} linked records; {success} are available in PlanReader.")
                     st.code("\n".join(messages))
+                elif records is not None:
+                    st.warning("No compatible linked-document records were found in the JobHub database.")
             linked = ldf("SELECT file_name,jobhub_table,jobhub_record_id,mime_type,uploaded_at FROM documents WHERE workspace_id=? AND source_type='JobHub linked document' ORDER BY id DESC", (workspace["id"],))
             st.dataframe(linked, use_container_width=True, hide_index=True)
     with tabs[2]:
