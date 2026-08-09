@@ -1704,12 +1704,14 @@ def default_rate_for(substrate: Any, element: Any, finish_system: Any, unit: Any
         return 280.0
     if "stair" in el:
         return 2000.0
+    if "interior coatings" in fin or "paint" in fin:
+        return 60.0
     if "floor" in el or "balcony" in el or "deck" in el:
         if "epoxy" in fin:
             return 95.0
         if "seal" in fin or "clear" in fin:
             return 42.0
-        return 55.0
+        return 60.0
     if "ceiling" in el or "soffit" in el or "ceiling flat" in fin:
         if "fibre" in sub or "soffit" in sub:
             return 38.0
@@ -1719,8 +1721,6 @@ def default_rate_for(substrate: Any, element: Any, finish_system: Any, unit: Any
             return 38.0
         return 95.0
     if "render" in sub or "brick" in sub or "block" in sub or "masonry" in sub:
-        return 42.0
-    if "interior coatings" in fin or "paint" in fin:
         return 42.0
     if "previously painted" in sub:
         return 32.0
