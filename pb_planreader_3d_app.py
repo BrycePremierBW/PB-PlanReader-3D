@@ -331,6 +331,15 @@ def init_local_db() -> None:
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_jobhub ON workspaces(jobhub_job_id) WHERE jobhub_job_id IS NOT NULL;
 
+        CREATE TABLE IF NOT EXISTS workspace_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT,
+            updated_at TEXT,
+            UNIQUE(workspace_id, key)
+        );
+
         CREATE TABLE IF NOT EXISTS documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             workspace_id INTEGER NOT NULL,
@@ -1087,6 +1096,42 @@ def auto_detect_scale(page: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return {"ratio": ratio, "px_per_m": round(px_per_m, 3), "source": match.group(0).strip()}
 
 
+def scale_gate_issues(workspace_id: int) -> List[Dict[str, Any]]:
+    """Pages that feed the take-off but do not have a calibrated scale yet.
+
+    The scale gate protects measured quantities: a row is only trustworthy when
+    every drawing page it was measured from has a confirmed ``px_per_m``. This
+    lists every selected page that is referenced by take-off rows or mapped
+    zones while still lacking a scale.
+    """
+    row_sources: set = set()
+    rows = ldf("SELECT DISTINCT source_page FROM takeoff_rows WHERE workspace_id=?", (workspace_id,))
+    if not rows.empty:
+        row_sources = {str(x).strip() for x in rows["source_page"].tolist() if str(x).strip()}
+    zone_page_ids: set = set()
+    zones = ldf("SELECT DISTINCT page_id FROM mapped_zones WHERE workspace_id=?", (workspace_id,))
+    if not zones.empty:
+        zone_page_ids = {int(x) for x in zones["page_id"].tolist()}
+    issues: List[Dict[str, Any]] = []
+    pages = ldf("SELECT id,page_label,page_type,px_per_m FROM pages WHERE workspace_id=? AND selected=1", (workspace_id,))
+    for p in pages.itertuples():
+        if to_float(p.px_per_m) > 0:
+            continue
+        label = str(p.page_label or "")
+        if label.strip() in row_sources or int(p.id) in zone_page_ids:
+            issues.append({
+                "page_id": int(p.id),
+                "page_label": label,
+                "page_type": str(p.page_type or ""),
+                "px_per_m": to_float(p.px_per_m),
+            })
+    return issues
+
+
+def scale_gate_blocked(workspace_id: int) -> bool:
+    return bool(scale_gate_issues(workspace_id))
+
+
 def _line_grid_positions(count: int) -> List[Tuple[float, float, float, float]]:
     """Spread ``count`` horizontal line segments across the page in a grid."""
     if count <= 0:
@@ -1124,9 +1169,11 @@ def takeoff_rows_for_mapper(workspace_id: int) -> List[Dict[str, Any]]:
         detail = " · ".join(x for x in [str(r.substrate or ""), str(r.finish_system or "")] if str(x).strip())
         if detail:
             label = f"{label} ({detail})"
+        group = f"{r.section or 'Unassigned'} · {r.element or 'Items'}"
         out.append({
             "id": int(r.id),
             "label": label,
+            "group": group,
             "unit": unit,
             "colour": line_colour_for(r.section, r.element),
             "quantity": to_float(r.quantity),
@@ -1277,48 +1324,232 @@ WALL_HEIGHT_M = 2.7
 def auto_detect_building_envelope(image_path: Any, min_area_pct: float = 0.4, max_contours: int = 3) -> List[Dict[str, Any]]:
     """Detect the outer building envelope(s) on a plan page.
 
-    Plan drawings are light paper with dark wall lines. The image is thresholded
-    so drawn lines become white, gaps between wall dashes are closed with a
-    morphological close, and the external contours of the largest dark regions
-    are traced. Each detected outline is returned as a polygon in percentage
-    image coordinates (matching the mapper's coordinate space) with its area as
-    a percentage of the page, so the user can place measurement boxes around the
+    The detector is iterative: it tests several dark-line thresholds and a
+    ladder of morphological closing sizes so gaps in the wall lines (door
+    openings, dashed partitions) are bridged before the exterior boundary is
+    traced. The largest stable interior region is taken as the building
+    envelope. The result is returned as a polygon in percentage image
+    coordinates (matching the mapper's coordinate space) with its area as a
+    percentage of the page, so the user can place measurement boxes around the
     cladding / external substrate envelope and the floor area of each level.
+
+    The core is pure numpy so it works whether or not OpenCV is installed;
+    OpenCV is used only to speed up the morphology when it is available.
     """
-    if cv2 is None:
-        return []
     path = Path(str(image_path or ""))
     if not path.exists():
         return []
-    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-    if img is None:
+    try:
+        from PIL import Image as _PILImage
+        img = _PILImage.open(path).convert("L")
+    except Exception:
         return []
-    h, w = img.shape
+    w, h = img.size
     if w < 16 or h < 16:
         return []
-    thr = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-    kernel = np.ones((7, 7), np.uint8)
-    closed = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel)
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    area_thr = (min_area_pct / 100.0) * w * h
+    gray = np.asarray(img, dtype=np.uint8)
+    min_px = (min_area_pct / 100.0) * w * h
     results: List[Dict[str, Any]] = []
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < area_thr:
+    tried: List[Tuple[int, int]] = []
+    thresholds = _envelope_thresholds(gray)
+    for thr_val in thresholds:
+        dark = gray < thr_val
+        # skip degenerate thresholds that catch nothing or nearly everything
+        frac = float(dark.sum()) / dark.size
+        if frac <= 0.002 or frac >= 0.75:
             continue
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.012 * peri, True)
-        pts = approx.reshape(-1, 2)
-        if len(pts) < 3:
-            continue
-        pct_pts = [[round(float(x) / w * 100.0, 3), round(float(y) / h * 100.0, 3)] for x, y in pts]
-        results.append({
-            "points": pct_pts,
-            "area_pct": round(area / (w * h) * 100.0, 2),
-            "perimeter_pct": round(peri / max(w, h) * 100.0, 2),
-        })
+        for k in _ENVELOPE_CLOSE_LADDER:
+            if (thr_val, k) in tried:
+                continue
+            tried.append((thr_val, k))
+            closed = _morph_close_binary(dark, k)
+            outside = _flood_background(closed)
+            interior = ~outside
+            area = int(interior.sum())
+            if area < min_px:
+                continue
+            outline = _moore_outline(interior)
+            if len(outline) < 4:
+                continue
+            eps = 0.006 * max(w, h)
+            simplified = _rdp_simplify(outline, eps)
+            if len(simplified) < 3:
+                simplified = _rough_polygon(outline)
+            pct_pts = [
+                [round(float(x) / w * 100.0, 3), round(float(y) / h * 100.0, 3)]
+                for x, y in simplified
+            ]
+            perim = sum(
+                math.hypot(pct_pts[j][0] - pct_pts[(j + 1) % len(pct_pts)][0],
+                           pct_pts[j][1] - pct_pts[(j + 1) % len(pct_pts)][1])
+                for j in range(len(pct_pts))
+            ) / 100.0 * max(w, h)
+            results.append({
+                "points": pct_pts,
+                "area_pct": round(polygon_area(pct_pts) / 100.0, 2),
+                "perimeter_pct": round(perim / max(w, h) * 100.0, 2),
+            })
+            break
     results.sort(key=lambda d: -d["area_pct"])
-    return results[:max_contours]
+    # de-duplicate near-identical outlines produced by adjacent thresholds
+    deduped: List[Dict[str, Any]] = []
+    for r in results:
+        if deduped and abs(deduped[-1]["area_pct"] - r["area_pct"]) <= 2.0:
+            continue
+        deduped.append(r)
+    return deduped[:max_contours]
+
+
+_ENVELOPE_CLOSE_LADDER = (9, 21, 45, 81, 121, 181)
+
+
+def _envelope_thresholds(gray: np.ndarray) -> List[int]:
+    """A small ladder of dark-line thresholds, from conservative to permissive."""
+    vals = [float(np.percentile(gray, p)) for p in (55, 70, 82, 90)]
+    out: List[int] = []
+    for v in vals:
+        if v < 6 or v > 245:
+            continue
+        t = int(v)
+        if t not in out:
+            out.append(t)
+    if not out:
+        hist = np.bincount(gray.ravel(), minlength=256)
+        total = int(gray.size)
+        acc = 0
+        for i in range(256):
+            acc += int(hist[i])
+            if acc >= total * 0.8:
+                out.append(max(2, i))
+                break
+    return out or [60, 90]
+
+
+def _morph_close_binary(mask: np.ndarray, k: int) -> np.ndarray:
+    """Binary morphological close (dilate then erode) of a bool mask."""
+    if cv2 is not None:
+        kernel = np.ones((k, k), np.uint8)
+        arr = mask.astype(np.uint8) * 255
+        closed = cv2.morphologyEx(arr, cv2.MORPH_CLOSE, kernel)
+        return closed > 127
+    from PIL import Image, ImageFilter
+    img = Image.fromarray((mask * 255).astype(np.uint8))
+    dil = img.filter(ImageFilter.MaxFilter(k))
+    ero = dil.filter(ImageFilter.MinFilter(k))
+    return np.asarray(ero, dtype=np.uint8) > 127
+
+
+def _dilate4(mask: np.ndarray) -> np.ndarray:
+    out = np.zeros_like(mask)
+    out[1:, :] |= mask[:-1, :]
+    out[:-1, :] |= mask[1:, :]
+    out[:, 1:] |= mask[:, :-1]
+    out[:, :-1] |= mask[:, 1:]
+    return out
+
+
+def _flood_background(fg: np.ndarray, max_iter: int = 4000) -> np.ndarray:
+    """Flood-fill the paper background from the image borders (4-connected)."""
+    h, w = fg.shape
+    bg = ~fg
+    out = np.zeros_like(bg)
+    if h <= 2 or w <= 2:
+        return out
+    out[0, :] = True
+    out[h - 1, :] = True
+    out[:, 0] = True
+    out[:, w - 1] = True
+    out &= bg
+    for _ in range(max_iter):
+        nxt = _dilate4(out) & bg
+        if nxt.sum() == out.sum():
+            return out
+        out = nxt
+    return out
+
+
+_DIR8 = ((0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1), (1, 0), (1, 1))
+
+
+def _moore_outline(mask: np.ndarray) -> List[Tuple[float, float]]:
+    """Trace the outer boundary of the foreground region (Moore neighbour trace).
+
+    Returns a closed polygon of (x, y) pixel coordinates.
+    """
+    ys, xs = np.nonzero(mask)
+    if len(ys) == 0:
+        return []
+    order = np.lexsort((xs, ys))
+    start = (int(ys[order[0]]), int(xs[order[0]]))
+    boundary: List[Tuple[float, float]] = [(float(start[1]), float(start[0]))]
+    prev = (start[0], start[1] - 1)
+    cur = start
+    moved = False
+    for _ in range(400000):
+        dy = prev[0] - cur[0]
+        dx = prev[1] - cur[1]
+        try:
+            base = _DIR8.index((dy, dx))
+        except ValueError:
+            break
+        nxt = None
+        for i in range(1, 9):
+            dy2, dx2 = _DIR8[(base + i) % 8]
+            ny, nx = cur[0] + dy2, cur[1] + dx2
+            if 0 <= ny < mask.shape[0] and 0 <= nx < mask.shape[1] and mask[ny, nx]:
+                nxt = (ny, nx)
+                break
+        if nxt is None:
+            break
+        if moved and nxt == start:
+            boundary.append((float(start[1]), float(start[0])))
+            break
+        moved = True
+        prev = cur
+        cur = nxt
+        boundary.append((float(cur[1]), float(cur[0])))
+        if len(boundary) >= 2 and cur == start:
+            break
+    return boundary
+
+
+def _point_line_dist(p: Sequence[float], a: Sequence[float], b: Sequence[float]) -> float:
+    x0, y0 = p
+    x1, y1 = a
+    x2, y2 = b
+    dx = x2 - x1
+    dy = y2 - y1
+    if dx == 0 and dy == 0:
+        return math.hypot(x0 - x1, y0 - y1)
+    return abs(dy * x0 - dx * y0 + x2 * y1 - y2 * x1) / math.hypot(dx, dy)
+
+
+def _rdp_simplify(points: Sequence[Sequence[float]], epsilon: float) -> List[Tuple[float, float]]:
+    """Ramer-Douglas-Peucker line simplification on an open polygon chain."""
+    pts = [(float(p[0]), float(p[1])) for p in points]
+    if len(pts) <= 2:
+        return pts
+    start, end = pts[0], pts[-1]
+    dmax, idx = 0.0, 0
+    for i in range(1, len(pts) - 1):
+        d = _point_line_dist(pts[i], start, end)
+        if d > dmax:
+            dmax, idx = d, i
+    if dmax > epsilon:
+        left = _rdp_simplify(pts[:idx + 1], epsilon)
+        right = _rdp_simplify(pts[idx:], epsilon)
+        return left[:-1] + right
+    return [start, end]
+
+
+def _rough_polygon(outline: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Fallback: axis-aligned bounding box of a traced outline."""
+    if not outline:
+        return []
+    xs = [p[0] for p in outline]
+    ys = [p[1] for p in outline]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    return [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
 
 
 def _polygon_px(shape: Dict[str, Any], width_px: int, height_px: int) -> List[Tuple[float, float]]:
@@ -2472,6 +2703,354 @@ def import_ai_result(workspace_id: int, data: Dict[str, Any]) -> Dict[str, int]:
 # -----------------------------------------------------------------------------
 
 
+# -----------------------------------------------------------------------------
+# Workspace settings, levels and per-level pricing
+# -----------------------------------------------------------------------------
+
+_LEVEL_ORDER = ["Ground", "Level 1", "Level 2", "Level 3", "Level 4", "Level 5", "Roof"]
+
+
+def workspace_setting(workspace_id: int, key: str, default: Any = None) -> Any:
+    rows = lquery("SELECT value FROM workspace_settings WHERE workspace_id=? AND key=?", (workspace_id, key))
+    return rows[0]["value"] if rows else default
+
+
+def set_workspace_setting(workspace_id: int, key: str, value: Any) -> None:
+    lexecute(
+        """INSERT INTO workspace_settings(workspace_id,key,value,updated_at) VALUES(?,?,?,?)
+           ON CONFLICT(workspace_id,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+        (workspace_id, key, str(value if value is not None else ""), now_stamp()),
+    )
+
+
+def level_of(location: Any) -> str:
+    text = str(location or "")
+    lower = text.lower()
+    if "ground" in lower:
+        return "Ground"
+    for level in ["Level 5", "Level 4", "Level 3", "Level 2", "Level 1"]:
+        if level.lower() in lower:
+            return level
+    if "roof" in lower:
+        return "Roof"
+    return "Unassigned"
+
+
+def level_sort_key(level: str) -> int:
+    return _LEVEL_ORDER.index(level) if level in _LEVEL_ORDER else len(_LEVEL_ORDER)
+
+
+def _level_rewrite(location: str, target_level: str) -> str:
+    """Rewrite a row's location to a new level, keeping the rest of the text."""
+    text = str(location or "").strip()
+    lower = text.lower()
+    for existing in ["Ground", "Level 5", "Level 4", "Level 3", "Level 2", "Level 1", "Roof"]:
+        if existing.lower() in lower:
+            return text.replace(existing, target_level, 1)
+    return f"{target_level} · {text}" if text else str(target_level)
+
+
+def copy_takeoff_rows_to_level(workspace_id: int, row_ids: Sequence[int], target_level: str) -> int:
+    """Duplicate the selected take-off rows for another level (locations rewritten)."""
+    created = 0
+    target_level = str(target_level or "").strip()
+    if not target_level:
+        return 0
+    for rid in row_ids:
+        rows = lquery("SELECT * FROM takeoff_rows WHERE id=?", (int(rid),))
+        if not rows:
+            continue
+        r = rows[0]
+        if int(r.get("workspace_id")) != int(workspace_id):
+            continue
+        new_loc = _level_rewrite(str(r.get("location") or ""), target_level)
+        dup = lquery(
+            "SELECT id FROM takeoff_rows WHERE workspace_id=? AND section=? AND element=? AND location=? AND substrate=? AND unit=?",
+            (workspace_id, str(r.get("section") or ""), str(r.get("element") or ""), new_loc,
+             str(r.get("substrate") or ""), str(r.get("unit") or "")),
+        )
+        if dup:
+            continue
+        lexecute(
+            """INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (workspace_id, r.get("section", ""), r.get("element", ""), new_loc, r.get("substrate", ""),
+             r.get("finish_system", ""), 0, r.get("unit", ""), "To measure", r.get("source_page", ""),
+             r.get("source_reference", ""), r.get("inclusion_status", ""), r.get("coats", 2),
+             r.get("coverage_m2_per_litre", 0), r.get("productivity_m2_per_hour", 0), r.get("rate_per_unit", 0),
+             "To review", f"Copied to {target_level}.", now_stamp(), now_stamp()),
+        )
+        created += 1
+    return created
+
+
+def _quote_settings(workspace_id: int) -> Dict[str, Any]:
+    def f(key: str, default: float) -> float:
+        try:
+            return float(workspace_setting(workspace_id, key, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    return {
+        "gst_rate_pct": f("gst_rate_pct", 10.0),
+        "pricing_margin_pct": f("pricing_margin_pct", 0.0),
+        "default_coverage_m2_per_litre": f("default_coverage_m2_per_litre", 12.0),
+        "default_productivity_m2_per_hour": f("default_productivity_m2_per_hour", 8.0),
+        "default_wall_height_m": f("default_wall_height_m", 2.7),
+        "quote_header": str(workspace_setting(workspace_id, "quote_header", "Premier Brushworks Pty Ltd")),
+        "quote_footer": str(workspace_setting(workspace_id, "quote_footer", "Valid for 30 days. All quantities require estimator review against the current issued drawings and specification before pricing or construction use.")),
+    }
+
+
+def per_level_summary(workspace_id: int) -> pd.DataFrame:
+    """Priced quantities grouped by building level for the quote summary."""
+    takeoff = dataframe_for_takeoff(workspace_id)
+    if takeoff.empty:
+        return pd.DataFrame(columns=["level", "rows", "m2", "lm", "count", "paint_litres", "labour_hours", "value_ex_gst"])
+    takeoff = takeoff.copy()
+    takeoff["level"] = [level_of(loc) for loc in takeoff["location"]]
+    out = []
+    for level, group in takeoff.groupby("level", dropna=False):
+        out.append({
+            "level": level,
+            "rows": int(len(group)),
+            "m2": float(group.loc[group["unit"].eq("m²"), "quantity"].sum()),
+            "lm": float(group.loc[group["unit"].eq("lm"), "quantity"].sum()),
+            "count": float(group.loc[group["unit"].isin({"No.", "item"}), "quantity"].sum()),
+            "paint_litres": float(group["paint_litres"].sum()),
+            "labour_hours": float(group["labour_hours"].sum()),
+            "value_ex_gst": float(group["value_ex_gst"].sum()),
+        })
+    df = pd.DataFrame(out)
+    df["sort"] = df["level"].map(level_sort_key)
+    df = df.sort_values("sort", ignore_index=True).drop(columns=["sort"])
+    return df
+
+
+def quote_summary_frame(workspace_id: int) -> pd.DataFrame:
+    """Per-level quote table including mark-up, GST and total."""
+    levels = per_level_summary(workspace_id)
+    if levels.empty:
+        return levels
+    settings = _quote_settings(workspace_id)
+    margin = settings["pricing_margin_pct"] / 100.0
+    gst = settings["gst_rate_pct"] / 100.0
+    levels = levels.copy()
+    levels["markup_ex_gst"] = levels["value_ex_gst"] * (1 + margin)
+    levels["gst"] = levels["markup_ex_gst"] * gst
+    levels["total_inc_gst"] = levels["markup_ex_gst"] + levels["gst"]
+    return levels
+
+
+def per_level_summary_csv(workspace_id: int) -> str:
+    frame = quote_summary_frame(workspace_id)
+    return frame.to_csv(index=False) if not frame.empty else ""
+
+
+def quote_workbook_bytes(workspace_id: int) -> bytes:
+    """Excel quotation with per-level pricing, mark-up, GST and full detail."""
+    workspace = lquery("SELECT * FROM workspaces WHERE id=?", (workspace_id,))[0]
+    settings = _quote_settings(workspace_id)
+    levels = quote_summary_frame(workspace_id)
+    takeoff = dataframe_for_takeoff(workspace_id)
+    margin = settings["pricing_margin_pct"] / 100.0
+    gst = settings["gst_rate_pct"] / 100.0
+    header = pd.DataFrame([
+        ["Quotation", str(settings["quote_header"])],
+        ["Job number", workspace.get("job_no", "")],
+        ["Project", workspace.get("job_name", "")],
+        ["Builder / client", workspace.get("builder_client", "")],
+        ["Site address", workspace.get("site_address", "")],
+        ["Drawing issue", workspace.get("drawing_issue", "")],
+        ["Estimator", workspace.get("estimator", "")],
+        ["Prepared", now_stamp()],
+        ["Mark-up (ex GST)", f"{settings['pricing_margin_pct']:.1f}%"],
+        ["GST", f"{settings['gst_rate_pct']:.1f}%"],
+    ], columns=["Field", "Value"])
+    totals = pd.DataFrame({
+        "Metric": ["Value ex GST", "Mark-up", "Subtotal ex GST", "GST", "Total inc GST"],
+        "Amount": [
+            float(takeoff["value_ex_gst"].sum()) if not takeoff.empty else 0.0,
+            float(takeoff["value_ex_gst"].sum()) * margin if not takeoff.empty else 0.0,
+            float(takeoff["value_ex_gst"].sum()) * (1 + margin) if not takeoff.empty else 0.0,
+            float(takeoff["value_ex_gst"].sum()) * (1 + margin) * gst if not takeoff.empty else 0.0,
+            float(takeoff["value_ex_gst"].sum()) * (1 + margin) * (1 + gst) if not takeoff.empty else 0.0,
+        ],
+    })
+    sheets: List[Tuple[str, pd.DataFrame]] = [
+        ("Quote Header", header),
+        ("Per-Level Summary", levels),
+        ("Totals", totals),
+        ("Take-off Detail", takeoff),
+        ("Door Schedule", register_df(workspace_id, "door_schedule")),
+        ("Inclusions", register_df(workspace_id, "inclusions")),
+        ("Exclusions", register_df(workspace_id, "exclusions")),
+        ("Separate Clarifications", register_df(workspace_id, "clarifications")),
+        ("Assumptions", register_df(workspace_id, "assumptions")),
+        ("RFIs", register_df(workspace_id, "rfis")),
+    ]
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for sheet_name, frame in sheets:
+            frame.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+            ws = writer.book[sheet_name[:31]]
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            for cell in ws[1]:
+                from openpyxl.styles import Alignment, Font, PatternFill
+                cell.fill = PatternFill("solid", fgColor="171717")
+                cell.font = Font(color="FFFFFF", bold=True)
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            for col in ws.columns:
+                letter = col[0].column_letter
+                max_len = min(65, max(10, max(len(str(c.value or "")) for c in col) + 2))
+                ws.column_dimensions[letter].width = max_len
+                for cell in col:
+                    cell.alignment = Alignment(vertical="top", wrap_text=True)
+    return output.getvalue()
+
+
+def quote_pdf_bytes(workspace_id: int) -> bytes:
+    """Portable PDF quotation: job header, per-level pricing and totals."""
+    workspace = lquery("SELECT * FROM workspaces WHERE id=?", (workspace_id,))[0]
+    settings = _quote_settings(workspace_id)
+    levels = quote_summary_frame(workspace_id)
+    takeoff = dataframe_for_takeoff(workspace_id)
+    margin = settings["pricing_margin_pct"] / 100.0
+    gst = settings["gst_rate_pct"] / 100.0
+    sub_total = float(takeoff["value_ex_gst"].sum()) if not takeoff.empty else 0.0
+    markup = sub_total * margin
+    subtotal_ex = sub_total + markup
+    gst_amount = subtotal_ex * gst
+    grand = subtotal_ex + gst_amount
+
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm, bottomMargin=16 * mm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("PTitle", parent=styles["Title"], fontSize=18, spaceAfter=2)
+    small = ParagraphStyle("PSmall", parent=styles["Normal"], fontSize=9, textColor=colors.HexColor("#5f574f"))
+    h2 = ParagraphStyle("PH2", parent=styles["Heading2"], fontSize=13, spaceBefore=10, spaceAfter=4)
+
+    flow: List[Any] = []
+    flow.append(Paragraph(str(settings["quote_header"]), title_style))
+    flow.append(Paragraph(f"Quotation for {workspace.get('job_name', '')}", styles["Normal"]))
+    flow.append(Spacer(1, 4))
+    info = Table([
+        ["Job number", str(workspace.get("job_no") or ""), "Builder / client", str(workspace.get("builder_client") or "")],
+        ["Site address", str(workspace.get("site_address") or ""), "Drawing issue", str(workspace.get("drawing_issue") or "")],
+        ["Estimator", str(workspace.get("estimator") or ""), "Prepared", now_stamp()],
+    ], colWidths=[28 * mm, 70 * mm, 32 * mm, 70 * mm])
+    info.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("GRID", (0, 0), (-1, -1), 0.2, colors.HexColor("#d8d2c8")),
+    ]))
+    flow.append(info)
+    flow.append(Spacer(1, 8))
+
+    flow.append(Paragraph("Per-level pricing (ex GST)", h2))
+    if levels.empty:
+        flow.append(Paragraph("No take-off rows yet.", small))
+    else:
+        head = [["Level", "Rows", "m²", "lm", "Count", "Paint (L)", "Labour (hrs)", "Value ex GST", "Mark-up", "GST", "Total inc GST"]]
+        body = head + [
+            [str(r["level"]), int(r["rows"]), f"{r['m2']:,.1f}", f"{r['lm']:,.1f}", f"{r['count']:,.1f}",
+             f"{r['paint_litres']:,.1f}", f"{r['labour_hours']:,.1f}", f"${r['value_ex_gst']:,.2f}",
+             f"${r['markup_ex_gst'] - r['value_ex_gst']:,.2f}", f"${r['gst']:,.2f}", f"${r['total_inc_gst']:,.2f}"]
+            for r in levels.to_dict("records")
+        ]
+        body.append(["TOTAL", int(levels["rows"].sum()), f"{levels['m2'].sum():,.1f}", f"{levels['lm'].sum():,.1f}",
+                     f"{levels['count'].sum():,.1f}", f"{levels['paint_litres'].sum():,.1f}",
+                     f"{levels['labour_hours'].sum():,.1f}", f"${sub_total:,.2f}", f"${markup:,.2f}",
+                     f"${gst_amount:,.2f}", f"${grand:,.2f}"])
+        table = Table(body, repeatRows=1, colWidths=[22 * mm, 13 * mm, 16 * mm, 13 * mm, 14 * mm, 17 * mm, 20 * mm, 24 * mm, 18 * mm, 15 * mm, 24 * mm])
+        table.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.2),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#171717")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d8d2c8")),
+            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+            ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#f3efe7")),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ]))
+        flow.append(table)
+    flow.append(Spacer(1, 6))
+    flow.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#8B6F47")))
+    flow.append(Paragraph(f"<b>Mark-up (ex GST):</b> {settings['pricing_margin_pct']:.1f}% · <b>GST:</b> {settings['gst_rate_pct']:.1f}% · <b>Total inc GST:</b> ${grand:,.2f}", h2))
+    flow.append(Paragraph(str(settings["quote_footer"]), small))
+    doc.build(flow)
+    return buf.getvalue()
+
+
+def reconcile_ai_vs_drawn(workspace_id: int) -> pd.DataFrame:
+    """Compare AI-drafted quantities against drawn/mapped quantities per line item.
+
+    Every take-off row is classified by its basis (AI draft, Drawn on plan,
+    JobHub import, or Manual). Rows are grouped by section/element/location/unit
+    and the AI quantity is compared with the drawn quantity so differences stand
+    out before the take-off is priced.
+    """
+    takeoff = dataframe_for_takeoff(workspace_id)
+    if takeoff.empty:
+        return pd.DataFrame(columns=["section", "element", "location", "unit", "ai_qty", "drawn_qty", "variance", "status"])
+    records = []
+    for r in takeoff.itertuples(index=False):
+        rid = int(r.id)
+        drawn = lquery("SELECT COUNT(*) AS c FROM measurement_lines WHERE takeoff_row_id=?", (rid,))[0]["c"]
+        source_ref = str(r.source_reference or "")
+        notes = str(r.notes or "")
+        is_ai = "AI" in source_ref or "AI plan review" in notes or "AI-generated" in notes or "AI draft" in notes
+        if drawn:
+            basis = "Drawn"
+        elif is_ai:
+            basis = "AI"
+        elif str(r.source_page or "") == "JobHub import":
+            basis = "JobHub"
+        else:
+            basis = "Manual"
+        records.append({
+            "id": rid, "section": str(r.section or ""), "element": str(r.element or ""),
+            "location": str(r.location or ""), "unit": str(r.unit or ""),
+            "quantity": to_float(r.quantity), "basis": basis,
+        })
+    df = pd.DataFrame(records)
+    key = ["section", "element", "location", "unit"]
+    out = []
+    for _, g in df.groupby(key, dropna=False):
+        ai_qty = float(g.loc[g["basis"].eq("AI"), "quantity"].sum())
+        dr_qty = float(g.loc[g["basis"].eq("Drawn"), "quantity"].sum())
+        bases = sorted(set(g["basis"].tolist()))
+        if ai_qty == 0 and dr_qty == 0:
+            status = "Manual / not yet measured"
+        elif ai_qty > 0 and dr_qty > 0:
+            variance = dr_qty - ai_qty
+            tol = max(0.01, 0.02 * max(ai_qty, dr_qty))
+            status = "Matched" if abs(variance) <= tol else "Difference"
+        elif ai_qty > 0:
+            variance = -ai_qty
+            status = "AI only (not drawn)"
+        else:
+            variance = dr_qty
+            status = "Drawn only (no AI draft)"
+        out.append({
+            "section": g["section"].iloc[0], "element": g["element"].iloc[0],
+            "location": g["location"].iloc[0], "unit": g["unit"].iloc[0],
+            "ai_qty": ai_qty, "drawn_qty": dr_qty, "variance": variance,
+            "basis": ", ".join(bases), "status": status,
+        })
+    return pd.DataFrame(out)
+
+
 def dataframe_for_takeoff(workspace_id: int) -> pd.DataFrame:
     df = ldf("SELECT * FROM takeoff_rows WHERE workspace_id=? ORDER BY id", (workspace_id,))
     if df.empty:
@@ -3021,6 +3600,567 @@ def pull_takeoff_from_jobhub(workspace_id: int, bridge: JobHubBridge) -> int:
 
 
 # -----------------------------------------------------------------------------
+# Shared JobHub bridge: job numbering, one-file progress marker, live take-off
+# -----------------------------------------------------------------------------
+
+
+def ensure_shared_jobhub_schema(bridge: JobHubBridge) -> List[str]:
+    """Create the shared PlanReader <-> JobHub tables used by live sync.
+
+    Only creates tables that do not already exist so an existing JobHub
+    database is never altered in place. Returns the names actually created.
+    """
+    created = []
+    pk = "INTEGER PRIMARY KEY AUTOINCREMENT" if bridge.kind == "sqlite" else "SERIAL PRIMARY KEY"
+    ddl = {
+        "jobs": f"""
+            CREATE TABLE IF NOT EXISTS jobs (
+                id {pk}, job_no TEXT UNIQUE, job_name TEXT, builder_client_id INTEGER,
+                site_address TEXT, status TEXT, leading_hand TEXT, start_date TEXT,
+                end_date TEXT, contract_value REAL, notes TEXT)
+        """,
+        "job_takeoff_rows": f"""
+            CREATE TABLE IF NOT EXISTS job_takeoff_rows (
+                id {pk}, job_id INTEGER NOT NULL, internal_external TEXT DEFAULT 'Internal',
+                area_location TEXT NOT NULL, substrate TEXT NOT NULL, labour_category TEXT,
+                qty_m2 REAL DEFAULT 0, lineal_m REAL DEFAULT 0, count REAL DEFAULT 0,
+                coats REAL DEFAULT 1, rate_ex_gst REAL DEFAULT 0, labour_hours REAL DEFAULT 0,
+                paint_litres REAL DEFAULT 0, value_ex_gst REAL DEFAULT 0, source_note TEXT,
+                confidence TEXT, updated_at TEXT NOT NULL,
+                UNIQUE(job_id, area_location, substrate))
+        """,
+        "job_colour_schedules": f"""
+            CREATE TABLE IF NOT EXISTS job_colour_schedules (
+                id {pk}, job_id INTEGER NOT NULL, area_location TEXT NOT NULL, surface TEXT NOT NULL,
+                colour TEXT, finish TEXT, product TEXT, notes TEXT, hex TEXT, updated_at TEXT NOT NULL,
+                UNIQUE(job_id, area_location, surface))
+        """,
+        "job_document_blobs": f"""
+            CREATE TABLE IF NOT EXISTS job_document_blobs (
+                id {pk}, job_id INTEGER NOT NULL, file_name TEXT NOT NULL, mime_type TEXT,
+                doc_type TEXT, notes TEXT, blob_data TEXT NOT NULL, created_at TEXT NOT NULL,
+                UNIQUE(job_id, file_name))
+        """,
+    }
+    for name, sql in ddl.items():
+        try:
+            bridge.execute(sql)
+            created.append(name)
+        except Exception:
+            pass
+    return created
+
+
+def next_jobhub_job_no(bridge: Optional[JobHubBridge]) -> str:
+    """Next sequential PB number from the shared JobHub jobs table.
+
+    Mirrors JobHub's ``next_job_no()``: no PB rows -> PB25001, otherwise the
+    last PB number + 1, formatted as ``{prefix}{int(digits)+1:05d}``. Falls
+    back to a dated local number when JobHub is not reachable.
+    """
+    if not bridge:
+        return f"PB-{datetime.now().strftime('%y%m%d')}"
+    try:
+        tables = set(bridge.table_names())
+    except Exception:
+        return f"PB-{datetime.now().strftime('%y%m%d')}"
+    if "jobs" not in tables:
+        return "PB25001"
+    try:
+        cols = set(bridge.columns("jobs"))
+    except Exception:
+        cols = set()
+    if "job_no" not in cols:
+        return "PB25001"
+    try:
+        rows = bridge.query("SELECT job_no FROM jobs WHERE job_no LIKE 'PB%' ORDER BY job_no DESC LIMIT 1")
+    except Exception:
+        return f"PB-{datetime.now().strftime('%y%m%d')}"
+    if not rows:
+        return "PB25001"
+    last = str(rows[0].get("job_no") or "")
+    digits = "".join(c for c in last if c.isdigit())
+    prefix = "".join(c for c in last if not c.isdigit())
+    if not digits:
+        return "PB25001"
+    return f"{prefix}{int(digits) + 1:05d}"
+
+
+def create_linked_jobhub_job(bridge: Optional[JobHubBridge], job_no: str, job_name: str = "", site_address: str = "", status: str = "Active") -> Optional[int]:
+    """Insert a shared JobHub job row if that job number does not exist yet.
+
+    Returns the JobHub ``jobs.id`` for the job, or None when the bridge is
+    unavailable. Used when creating a standalone workspace with the
+    ``link to JobHub`` option so both apps share the same job number.
+    """
+    if not bridge:
+        return None
+    job_no = str(job_no or "").strip()
+    if not job_no:
+        return None
+    try:
+        tables = set(bridge.table_names())
+    except Exception:
+        return None
+    if "jobs" not in tables:
+        try:
+            ensure_shared_jobhub_schema(bridge)
+        except Exception:
+            return None
+    try:
+        existing = bridge.query("SELECT id FROM jobs WHERE job_no=?", (job_no,))
+        if existing:
+            return int(existing[0]["id"])
+    except Exception:
+        return None
+    try:
+        bridge.execute(
+            "INSERT INTO jobs(job_no,job_name,site_address,status,notes,start_date,end_date) VALUES(?,?,?,?,?,?,?)",
+            (job_no, str(job_name or ""), str(site_address or ""), str(status or "Active"),
+             "Created by PB PlanReader sync.", datetime.now().date().isoformat(), ""),
+        )
+    except Exception:
+        return None
+    try:
+        existing = bridge.query("SELECT id FROM jobs WHERE job_no=?", (job_no,))
+        if existing:
+            return int(existing[0]["id"])
+    except Exception:
+        pass
+    return None
+
+
+def _jobhub_takeoff_lines_csv(workspace: Dict[str, Any], takeoff: pd.DataFrame) -> str:
+    """Take-off rows in JobHub's shared ``job_takeoff_rows`` column order."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["internal_external", "area_location", "substrate", "labour_category",
+                     "qty_m2", "lineal_m", "count", "coats", "rate_ex_gst",
+                     "labour_hours", "paint_litres", "value_ex_gst", "source_note", "confidence"])
+    for _, row in takeoff.iterrows():
+        unit = str(row.get("unit") or "")
+        qty = to_float(row.get("quantity"))
+        m2 = qty if unit == "m²" else 0
+        lm = qty if unit == "lm" else 0
+        count = qty if unit in {"No.", "item"} else 0
+        section = str(row.get("section") or "Internal walls and ceilings")
+        internal_external = "Internal" if "internal" in section.lower() else ("External" if "external" in section.lower() else "Internal")
+        writer.writerow([
+            internal_external,
+            str(row.get("location") or row.get("element") or "General"),
+            str(row.get("substrate") or "Other"),
+            str(row.get("element") or ""),
+            m2, lm, count,
+            to_float(row.get("coats"), 1),
+            to_float(row.get("rate_per_unit")),
+            to_float(row.get("labour_hours")),
+            to_float(row.get("paint_litres")),
+            to_float(row.get("value_ex_gst")),
+            str(row.get("source_reference") or ""),
+            str(row.get("confidence") or ""),
+        ])
+    return buf.getvalue()
+
+
+def _takeoff_summary_csv(takeoff: pd.DataFrame) -> str:
+    if takeoff.empty:
+        return "section,m2,lineal_m,count,paint_litres,labour_hours,value_ex_gst\n"
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["section", "m2", "lineal_m", "count", "paint_litres", "labour_hours", "value_ex_gst"])
+    for section, group in takeoff.groupby("section", dropna=False):
+        writer.writerow([
+            str(section or "Unassigned"),
+            float(group.loc[group["unit"].eq("m²"), "quantity"].sum()),
+            float(group.loc[group["unit"].eq("lm"), "quantity"].sum()),
+            float(group.loc[group["unit"].isin({"No.", "item"}), "quantity"].sum()),
+            float(group["paint_litres"].sum()),
+            float(group["labour_hours"].sum()),
+            float(group["value_ex_gst"].sum()),
+        ])
+    return buf.getvalue()
+
+
+def _progress_package_readme(workspace: Dict[str, Any], takeoff: pd.DataFrame, pages: pd.DataFrame) -> str:
+    lines = [
+        "PB PlanReader — progress marker package",
+        "=======================================",
+        f"Job number:        {workspace.get('job_no', '')}",
+        f"Project:           {workspace.get('job_name', '')}",
+        f"Builder / client:  {workspace.get('builder_client', '')}",
+        f"Site address:      {workspace.get('site_address', '')}",
+        f"Drawing issue:     {workspace.get('drawing_issue', '')}",
+        f"Estimator:         {workspace.get('estimator', '')}",
+        f"Status:            {workspace.get('status', '')}",
+        f"Generated:         {now_stamp()}",
+        f"3D model status:   Conceptual unless geometry is marked Measured or Verified.",
+        "",
+        "This package is the single progress marker for the job:",
+        "  3d/3d_progress_marker.html      interactive 3D render (opens in a browser)",
+        "  3d/building.obj                 OBJ geometry",
+        "  3d/building_geometry.json       masses, openings, mapped zones, measurement lines",
+        "  takeoff/paint_takeoff.xlsx      subscription-style Excel take-off pack",
+        "  takeoff/takeoff_schedule.csv    full take-off schedule",
+        "  takeoff/quantity_summary.csv    quantities by section",
+        "  takeoff/takeoff_lines_jobhub.csv  take-off rows in JobHub shared format",
+        "  registers/*.csv                 door schedule, inclusions, exclusions, RFIs, etc.",
+        "  source_documents/               original plan / spec documents",
+        "  rendered_pages/                 processed drawing page images",
+        "  package_manifest.json           machine-readable manifest with totals",
+        "",
+    ]
+    if takeoff.empty:
+        lines.append("No measured take-off rows are in this package yet.")
+    else:
+        lines.append(f"Take-off lines:   {len(takeoff)}")
+        lines.append(f"Measured m2:      {float(takeoff.loc[takeoff['unit'].eq('m2' if 'm2' in set(takeoff['unit'].astype(str)) else 'm²'), 'quantity'].sum()):,.2f}")
+        lines.append(f"Paint litres:     {float(takeoff['paint_litres'].sum()):,.2f}")
+        lines.append(f"Labour hours:     {float(takeoff['labour_hours'].sum()):,.2f}")
+        lines.append(f"Value ex GST:     ${float(takeoff['value_ex_gst'].sum()):,.2f}")
+    lines += [
+        "",
+        "All quantities must be reviewed against the current issued drawings and",
+        "specifications before pricing or construction use. The 3D model is not",
+        "construction-grade BIM.",
+    ]
+    return "\n".join(lines)
+
+
+def progress_package_bytes(workspace_id: int) -> bytes:
+    """Build the single 'progress marker' ZIP: 3D render + take-off + job documents."""
+    workspace = lquery("SELECT * FROM workspaces WHERE id=?", (workspace_id,))[0]
+    output = io.BytesIO()
+    takeoff = dataframe_for_takeoff(workspace_id)
+    pages = ldf(
+        """SELECT p.id,p.page_label,p.page_type,p.scale_text,p.page_no,p.selected,p.image_path,d.file_name
+           FROM pages p JOIN documents d ON d.id=p.document_id WHERE p.workspace_id=? ORDER BY d.id,p.page_no""",
+        (workspace_id,),
+    )
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("README.txt", _progress_package_readme(workspace, takeoff, pages))
+        manifest = {
+            "app": APP_NAME,
+            "app_version": APP_VERSION,
+            "job_no": workspace.get("job_no", ""),
+            "job_name": workspace.get("job_name", ""),
+            "builder_client": workspace.get("builder_client", ""),
+            "site_address": workspace.get("site_address", ""),
+            "drawing_issue": workspace.get("drawing_issue", ""),
+            "estimator": workspace.get("estimator", ""),
+            "status": workspace.get("status", ""),
+            "generated": now_stamp(),
+            "executive_summary": workspace.get("executive_summary", ""),
+            "totals": {
+                "m2": float(takeoff.loc[takeoff["unit"].eq("m²"), "quantity"].sum()) if not takeoff.empty else 0.0,
+                "lm": float(takeoff.loc[takeoff["unit"].eq("lm"), "quantity"].sum()) if not takeoff.empty else 0.0,
+                "count": float(takeoff.loc[takeoff["unit"].isin({"No.", "item"}), "quantity"].sum()) if not takeoff.empty else 0.0,
+                "paint_litres": float(takeoff["paint_litres"].sum()) if not takeoff.empty else 0.0,
+                "labour_hours": float(takeoff["labour_hours"].sum()) if not takeoff.empty else 0.0,
+                "value_ex_gst": float(takeoff["value_ex_gst"].sum()) if not takeoff.empty else 0.0,
+            },
+            "pages": pages.to_dict("records"),
+            "measured_rows": int((takeoff["quantity_status"].astype(str).str.lower().str.contains("measur") if not takeoff.empty else pd.Series(dtype=bool)).sum()),
+        }
+        zf.writestr("package_manifest.json", json.dumps(manifest, indent=2, default=str))
+        zf.writestr("3d/3d_progress_marker.html", build_3d_figure(workspace_id).to_html(full_html=True, include_plotlyjs=True))
+        zf.writestr("3d/building.obj", generate_obj(workspace_id))
+        zf.writestr("3d/building_geometry.json", json.dumps({
+            "workspace": workspace,
+            "masses": lquery("SELECT * FROM model_masses WHERE workspace_id=?", (workspace_id,)),
+            "openings": lquery("SELECT * FROM model_openings WHERE workspace_id=?", (workspace_id,)),
+            "mapped_zones": lquery("SELECT * FROM mapped_zones WHERE workspace_id=?", (workspace_id,)),
+            "measurement_lines": lquery("SELECT * FROM measurement_lines WHERE workspace_id=?", (workspace_id,)),
+        }, indent=2, default=str))
+        zf.writestr("takeoff/paint_takeoff.xlsx", excel_export_bytes(workspace_id))
+        if not takeoff.empty:
+            zf.writestr("takeoff/takeoff_schedule.csv", takeoff.to_csv(index=False))
+            zf.writestr("takeoff/quantity_summary.csv", _takeoff_summary_csv(takeoff))
+            zf.writestr("takeoff/takeoff_lines_jobhub.csv", _jobhub_takeoff_lines_csv(workspace, takeoff))
+        for register_name, label in [
+            ("door_schedule", "door_schedule"),
+            ("inclusions", "inclusions"),
+            ("exclusions", "exclusions"),
+            ("clarifications", "separate_clarifications"),
+            ("assumptions", "assumptions"),
+            ("rfis", "rfis"),
+            ("source_basis", "source_and_basis"),
+            ("colour_finish_schedule", "colours_and_finishes"),
+            ("access_constraints", "access_constraints"),
+            ("risks", "risks"),
+        ]:
+            frame = register_df(workspace_id, register_name)
+            if not frame.empty:
+                zf.writestr(f"registers/{label}.csv", frame.to_csv(index=False))
+        if not pages.empty:
+            zf.writestr("registers/drawing_register.csv", pages.drop(columns=["image_path"], errors="ignore").to_csv(index=False))
+        else:
+            zf.writestr("registers/drawing_register.csv", "page_label,page_type,scale_text,page_no,file_name,selected\n")
+        for doc in lquery("SELECT * FROM documents WHERE workspace_id=?", (workspace_id,)):
+            path = Path(str(doc.get("path") or ""))
+            if path.exists():
+                zf.write(path, f"source_documents/{safe_name(doc.get('file_name'))}")
+        for page in pages.itertuples(index=False):
+            path = Path(str(getattr(page, "image_path") or ""))
+            if path.exists():
+                zf.write(path, f"rendered_pages/{safe_name(page.file_name)}_{int(page.id)}.png")
+    return output.getvalue()
+
+
+def _sync_jobhub_takeoff_rows(bridge: JobHubBridge, job_id: int, takeoff: pd.DataFrame) -> int:
+    """Upsert the workspace take-off into the shared ``job_takeoff_rows`` table."""
+    if takeoff.empty:
+        return 0
+    stamp = now_stamp()
+    payloads = []
+    for _, row in takeoff.iterrows():
+        unit = str(row.get("unit") or "")
+        qty = to_float(row.get("quantity"))
+        m2 = qty if unit == "m²" else 0
+        lm = qty if unit == "lm" else 0
+        count = qty if unit in {"No.", "item"} else 0
+        section = str(row.get("section") or "Internal walls and ceilings")
+        internal_external = "Internal" if "internal" in section.lower() else ("External" if "external" in section.lower() else "Internal")
+        payloads.append((
+            int(job_id), internal_external,
+            str(row.get("location") or row.get("element") or "General"),
+            str(row.get("substrate") or "Other"),
+            str(row.get("element") or ""),
+            m2, lm, count,
+            to_float(row.get("coats"), 1),
+            to_float(row.get("rate_per_unit")),
+            to_float(row.get("labour_hours")),
+            to_float(row.get("paint_litres")),
+            to_float(row.get("value_ex_gst")),
+            str(row.get("source_reference") or ""),
+            str(row.get("confidence") or ""),
+            stamp,
+        ))
+    for payload in payloads:
+        bridge.execute(
+            """
+            INSERT INTO job_takeoff_rows(job_id,internal_external,area_location,substrate,labour_category,
+                qty_m2,lineal_m,count,coats,rate_ex_gst,labour_hours,paint_litres,value_ex_gst,source_note,confidence,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(job_id, area_location, substrate) DO UPDATE SET
+                internal_external=excluded.internal_external, labour_category=excluded.labour_category,
+                qty_m2=excluded.qty_m2, lineal_m=excluded.lineal_m, count=excluded.count,
+                coats=excluded.coats, rate_ex_gst=excluded.rate_ex_gst,
+                labour_hours=excluded.labour_hours, paint_litres=excluded.paint_litres,
+                value_ex_gst=excluded.value_ex_gst, source_note=excluded.source_note,
+                confidence=excluded.confidence, updated_at=excluded.updated_at
+            """,
+            payload,
+        )
+    return len(payloads)
+
+
+def push_progress_marker_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: str) -> Dict[str, Any]:
+    """Send the one-file progress package to the shared JobHub database.
+
+    Stores the ZIP (3D render + take-off + job documents) as a progress marker
+    blob on the linked job, upserts live take-off rows into the shared
+    ``job_takeoff_rows`` table, records the marker in ``planreader_documents``
+    when present, and keeps the existing draft take-off package history.
+    """
+    workspace = lquery("SELECT * FROM workspaces WHERE id=?", (workspace_id,))[0]
+    job_id = workspace.get("jobhub_job_id")
+    if not job_id:
+        raise RuntimeError("Link this workspace to a JobHub job first (or create it as a linked job).")
+    takeoff = dataframe_for_takeoff(workspace_id)
+    if takeoff.empty:
+        raise RuntimeError("There are no take-off rows to send in the progress marker.")
+    ensure_shared_jobhub_schema(bridge)
+    file_name = f"progress_marker_{safe_name(workspace.get('job_no'))}_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
+    blob_bytes = progress_package_bytes(workspace_id)
+    stamp = now_stamp()
+    try:
+        bridge.execute(
+            """
+            INSERT INTO job_document_blobs(job_id,file_name,mime_type,doc_type,notes,blob_data,created_at)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(job_id, file_name) DO UPDATE SET
+                mime_type=excluded.mime_type, doc_type=excluded.doc_type, notes=excluded.notes,
+                blob_data=excluded.blob_data, created_at=excluded.created_at
+            """,
+            (int(job_id), file_name, "application/zip", "Progress Marker",
+             f"PB PlanReader progress marker: 3D render + take-off + job documents. Generated by {created_by}.",
+             base64.b64encode(blob_bytes).decode("ascii"), stamp),
+        )
+    except Exception:
+        pass
+    synced = _sync_jobhub_takeoff_rows(bridge, int(job_id), takeoff)
+    try:
+        ensure_planreader_document_table(bridge)
+        bridge.execute(
+            "INSERT INTO planreader_documents(job_id,file_name,mime_type,storage_path,source_app,uploaded_by,uploaded_at,notes) VALUES(?,?,?,?,?,?,?,?)",
+            (int(job_id), file_name, "application/zip", "", "PlanReader", created_by, stamp,
+             "One-file progress marker package (3D render + take-off + documents)."),
+        )
+    except Exception:
+        pass
+    package_id, line_count = push_takeoff_to_jobhub(workspace_id, bridge, created_by)
+    return {
+        "file_name": file_name,
+        "size_bytes": len(blob_bytes),
+        "blob_recorded": True,
+        "takeoff_rows_synced": synced,
+        "package_id": int(package_id),
+        "package_lines": int(line_count),
+        "job_id": int(job_id),
+    }
+
+
+def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: str) -> Dict[str, Any]:
+    """Publish the final take-off and quotation to the shared JobHub job.
+
+    Creates a final take-off package marked ``Published``, writes the priced
+    Excel quotation as a ``Final quotation`` document blob, stores the one-file
+    progress package, and updates the shared ``jobs.status`` to ``Published``.
+    """
+    workspace = lquery("SELECT * FROM workspaces WHERE id=?", (workspace_id,))[0]
+    job_id = workspace.get("jobhub_job_id")
+    if not job_id:
+        raise RuntimeError("Link this workspace to a JobHub job before publishing.")
+    takeoff = dataframe_for_takeoff(workspace_id)
+    if takeoff.empty:
+        raise RuntimeError("There are no take-off rows to publish.")
+    ensure_shared_jobhub_schema(bridge)
+    ensure_jobhub_takeoff_tables(bridge)
+    stamp = now_stamp()
+    job_no = safe_name(workspace.get("job_no"))
+    quote_name = f"quotation_{job_no}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    quote_bytes = quote_workbook_bytes(workspace_id)
+    try:
+        bridge.execute(
+            """INSERT INTO job_document_blobs(job_id,file_name,mime_type,doc_type,notes,blob_data,created_at)
+               VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(job_id, file_name) DO UPDATE SET
+                   mime_type=excluded.mime_type, doc_type=excluded.doc_type, notes=excluded.notes,
+                   blob_data=excluded.blob_data, created_at=excluded.created_at""",
+            (int(job_id), quote_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+             "Final quotation",
+             f"Priced per-level quotation generated by PB PlanReader ({created_by}).",
+             base64.b64encode(quote_bytes).decode("ascii"), stamp),
+        )
+    except Exception:
+        pass
+    progress_name = f"progress_marker_{job_no}_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
+    progress_bytes = progress_package_bytes(workspace_id)
+    try:
+        bridge.execute(
+            """INSERT INTO job_document_blobs(job_id,file_name,mime_type,doc_type,notes,blob_data,created_at)
+               VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(job_id, file_name) DO UPDATE SET
+                   mime_type=excluded.mime_type, doc_type=excluded.doc_type, notes=excluded.notes,
+                   blob_data=excluded.blob_data, created_at=excluded.created_at""",
+            (int(job_id), progress_name, "application/zip", "Progress Marker",
+             f"Published take-off + 3D render + documents ({created_by}).",
+             base64.b64encode(progress_bytes).decode("ascii"), stamp),
+        )
+    except Exception:
+        pass
+    synced = _sync_jobhub_takeoff_rows(bridge, int(job_id), takeoff)
+    docs = ", ".join(d["file_name"] for d in lquery("SELECT file_name FROM documents WHERE workspace_id=? ORDER BY id", (workspace_id,)))
+    internal_mask = takeoff["section"].astype(str).str.lower().str.contains("internal|ceiling|door|joinery")
+    external_mask = takeoff["section"].astype(str).str.lower().str.contains("external|facade|elevation|soffit|canopy")
+    m2_mask = takeoff["unit"].astype(str).eq("m²")
+    interior = float(takeoff.loc[internal_mask & m2_mask, "quantity"].fillna(0).sum())
+    exterior = float(takeoff.loc[external_mask & m2_mask, "quantity"].fillna(0).sum())
+    total_hours = float(takeoff["labour_hours"].fillna(0).sum())
+    total_litres = float(takeoff["paint_litres"].fillna(0).sum())
+    takeoff_no = f"PR-{workspace.get('job_no')}-PUB-{datetime.now().strftime('%Y%m%d-%H%M')}"
+    if bridge.kind == "postgres":
+        package_id = bridge.execute(
+            """INSERT INTO painting_takeoff_packages(job_id,takeoff_no,takeoff_date,status,source_documents,interior_total_m2,exterior_total_m2,total_labour_hours,total_paint_litres,generated_method,assumptions,ai_notes,created_by,created_at,updated_at,notes)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id""",
+            (job_id, takeoff_no, datetime.now().date().isoformat(), "Published", docs, interior, exterior,
+             total_hours, total_litres, "PB PlanReader subscription method",
+             "Final quantities approved for pricing.", workspace.get("executive_summary", ""),
+             created_by, stamp, stamp, "Published by PB PlanReader."),
+            returning=True,
+        )
+    else:
+        bridge.execute(
+            """INSERT INTO painting_takeoff_packages(job_id,takeoff_no,takeoff_date,status,source_documents,interior_total_m2,exterior_total_m2,total_labour_hours,total_paint_litres,generated_method,assumptions,ai_notes,created_by,created_at,updated_at,notes)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (job_id, takeoff_no, datetime.now().date().isoformat(), "Published", docs, interior, exterior,
+             total_hours, total_litres, "PB PlanReader subscription method",
+             "Final quantities approved for pricing.", workspace.get("executive_summary", ""),
+             created_by, stamp, stamp, "Published by PB PlanReader."),
+        )
+        package_id = bridge.query("SELECT id FROM painting_takeoff_packages WHERE takeoff_no=?", (takeoff_no,))[0]["id"]
+    line_count = 0
+    for _, row in takeoff.iterrows():
+        unit = str(row.get("unit") or "")
+        qty = to_float(row.get("quantity"))
+        m2 = qty if unit == "m²" else 0
+        lm = qty if unit == "lm" else 0
+        count = qty if unit in {"No.", "item"} else 0
+        bridge.execute(
+            """INSERT INTO painting_takeoff_lines(package_id,area_type,location_area,substrate,labour_category,m2,unit,quantity,coats,productivity_m2_per_hour,labour_hours,finish_type,element_count,lineal_metres,paint_litres,flags,notes,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (package_id, row.get("section", ""), row.get("location", ""), row.get("substrate", ""), row.get("element", ""),
+             m2, unit, qty, row.get("coats", 0), row.get("productivity_m2_per_hour", 0), row.get("labour_hours", 0),
+             row.get("finish_system", ""), count, lm, row.get("paint_litres", 0), row.get("confidence", ""),
+             f"{row.get('notes', '')} | Source: {row.get('source_reference', '')}", stamp),
+        )
+        line_count += 1
+    try:
+        bridge.execute(
+            "UPDATE jobs SET status=?, notes=COALESCE(notes, '') || ' | Published by PB PlanReader.' WHERE id=?",
+            ("Published", int(job_id)),
+        )
+    except Exception:
+        pass
+    try:
+        ensure_planreader_document_table(bridge)
+        bridge.execute(
+            "INSERT INTO planreader_documents(job_id,file_name,mime_type,storage_path,source_app,uploaded_by,uploaded_at,notes) VALUES(?,?,?,?,?,?,?,?)",
+            (int(job_id), quote_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "",
+             "PlanReader", created_by, stamp, "Final priced quotation."),
+        )
+    except Exception:
+        pass
+    return {
+        "package_id": int(package_id),
+        "package_lines": int(line_count),
+        "job_id": int(job_id),
+        "quotation": quote_name,
+        "progress_marker": progress_name,
+        "takeoff_rows_synced": synced,
+        "job_status": "Published",
+    }
+
+
+def list_jobhub_progress_markers(bridge: Optional[JobHubBridge], job_id: int) -> List[Dict[str, Any]]:
+    """Progress marker records already stored on a JobHub job."""
+    if not bridge or not job_id:
+        return []
+    try:
+        tables = set(bridge.table_names())
+    except Exception:
+        return []
+    if "job_document_blobs" not in tables:
+        return []
+    try:
+        cols = set(bridge.columns("job_document_blobs"))
+    except Exception:
+        cols = set()
+    selectable = [c for c in ["id", "file_name", "mime_type", "doc_type", "notes", "created_at"] if c in cols]
+    if "doc_type" not in cols:
+        rows = bridge.query(
+            f"SELECT {', '.join(selectable)} FROM job_document_blobs WHERE job_id=? ORDER BY id DESC",
+            (int(job_id),),
+        )
+    else:
+        rows = bridge.query(
+            f"SELECT {', '.join(selectable)} FROM job_document_blobs WHERE job_id=? AND doc_type LIKE ? ORDER BY id DESC",
+            (int(job_id), "%Progress Marker%"),
+        )
+    return rows if rows else []
+
+
+# -----------------------------------------------------------------------------
 # UI helpers and pages
 # -----------------------------------------------------------------------------
 
@@ -3122,17 +4262,27 @@ def sidebar_workspace_selector(bridge: Optional[JobHubBridge]) -> Optional[int]:
             st.session_state["workspace_id"] = int(selected_ws["id"])
             st.rerun()
     with st.sidebar.expander("Create standalone workspace"):
+        default_job_no = next_jobhub_job_no(bridge)
         with st.form("create_workspace"):
-            job_no = st.text_input("Job number", value=f"PB-{datetime.now().strftime('%y%m%d')}")
+            job_no = st.text_input("Job number (auto: next shared JobHub number)", value=default_job_no)
             job_name = st.text_input("Project name")
             builder = st.text_input("Builder / client")
             address = st.text_input("Site address")
+            link_to_jobhub = st.checkbox("Create this job in the shared JobHub database", value=bool(bridge))
             create = st.form_submit_button("Create workspace", use_container_width=True)
         if create:
             if not job_name.strip():
                 st.error("Project name is required.")
             else:
-                st.session_state["workspace_id"] = create_standalone_workspace(job_no.strip(), job_name.strip(), builder.strip(), address.strip())
+                workspace_id = create_standalone_workspace(job_no.strip(), job_name.strip(), builder.strip(), address.strip())
+                if bridge and link_to_jobhub:
+                    jobhub_id = create_linked_jobhub_job(bridge, job_no.strip(), job_name.strip(), address.strip())
+                    if jobhub_id:
+                        lexecute("UPDATE workspaces SET jobhub_job_id=? WHERE id=?", (int(jobhub_id), workspace_id))
+                        st.sidebar.success(f"Linked to JobHub job #{jobhub_id}.")
+                    else:
+                        st.sidebar.error("Could not link to JobHub. The job number may already be taken.")
+                st.session_state["workspace_id"] = workspace_id
                 st.rerun()
     return st.session_state.get("workspace_id")
 
@@ -3420,7 +4570,7 @@ def add_register_item_form(workspace_id:int, register_name:str, key_suffix:str="
 
 def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, ai_provider: str = "OpenAI") -> None:
     hero(workspace)
-    tabs=st.tabs(["AI plan read","Take-off schedule","Scope registers","Door schedule","Source & basis"])
+    tabs=st.tabs(["AI plan read","Take-off schedule","Scope registers","Door schedule","Source & basis","AI vs drawn"])
     with tabs[0]:
         pages=ldf("SELECT id,page_label,page_type,image_path,selected FROM pages WHERE workspace_id=? ORDER BY id",(workspace["id"],))
         if pages.empty:
@@ -3452,6 +4602,9 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
                 st.warning("Configure the AI API key (OPENAI_API_KEY or GEMINI_API_KEY) or enter a session key in the sidebar to enable AI plan reading. Manual mapping and 3D modelling still work without it.")
     with tabs[1]:
         takeoff_import_panel(int(workspace["id"]))
+        scale_issues=scale_gate_issues(int(workspace["id"]))
+        if scale_issues:
+            st.warning("**Scale gate:** these page(s) feed the take-off but have no calibrated scale yet — calibrate them in the **Plan Mapper → Scale** tab before treating quantities as measured: " + ", ".join(f"`{i['page_label']}`" for i in scale_issues[:8]))
         takeoff=ldf("SELECT * FROM takeoff_rows WHERE workspace_id=? ORDER BY id",(workspace["id"],))
         editor_cols=["id"]+TAKEOFF_COLUMNS
         if takeoff.empty:
@@ -3464,8 +4617,11 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
             "quantity_status":st.column_config.SelectboxColumn(options=STATUS_OPTIONS),
             "inclusion_status":st.column_config.SelectboxColumn(options=INCLUSION_OPTIONS),
         },height=560,key="takeoff_editor")
+        gate_confirmed=not scale_issues
+        if scale_issues:
+            gate_confirmed=st.checkbox("I will calibrate the affected page scales before using these quantities",key=f"scale_gate_{int(workspace['id'])}")
         c1,c2=st.columns(2)
-        if c1.button("Save take-off schedule",type="primary",use_container_width=True):
+        if c1.button("Save take-off schedule",type="primary",disabled=not gate_confirmed,use_container_width=True):
             lexecute("DELETE FROM takeoff_rows WHERE workspace_id=?",(workspace["id"],))
             for row in edited.to_dict("records"):
                 if not any(str(row.get(c) or "").strip() for c in ["section","element","location","source_reference"]):
@@ -3506,6 +4662,20 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
             lexecute("DELETE FROM takeoff_rows WHERE workspace_id=?", (workspace["id"],))
             st.success("Take-off data cleared.")
             st.rerun()
+        with st.expander("Copy rows to another level", expanded=False):
+            st.caption("Duplicates the selected rows for a new level. Locations are rewritten (e.g. 'Level 1 · all walls' → 'Level 2 · all walls'); rows that already exist for that level are skipped.")
+            copy_pool=ldf("SELECT id,section,element,location,unit FROM takeoff_rows WHERE workspace_id=? ORDER BY section,element,location",(workspace["id"],))
+            if copy_pool.empty:
+                st.caption("No take-off rows to copy yet.")
+            else:
+                copy_options={f"#{int(r.id)} · {r.section} · {r.element} · {r.location} ({r.unit})":int(r.id) for r in copy_pool.itertuples()}
+                cc1,cc2,cc3=st.columns([.6,.2,.2])
+                picked=cc1.multiselect("Rows to copy",list(copy_options.keys()))
+                target_level=cc2.selectbox("Target level",["Level 1","Ground","Level 2","Level 3","Level 4","Level 5","Roof"],key=f"copy_level_{int(workspace['id'])}")
+                if cc3.button("Copy rows",type="primary",disabled=not picked):
+                    n=copy_takeoff_rows_to_level(int(workspace["id"]),[copy_options[x] for x in picked],str(target_level))
+                    st.success(f"Copied {n} row(s) to {target_level}." if n else "No new rows created (they may already exist for that level).")
+                    st.rerun()
     with tabs[2]:
         names=["inclusions","exclusions","clarifications","assumptions","rfis","colour_finish_schedule","access_constraints","risks"]
         selected_reg=st.selectbox("Register",names,format_func=lambda x:x.replace("_"," ").title())
@@ -3534,6 +4704,20 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
                 if not exists:
                     lexecute("INSERT INTO register_items(workspace_id,register_name,item_no,title,detail,priority,source_reference,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(workspace["id"],"source_basis",p.get("page_label",""),p.get("page_type",""),f"Scale: {p.get('scale_text') or 'not confirmed'}","",ref,"Used / review",now_stamp()))
             st.rerun()
+    with tabs[5]:
+        st.subheader("AI vs drawn reconciliation")
+        st.markdown("<div class='pb-note'>Compares AI-drafted quantities with quantities drawn on the plan (and JobHub imports). Rows are grouped by scope line so differences stand out before the take-off is priced. This does not change data — it only reports it.</div>",unsafe_allow_html=True)
+        reco=reconcile_ai_vs_drawn(int(workspace["id"]))
+        if reco.empty:
+            st.info("Build the take-off first, then import an AI draft and/or draw measurements to compare them.")
+        else:
+            st.dataframe(reco,use_container_width=True,hide_index=True,height=420)
+            diffs=reco[reco["status"].isin(["Difference","AI only (not drawn)","Drawn only (no AI draft)"])]
+            if diffs.empty:
+                st.success("No material differences between AI and drawn quantities.")
+            else:
+                st.warning(f"**{len(diffs)} line item(s) need review** — check the variance column and confirm which basis to price.")
+                st.dataframe(diffs,use_container_width=True,hide_index=True)
 
 
 def overlay_image(page:Dict[str,Any],zones:List[Dict[str,Any]]) -> Optional[Image.Image]:
@@ -3646,10 +4830,12 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
                 st.session_state[store_key]=result
         else:
             st.error("The interactive line editor is unavailable in this environment.")
-        if st.button("Save drawn measurements",type="primary",key=f"save_{page['id']}"):
+        if st.button("Save drawn measurements",type="primary",key=f"save_{page['id']}",disabled=pxpm<=0):
             outcome=save_measurement_lines(int(workspace["id"]),int(page["id"]),st.session_state.get(store_key) or comp_lines)
             st.success(f"Saved {outcome['saved']} drawn shape(s); {outcome['synced']} take-off quantities updated to their mapped measurements.")
             st.rerun()
+        if pxpm<=0:
+            st.error("**Scale gate:** this page has no calibrated scale, so drawn lengths and areas cannot be converted to real units. Set the scale in the **Scale** tab, then save again.")
         saved_lines=lquery("SELECT * FROM measurement_lines WHERE page_id=? ORDER BY id",(int(page["id"]),))
         if saved_lines:
             st.markdown("#### Saved overlay")
@@ -3881,16 +5067,56 @@ def quantity_schedule_page(workspace:Dict[str,Any]) -> None:
     if takeoff.empty:
         st.info("Build the take-off schedule first.")
         return
+    scale_issues=scale_gate_issues(int(workspace["id"]))
+    if scale_issues:
+        st.warning("**Scale gate:** these page(s) have take-off rows/zones but no calibrated scale: " + ", ".join(f"`{i['page_label']}`" for i in scale_issues[:8]) + ". Calibrate in **Plan Mapper → Scale** before relying on the totals.")
     c1,c2,c3,c4,c5=st.columns(5)
     c1.metric("Total m²",f"{takeoff.loc[takeoff['unit'].eq('m²'),'quantity'].sum():,.1f}")
     c2.metric("Lineal metres",f"{takeoff.loc[takeoff['unit'].eq('lm'),'quantity'].sum():,.1f}")
     c3.metric("Paint",f"{takeoff['paint_litres'].sum():,.1f} L")
     c4.metric("Labour",f"{takeoff['labour_hours'].sum():,.1f} hrs")
     c5.metric("Value ex GST",f"${takeoff['value_ex_gst'].sum():,.0f}")
-    st.dataframe(takeoff[["id","section","element","location","substrate","finish_system","quantity","unit","quantity_status","coats","paint_litres","labour_hours","rate_per_unit","value_ex_gst","confidence","source_reference","notes"]],use_container_width=True,hide_index=True,height=560)
-    section=takeoff.groupby("section",dropna=False).agg(rows=("id","count"),m2=("quantity",lambda s:float(s[takeoff.loc[s.index,"unit"].eq("m²")].sum())),paint_litres=("paint_litres","sum"),labour_hours=("labour_hours","sum"),value_ex_gst=("value_ex_gst","sum")).reset_index()
-    st.subheader("Section summary")
-    st.dataframe(section,use_container_width=True,hide_index=True)
+    tabs=st.tabs(["Schedule","Per-level pricing","Reconciliation","Quote export"])
+    with tabs[0]:
+        st.dataframe(takeoff[["id","section","element","location","substrate","finish_system","quantity","unit","quantity_status","coats","paint_litres","labour_hours","rate_per_unit","value_ex_gst","confidence","source_reference","notes"]],use_container_width=True,hide_index=True,height=560)
+        section=takeoff.groupby("section",dropna=False).agg(rows=("id","count"),m2=("quantity",lambda s:float(s[takeoff.loc[s.index,"unit"].eq("m²")].sum())),paint_litres=("paint_litres","sum"),labour_hours=("labour_hours","sum"),value_ex_gst=("value_ex_gst","sum")).reset_index()
+        st.subheader("Section summary")
+        st.dataframe(section,use_container_width=True,hide_index=True)
+    with tabs[1]:
+        st.subheader("Priced per-level summary")
+        st.caption("Levels are read from the row locations (Ground, Level 1 … Roof). Pricing settings (mark-up, GST) come from Settings.")
+        levels=quote_summary_frame(int(workspace["id"]))
+        st.dataframe(levels,use_container_width=True,hide_index=True)
+        if not levels.empty:
+            g1,g2,g3,g4=st.columns(4)
+            g1.metric("Value ex GST",f"${levels['value_ex_gst'].sum():,.2f}")
+            g2.metric("Mark-up ex GST",f"${(levels['markup_ex_gst']-levels['value_ex_gst']).sum():,.2f}")
+            g3.metric("GST",f"${levels['gst'].sum():,.2f}")
+            g4.metric("Total inc GST",f"${levels['total_inc_gst'].sum():,.2f}")
+            st.download_button("Download per-level summary CSV",per_level_summary_csv(int(workspace["id"])).encode("utf-8"),file_name=f"{safe_name(workspace.get('job_no'))}_per_level_summary.csv",mime="text/csv")
+    with tabs[2]:
+        st.subheader("AI vs drawn reconciliation")
+        reco=reconcile_ai_vs_drawn(int(workspace["id"]))
+        if reco.empty:
+            st.caption("No rows to reconcile yet.")
+        else:
+            st.dataframe(reco,use_container_width=True,hide_index=True,height=420)
+            diffs=reco[reco["status"].isin(["Difference","AI only (not drawn)","Drawn only (no AI draft)"])]
+            if not diffs.empty:
+                st.warning(f"**{len(diffs)} line item(s) differ between AI and drawn quantities.**")
+    with tabs[3]:
+        st.subheader("Quotation export")
+        st.markdown("<div class='pb-note'>Priced per-level quotation with the mark-up and GST configured in Settings. PDF uses the same figures.</div>",unsafe_allow_html=True)
+        try:
+            quote_xlsx=quote_workbook_bytes(int(workspace["id"]))
+            quote_pdf=quote_pdf_bytes(int(workspace["id"]))
+        except Exception as exc:
+            st.exception(exc)
+            quote_xlsx, quote_pdf = None, None
+        if quote_xlsx:
+            st.download_button("Download priced quotation (Excel)",quote_xlsx,file_name=f"{safe_name(workspace.get('job_no'))}_quotation.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+        if quote_pdf:
+            st.download_button("Download priced quotation (PDF)",quote_pdf,file_name=f"{safe_name(workspace.get('job_no'))}_quotation.pdf",mime="application/pdf",use_container_width=True)
 
 
 def export_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],user:Dict[str,Any]) -> None:
@@ -3917,6 +5143,29 @@ def export_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],user:Dict[
                 st.exception(exc)
     st.markdown("</div>",unsafe_allow_html=True)
     st.markdown("<div class='pb-card'>",unsafe_allow_html=True)
+    st.subheader("One-file progress marker → JobHub")
+    if not bridge or not workspace.get("jobhub_job_id"):
+        st.info("Link this workspace to a JobHub job to send the progress marker (3D render + take-off + job documents in one file).")
+    else:
+        st.markdown("<div class='pb-note'>Builds a single ZIP: the interactive 3D render, OBJ + geometry, the Excel take-off pack, take-off CSVs (including JobHub's shared format), scope registers, source plans and rendered page previews. The ZIP is stored on the job in JobHub as a <b>Progress Marker</b>, take-off rows are synced live into <code>job_takeoff_rows</code>, and a draft take-off package is created alongside.</div>",unsafe_allow_html=True)
+        confirmed=st.checkbox("I have reviewed the take-off, drawing revision and 3D geometry")
+        if st.button("Build & send progress marker to JobHub",type="primary",disabled=not confirmed):
+            try:
+                result=push_progress_marker_to_jobhub(int(workspace["id"]),bridge,str(user.get("username") or "PlanReader"))
+                st.success(f"Sent {result['file_name']} ({result['size_bytes']/1024:.0f} KB) to JobHub job #{result['job_id']} as a progress marker; {result['takeoff_rows_synced']} take-off rows synced live and draft package #{result['package_id']} created ({result['package_lines']} lines).")
+            except Exception as exc:
+                st.exception(exc)
+        st.markdown("#### Progress markers already on this job")
+        try:
+            markers=list_jobhub_progress_markers(bridge,int(workspace.get("jobhub_job_id")))
+        except Exception:
+            markers=[]
+        if markers:
+            st.dataframe(pd.DataFrame(markers),use_container_width=True,hide_index=True)
+        else:
+            st.caption("No progress markers sent yet for this job.")
+    st.markdown("</div>",unsafe_allow_html=True)
+    st.markdown("<div class='pb-card'>",unsafe_allow_html=True)
     st.subheader("Import take-off from JobHub")
     if not bridge or not workspace.get("jobhub_job_id"):
         st.info("Link this workspace to a JobHub job to pull take-off rows already stored in JobHub.")
@@ -3927,6 +5176,23 @@ def export_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],user:Dict[
                 n=pull_takeoff_from_jobhub(int(workspace["id"]),bridge)
                 st.success(f"Imported {n} take-off row(s) from JobHub." if n else "JobHub has no take-off rows for this job.")
                 st.rerun()
+            except Exception as exc:
+                st.exception(exc)
+    st.markdown("</div>",unsafe_allow_html=True)
+    st.markdown("<div class='pb-card'>",unsafe_allow_html=True)
+    st.subheader("Publish final take-off to JobHub")
+    if not bridge or not workspace.get("jobhub_job_id"):
+        st.info("Link this workspace to a JobHub job to publish the final take-off and quotation.")
+    else:
+        st.markdown("<div class='pb-warning'>Publishes the final take-off package (status <b>Published</b>), the priced Excel quotation and the progress package, syncs take-off rows live, and marks the shared JobHub job as <b>Published</b>. Only do this when quantities, drawing revision and pricing are final.</div>",unsafe_allow_html=True)
+        scale_issues=scale_gate_issues(int(workspace["id"]))
+        if scale_issues:
+            st.warning("**Scale gate:** " + ", ".join(f"`{i['page_label']}`" for i in scale_issues[:8]) + " has no calibrated scale — calibrate before publishing.")
+        publish_confirm=st.checkbox("I confirm this is the final, reviewed and priced take-off for the current drawing issue")
+        if st.button("Publish to JobHub",type="primary",disabled=not publish_confirm or bool(scale_issues)):
+            try:
+                result=publish_job_to_jobhub(int(workspace["id"]),bridge,str(user.get("username") or "PlanReader"))
+                st.success(f"Published job #{result['job_id']}: final package #{result['package_id']} ({result['package_lines']} lines), quotation '{result['quotation']}' and progress marker '{result['progress_marker']}' stored; {result['takeoff_rows_synced']} take-off rows synced. JobHub status: {result['job_status']}.")
             except Exception as exc:
                 st.exception(exc)
     st.markdown("</div>",unsafe_allow_html=True)
@@ -3947,6 +5213,26 @@ def settings_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],session_
             st.write(f"JobHub tables detected: `{', '.join(sorted(bridge.table_names())[:30])}`")
         except Exception as exc:
             st.error(f"JobHub bridge error: {exc}")
+    st.markdown("<div class='pb-card'>",unsafe_allow_html=True)
+    st.subheader("Project-level settings")
+    st.caption("Defaults used by the take-off and quotation for this job only. Rows keep their own values where already set; these are the fallbacks and quote pricing inputs.")
+    wid=int(workspace["id"])
+    with st.form("workspace_settings_form"):
+        s1,s2,s3=st.columns(3)
+        coverage=s1.number_input("Default coverage (m²/L)",min_value=1.0,value=float(workspace_setting(wid,"default_coverage_m2_per_litre",12.0)),step=0.5)
+        productivity=s2.number_input("Default productivity (m²/hr)",min_value=0.5,value=float(workspace_setting(wid,"default_productivity_m2_per_hour",8.0)),step=0.5)
+        wall_height=s3.number_input("Default wall height (m)",min_value=0.5,value=float(workspace_setting(wid,"default_wall_height_m",2.7)),step=0.1)
+        p1,p2=st.columns(2)
+        margin=p1.number_input("Pricing mark-up (%)",min_value=0.0,value=float(workspace_setting(wid,"pricing_margin_pct",0.0)),step=0.5)
+        gst=p2.number_input("GST rate (%)",min_value=0.0,value=float(workspace_setting(wid,"gst_rate_pct",10.0)),step=0.5)
+        header=st.text_input("Quote header / company name",value=str(workspace_setting(wid,"quote_header","Premier Brushworks Pty Ltd")))
+        footer=st.text_area("Quote footer",value=str(workspace_setting(wid,"quote_footer","Valid for 30 days. All quantities require estimator review against the current issued drawings and specification before pricing or construction use.")),height=90)
+        if st.form_submit_button("Save project settings",type="primary"):
+            for key,val in [("default_coverage_m2_per_litre",coverage),("default_productivity_m2_per_hour",productivity),("default_wall_height_m",wall_height),("pricing_margin_pct",margin),("gst_rate_pct",gst),("quote_header",header),("quote_footer",footer)]:
+                set_workspace_setting(wid,key,val)
+            st.success("Project settings saved.")
+            st.rerun()
+    st.markdown("</div>",unsafe_allow_html=True)
     st.markdown("<div class='pb-note'>For permanent Render storage, attach a persistent disk and set PLANREADER_DATA_DIR to its mount path. Separate Render services cannot read each other's local disk paths; use shared PostgreSQL for metadata and object storage or PlanReader uploads for file bytes.</div>",unsafe_allow_html=True)
     if st.checkbox("Show destructive controls"):
         confirm=st.text_input("Type DELETE to remove this PlanReader workspace")

@@ -558,12 +558,6 @@
     }
   }
 
-  function canvasMove(ev) {
-    state.hover = toPct(ev);
-    updateLive();
-    draw();
-  }
-
   function updateLive() {
     var el = document.getElementById('pr_live');
     if (!el) return;
@@ -635,12 +629,22 @@
       opt.textContent = 'No drawable take-off rows (create m or m² rows first)';
       sel.appendChild(opt);
     }
+    var groups = {};
     state.rows.forEach(function (r) {
-      var o = document.createElement('option');
-      o.value = String(r.id);
-      o.textContent = r.label + ' · ' + (r.unit || '') + (r.quantity > 0 ? ' · ' + r2(r.quantity) : '');
-      if (String(r.id) === String(state.activeRowId)) o.selected = true;
-      sel.appendChild(o);
+      var g = String(r.group || '').trim() || 'Unassigned';
+      (groups[g] = groups[g] || []).push(r);
+    });
+    Object.keys(groups).sort().forEach(function (gname) {
+      var og = document.createElement('optgroup');
+      og.label = gname;
+      groups[gname].forEach(function (r) {
+        var o = document.createElement('option');
+        o.value = String(r.id);
+        o.textContent = r.label + ' · ' + (r.unit || '') + (r.quantity > 0 ? ' · ' + r2(r.quantity) : '');
+        if (String(r.id) === String(state.activeRowId)) o.selected = true;
+        og.appendChild(o);
+      });
+      sel.appendChild(og);
     });
     sel.addEventListener('change', function () {
       state.activeRowId = sel.value ? parseInt(sel.value, 10) : null;
@@ -798,10 +802,12 @@
       state.imgEl = img;
       cv.addEventListener('click', canvasClick);
       cv.addEventListener('dblclick', canvasDblClick);
-      cv.addEventListener('mousedown', canvasDown);
-      cv.addEventListener('mouseup', canvasUp);
-      cv.addEventListener('mousemove', canvasMove);
-      cv.addEventListener('mouseleave', function () { state.hover = null; updateLive(); draw(); });
+      cv.addEventListener('pointerdown', canvasDown);
+      cv.addEventListener('pointerup', canvasUp);
+      cv.addEventListener('pointermove', canvasMove);
+      cv.addEventListener('pointerleave', function () { state.hover = null; updateLive(); draw(); });
+      cv.addEventListener('pointercancel', function () { if (state.drag) { state.drag = null; postValue(); } state.hover = null; updateLive(); draw(); });
+      cv.addEventListener('touchstart', function (ev) { if (ev.touches.length === 1) ev.preventDefault(); }, { passive: false });
       state.fitW = Math.min(1100, state.cw);
       applyZoom();
       updateChip();

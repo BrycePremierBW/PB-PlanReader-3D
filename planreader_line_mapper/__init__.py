@@ -107,6 +107,7 @@ def plan_line_editor(
             "unit": str(r.get("unit") or ""),
             "colour": str(r.get("colour") or "#1f6fb2"),
             "quantity": _finite(r.get("quantity"), 0.0),
+            "group": str(r.get("group") or ""),
         })
     return _plan_line_mapper(
         image=image_data_uri,
