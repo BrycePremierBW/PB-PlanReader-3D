@@ -631,7 +631,6 @@ class JobHubBridge:
                 select_parts.append(f"{mime_col} AS mime_type" if mime_col else "'' AS mime_type")
                 select_parts.append(f"{path_col} AS storage_path" if path_col else "'' AS storage_path")
                 select_parts.append(f"{url_col} AS file_url" if url_col else "'' AS file_url")
-                select_parts.append(f"{blob_col} AS file_blob" if blob_col else "NULL AS file_blob")
                 select_parts.append(f"{date_col} AS uploaded_at" if date_col else "'' AS uploaded_at")
                 try:
                     cur.execute(
@@ -644,8 +643,34 @@ class JobHubBridge:
                 for row in rows:
                     record = dict(row)
                     record["source_table"] = table
+                    record["has_blob"] = bool(blob_col)
                     records.append(record)
         return records
+
+    def fetch_document_blob(self, table: str, record_id: int) -> Optional[bytes]:
+        """Return a single document's file_data bytes (or None if absent).
+
+        Fetched one document at a time so discovery never holds every PDF in
+        memory at once — the render free tier only has ~512 MB to work with.
+        """
+        if not record_id:
+            return None
+        safe = re.sub(r"[^A-Za-z0-9_]", "", table)
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cols = self._columns_for_connection(cur, safe)
+            blob_col = next((c for c in ["blob_data", "file_data", "content", "data", "blob", "bytes"] if c in cols), None)
+            if not blob_col:
+                return None
+            placeholder = "%s" if self.kind == "postgres" else "?"
+            cur.execute(f"SELECT {blob_col} FROM {safe} WHERE id={placeholder}", (int(record_id),))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            value = row[0]
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return bytes(value)
+            return None
 
     def _columns_for_connection(self, cur, table: str) -> List[str]:
         safe = re.sub(r"[^A-Za-z0-9_]", "", table)
@@ -2734,6 +2759,11 @@ def project_documents_page(workspace: Dict[str, Any], bridge: Optional[JobHubBri
                     messages=[]
                     success=0
                     for record in records:
+                        if record.get("has_blob") and record.get("source_table") and record.get("record_id"):
+                            try:
+                                record["file_blob"] = bridge.fetch_document_blob(record["source_table"], int(record["record_id"]))
+                            except Exception:
+                                record["file_blob"] = None
                         ok,msg = copy_jobhub_document_to_workspace(record, int(workspace["id"]))
                         messages.append(msg)
                         success += int(ok)
