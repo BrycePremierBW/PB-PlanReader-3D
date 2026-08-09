@@ -1,12 +1,18 @@
-streamlit>=1.39
-pandas>=2.2
-numpy>=1.26
-plotly>=5.24
-PyMuPDF>=1.24
-Pillow>=10.4
-openpyxl>=3.1
-python-docx>=1.1
-requests>=2.32
-psycopg2-binary>=2.9
-openai>=1.109
-streamlit-drawable-canvas>=0.9.3
+# Pinned dependency set verified together on Python 3.13.14 (local repro venv).
+# Render previously resolved unpinned ranges (e.g. streamlit>=1.39) to the
+# latest versions, which periodically produced build/deploy differences from
+# the code they were tested against. Keep these exact until an upgrade is
+# tested end-to-end on the same Python runtime.
+streamlit==1.59.2
+pandas==2.3.3
+numpy==2.5.1
+plotly==6.9.0
+PyMuPDF==1.28.0
+Pillow==12.3.0
+openpyxl==3.1.5
+python-docx==1.1.2
+requests==2.34.2
+psycopg2-binary==2.9.12
+openai==1.109.1
+streamlit-drawable-canvas==0.9.3
+protobuf==7.35.1
