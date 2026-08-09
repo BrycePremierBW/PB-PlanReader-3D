@@ -66,6 +66,20 @@ _EXACT_HEADER_TARGETS = {
     "sourcereference": "source_reference",
     "inclusionstatus": "inclusion_status",
     "quantitystatus": "quantity_status",
+    "unit": "unit",
+    "quantity": "quantity",
+    "intext": "section",
+    "intorext": "section",
+    "intorexternal": "section",
+    "include": "inclusion_status",
+    "sourcedrawing": "source_reference",
+    "drawingsource": "source_reference",
+    "drawingreference": "source_reference",
+    "paintcoverageallowance": "coverage_m2_per_litre",
+    "coverageallowance": "coverage_m2_per_litre",
+    "productivityqtyhr": "productivity_m2_per_hour",
+    "qtyperhr": "productivity_m2_per_hour",
+    "paintqtyperhour": "productivity_m2_per_hour",
 }
 
 _M2_HEADERS = {
@@ -80,6 +94,8 @@ _COUNT_HEADERS = {
 
 _JOBHUB_DIRECT = {
     "internalexternal": "section",
+    "intext": "section",
+    "intorext": "section",
     "arealocation": "location",
     "labourcategory": "element",
     "laborcategory": "element",
@@ -88,12 +104,77 @@ _JOBHUB_DIRECT = {
     "rateexgst": "rate_per_unit",
     "confidence": "confidence",
     "sourcenote": "notes",
+    "include": "inclusion_status",
+    "sourcedrawing": "source_reference",
+    "paintcoverageallowance": "coverage_m2_per_litre",
+    "productivityqtyhr": "productivity_m2_per_hour",
 }
 
 _IGNORED_CALCULATED_HEADERS = {
     "labourhours", "laborhours", "paintlitres", "paintliters", "valueexgst",
     "totalexgst", "extendedvalue", "updatedat", "id", "jobid"
 }
+
+_TOTAL_LABEL = re.compile(r"\b(total|subtotal|grand\s*total|sum|average|base\s+totals)\b", re.I)
+
+_LOCATION_PREFIX = re.compile(
+    r"^\s*(?:units?\s+\d+(?:\s*[\u2013\u2014\-]\s*\d+)?\s+|"
+    r"unit\s+\d+\s+|"
+    r"block\s+[a-z0-9]+\s*|"
+    r"level\s+\d+\s+|"
+    r"[a-z]+\s+street\s+)",
+    re.I,
+)
+
+# (regex, label) in priority order. Matched against the Area/Location text once
+# any "Units 5-9 / Block B / King Street"-style location prefix has been removed.
+_ELEMENT_RULES = [
+    (re.compile(r"\binternal\s+walls?\b", re.I), "Internal walls"),
+    (re.compile(r"\bexternal\s+walls?\b", re.I), "External walls"),
+    (re.compile(r"\binternal\s+(single\s+)?hinged\s+doors?\b", re.I), "Internal hinged doors"),
+    (re.compile(r"\bcavity\s+sliders?\b", re.I), "Cavity sliders"),
+    (re.compile(r"\bsliding\s+doors?\b|\bsliders?\b", re.I), "Sliding doors"),
+    (re.compile(r"\bskirting\b|\barchitraves?\b|\btrim\b", re.I), "Skirting / trim"),
+    (re.compile(r"\bceilings?\b", re.I), "Ceilings"),
+    (re.compile(r"\bsoffits?\b", re.I), "Soffits"),
+    (re.compile(r"\btextureboard\b", re.I), "Textureboard cladding"),
+    (re.compile(r"\blineaboard\b", re.I), "Lineaboard cladding"),
+    (re.compile(r"\beasylap\b", re.I), "Easylap cladding"),
+    (re.compile(r"\bcladding\b", re.I), "Cladding"),
+    (re.compile(r"\bfences?\b", re.I), "Fence"),
+    (re.compile(r"\brendered\s+block\b|\bblockwork\b", re.I), "Rendered block"),
+    (re.compile(r"\bdoors?\b", re.I), "Doors"),
+    (re.compile(r"\bwindows?\b", re.I), "Windows"),
+    (re.compile(r"\bwalls?\b", re.I), "Walls"),
+    (re.compile(r"\bmetalwork\b|\bmetal\b|\bsteel\b|\bhandrails?\b|\brailing\b", re.I), "Metalwork"),
+]
+
+
+def _derive_element(location: Any) -> str:
+    text = str(location or "").strip()
+    stripped = _LOCATION_PREFIX.sub("", text).strip(" ,:;.-\u2013\u2014")
+    search_in = stripped or text
+    for pattern, label in _ELEMENT_RULES:
+        if pattern.search(search_in):
+            return label
+    return ""
+
+
+def _normalise_inclusion(raw: Any) -> str:
+    low = str(raw or "").strip().casefold()
+    if not low or low in {"base", "included", "include", "yes", "incl", "inc"}:
+        return "INCLUSION"
+    if low in {"optional", "opt", "option"}:
+        return "PROVISIONAL"
+    if low in {"excluded", "exclude", "exc", "no"}:
+        return "EXCLUSION"
+    if low in {"provisional", "prov"}:
+        return "PROVISIONAL"
+    if low in {"separate", "separate item"}:
+        return "SEPARATE ITEM"
+    if low in {"clarification", "clarify"}:
+        return "CLARIFICATION"
+    return str(raw or "").strip() or "INCLUSION"
 
 
 def _to_float(app, value: Any) -> float:
@@ -307,11 +388,19 @@ def make_parse_takeoff_file(app):
         metrics = _metric_columns(raw_headers)
         direct = _direct_indices(raw_headers)
         has_pb_metrics = any(metrics.values())
+        unit_idx = next((i for i, t in mapping.items() if t == "unit"), None)
+        has_notes_col = any(_key(h) in {"notes", "sourcenote", "comments", "comment", "remarks"} for h in raw_headers)
         rows: List[Dict[str, Any]] = []
 
         for source_row_no, line in enumerate(body, start=2):
             if not any(str(v or "").strip().lower() not in {"", "nan", "none"} for v in line):
                 continue
+
+            # Skip roll-up rows such as "BASE TOTALS" placed in the unit column.
+            if unit_idx is not None and unit_idx < len(line):
+                unit_cell = str(line[unit_idx] or "").strip()
+                if _TOTAL_LABEL.search(unit_cell):
+                    continue
 
             base: Dict[str, Any] = {c: "" for c in app.TAKEOFF_COLUMNS}
 
@@ -346,8 +435,15 @@ def make_parse_takeoff_file(app):
                     if text.lower() not in {"nan", "none"}:
                         base[target] = text
 
+            # PB take-off sheets keep the item description in the area/location
+            # text. Derive a concise element label from it when none was given.
+            if not str(base.get("element") or "").strip():
+                base["element"] = _derive_element(base.get("location") or "")
+            if str(base.get("inclusion_status") or "").strip():
+                base["inclusion_status"] = _normalise_inclusion(base.get("inclusion_status"))
+
             source_note = str(base.get("notes") or "").strip()
-            extra = _extra_jobhub_notes(app, raw_headers, line)
+            extra = "" if has_notes_col else _extra_jobhub_notes(app, raw_headers, line)
             if extra:
                 source_note = f"{source_note} · {extra}".strip(" ·")
             base["notes"] = source_note
