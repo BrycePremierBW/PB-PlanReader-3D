@@ -170,6 +170,9 @@ SUBSTRATES = [
     "Fibre cement",
     "Precast concrete",
     "Masonry / blockwork",
+    "Render",
+    "Acrylic render",
+    "Cement render",
     "Timber door",
     "Timber trim / joinery",
     "Structural steel",
@@ -181,6 +184,7 @@ SUBSTRATES = [
 ]
 
 FINISH_SYSTEMS = [
+    "Interior coatings",
     "Ceiling flat",
     "Low sheen wall system",
     "Semi-gloss / enamel",
@@ -1112,6 +1116,9 @@ def takeoff_rows_for_mapper(workspace_id: int) -> List[Dict[str, Any]]:
         if unit not in {"m", "m2"}:
             continue
         label = f"{r.section or ''} · {r.element or ''} · {r.location or ''}".strip(" ·")
+        detail = " · ".join(x for x in [str(r.substrate or ""), str(r.finish_system or "")] if str(x).strip())
+        if detail:
+            label = f"{label} ({detail})"
         out.append({
             "id": int(r.id),
             "label": label,
@@ -1119,6 +1126,8 @@ def takeoff_rows_for_mapper(workspace_id: int) -> List[Dict[str, Any]]:
             "colour": line_colour_for(r.section, r.element),
             "quantity": to_float(r.quantity),
             "status": str(r.quantity_status or ""),
+            "substrate": str(r.substrate or ""),
+            "finish_system": str(r.finish_system or ""),
         })
     return out
 
@@ -3406,6 +3415,21 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
                 st.rerun()
         elif not pxpm:
             st.warning("No scale for this page yet — calibrate it in the **Scale** tab (or confirm a detected scale above) so line lengths and areas are measured in real units.")
+        with st.expander("Quick add a take-off row to draw (e.g. Floor plan by area)",expanded=False):
+            qa_cols=st.columns([.28,.3,.22,.2])
+            qa_element=qa_cols[0].selectbox("Element",["Floor plan","Walls","Ceilings","Skirtings","Doors","Frames","External walls / cladding","Steel / columns"],key=f"qa_el_{page['id']}")
+            qa_loc=qa_cols[1].text_input("Location / description",value="All internal areas",key=f"qa_loc_{page['id']}")
+            qa_sub=qa_cols[2].selectbox("Substrate",SUBSTRATES,index=SUBSTRATES.index("Render") if "Render" in SUBSTRATES else 0,key=f"qa_sub_{page['id']}")
+            qa_fin=qa_cols[3].selectbox("Finish system",FINISH_SYSTEMS,index=0,key=f"qa_fin_{page['id']}")
+            qa_unit = "m²" if qa_element in {"Floor plan","Walls","Ceilings","External walls / cladding"} else "lm"
+            qa_section = "Internal" if qa_element not in {"External walls / cladding","Steel / columns"} else "External"
+            qa_rate = default_rate_for(qa_sub,qa_element,qa_fin,qa_unit)
+            st.caption(f"Will add: **{qa_section} · {qa_element} · {qa_loc}** on **{qa_sub}** with finish **{qa_fin}** ({qa_unit}). Default rate ${qa_rate:.2f}/{qa_unit} — editable in the take-off schedule.")
+            if st.button("Add row and select it for drawing",key=f"qa_add_{page['id']}"):
+                new_id=lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(int(workspace["id"]),qa_section,qa_element,qa_loc,qa_sub,qa_fin,0,qa_unit,"To measure",page.get("page_label",""),"","INCLUSION",2 if qa_unit=="lm" else 3,12,8,qa_rate,"To review","Quick-added from Draw measurements tab.",now_stamp(),now_stamp()))
+                st.session_state[f"ml_active_{int(page['id'])}"]=int(new_id)
+                st.session_state[rev_key]=int(st.session_state.get(rev_key,0))+1
+                st.rerun()
         store_key=f"ml_store_{int(page['id'])}"
         widget_key=f"ml_{int(page['id'])}"
         rev_key=f"mlrev_{int(page['id'])}"
@@ -3448,7 +3472,8 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
             st.rerun()
         path=Path(str(page.get("image_path") or ""))
         if plan_line_editor is not None and path.exists():
-            result=plan_line_editor(path.read_bytes(),comp_lines,mapper_rows,pxpm,int(st.session_state.get(rev_key,0)),key=widget_key,height=760)
+            active_row_id=st.session_state.get(f"ml_active_{int(page['id'])}")
+            result=plan_line_editor(path.read_bytes(),comp_lines,mapper_rows,pxpm,int(st.session_state.get(rev_key,0)),key=widget_key,height=760,active_row_id=active_row_id)
             if result is not None:
                 st.session_state[store_key]=result
         else:
@@ -3469,6 +3494,26 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
                 with lcols[i%2]:
                     unit_note=f"{ln.get('unit') or ''}" + (f" · {ln.get('length_m')} m" if float(ln.get('length_m') or 0)>0 and (ln.get('kind') or 'line')=='line' else "") + (f" · {ln.get('area_m2')} m²" if float(ln.get('area_m2') or 0)>0 else "")
                     st.markdown(f"<span style='display:inline-block;width:18px;height:4px;background:{ln.get('colour')};vertical-align:middle;margin-right:6px'></span>{ln.get('label') or 'Measurement'} · {unit_note}",unsafe_allow_html=True)
+        with st.expander("Substrate coverage check — which rows have been drawn?",expanded=False):
+            shape_counts={}
+            for ln in (comp_lines or []):
+                rid=ln.get("takeoff_row_id")
+                if rid is not None:
+                    shape_counts[int(rid)]=shape_counts.get(int(rid),0)+1
+            if not mapper_rows:
+                st.caption("No drawable take-off rows yet.")
+            else:
+                missing=[r for r in mapper_rows if shape_counts.get(int(r["id"]),0)==0]
+                covered=[r for r in mapper_rows if shape_counts.get(int(r["id"]),0)>0]
+                if missing:
+                    st.warning(f"**{len(missing)} row(s) have nothing drawn on this page yet** — check these substrates before saving.")
+                else:
+                    st.success(f"All {len(mapper_rows)} drawable row(s) have at least one shape drawn on this page.")
+                for r in mapper_rows:
+                    n=shape_counts.get(int(r["id"]),0)
+                    flag=" <span style='color:#b42318;font-weight:700'>— NOT DRAWN</span>" if n==0 else ""
+                    qty=f" · measured {r['quantity']:.2f}" if r["quantity"] else ""
+                    st.markdown(f"<span style='display:inline-block;width:12px;height:12px;border-radius:3px;background:{r['colour']};vertical-align:middle;margin-right:6px'></span>{r['label']} · {r['unit']} · {n} shape(s){qty}{flag}",unsafe_allow_html=True)
     with tab1:
         st.write(f"Drawing scale text: **{page.get('scale_text') or 'not entered'}**")
         c1,c2=st.columns(2)

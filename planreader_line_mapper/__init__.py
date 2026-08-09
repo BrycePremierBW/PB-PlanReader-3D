@@ -52,6 +52,7 @@ def plan_line_editor(
     revision=0,
     key=None,
     height=760,
+    active_row_id=None,
 ):
     """Render a plan page for drawing take-off measurements.
 
@@ -61,7 +62,8 @@ def plan_line_editor(
     length_m/area_m2/perimeter_m). ``rows`` is the list of draw targets from
     :func:`takeoff_rows_for_mapper` (id, label, unit, colour, quantity).
     ``px_per_m`` is the page's saved drawing scale used to show real lengths
-    and areas; pass 0 when no scale exists.
+    and areas; pass 0 when no scale exists. ``active_row_id`` optionally names
+    the row to select when the component first adopts the current data.
 
     Returns the current shapes list (or None if the user has not edited).
     """
@@ -115,4 +117,16 @@ def plan_line_editor(
         default=None,
         key=key,
         height=height,
+        active_row_id=_active_row_id(active_row_id, cleaned_rows),
     )
+
+
+def _active_row_id(active_row_id, rows) -> int:
+    try:
+        want = int(active_row_id)
+    except (TypeError, ValueError):
+        want = 0
+    ids = [int(r.get("id") or 0) for r in rows]
+    if want in ids:
+        return want
+    return ids[0] if ids else 0

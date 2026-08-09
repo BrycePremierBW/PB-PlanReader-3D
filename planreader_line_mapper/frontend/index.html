@@ -25,6 +25,9 @@
   .stage canvas { max-width: 100%; display: block; cursor: crosshair; touch-action: none; }
   .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; font-size: 12px; color: #5f574f; }
   .legend .swatch { display: inline-block; width: 18px; height: 4px; vertical-align: middle; margin-right: 6px; border-radius: 2px; }
+  .legend .swatch.sq { width: 12px; height: 12px; border-radius: 3px; }
+  .legend .miss { color: #b42318; font-weight: 700; }
+  .legend .orphan { color: #8a8277; font-style: italic; }
   .live { margin-top: 6px; font-size: 13px; font-weight: 600; color: #1f1f1f; min-height: 18px; }
 </style>
 </head>
@@ -36,7 +39,7 @@
   var state = {
     imageKey: null, revision: -1, pxPerM: 0, lines: [], rows: [],
     activeRowId: null, tool: 'line', drawing: null,
-    selectedId: null, hover: null, natW: 0, natH: 0, cw: 0, ch: 0, imgEl: null
+    selectedId: null, hover: null, natW: 0, natH: 0, cw: 0, ch: 0, imgEl: null, review: false
   };
 
   function post(type, payload) {
@@ -164,12 +167,12 @@
         var pts = (ln.points || []).map(function (p) { return [p[0] / 100 * w, p[1] / 100 * h]; });
         if (pts.length >= 3) {
           ctx.strokeStyle = col;
-          ctx.lineWidth = selected ? 6 : 3.5;
+          ctx.lineWidth = selected ? 6 : (state.review ? 4.5 : 3.5);
           ctx.beginPath();
           ctx.moveTo(pts[0][0], pts[0][1]);
           for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
           ctx.closePath();
-          ctx.fillStyle = col + '33';
+          ctx.fillStyle = col + (state.review ? '88' : '33');
           ctx.fill();
           ctx.stroke();
           pts.forEach(function (p) {
@@ -183,7 +186,7 @@
         var x1 = ln.x1 / 100 * w, y1 = ln.y1 / 100 * h;
         var x2 = ln.x2 / 100 * w, y2 = ln.y2 / 100 * h;
         ctx.strokeStyle = col;
-        ctx.lineWidth = selected ? 6 : 3.5;
+        ctx.lineWidth = selected ? 6 : (state.review ? 6 : 3.5);
         ctx.beginPath();
         ctx.moveTo(x1, y1);
         ctx.lineTo(x2, y2);
@@ -509,7 +512,9 @@
     tbLeft.className = 'tb-left';
     var hint = document.createElement('div');
     hint.className = 'hint';
-    hint.textContent = state.tool === 'line'
+    hint.textContent = state.review
+      ? 'Review map — every drawn shape is filled in its substrate colour and the legend below lists all take-off rows. Rows in red have nothing drawn yet, so you can spot missed substrates before saving.'
+      : (state.tool === 'line'
       ? 'Line tool — click two points on the plan to draw a length (walls, doors, frames, skirting).'
       : (state.tool === 'polygon'
         ? 'Outline tool — click each corner, then double-click or press Close outline to finish (footprint, ceilings).'
@@ -530,6 +535,12 @@
     selBtn.className = state.tool === 'select' ? 'active' : '';
     selBtn.addEventListener('click', function () { state.tool = 'select'; state.drawing = null; render(); });
     btns.appendChild(selBtn);
+    var reviewBtn = document.createElement('button');
+    reviewBtn.type = 'button';
+    reviewBtn.textContent = state.review ? 'Review map: ON' : 'Review map (coverage)';
+    reviewBtn.className = state.review ? 'active' : '';
+    reviewBtn.addEventListener('click', function () { state.review = !state.review; draw(); render(); });
+    btns.appendChild(reviewBtn);
     var lineBtn = document.createElement('button');
     lineBtn.type = 'button';
     lineBtn.textContent = 'Line';
@@ -616,6 +627,56 @@
 
     var legend = document.createElement('div');
     legend.className = 'legend';
+    if (state.review) {
+      var rl = buildLegend();
+      root.appendChild(rl);
+    } else {
+      var sl = buildSmallLegend();
+      if (state.lines.length) root.appendChild(sl);
+    }
+  }
+
+  function shapeCountsByRow() {
+    var c = {};
+    state.lines.forEach(function (ln) {
+      var k = String(ln.takeoff_row_id === null || ln.takeoff_row_id === undefined || ln.takeoff_row_id === '' ? 'orphan' : ln.takeoff_row_id);
+      c[k] = (c[k] || 0) + 1;
+    });
+    return c;
+  }
+
+  function buildLegend() {
+    var legend = document.createElement('div');
+    legend.className = 'legend';
+    var counts = shapeCountsByRow();
+    state.rows.forEach(function (r) {
+      var n = counts[String(r.id)] || 0;
+      var covered = n > 0;
+      var item = document.createElement('span');
+      var sw = document.createElement('span');
+      sw.className = 'swatch sq';
+      sw.style.background = r.colour;
+      item.appendChild(sw);
+      var txt = document.createElement('span');
+      txt.textContent = (r.label || 'row') + ' · ' + (r.unit || '') + ' · ' + n + ' shape' + (n === 1 ? '' : 's') + (covered ? ' drawn' : ' · NOT DRAWN');
+      if (!covered) {
+        txt.className = 'miss';
+      }
+      item.appendChild(txt);
+      legend.appendChild(item);
+    });
+    if (counts['orphan']) {
+      var oi = document.createElement('span');
+      oi.className = 'orphan';
+      oi.textContent = counts['orphan'] + ' unassigned shape(s) on plan';
+      legend.appendChild(oi);
+    }
+    return legend;
+  }
+
+  function buildSmallLegend() {
+    var legend = document.createElement('div');
+    legend.className = 'legend';
     var shown = {};
     var count = 0;
     for (var i = 0; i < state.lines.length && count < 10; i++) {
@@ -632,7 +693,7 @@
       item.appendChild(document.createTextNode((ln.label || 'Measurement') + ' · ' + (ln.unit || '')));
       legend.appendChild(item);
     }
-    if (state.lines.length) root.appendChild(legend);
+    return legend;
   }
 
   function updateChip() {
@@ -656,6 +717,7 @@
     var image = String(args.image || '');
     var revision = num(args.revision, 0);
     var newPx = num(args.px_per_m, 0);
+    var newActive = parseInt(args.active_row_id, 10);
     if (!state.imageKey || image !== state.imageKey || revision !== state.revision) {
       state.imageKey = image;
       state.revision = revision;
@@ -671,8 +733,13 @@
       });
       state.lines = (args.lines || []).map(sanitize);
       if (state.rows.length) {
+        var preferred = state.rows.some(function (r) { return r.id === newActive; }) ? newActive : null;
         var stillActive = state.rows.some(function (r) { return r.id === state.activeRowId; });
-        if (!stillActive) state.activeRowId = state.rows[0].id;
+        if (preferred !== null) {
+          state.activeRowId = preferred;
+        } else if (!stillActive) {
+          state.activeRowId = state.rows[0].id;
+        }
       } else {
         state.activeRowId = null;
       }
