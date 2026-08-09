@@ -2776,7 +2776,11 @@ def login_screen(bridge: Optional[JobHubBridge]) -> None:
     hero()
     st.markdown("<div class='pb-card'>", unsafe_allow_html=True)
     st.subheader("Sign in")
-    if bridge and "app_users" in set(bridge.table_names()):
+    try:
+        has_user_table = bool(bridge) and "app_users" in set(bridge.table_names())
+    except Exception:
+        has_user_table = False
+    if has_user_table:
         st.caption("Use the same username and password as JobHub.")
         with st.form("login_form"):
             username = st.text_input("Username")

@@ -73,14 +73,29 @@ def apply(app) -> None:
     def mark_success(key: str) -> None:
         failure_cache.pop(key, None)
 
+    def _with_retry(fn):
+        """Run a read once, retrying a single time after a short pause for the
+        transient SSL/connection drops Render Postgres occasionally serves."""
+        try:
+            return fn()
+        except Exception:
+            time.sleep(0.4)
+            return fn()
+
     class StableJobHubBridge(base_bridge):
         def table_names(self) -> List[str]:
             key = bridge_key(self)
             hit = cooldown_check(key, table_cache)
             if hit is not None:
                 return hit
+
+            base = super()
+
+            def _run():
+                return base.table_names()
+
             try:
-                value = list(super().table_names())
+                value = list(_with_retry(_run))
             except Exception:
                 mark_failure(key)
                 stale = stale_value(table_cache, key)
@@ -96,8 +111,14 @@ def apply(app) -> None:
             hit = cooldown_check(key, column_cache)
             if hit is not None:
                 return hit
+
+            base = super()
+
+            def _run():
+                return base.columns(table)
+
             try:
-                value = list(super().columns(table))
+                value = list(_with_retry(_run))
             except Exception:
                 mark_failure(key[0])
                 stale = stale_value(column_cache, key)
