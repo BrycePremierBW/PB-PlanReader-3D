@@ -241,7 +241,10 @@ def to_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
             return default
-        return float(value)
+        result = float(value)
+        if result != result or result in (float("inf"), float("-inf")):
+            return default
+        return result
     except Exception:
         return default
 

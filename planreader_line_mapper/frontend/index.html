@@ -35,14 +35,21 @@
   function post(type, payload) {
     window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, payload), '*');
   }
+  function finiteNum(v, fallback) { var n = num(v, fallback); return (isFinite(n) && n === n) ? n : fallback; }
   function postValue() {
     var value = state.lines.map(function (ln) {
       return {
-        id: ln.id, takeoff_row_id: ln.takeoff_row_id,
-        label: ln.label, unit: ln.unit, colour: ln.colour,
-        x1: ln.x1, y1: ln.y1, x2: ln.x2, y2: ln.y2,
-        length_m: ln.length_m, quantity_status: ln.quantity_status,
-        moved: ln.moved ? 1 : 0, notes: ln.notes
+        id: String(ln.id || ''),
+        takeoff_row_id: (ln.takeoff_row_id === undefined || ln.takeoff_row_id === null || ln.takeoff_row_id === '') ? null : ln.takeoff_row_id,
+        label: String(ln.label || ''),
+        unit: String(ln.unit || ''),
+        colour: /^#[0-9a-fA-F]{6}$/.test(String(ln.colour || '')) ? ln.colour : '#1f6fb2',
+        x1: finiteNum(ln.x1, 0), y1: finiteNum(ln.y1, 0),
+        x2: finiteNum(ln.x2, 0), y2: finiteNum(ln.y2, 0),
+        length_m: finiteNum(ln.length_m, 0),
+        quantity_status: String(ln.quantity_status || 'Mapped'),
+        moved: ln.moved ? 1 : 0,
+        notes: String(ln.notes || '')
       };
     });
     post('streamlit:setComponentValue', { value: value, dataType: 'json' });
@@ -79,7 +86,7 @@
   }
   function liveLength(ln) {
     var m = lineLengthM(ln);
-    return m === null ? null : r2(m);
+    return m === null ? null : finiteNum(r2(m), 0);
   }
   function labelText(ln) {
     var base = ln.label || 'Measurement';
@@ -279,8 +286,9 @@
       : 'Drag a line to move it; drag a round end point to change its length or angle; click a line to select it.';
     tbLeft.appendChild(hint);
     var scaleInfo = document.createElement('span');
-    scaleInfo.className = state.pxPerM > 0 ? 'scale-ok' : 'scale-none';
-    scaleInfo.textContent = state.pxPerM > 0 ? ('Scale set · ' + state.pxPerM + ' px/m') : 'Scale not calibrated — lengths shown unmeasured';
+    var pxpm = finiteNum(state.pxPerM, 0);
+    scaleInfo.className = pxpm > 0 ? 'scale-ok' : 'scale-none';
+    scaleInfo.textContent = pxpm > 0 ? ('Scale set · ' + Math.round(pxpm * 100) / 100 + ' px/m') : 'Scale not calibrated — lengths shown unmeasured';
     tbLeft.appendChild(scaleInfo);
     toolbar.appendChild(tbLeft);
 
