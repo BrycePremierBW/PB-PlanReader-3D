@@ -3030,6 +3030,7 @@ def reconcile_ai_vs_drawn(workspace_id: int) -> pd.DataFrame:
         ai_qty = float(g.loc[g["basis"].eq("AI"), "quantity"].sum())
         dr_qty = float(g.loc[g["basis"].eq("Drawn"), "quantity"].sum())
         bases = sorted(set(g["basis"].tolist()))
+        variance = 0.0
         if ai_qty == 0 and dr_qty == 0:
             status = "Manual / not yet measured"
         elif ai_qty > 0 and dr_qty > 0:

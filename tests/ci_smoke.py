@@ -91,6 +91,19 @@ ai_qty = float(reco.loc[reco["status"].eq("AI only (not drawn)"), "ai_qty"].sum(
 assert ai_qty > 0, "expected an AI-only line for the external facade"
 print(f"[ok] reconcile_ai_vs_drawn: {len(reco)} grouped line(s), AI-only m²={ai_qty:.1f}")
 
+# 6b. Manual-only groups must not hit an unbound variance (first group is manual)
+manual_wid = app.create_standalone_workspace("PB25002", "Manual-only Job", "b", "")
+app.lexecute(
+    """INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+    (manual_wid, "Manual works", "Allowance", "Level 1 · nook", "Other", "", 25.0, "m²", "Manual",
+     "", "", "Included", 2, 12, 8, 5.0, "Manual", "", app.now_stamp(), app.now_stamp()),
+)
+reco_manual = app.reconcile_ai_vs_drawn(manual_wid)
+assert len(reco_manual) == 1, reco_manual
+assert reco_manual.iloc[0]["status"] == "Manual / not yet measured" and reco_manual.iloc[0]["variance"] == 0.0
+print("[ok] reconcile_ai_vs_drawn: manual-only group variance=0.0 (unbound fix)")
+
 # 7. Publish to shared JobHub (SQLite bridge)
 bridge = app.get_jobhub_bridge()
 assert bridge is not None, "no JobHub bridge"
