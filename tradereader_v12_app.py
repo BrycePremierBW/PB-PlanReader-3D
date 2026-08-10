@@ -41,7 +41,9 @@ def _tag_trade_result(trade_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
         marker = f"[Trade: {trade_name}]"
         note = str(row.get("notes") or "").strip()
         row["notes"] = note if marker in note else f"{marker} {note}".strip()
-        row["rate_per_unit"] = 0 if row.get("rate_per_unit") in (None, "") else row.get("rate_per_unit")
+        # The all-trade AI pass is quantity/scope evidence only. Commercial
+        # rates must be estimator-entered after review, never carried from AI.
+        row["rate_per_unit"] = 0
         rows.append(row)
     tagged["takeoff_rows"] = rows
 
@@ -177,13 +179,21 @@ def _render_all_trade_scan(workspace: Dict[str, Any], session_api_key: str, ai_p
 
     scan_trades = [trade for trade in TRADE_OPTIONS if trade != "Custom trade"]
     suggested = [row["trade"] for row in detections if row["trade"] in scan_trades]
+
+    def _select_every_trade() -> None:
+        app.st.session_state["tradereader_v12_trades"] = list(scan_trades)
+
+    # Callback runs before the multiselect is instantiated on the rerun, which
+    # avoids mutating a live widget key after Streamlit has created the widget.
+    app.st.button(
+        "Select every built-in trade",
+        key="tradereader_v12_every_trade",
+        on_click=_select_every_trade,
+    )
     selected_trades = app.st.multiselect(
         "Trades to read", scan_trades, default=suggested, key="tradereader_v12_trades",
         help="Detected trades are preselected. Add any trade that is in scope even when its drawing text is sparse.",
     )
-    if app.st.button("Select every built-in trade", key="tradereader_v12_every_trade"):
-        app.st.session_state["tradereader_v12_trades"] = scan_trades
-        app.st.rerun()
 
     model = app.st.text_input(
         "All-trade AI model", value=app.default_ai_model(ai_provider), key="tradereader_v12_model"
