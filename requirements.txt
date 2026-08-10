@@ -1,9 +1,10 @@
-# Pinned dependency set for Python 3.13.
-# Keep NumPy below 2.3 because opencv-python-headless 4.12.0.88 requires
-# numpy>=2,<2.3 on Python >=3.9. NumPy 2.2.6 supports Python 3.13.
+# Pinned dependency set verified on Python 3.13 and 3.14.
+# opencv-python-headless 4.14+ and numpy 2.3+ both ship Python 3.14 wheels,
+# matching the Python 3.14 runtime the Render service currently runs.
+# Keep opencv-python-headless at 4.x (cv2 morphology APIs are stable).
 streamlit==1.59.2
 pandas==2.3.3
-numpy==2.2.6
+numpy==2.3.5
 plotly==6.9.0
 PyMuPDF==1.28.0
 Pillow==12.3.0
@@ -14,5 +15,5 @@ psycopg2-binary==2.9.12
 openai==1.109.1
 streamlit-drawable-canvas==0.9.3
 protobuf==7.35.1
-opencv-python-headless==4.12.0.88
+opencv-python-headless==4.14.0.94
 reportlab==5.0.0
