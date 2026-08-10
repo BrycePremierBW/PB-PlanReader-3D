@@ -397,6 +397,7 @@ def init_local_db() -> None:
             rate_per_unit REAL DEFAULT 0,
             confidence TEXT,
             notes TEXT,
+            row_role TEXT DEFAULT '',
             created_at TEXT,
             updated_at TEXT,
             FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
@@ -517,6 +518,7 @@ def init_local_db() -> None:
         """
     )
     _ensure_measurement_columns(conn)
+    _ensure_takeoff_columns(conn)
     conn.commit()
     conn.close()
 
@@ -538,6 +540,17 @@ def _ensure_measurement_columns(conn: sqlite3.Connection) -> None:
     for name, ddl in wanted.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE measurement_lines ADD COLUMN {name} {ddl}")
+
+
+def _ensure_takeoff_columns(conn: sqlite3.Connection) -> None:
+    """Migrate existing ``takeoff_rows`` tables to carry the row role column.
+
+    ``row_role`` marks measurement rows such as per-level internal floor areas
+    (``floor_area``) that drive floor-m² pricing but are not themselves priced.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(takeoff_rows)").fetchall()}
+    if "row_role" not in existing:
+        conn.execute("ALTER TABLE takeoff_rows ADD COLUMN row_role TEXT DEFAULT ''")
 
 
 def lquery(sql: str, params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
@@ -1637,10 +1650,10 @@ def _ensure_mapper_row(workspace_id: int, section: str, element: str, location: 
     unit_norm = normalise_line_unit(unit)
     rate = default_rate_for(substrate, element, finish_system, unit)
     return lexecute(
-        """INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        """INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,row_role,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (workspace_id, section, element, location, substrate, finish_system, 0, unit_norm, "To measure", source_page, "", "INCLUSION",
-         3 if unit_norm == "m2" else 2, 12, 8, rate, "To review", f"Auto-detected from {source_page}.", now_stamp(), now_stamp()),
+         3 if unit_norm == "m2" else 2, 12, 8, rate, "To review", f"Auto-detected from {source_page}.", "", now_stamp(), now_stamp()),
     )
 
 
@@ -2235,6 +2248,7 @@ def ai_schema() -> Dict[str, Any]:
         "rate_per_unit": {"type": "number"},
         "confidence": {"type": "string"},
         "notes": {"type": "string"},
+        "row_role": {"type": "string", "enum": ["", "floor_area"]},
     }
     register_props = {
         "register_name": {"type": "string"},
@@ -2400,10 +2414,11 @@ Required method:
 2. Separate INCLUSIONS, EXCLUSIONS, SEPARATE ITEMS and PROVISIONAL items.
 3. Create clarification/RFI items wherever scope, finish, scale, issue, access, opening deductions or dimensions are uncertain.
 4. Create measurable painting take-off rows for internal walls, ceilings, doors, frames, joinery, external walls/cladding, soffits, steel, concrete coatings and specialist coatings only when supported.
-5. Never invent dimensions. If a quantity cannot be measured from the supplied evidence, use quantity=0 and quantity_status='To measure'.
-6. For model geometry, only create rectangular building masses where width/depth/height are supported. Use confidence='Measured' only for clear dimensions, 'Derived' for calculated dimensions, and 'Assumed' for placeholders.
-7. Leave rate_per_unit at zero; the PlanReader default estimating rate library is applied automatically for every row on import. Use practical default coats, coverage and productivity only as editable estimating defaults, and explain them in notes.
-8. Surface areas must be net or clearly marked gross/provisional. Identify exclusions such as glazing, tiles, prefinished metal, signage, roofing and specialist systems.
+5. For every floor plan level, read and report the internal floor area (m²) as its own measurement row: section='Internal', element='Floor area', unit='m²', row_role='floor_area', quantity=the internal floor area read from that level. Read internal wall areas as normal wall rows with row_role=''. If a floor area is not dimensioned on the plan, set quantity=0 and quantity_status='To measure'. Do not add a rate to floor-area rows.
+6. Never invent dimensions. If a quantity cannot be measured from the supplied evidence, use quantity=0 and quantity_status='To measure'.
+7. For model geometry, only create rectangular building masses where width/depth/height are supported. Use confidence='Measured' only for clear dimensions, 'Derived' for calculated dimensions, and 'Assumed' for placeholders.
+8. Leave rate_per_unit at zero; the PlanReader default estimating rate library is applied automatically for every row on import. Use practical default coats, coverage and productivity only as editable estimating defaults, and explain them in notes.
+9. Surface areas must be net or clearly marked gross/provisional. Identify exclusions such as glazing, tiles, prefinished metal, signage, roofing and specialist systems.
 
 Return structured data only. References must name the drawing/page or visible note that supports each item.
 """
@@ -2631,13 +2646,17 @@ def import_ai_result(workspace_id: int, data: Dict[str, Any]) -> Dict[str, int]:
             row["rate_per_unit"] = default_rate_for(
                 row.get("substrate"), row.get("element"), row.get("finish_system"), row.get("unit")
             )
+        row_role = str(row.get("row_role") or "").strip()
+        if row_role not in {"", "floor_area"}:
+            row_role = ""
+        row["row_role"] = row_role
         values = [row.get(col, "") for col in TAKEOFF_COLUMNS]
         lexecute(
             """
-            INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,row_role,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            (workspace_id, *values, now_stamp(), now_stamp()),
+            (workspace_id, *values, row_role, now_stamp(), now_stamp()),
         )
         counts["takeoff"] += 1
     for row in data.get("register_items", []):
@@ -2772,13 +2791,13 @@ def copy_takeoff_rows_to_level(workspace_id: int, row_ids: Sequence[int], target
         if dup:
             continue
         lexecute(
-            """INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,row_role,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (workspace_id, r.get("section", ""), r.get("element", ""), new_loc, r.get("substrate", ""),
              r.get("finish_system", ""), 0, r.get("unit", ""), "To measure", r.get("source_page", ""),
              r.get("source_reference", ""), r.get("inclusion_status", ""), r.get("coats", 2),
              r.get("coverage_m2_per_litre", 0), r.get("productivity_m2_per_hour", 0), r.get("rate_per_unit", 0),
-             "To review", f"Copied to {target_level}.", now_stamp(), now_stamp()),
+             "To review", f"Copied to {target_level}.", r.get("row_role", ""), now_stamp(), now_stamp()),
         )
         created += 1
     return created
@@ -2797,29 +2816,86 @@ def _quote_settings(workspace_id: int) -> Dict[str, Any]:
         "default_coverage_m2_per_litre": f("default_coverage_m2_per_litre", 12.0),
         "default_productivity_m2_per_hour": f("default_productivity_m2_per_hour", 8.0),
         "default_wall_height_m": f("default_wall_height_m", 2.7),
+        "internal_pricing_basis": str(workspace_setting(workspace_id, "internal_pricing_basis", "wall_m2") or "wall_m2").strip().lower(),
         "quote_header": str(workspace_setting(workspace_id, "quote_header", "Premier Brushworks Pty Ltd")),
         "quote_footer": str(workspace_setting(workspace_id, "quote_footer", "Valid for 30 days. All quantities require estimator review against the current issued drawings and specification before pricing or construction use.")),
     }
 
 
+def pricing_basis_label(basis: Any) -> str:
+    """Human label for the project-level internal pricing basis setting."""
+    return "Floor m²" if str(basis or "").strip().lower() == "floor_m2" else "Wall m²"
+
+
+def is_floor_area_row(row: Any) -> bool:
+    return str(getattr(row, "row_role", "") or "").strip() == "floor_area"
+
+
+def takeoff_work_rows(takeoff: pd.DataFrame) -> pd.DataFrame:
+    """Take-off rows that represent priced work (excludes floor-area measurement rows).
+
+    Floor-area rows are per-level measurement rows used to drive floor-m² pricing;
+    they carry real m² but are never painted quantities, so they are filtered out
+    of painted-area totals and JobHub line pushes.
+    """
+    if takeoff.empty or "row_role" not in takeoff.columns:
+        return takeoff
+    return takeoff.loc[takeoff["row_role"].fillna("").ne("floor_area")]
+
+
+def is_internal_wall_row(section: Any, element: Any) -> bool:
+    """True when a row is an internal wall m² row that can be priced off floor area."""
+    sec = str(section or "").strip().lower()
+    elm = str(element or "").strip().lower()
+    if any(token in sec for token in ["external", "exterior", "facade", "elevation", "soffit", "cladding", "roof", "canopy", "balcony", "deck"]):
+        return False
+    return "wall" in elm
+
+
+def floor_area_by_level(takeoff: pd.DataFrame) -> Dict[str, float]:
+    """Per-level internal floor area (m²) from rows tagged ``floor_area``."""
+    out: Dict[str, float] = {}
+    if takeoff.empty or "row_role" not in takeoff.columns:
+        return out
+    floor = takeoff.loc[
+        takeoff["row_role"].fillna("").eq("floor_area") & takeoff["unit"].astype(str).eq("m²")
+    ]
+    for r in floor.itertuples(index=False):
+        lvl = level_of(r.location)
+        out[lvl] = out.get(lvl, 0.0) + to_float(r.quantity)
+    return out
+
+
 def per_level_summary(workspace_id: int) -> pd.DataFrame:
-    """Priced quantities grouped by building level for the quote summary."""
+    """Priced quantities grouped by building level for the quote summary.
+
+    Floor-area measurement rows (``row_role='floor_area'``) are reported in a
+    dedicated ``floor_m2`` column and excluded from the painted m²/value totals.
+    """
     takeoff = dataframe_for_takeoff(workspace_id)
     if takeoff.empty:
-        return pd.DataFrame(columns=["level", "rows", "m2", "lm", "count", "paint_litres", "labour_hours", "value_ex_gst"])
+        return pd.DataFrame(columns=["level", "rows", "m2", "floor_m2", "lm", "count", "paint_litres", "labour_hours", "value_ex_gst"])
     takeoff = takeoff.copy()
     takeoff["level"] = [level_of(loc) for loc in takeoff["location"]]
+    work = takeoff_work_rows(takeoff)
     out = []
     for level, group in takeoff.groupby("level", dropna=False):
+        work_group = work.loc[work["level"].eq(level)]
+        floor_group = takeoff.loc[
+            takeoff["level"].eq(level)
+            & takeoff["row_role"].fillna("").eq("floor_area")
+            & takeoff["unit"].eq("m²")
+        ]
         out.append({
             "level": level,
-            "rows": int(len(group)),
-            "m2": float(group.loc[group["unit"].eq("m²"), "quantity"].sum()),
-            "lm": float(group.loc[group["unit"].eq("lm"), "quantity"].sum()),
-            "count": float(group.loc[group["unit"].isin({"No.", "item"}), "quantity"].sum()),
-            "paint_litres": float(group["paint_litres"].sum()),
-            "labour_hours": float(group["labour_hours"].sum()),
-            "value_ex_gst": float(group["value_ex_gst"].sum()),
+            "rows": int(len(work_group)),
+            "m2": float(work_group.loc[work_group["unit"].eq("m²"), "quantity"].sum()),
+            "floor_m2": float(floor_group["quantity"].sum()),
+            "lm": float(work_group.loc[work_group["unit"].eq("lm"), "quantity"].sum()),
+            "count": float(work_group.loc[work_group["unit"].isin({"No.", "item"}), "quantity"].sum()),
+            "paint_litres": float(work_group["paint_litres"].sum()),
+            "labour_hours": float(work_group["labour_hours"].sum()),
+            "value_ex_gst": float(work_group["value_ex_gst"].sum()),
         })
     df = pd.DataFrame(out)
     df["sort"] = df["level"].map(level_sort_key)
@@ -2957,21 +3033,26 @@ def quote_pdf_bytes(workspace_id: int) -> bytes:
     flow.append(Spacer(1, 8))
 
     flow.append(Paragraph("Per-level pricing (ex GST)", h2))
+    flow.append(Paragraph(
+        f"Internal pricing basis: <b>{pricing_basis_label(settings['internal_pricing_basis'])}</b>"
+        + (" — internal wall rates apply to each level's floor area (floor m²), with measured wall m² shown for reference." if settings["internal_pricing_basis"] == "floor_m2" else " — internal rates apply to each measured wall area."),
+        small,
+    ))
     if levels.empty:
         flow.append(Paragraph("No take-off rows yet.", small))
     else:
-        head = [["Level", "Rows", "m²", "lm", "Count", "Paint (L)", "Labour (hrs)", "Value ex GST", "Mark-up", "GST", "Total inc GST"]]
+        head = [["Level", "Rows", "m²", "Floor m²", "lm", "Count", "Paint (L)", "Labour (hrs)", "Value ex GST", "Mark-up", "GST", "Total inc GST"]]
         body = head + [
-            [str(r["level"]), int(r["rows"]), f"{r['m2']:,.1f}", f"{r['lm']:,.1f}", f"{r['count']:,.1f}",
+            [str(r["level"]), int(r["rows"]), f"{r['m2']:,.1f}", f"{r['floor_m2']:,.1f}", f"{r['lm']:,.1f}", f"{r['count']:,.1f}",
              f"{r['paint_litres']:,.1f}", f"{r['labour_hours']:,.1f}", f"${r['value_ex_gst']:,.2f}",
              f"${r['markup_ex_gst'] - r['value_ex_gst']:,.2f}", f"${r['gst']:,.2f}", f"${r['total_inc_gst']:,.2f}"]
             for r in levels.to_dict("records")
         ]
-        body.append(["TOTAL", int(levels["rows"].sum()), f"{levels['m2'].sum():,.1f}", f"{levels['lm'].sum():,.1f}",
+        body.append(["TOTAL", int(levels["rows"].sum()), f"{levels['m2'].sum():,.1f}", f"{levels['floor_m2'].sum():,.1f}", f"{levels['lm'].sum():,.1f}",
                      f"{levels['count'].sum():,.1f}", f"{levels['paint_litres'].sum():,.1f}",
                      f"{levels['labour_hours'].sum():,.1f}", f"${sub_total:,.2f}", f"${markup:,.2f}",
                      f"${gst_amount:,.2f}", f"${grand:,.2f}"])
-        table = Table(body, repeatRows=1, colWidths=[22 * mm, 13 * mm, 16 * mm, 13 * mm, 14 * mm, 17 * mm, 20 * mm, 24 * mm, 18 * mm, 15 * mm, 24 * mm])
+        table = Table(body, repeatRows=1, colWidths=[20 * mm, 12 * mm, 15 * mm, 15 * mm, 12 * mm, 13 * mm, 16 * mm, 19 * mm, 23 * mm, 17 * mm, 14 * mm, 23 * mm])
         table.setStyle(TableStyle([
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
             ("FONTSIZE", (0, 0), (-1, -1), 7.2),
@@ -3056,9 +3137,45 @@ def dataframe_for_takeoff(workspace_id: int) -> pd.DataFrame:
     df = ldf("SELECT * FROM takeoff_rows WHERE workspace_id=? ORDER BY id", (workspace_id,))
     if df.empty:
         return df
-    df["paint_litres"] = [paint_litres(to_float(r.quantity), str(r.unit), to_float(r.coats, 2), to_float(r.coverage_m2_per_litre, 12)) for r in df.itertuples()]
-    df["labour_hours"] = [labour_hours(to_float(r.quantity), str(r.unit), to_float(r.productivity_m2_per_hour, 8)) for r in df.itertuples()]
-    df["value_ex_gst"] = [row_value(to_float(r.quantity), to_float(r.rate_per_unit)) for r in df.itertuples()]
+    basis = str(workspace_setting(workspace_id, "internal_pricing_basis", "wall_m2") or "wall_m2").strip().lower()
+    floor_by_level = floor_area_by_level(df)
+    paint_rows: List[float] = []
+    labour_rows: List[float] = []
+    value_rows: List[float] = []
+    priced_qty_rows: List[float] = []
+    basis_rows: List[str] = []
+    for r in df.itertuples():
+        qty = to_float(r.quantity)
+        unit = str(r.unit or "")
+        role = str(r.row_role or "").strip()
+        coats = to_float(r.coats, 2)
+        coverage = to_float(r.coverage_m2_per_litre, 12)
+        productivity = to_float(r.productivity_m2_per_hour, 8)
+        if role == "floor_area":
+            paint_rows.append(0.0)
+            labour_rows.append(0.0)
+            value_rows.append(0.0)
+            priced_qty_rows.append(qty if unit == "m²" else 0.0)
+            basis_rows.append("Floor area (reference)")
+            continue
+        litres = paint_litres(qty, unit, coats, coverage)
+        hours = labour_hours(qty, unit, productivity)
+        paint_rows.append(litres)
+        labour_rows.append(hours)
+        if basis == "floor_m2" and unit == "m²" and is_internal_wall_row(r.section, r.element):
+            floor_m2 = floor_by_level.get(level_of(r.location), 0.0)
+            priced_qty_rows.append(floor_m2)
+            basis_rows.append("Floor m²")
+            value_rows.append(row_value(floor_m2, to_float(r.rate_per_unit)))
+        else:
+            priced_qty_rows.append(qty)
+            basis_rows.append("Wall m²" if basis == "floor_m2" and unit == "m²" else "Quantity")
+            value_rows.append(row_value(qty, to_float(r.rate_per_unit)))
+    df["paint_litres"] = paint_rows
+    df["labour_hours"] = labour_rows
+    df["priced_quantity"] = priced_qty_rows
+    df["pricing_basis"] = basis_rows
+    df["value_ex_gst"] = value_rows
     return df
 
 
@@ -3073,6 +3190,7 @@ _TAKEOFF_HEADER_SYNONYMS = {
     "substrate": ["substrate", "surface", "material", "background", "base material", "substrate/surface", "wall type", "surface type"],
     "finish_system": ["finish system", "finish", "system", "paint system", "spec", "coating", "finish spec", "paint type"],
     "quantity": ["quantity", "qty", "quantity (m2)", "qty (m2)", "quantity m2", "qty m2", "area m2", "area (m2)", "amount", "count", "qty (no.)", "qty (no)", "quantity (no.)"],
+    "floor_area": ["floor area", "floor area m2", "floor m2", "internal floor area", "internal floor area m2", "gross floor area", "nett floor area", "net floor area", "floor area (m2)"],
     "unit": ["unit", "uom", "units", "unit of measure", "measure"],
     "quantity_status": ["quantity status", "status", "measurement status", "qty status", "takeoff status"],
     "source_page": ["source page", "page", "drawing", "sheet", "plan no", "drawing no", "ref page"],
@@ -3214,12 +3332,17 @@ def parse_takeoff_file(upload: Any, mapping: Optional[Dict[int, str]] = None,
     rows: List[Dict[str, Any]] = []
     for line in body:
         row: Dict[str, Any] = {c: "" for c in TAKEOFF_COLUMNS}
+        row["row_role"] = ""
         for idx, target in mapping.items():
             if idx >= len(line):
                 continue
             value = line[idx]
             if target == "quantity":
                 row["quantity"] = _parse_qty(value)
+            elif target == "floor_area":
+                row["quantity"] = _parse_qty(value)
+                row["unit"] = "m²"
+                row["row_role"] = "floor_area"
             elif target == "unit":
                 row["unit"] = _normalise_unit(value)
             elif target in {"coats", "coverage_m2_per_litre", "productivity_m2_per_hour", "rate_per_unit"}:
@@ -3229,8 +3352,13 @@ def parse_takeoff_file(upload: Any, mapping: Optional[Dict[int, str]] = None,
         text_signature = " ".join(str(row.get(c) or "") for c in ["element", "location", "section", "source_reference"]).strip()
         if not text_signature:
             continue
+        if not row["row_role"]:
+            element_text = str(row.get("element") or "").lower()
+            location_text = str(row.get("location") or "").lower()
+            if "floor area" in element_text or "internal floor" in element_text or "floor m2" in element_text or (location_text.startswith("floor area") or "floor area" in location_text):
+                row["row_role"] = "floor_area"
         if not row.get("unit"):
-            qty_header = next((raw_headers[i] for i, t in mapping.items() if t == "quantity"), "")
+            qty_header = next((raw_headers[i] for i, t in mapping.items() if t in {"quantity", "floor_area"}), "")
             qty_lower = qty_header.lower()
             if qty_header and "no" in qty_lower:
                 row["unit"] = "No."
@@ -3251,7 +3379,7 @@ def parse_takeoff_file(upload: Any, mapping: Optional[Dict[int, str]] = None,
     if len(mapping) < 4:
         warnings.append("Only a few columns were recognised — map them manually below or review the imported rows.")
 
-    return pd.DataFrame(rows, columns=TAKEOFF_COLUMNS), warnings
+    return pd.DataFrame(rows, columns=TAKEOFF_COLUMNS + ["row_role"]), warnings
 
 
 def takeoff_import_panel(workspace_id: int, widget_key: str = "takeoff_import") -> None:
@@ -3282,7 +3410,8 @@ def takeoff_import_panel(workspace_id: int, widget_key: str = "takeoff_import") 
             st.session_state[f"{widget_key}_map"] = pd.DataFrame({"Column": cols, "Maps to": [auto.get(i) or "" for i in range(len(cols))]})
             st.session_state.pop(f"{widget_key}_editor", None)
         map_df = st.data_editor(st.session_state[f"{widget_key}_map"], key=f"{widget_key}_editor", hide_index=True, use_container_width=True,
-            column_config={"Column": st.column_config.TextColumn(disabled=True), "Maps to": st.column_config.SelectboxColumn(options=[""] + TAKEOFF_COLUMNS)})
+            column_config={"Column": st.column_config.TextColumn(disabled=True), "Maps to": st.column_config.SelectboxColumn(options=[""] + TAKEOFF_COLUMNS + ["floor_area"])})
+        st.caption("Map a quantity column headed 'Floor area (m²)' / 'Floor m²' to **floor_area** so it becomes a per-level floor-area measurement row that can drive floor-m² pricing.")
         st.session_state[f"{widget_key}_map"] = map_df
         mapping = {}
         for i, m in enumerate(map_df["Maps to"]):
@@ -3305,8 +3434,11 @@ def takeoff_import_panel(workspace_id: int, widget_key: str = "takeoff_import") 
                     continue
                 if not to_float(row.get("rate_per_unit")):
                     row["rate_per_unit"] = default_rate_for(row.get("substrate"), row.get("element"), row.get("finish_system"), row.get("unit"))
+                row_role = str(row.get("row_role") or "").strip()
+                if row_role not in {"", "floor_area"}:
+                    row_role = ""
                 values = [row.get(col, "") for col in TAKEOFF_COLUMNS]
-                lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (workspace_id, *values, now_stamp(), now_stamp()))
+                lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,row_role,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (workspace_id, *values, row_role, now_stamp(), now_stamp()))
                 imported += 1
             st.success(f"Imported {imported} take-off rows. Open the Take-off schedule tab to review them.")
             for k in (f"{widget_key}_file", f"{widget_key}_sig", f"{widget_key}_map", f"{widget_key}_editor", f"{widget_key}_header_row"):
@@ -3465,6 +3597,9 @@ def push_takeoff_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: 
     takeoff = dataframe_for_takeoff(workspace_id)
     if takeoff.empty:
         raise RuntimeError("There are no take-off rows to send.")
+    takeoff = takeoff_work_rows(takeoff)
+    if takeoff.empty:
+        raise RuntimeError("There are no priced work rows to send (only floor-area measurement rows).")
     ensure_jobhub_takeoff_tables(bridge)
     docs = ", ".join(d["file_name"] for d in lquery("SELECT file_name FROM documents WHERE workspace_id=? ORDER BY id", (workspace_id,)))
     internal_mask = takeoff["section"].astype(str).str.lower().str.contains("internal|ceiling|door|joinery")
@@ -3563,8 +3698,8 @@ def pull_takeoff_from_jobhub(workspace_id: int, bridge: JobHubBridge) -> int:
             """
             INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,
                 quantity,unit,quantity_status,source_page,source_reference,inclusion_status,
-                coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,row_role,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 workspace_id,
@@ -3588,6 +3723,7 @@ def pull_takeoff_from_jobhub(workspace_id: int, bridge: JobHubBridge) -> int:
                  f"paint {to_float(row.get('paint_litres')):.1f} L · value {to_float(row.get('value_ex_gst')):.2f}")
                 if any(v is not None for v in [row.get("labour_hours"), row.get("paint_litres"), row.get("value_ex_gst")])
                 else "Imported from JobHub",
+                "",
                 now_stamp(),
                 now_stamp(),
             ),
@@ -3738,7 +3874,7 @@ def _jobhub_takeoff_lines_csv(workspace: Dict[str, Any], takeoff: pd.DataFrame) 
     writer.writerow(["internal_external", "area_location", "substrate", "labour_category",
                      "qty_m2", "lineal_m", "count", "coats", "rate_ex_gst",
                      "labour_hours", "paint_litres", "value_ex_gst", "source_note", "confidence"])
-    for _, row in takeoff.iterrows():
+    for _, row in takeoff_work_rows(takeoff).iterrows():
         unit = str(row.get("unit") or "")
         qty = to_float(row.get("quantity"))
         m2 = qty if unit == "m²" else 0
@@ -3769,7 +3905,7 @@ def _takeoff_summary_csv(takeoff: pd.DataFrame) -> str:
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["section", "m2", "lineal_m", "count", "paint_litres", "labour_hours", "value_ex_gst"])
-    for section, group in takeoff.groupby("section", dropna=False):
+    for section, group in takeoff_work_rows(takeoff).groupby("section", dropna=False):
         writer.writerow([
             str(section or "Unassigned"),
             float(group.loc[group["unit"].eq("m²"), "quantity"].sum()),
@@ -3813,11 +3949,16 @@ def _progress_package_readme(workspace: Dict[str, Any], takeoff: pd.DataFrame, p
     if takeoff.empty:
         lines.append("No measured take-off rows are in this package yet.")
     else:
-        lines.append(f"Take-off lines:   {len(takeoff)}")
-        lines.append(f"Measured m2:      {float(takeoff.loc[takeoff['unit'].eq('m2' if 'm2' in set(takeoff['unit'].astype(str)) else 'm²'), 'quantity'].sum()):,.2f}")
-        lines.append(f"Paint litres:     {float(takeoff['paint_litres'].sum()):,.2f}")
-        lines.append(f"Labour hours:     {float(takeoff['labour_hours'].sum()):,.2f}")
-        lines.append(f"Value ex GST:     ${float(takeoff['value_ex_gst'].sum()):,.2f}")
+        work = takeoff_work_rows(takeoff)
+        lines.append(f"Take-off lines:   {len(work)}")
+        lines.append(f"Measured m2:      {float(work.loc[work['unit'].eq('m2' if 'm2' in set(work['unit'].astype(str)) else 'm²'), 'quantity'].sum()):,.2f}")
+        lines.append(f"Paint litres:     {float(work['paint_litres'].sum()):,.2f}")
+        lines.append(f"Labour hours:     {float(work['labour_hours'].sum()):,.2f}")
+        lines.append(f"Value ex GST:     ${float(work['value_ex_gst'].sum()):,.2f}")
+        if "row_role" in takeoff.columns:
+            floor_m2 = float(takeoff.loc[takeoff["row_role"].fillna("").eq("floor_area") & takeoff["unit"].eq("m²"), "quantity"].sum())
+            if floor_m2:
+                lines.append(f"Floor m2 (ref):   {floor_m2:,.2f}")
     lines += [
         "",
         "All quantities must be reviewed against the current issued drawings and",
@@ -3839,6 +3980,7 @@ def progress_package_bytes(workspace_id: int) -> bytes:
     )
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("README.txt", _progress_package_readme(workspace, takeoff, pages))
+        work_takeoff = takeoff_work_rows(takeoff)
         manifest = {
             "app": APP_NAME,
             "app_version": APP_VERSION,
@@ -3852,15 +3994,15 @@ def progress_package_bytes(workspace_id: int) -> bytes:
             "generated": now_stamp(),
             "executive_summary": workspace.get("executive_summary", ""),
             "totals": {
-                "m2": float(takeoff.loc[takeoff["unit"].eq("m²"), "quantity"].sum()) if not takeoff.empty else 0.0,
-                "lm": float(takeoff.loc[takeoff["unit"].eq("lm"), "quantity"].sum()) if not takeoff.empty else 0.0,
-                "count": float(takeoff.loc[takeoff["unit"].isin({"No.", "item"}), "quantity"].sum()) if not takeoff.empty else 0.0,
-                "paint_litres": float(takeoff["paint_litres"].sum()) if not takeoff.empty else 0.0,
-                "labour_hours": float(takeoff["labour_hours"].sum()) if not takeoff.empty else 0.0,
-                "value_ex_gst": float(takeoff["value_ex_gst"].sum()) if not takeoff.empty else 0.0,
+                "m2": float(work_takeoff.loc[work_takeoff["unit"].eq("m²"), "quantity"].sum()) if not work_takeoff.empty else 0.0,
+                "lm": float(work_takeoff.loc[work_takeoff["unit"].eq("lm"), "quantity"].sum()) if not work_takeoff.empty else 0.0,
+                "count": float(work_takeoff.loc[work_takeoff["unit"].isin({"No.", "item"}), "quantity"].sum()) if not work_takeoff.empty else 0.0,
+                "paint_litres": float(work_takeoff["paint_litres"].sum()) if not work_takeoff.empty else 0.0,
+                "labour_hours": float(work_takeoff["labour_hours"].sum()) if not work_takeoff.empty else 0.0,
+                "value_ex_gst": float(work_takeoff["value_ex_gst"].sum()) if not work_takeoff.empty else 0.0,
             },
             "pages": pages.to_dict("records"),
-            "measured_rows": int((takeoff["quantity_status"].astype(str).str.lower().str.contains("measur") if not takeoff.empty else pd.Series(dtype=bool)).sum()),
+            "measured_rows": int((work_takeoff["quantity_status"].astype(str).str.lower().str.contains("measur") if not work_takeoff.empty else pd.Series(dtype=bool)).sum()),
         }
         zf.writestr("package_manifest.json", json.dumps(manifest, indent=2, default=str))
         zf.writestr("3d/3d_progress_marker.html", build_3d_figure(workspace_id).to_html(full_html=True, include_plotlyjs=True))
@@ -3909,6 +4051,7 @@ def progress_package_bytes(workspace_id: int) -> bytes:
 
 def _sync_jobhub_takeoff_rows(bridge: JobHubBridge, job_id: int, takeoff: pd.DataFrame) -> int:
     """Upsert the workspace take-off into the shared ``job_takeoff_rows`` table."""
+    takeoff = takeoff_work_rows(takeoff)
     if takeoff.empty:
         return 0
     stamp = now_stamp()
@@ -4025,6 +4168,7 @@ def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: s
     takeoff = dataframe_for_takeoff(workspace_id)
     if takeoff.empty:
         raise RuntimeError("There are no take-off rows to publish.")
+    takeoff = takeoff_work_rows(takeoff)
     ensure_shared_jobhub_schema(bridge)
     ensure_jobhub_takeoff_tables(bridge)
     stamp = now_stamp()
@@ -4607,7 +4751,7 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
         if scale_issues:
             st.warning("**Scale gate:** these page(s) feed the take-off but have no calibrated scale yet — calibrate them in the **Plan Mapper → Scale** tab before treating quantities as measured: " + ", ".join(f"`{i['page_label']}`" for i in scale_issues[:8]))
         takeoff=ldf("SELECT * FROM takeoff_rows WHERE workspace_id=? ORDER BY id",(workspace["id"],))
-        editor_cols=["id"]+TAKEOFF_COLUMNS
+        editor_cols=["id"]+TAKEOFF_COLUMNS+["row_role"]
         if takeoff.empty:
             takeoff=pd.DataFrame(columns=editor_cols)
         edited=st.data_editor(takeoff[editor_cols],use_container_width=True,hide_index=True,num_rows="dynamic",column_config={
@@ -4617,7 +4761,9 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
             "unit":st.column_config.SelectboxColumn(options=UNIT_OPTIONS),
             "quantity_status":st.column_config.SelectboxColumn(options=STATUS_OPTIONS),
             "inclusion_status":st.column_config.SelectboxColumn(options=INCLUSION_OPTIONS),
+            "row_role":st.column_config.SelectboxColumn(options=["", "floor_area"],required=False,help="Mark a row as floor_area to record a per-level internal floor area (m²) measurement that drives floor-m² pricing. Floor-area rows are not priced themselves."),
         },height=560,key="takeoff_editor")
+        st.caption("Rows marked **floor_area** hold each level's internal floor area (m²) — they appear in the schedule for reference and drive floor-m² pricing, but are not priced themselves. Set the pricing basis in **Settings → Project-level settings**.")
         gate_confirmed=not scale_issues
         if scale_issues:
             gate_confirmed=st.checkbox("I will calibrate the affected page scales before using these quantities",key=f"scale_gate_{int(workspace['id'])}")
@@ -4629,8 +4775,11 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
                     continue
                 if not to_float(row.get("rate_per_unit")):
                     row["rate_per_unit"] = default_rate_for(row.get("substrate"),row.get("element"),row.get("finish_system"),row.get("unit"))
+                row_role=str(row.get("row_role") or "").strip()
+                if row_role not in {"", "floor_area"}:
+                    row_role=""
                 values=[row.get(col,"") for col in TAKEOFF_COLUMNS]
-                lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(workspace["id"],*values,now_stamp(),now_stamp()))
+                lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,row_role,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(workspace["id"],*values,row_role,now_stamp(),now_stamp()))
             st.success("Take-off schedule saved.")
             st.rerun()
         if c2.button("Apply default rates to all rows",use_container_width=True):
@@ -4644,14 +4793,15 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
             st.rerun()
         if c2.button("Add standard empty scope rows",use_container_width=True):
             seeds=[
-                ("Internal","Walls","All internal areas","Plasterboard","Low sheen wall system",0,"m²","To measure","","","INCLUSION",3,12,8,default_rate_for("Plasterboard","Walls","Low sheen wall system","m²"),"To review","Net of tiles, glazing and joinery."),
-                ("Internal","Ceilings","Flushset ceilings","Plasterboard","Ceiling flat",0,"m²","To measure","","","INCLUSION",3,12,10,default_rate_for("Plasterboard","Ceilings","Ceiling flat","m²"),"To review","Exclude grid ceiling tiles."),
-                ("Internal","Doors","Painted door leaves","Timber door","Semi-gloss / enamel",0,"No.","To measure","","","INCLUSION",3,10,1,default_rate_for("Timber door","Doors","Semi-gloss / enamel","No."),"To review","Confirm leaf and frame finishes."),
-                ("External","External walls / cladding","All elevations","Fibre cement","Exterior acrylic",0,"m²","To measure","","","INCLUSION",3,10,6,default_rate_for("Fibre cement","External walls / cladding","Exterior acrylic","m²"),"To review","Net of glazing, signage and prefinished cladding."),
-                ("External","Steel / columns","Canopies and exposed steel","Structural steel","Metal primer + topcoats",0,"m²","To measure","","","PROVISIONAL",3,9,4,default_rate_for("Structural steel","Steel / columns","Metal primer + topcoats","m²"),"To review","Confirm site-painted versus factory finish."),
+                ("Internal","Walls","All internal areas","Plasterboard","Low sheen wall system",0,"m²","To measure","","","INCLUSION",3,12,8,default_rate_for("Plasterboard","Walls","Low sheen wall system","m²"),"To review","Net of tiles, glazing and joinery.",""),
+                ("Internal","Floor area","All internal areas","Other","N/A",0,"m²","To measure","","","INCLUSION",0,12,0,0.0,"To review","Internal floor area measurement row — drives floor-m² pricing when selected in Settings; not priced itself.","floor_area"),
+                ("Internal","Ceilings","Flushset ceilings","Plasterboard","Ceiling flat",0,"m²","To measure","","","INCLUSION",3,12,10,default_rate_for("Plasterboard","Ceilings","Ceiling flat","m²"),"To review","Exclude grid ceiling tiles.",""),
+                ("Internal","Doors","Painted door leaves","Timber door","Semi-gloss / enamel",0,"No.","To measure","","","INCLUSION",3,10,1,default_rate_for("Timber door","Doors","Semi-gloss / enamel","No."),"To review","Confirm leaf and frame finishes.",""),
+                ("External","External walls / cladding","All elevations","Fibre cement","Exterior acrylic",0,"m²","To measure","","","INCLUSION",3,10,6,default_rate_for("Fibre cement","External walls / cladding","Exterior acrylic","m²"),"To review","Net of glazing, signage and prefinished cladding.",""),
+                ("External","Steel / columns","Canopies and exposed steel","Structural steel","Metal primer + topcoats",0,"m²","To measure","","","PROVISIONAL",3,9,4,default_rate_for("Structural steel","Steel / columns","Metal primer + topcoats","m²"),"To review","Confirm site-painted versus factory finish.",""),
             ]
             for seed in seeds:
-                lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(workspace["id"],*seed,now_stamp(),now_stamp()))
+                lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,row_role,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(workspace["id"],*seed,now_stamp(),now_stamp()))
             st.success("Standard rows added.")
             st.rerun()
         c3, c4 = st.columns(2)
@@ -4772,7 +4922,7 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
             qa_rate = default_rate_for(qa_sub,qa_element,qa_fin,qa_unit)
             st.caption(f"Will add: **{qa_section} · {qa_element} · {qa_loc}** on **{qa_sub}** with finish **{qa_fin}** ({qa_unit}). Default rate ${qa_rate:.2f}/{qa_unit} — editable in the take-off schedule.")
             if st.button("Add row and select it for drawing",key=f"qa_add_{page['id']}"):
-                new_id=lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(int(workspace["id"]),qa_section,qa_element,qa_loc,qa_sub,qa_fin,0,qa_unit,"To measure",page.get("page_label",""),"","INCLUSION",2 if qa_unit=="lm" else 3,12,8,qa_rate,"To review","Quick-added from Draw measurements tab.",now_stamp(),now_stamp()))
+                new_id=lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,row_role,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(int(workspace["id"]),qa_section,qa_element,qa_loc,qa_sub,qa_fin,0,qa_unit,"To measure",page.get("page_label",""),"","INCLUSION",2 if qa_unit=="lm" else 3,12,8,qa_rate,"To review","Quick-added from Draw measurements tab.","",now_stamp(),now_stamp()))
                 st.session_state[f"ml_active_{int(page['id'])}"]=int(new_id)
                 st.session_state[rev_key]=int(st.session_state.get(rev_key,0))+1
                 st.rerun()
@@ -4955,7 +5105,7 @@ def plan_mapper_page(workspace:Dict[str,Any]) -> None:
             if selected and c1.button("Add selected zones to take-off"):
                 for label in selected:
                     z=lquery("SELECT * FROM mapped_zones WHERE id=?",(choices[label],))[0]
-                    lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(workspace["id"],"Mapped drawing","Mapped zone",z.get("name",""),z.get("substrate",""),z.get("finish_system",""),z.get("area_m2",0),"m²",z.get("quantity_status","Measured"),page.get("page_label",""),z.get("source_reference",""),"INCLUSION",3,12,8,default_rate_for(z.get("substrate",""),"Mapped zone",z.get("finish_system",""),"m²"),"Measured" if pxpm>0 else "To review","Rectangle mapped in PlanReader.",now_stamp(),now_stamp()))
+                    lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,row_role,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(workspace["id"],"Mapped drawing","Mapped zone",z.get("name",""),z.get("substrate",""),z.get("finish_system",""),z.get("area_m2",0),"m²",z.get("quantity_status","Measured"),page.get("page_label",""),z.get("source_reference",""),"INCLUSION",3,12,8,default_rate_for(z.get("substrate",""),"Mapped zone",z.get("finish_system",""),"m²"),"Measured" if pxpm>0 else "To review","Rectangle mapped in PlanReader.","",now_stamp(),now_stamp()))
                 st.success("Take-off rows added.")
             if selected and c2.button("Create conceptual 3D masses from selected zones"):
                 for label in selected:
@@ -5085,7 +5235,8 @@ def quantity_schedule_page(workspace:Dict[str,Any]) -> None:
         st.dataframe(section,use_container_width=True,hide_index=True)
     with tabs[1]:
         st.subheader("Priced per-level summary")
-        st.caption("Levels are read from the row locations (Ground, Level 1 … Roof). Pricing settings (mark-up, GST) come from Settings.")
+        basis=workspace_setting(int(workspace["id"]),"internal_pricing_basis","wall_m2")
+        st.caption(f"Levels are read from the row locations (Ground, Level 1 … Roof). Internal wall pricing basis: **{pricing_basis_label(basis)}**. Pricing settings (mark-up, GST) come from Settings. Floor-area rows are not priced.")
         levels=quote_summary_frame(int(workspace["id"]))
         st.dataframe(levels,use_container_width=True,hide_index=True)
         if not levels.empty:
@@ -5226,10 +5377,11 @@ def settings_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],session_
         p1,p2=st.columns(2)
         margin=p1.number_input("Pricing mark-up (%)",min_value=0.0,value=float(workspace_setting(wid,"pricing_margin_pct",0.0)),step=0.5)
         gst=p2.number_input("GST rate (%)",min_value=0.0,value=float(workspace_setting(wid,"gst_rate_pct",10.0)),step=0.5)
+        basis=st.radio("Internal wall pricing basis",options=["wall_m2","floor_m2"],format_func=lambda o:"Wall m² (rate × measured wall area)" if o=="wall_m2" else "Floor m² (rate × each level's floor area)",index=0 if workspace_setting(wid,"internal_pricing_basis","wall_m2")!="floor_m2" else 1,help="Wall m² prices internal wall rows from their measured wall area. Floor m² prices internal wall rows from each level's internal floor area (rate × floor m²), with measured wall m² still shown for reference in the schedule and quotation. Floor-area rows are never priced themselves.")
         header=st.text_input("Quote header / company name",value=str(workspace_setting(wid,"quote_header","Premier Brushworks Pty Ltd")))
         footer=st.text_area("Quote footer",value=str(workspace_setting(wid,"quote_footer","Valid for 30 days. All quantities require estimator review against the current issued drawings and specification before pricing or construction use.")),height=90)
         if st.form_submit_button("Save project settings",type="primary"):
-            for key,val in [("default_coverage_m2_per_litre",coverage),("default_productivity_m2_per_hour",productivity),("default_wall_height_m",wall_height),("pricing_margin_pct",margin),("gst_rate_pct",gst),("quote_header",header),("quote_footer",footer)]:
+            for key,val in [("default_coverage_m2_per_litre",coverage),("default_productivity_m2_per_hour",productivity),("default_wall_height_m",wall_height),("pricing_margin_pct",margin),("gst_rate_pct",gst),("internal_pricing_basis",basis),("quote_header",header),("quote_footer",footer)]:
                 set_workspace_setting(wid,key,val)
             st.success("Project settings saved.")
             st.rerun()

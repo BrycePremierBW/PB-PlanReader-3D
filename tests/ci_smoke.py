@@ -47,12 +47,12 @@ assert wid, "workspace not created"
 app.set_workspace_setting(wid, "pricing_margin_pct", 10.0)
 app.set_workspace_setting(wid, "gst_rate_pct", 10.0)
 
-def add_row(section, element, location, qty, unit, rate, ref="", notes="", status="Measured"):
+def add_row(section, element, location, qty, unit, rate, ref="", notes="", status="Measured", row_role=""):
     return app.lexecute(
-        """INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,created_at,updated_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        """INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,row_role,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (wid, section, element, location, "Gyprock", "Dulux system", qty, unit, status, "",
-         ref, "Included", 2, 12, 8, rate, "Measured", notes, app.now_stamp(), app.now_stamp()),
+         ref, "Included", 2, 12, 8, rate, "Measured", notes, row_role, app.now_stamp(), app.now_stamp()),
     )
 
 wall_ai = add_row("Internal walls", "Wall paint", "Level 1 · all walls", 100.0, "m²", 12.0, ref="AI plan review")
@@ -104,6 +104,54 @@ assert len(reco_manual) == 1, reco_manual
 assert reco_manual.iloc[0]["status"] == "Manual / not yet measured" and reco_manual.iloc[0]["variance"] == 0.0
 print("[ok] reconcile_ai_vs_drawn: manual-only group variance=0.0 (unbound fix)")
 
+# 6c. Floor-m² internal pricing basis (project-level setting)
+f_wid = app.create_standalone_workspace("PB25003", "Floor-basis Job", "b", "")
+def add_row_w(workspace_id, section, element, location, qty, unit, rate, row_role=""):
+    return app.lexecute(
+        """INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,row_role,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (workspace_id, section, element, location, "Gyprock", "Dulux system", qty, unit, "Measured", "",
+         "", "Included", 2, 12, 8, rate, "Measured", "", row_role, app.now_stamp(), app.now_stamp()),
+    )
+add_row_w(f_wid, "Internal", "Wall paint", "Level 1 · all walls", 80.0, "m²", 10.0)
+add_row_w(f_wid, "Internal", "Floor area", "Level 1 · all floors", 150.0, "m²", 0.0, row_role="floor_area")
+app.set_workspace_setting(f_wid, "internal_pricing_basis", "floor_m2")
+
+frame = app.dataframe_for_takeoff(f_wid)
+wall_rows = frame.loc[frame["element"].eq("Wall paint")]
+floor_rows = frame.loc[frame["row_role"].eq("floor_area")]
+assert len(wall_rows) == 1 and float(wall_rows.iloc[0]["priced_quantity"]) == 150.0, wall_rows[["quantity", "priced_quantity"]]
+assert wall_rows.iloc[0]["pricing_basis"] == "Floor m²" and abs(float(wall_rows.iloc[0]["value_ex_gst"]) - 1500.0) < 1e-6
+assert len(floor_rows) == 1 and float(floor_rows.iloc[0]["value_ex_gst"]) == 0.0
+assert floor_rows.iloc[0]["pricing_basis"] == "Floor area (reference)"
+print("[ok] floor-m² pricing: internal wall row priced from 150 m² floor area at 10.00 = $1,500; floor row unpriced")
+
+levels = app.per_level_summary(f_wid)
+assert len(levels) == 1 and abs(float(levels.iloc[0]["floor_m2"]) - 150.0) < 1e-6, levels
+assert int(levels.iloc[0]["rows"]) == 1 and abs(float(levels.iloc[0]["value_ex_gst"]) - 1500.0) < 1e-6, "floor rows must be excluded from priced rows/value"
+assert abs(float(levels.iloc[0]["m2"]) - 80.0) < 1e-6, "painted m² is the measured wall m², not the priced floor area"
+print("[ok] per_level_summary: floor_m2=150, value=$1,500, floor row excluded from rows/m²")
+
+app.set_workspace_setting(f_wid, "internal_pricing_basis", "wall_m2")
+frame_wall = app.dataframe_for_takeoff(f_wid)
+assert abs(float(frame_wall.loc[frame_wall["element"].eq("Wall paint")].iloc[0]["value_ex_gst"]) - 800.0) < 1e-6
+print("[ok] wall-m² fallback: internal wall row priced from measured 80 m² = $800")
+
+# 6d. Import maps a 'Floor area (m²)' header to floor_area rows
+parsed, warnings = app.parse_takeoff_file(None, raw_headers=["Element", "Floor area (m²)"], body=[["Internal", "150"], ["Ceiling", ""]])
+assert len(parsed) == 2 and {"row_role", "quantity", "unit"}.issubset(parsed.columns), parsed.columns
+assert (parsed["row_role"] == "floor_area").all() and parsed["unit"].eq("m²").all()
+assert float(parsed.loc[parsed["element"].eq("Internal")].iloc[0]["quantity"]) == 150.0
+print("[ok] parse_takeoff_file: 'Floor area (m²)' column maps rows to row_role='floor_area', m² and quantity")
+
+parsed1, _w1 = app.parse_takeoff_file(None, raw_headers=["Element", "Qty (m²)"], body=[["Internal floor area", "150"]])
+assert parsed1.iloc[0]["row_role"] == "floor_area" and float(parsed1.iloc[0]["quantity"]) == 150.0 and parsed1.iloc[0]["unit"] == "m²"
+print("[ok] parse_takeoff_file: element text 'floor area' auto-tags a row as floor_area")
+
+parsed2, _w2 = app.parse_takeoff_file(None, raw_headers=["Element", "Qty (m²)", "Unit"], body=[["Walls", "80", "m²"]])
+assert parsed2.iloc[0]["row_role"] == "" and float(parsed2.iloc[0]["quantity"]) == 80.0 and parsed2.iloc[0]["unit"] == "m²"
+print("[ok] parse_takeoff_file: plain 'Qty (m²)' row stays a priced row")
+
 # 7. Publish to shared JobHub (SQLite bridge)
 bridge = app.get_jobhub_bridge()
 assert bridge is not None, "no JobHub bridge"
@@ -118,6 +166,17 @@ assert jobs and jobs[0]["status"] == "Published", jobs
 packages = bridge.query("SELECT status, total_labour_hours FROM painting_takeoff_packages WHERE job_id=?", (job_id,))
 assert packages and packages[0]["status"] == "Published", packages
 print(f"[ok] publish_job_to_jobhub: package #{result['package_id']}, {result['package_lines']} lines, job status {result['job_status']}")
+
+# 7b. Floor-area rows never publish to JobHub
+app.set_workspace_setting(f_wid, "internal_pricing_basis", "floor_m2")
+f_job_id = app.create_linked_jobhub_job(bridge, "PB25003", "Floor-basis Job", "")
+assert f_job_id, "floor-basis job not created in shared DB"
+app.lexecute("UPDATE workspaces SET jobhub_job_id=? WHERE id=?", (f_job_id, f_wid))
+f_result = app.publish_job_to_jobhub(f_wid, bridge, "CI")
+assert f_result["package_lines"] == 1, f"expected only the wall line, got {f_result['package_lines']}"
+f_rows = bridge.query("SELECT area_location, internal_external FROM job_takeoff_rows WHERE job_id=?", (f_job_id,))
+assert len(f_rows) == 1 and "floor area" not in str(f_rows[0].get("area_location") or "").lower(), f_rows
+print("[ok] publish_job_to_jobhub: floor-area row excluded from job_takeoff_rows and package lines")
 
 print("CI SMOKE TEST PASSED")
 sys.exit(0)
