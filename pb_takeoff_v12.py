@@ -80,6 +80,13 @@ _EXACT_HEADER_TARGETS = {
     "productivityqtyhr": "productivity_m2_per_hour",
     "qtyperhr": "productivity_m2_per_hour",
     "paintqtyperhour": "productivity_m2_per_hour",
+    "floorarea": "floor_area",
+    "flooraream2": "floor_area",
+    "internalfloorarea": "floor_area",
+    "internalflooraream2": "floor_area",
+    "netfloorarea": "floor_area",
+    "nettfloorarea": "floor_area",
+    "grossfloorarea": "floor_area",
 }
 
 _M2_HEADERS = {
@@ -403,12 +410,25 @@ def make_parse_takeoff_file(app):
                     continue
 
             base: Dict[str, Any] = {c: "" for c in app.TAKEOFF_COLUMNS}
+            base["row_role"] = ""
+            floor_column_qty: Optional[float] = None
 
             # Generic/manual mappings first.
             for idx, target in mapping.items():
-                if idx >= len(line) or target not in app.TAKEOFF_COLUMNS:
+                if idx >= len(line):
                     continue
                 value = line[idx]
+                if target == "floor_area":
+                    # A 'Floor area (m²)' / 'Floor m²' column records each level's
+                    # internal floor area as a reference measurement row that can
+                    # drive floor-m² pricing; it is never a painted quantity.
+                    base["quantity"] = max(0.0, _to_float(app, value))
+                    base["unit"] = "m²"
+                    base["row_role"] = "floor_area"
+                    floor_column_qty = max(0.0, _to_float(app, value))
+                    continue
+                if target not in app.TAKEOFF_COLUMNS:
+                    continue
                 if target == "quantity":
                     # PB metric columns are resolved below so qty_m2/lineal_m/count
                     # cannot overwrite one another.
@@ -441,6 +461,12 @@ def make_parse_takeoff_file(app):
                 base["element"] = _derive_element(base.get("location") or "")
             if str(base.get("inclusion_status") or "").strip():
                 base["inclusion_status"] = _normalise_inclusion(base.get("inclusion_status"))
+
+            if not base["row_role"]:
+                element_text = str(base.get("element") or "").lower()
+                location_text = str(base.get("location") or "").lower()
+                if "floor area" in element_text or "internal floor" in element_text or "floor m2" in element_text or "floor area" in location_text:
+                    base["row_role"] = "floor_area"
 
             source_note = str(base.get("notes") or "").strip()
             extra = "" if has_notes_col else _extra_jobhub_notes(app, raw_headers, line)
@@ -483,6 +509,12 @@ def make_parse_takeoff_file(app):
             # preserve every channel as its own take-off line instead of dropping two.
             for quantity, unit, metric_source in metric_values:
                 row = dict(base)
+                if floor_column_qty is not None:
+                    # Floor-area rows keep the quantity read from the floor-area
+                    # column rather than any general quantity channel.
+                    quantity = floor_column_qty
+                    unit = "m²"
+                    metric_source = ""
                 row["quantity"] = quantity
                 row["unit"] = unit
                 if metric_source and len(metric_values) > 1:
@@ -490,8 +522,10 @@ def make_parse_takeoff_file(app):
                     row["notes"] = f"{row.get('notes') or ''} · {suffix}".strip(" ·")
                 row["quantity_status"] = str(row.get("quantity_status") or ("Measured" if quantity > 0 else "To measure"))
                 row["inclusion_status"] = str(row.get("inclusion_status") or "INCLUSION")
+                row_role = str(row.get("row_role") or "").strip()
                 row = _normalise_row(app, row)
-                rows.append({c: row.get(c, "") for c in app.TAKEOFF_COLUMNS})
+                row["row_role"] = row_role
+                rows.append({c: row.get(c, "") for c in (app.TAKEOFF_COLUMNS + ["row_role"])})
 
         if not rows:
             raise RuntimeError(
@@ -506,7 +540,7 @@ def make_parse_takeoff_file(app):
         if len(mapping) < 3 and not has_pb_metrics:
             warnings.append("Only a few columns were recognised — review the mapping before importing.")
 
-        frame = pd.DataFrame(rows, columns=app.TAKEOFF_COLUMNS)
+        frame = pd.DataFrame(rows, columns=app.TAKEOFF_COLUMNS + ["row_role"])
         return frame, warnings
 
     return parse_takeoff_file

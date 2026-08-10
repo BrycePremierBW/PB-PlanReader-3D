@@ -2,7 +2,7 @@ services:
   - type: web
     name: premier-brushworks-planreader-3d
     runtime: python
-    pythonVersion: "3.13.14"
+    pythonVersion: "3.14"
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run pb_planreader_v11_app.py --server.address 0.0.0.0 --server.port $PORT
     envVars:

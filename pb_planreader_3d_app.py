@@ -2827,10 +2827,6 @@ def pricing_basis_label(basis: Any) -> str:
     return "Floor m²" if str(basis or "").strip().lower() == "floor_m2" else "Wall m²"
 
 
-def is_floor_area_row(row: Any) -> bool:
-    return str(getattr(row, "row_role", "") or "").strip() == "floor_area"
-
-
 def takeoff_work_rows(takeoff: pd.DataFrame) -> pd.DataFrame:
     """Take-off rows that represent priced work (excludes floor-area measurement rows).
 
@@ -4438,20 +4434,21 @@ def dashboard_page(workspace: Dict[str, Any]) -> None:
     pages = ldf("SELECT * FROM pages WHERE workspace_id=?", (workspace["id"],))
     takeoff = dataframe_for_takeoff(int(workspace["id"]))
     masses = ldf("SELECT * FROM model_masses WHERE workspace_id=?", (workspace["id"],))
+    work = takeoff_work_rows(takeoff)
     cols = st.columns(6)
     cols[0].metric("Documents", len(docs))
     cols[1].metric("Drawing pages", len(pages))
-    cols[2].metric("Take-off lines", len(takeoff))
-    cols[3].metric("Measured m²", f"{takeoff.loc[takeoff['unit'].eq('m²'),'quantity'].sum():,.1f}" if not takeoff.empty else "0")
-    cols[4].metric("Paint litres", f"{takeoff['paint_litres'].sum():,.1f}" if not takeoff.empty else "0")
+    cols[2].metric("Take-off lines", len(work))
+    cols[3].metric("Measured m²", f"{work.loc[work['unit'].eq('m²'),'quantity'].sum():,.1f}" if not work.empty else "0")
+    cols[4].metric("Paint litres", f"{work['paint_litres'].sum():,.1f}" if not work.empty else "0")
     cols[5].metric("3D masses", len(masses))
     st.markdown("<div class='pb-card'>", unsafe_allow_html=True)
     st.subheader("Recommended workflow")
     st.write("1. Link or create a job → 2. Sync/upload every plan and specification → 3. Process drawings → 4. review the drawing register → 5. run AI and/or map measured zones → 6. review the take-off → 7. build the 3D model → 8. export or send the approved draft to JobHub.")
     st.markdown("<div class='pb-warning'><b>Accuracy rule:</b> the app labels geometry as Measured, Derived or Assumed. The model is not construction-grade BIM and must not be treated as exact until the estimator verifies dimensions against the current drawing issue.</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
-    if not takeoff.empty:
-        section_summary = takeoff.groupby("section", dropna=False).agg(quantity_rows=("id","count"), paint_litres=("paint_litres","sum"), labour_hours=("labour_hours","sum"), value_ex_gst=("value_ex_gst","sum")).reset_index()
+    if not work.empty:
+        section_summary = work.groupby("section", dropna=False).agg(quantity_rows=("id","count"), paint_litres=("paint_litres","sum"), labour_hours=("labour_hours","sum"), value_ex_gst=("value_ex_gst","sum")).reset_index()
         st.subheader("Take-off summary")
         st.dataframe(section_summary, use_container_width=True, hide_index=True)
     if not masses.empty or not ldf("SELECT * FROM mapped_zones WHERE workspace_id=?", (workspace["id"],)).empty:
@@ -5222,15 +5219,16 @@ def quantity_schedule_page(workspace:Dict[str,Any]) -> None:
     if scale_issues:
         st.warning("**Scale gate:** these page(s) have take-off rows/zones but no calibrated scale: " + ", ".join(f"`{i['page_label']}`" for i in scale_issues[:8]) + ". Calibrate in **Plan Mapper → Scale** before relying on the totals.")
     c1,c2,c3,c4,c5=st.columns(5)
-    c1.metric("Total m²",f"{takeoff.loc[takeoff['unit'].eq('m²'),'quantity'].sum():,.1f}")
-    c2.metric("Lineal metres",f"{takeoff.loc[takeoff['unit'].eq('lm'),'quantity'].sum():,.1f}")
-    c3.metric("Paint",f"{takeoff['paint_litres'].sum():,.1f} L")
-    c4.metric("Labour",f"{takeoff['labour_hours'].sum():,.1f} hrs")
-    c5.metric("Value ex GST",f"${takeoff['value_ex_gst'].sum():,.0f}")
+    work=takeoff_work_rows(takeoff)
+    c1.metric("Total m²",f"{work.loc[work['unit'].eq('m²'),'quantity'].sum():,.1f}")
+    c2.metric("Lineal metres",f"{work.loc[work['unit'].eq('lm'),'quantity'].sum():,.1f}")
+    c3.metric("Paint",f"{work['paint_litres'].sum():,.1f} L")
+    c4.metric("Labour",f"{work['labour_hours'].sum():,.1f} hrs")
+    c5.metric("Value ex GST",f"${work['value_ex_gst'].sum():,.0f}")
     tabs=st.tabs(["Schedule","Per-level pricing","Reconciliation","Quote export"])
     with tabs[0]:
         st.dataframe(takeoff[["id","section","element","location","substrate","finish_system","quantity","unit","quantity_status","coats","paint_litres","labour_hours","rate_per_unit","value_ex_gst","confidence","source_reference","notes"]],use_container_width=True,hide_index=True,height=560)
-        section=takeoff.groupby("section",dropna=False).agg(rows=("id","count"),m2=("quantity",lambda s:float(s[takeoff.loc[s.index,"unit"].eq("m²")].sum())),paint_litres=("paint_litres","sum"),labour_hours=("labour_hours","sum"),value_ex_gst=("value_ex_gst","sum")).reset_index()
+        section=work.groupby("section",dropna=False).agg(rows=("id","count"),m2=("quantity",lambda s:float(s[work.loc[s.index,"unit"].eq("m²")].sum())),paint_litres=("paint_litres","sum"),labour_hours=("labour_hours","sum"),value_ex_gst=("value_ex_gst","sum")).reset_index()
         st.subheader("Section summary")
         st.dataframe(section,use_container_width=True,hide_index=True)
     with tabs[1]:

@@ -152,6 +152,29 @@ parsed2, _w2 = app.parse_takeoff_file(None, raw_headers=["Element", "Qty (m²)",
 assert parsed2.iloc[0]["row_role"] == "" and float(parsed2.iloc[0]["quantity"]) == 80.0 and parsed2.iloc[0]["unit"] == "m²"
 print("[ok] parse_takeoff_file: plain 'Qty (m²)' row stays a priced row")
 
+# 6e. Painted totals exclude floor-area rows (used by Dashboard / Quantity Schedule)
+work_frame = app.takeoff_work_rows(frame)
+assert float(work_frame.loc[work_frame["unit"].eq("m²"), "quantity"].sum()) == 80.0, "painted m² must exclude floor m²"
+print("[ok] takeoff_work_rows: painted m² = 80 (floor 150 excluded)")
+
+# 6f. v1.2 overlay (production importer) maps floor-area columns to floor_area rows
+import pb_takeoff_v12
+assert pb_takeoff_v12._EXACT_HEADER_TARGETS.get(pb_takeoff_v12._key("Floor area (m²)")) == "floor_area"
+_orig_matcher = app._match_takeoff_header
+try:
+    app._match_takeoff_header = pb_takeoff_v12._make_matcher(app)
+    v12_parse = pb_takeoff_v12.make_parse_takeoff_file(app)
+    fv, _wv = v12_parse(None, raw_headers=["Element", "Floor area (m²)"], body=[["Internal", "150"], ["Ceiling", ""]])
+    assert (fv["row_role"] == "floor_area").all() and fv["unit"].eq("m²").all()
+    assert float(fv.loc[fv["element"].eq("Internal")].iloc[0]["quantity"]) == 150.0
+    fv2, _wv2 = v12_parse(None, raw_headers=["Element", "Qty (m²)"], body=[["Internal floor area", "150"]])
+    assert fv2.iloc[0]["row_role"] == "floor_area" and float(fv2.iloc[0]["quantity"]) == 150.0
+    fv3, _wv3 = v12_parse(None, raw_headers=["Element", "Qty (m²)", "Unit"], body=[["Walls", "80", "m²"]])
+    assert fv3.iloc[0]["row_role"] == ""
+finally:
+    app._match_takeoff_header = _orig_matcher
+print("[ok] pb_takeoff_v12: 'Floor area (m²)' column and element text map to floor_area rows")
+
 # 7. Publish to shared JobHub (SQLite bridge)
 bridge = app.get_jobhub_bridge()
 assert bridge is not None, "no JobHub bridge"
