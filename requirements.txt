@@ -1,11 +1,9 @@
-# Pinned dependency set verified together on Python 3.13.14 (local repro venv).
-# Render previously resolved unpinned ranges (e.g. streamlit>=1.39) to the
-# latest versions, which periodically produced build/deploy differences from
-# the code they were tested against. Keep these exact until an upgrade is
-# tested end-to-end on the same Python runtime.
+# Pinned dependency set for Python 3.13.
+# Keep NumPy below 2.3 because opencv-python-headless 4.12.0.88 requires
+# numpy>=2,<2.3 on Python >=3.9. NumPy 2.2.6 supports Python 3.13.
 streamlit==1.59.2
 pandas==2.3.3
-numpy==2.5.1
+numpy==2.2.6
 plotly==6.9.0
 PyMuPDF==1.28.0
 Pillow==12.3.0
