@@ -3,7 +3,7 @@ services:
     name: tradereader-3d
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: streamlit run tradereader_v11_app.py --server.address 0.0.0.0 --server.port $PORT
+    startCommand: streamlit run tradereader_v12_app.py --server.address 0.0.0.0 --server.port $PORT
     envVars:
       - key: PLANREADER_DATA_DIR
         value: /var/data/tradereader

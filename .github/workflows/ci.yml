@@ -26,7 +26,22 @@ jobs:
           pip install -r requirements.txt
 
       - name: Compile check
-        run: python -m py_compile pb_planreader_3d_app.py pb_takeoff_v12.py pb_jobhub_stability_v123.py planreader_line_mapper/__init__.py
+        run: |
+          python -m py_compile \
+            pb_planreader_3d_app.py \
+            pb_takeoff_v12.py \
+            pb_jobhub_stability_v123.py \
+            planreader_line_mapper/__init__.py \
+            tradereader_app.py \
+            tradereader_v11_app.py \
+            tradereader_v12_app.py \
+            tradereader_trade_modules.py \
+            tradereader_trade_detection.py \
+            tradereader_universal_specialist.py \
+            tradereader_plastering.py
+
+      - name: TradeReader all-trade tests
+        run: python -m unittest discover -s tests -p "test_tradereader_all_trades.py" -v
 
       - name: Smoke test (envelope, quotes, copy, reconcile, publish)
         run: python tests/ci_smoke.py
