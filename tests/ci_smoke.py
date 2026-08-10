@@ -201,5 +201,28 @@ f_rows = bridge.query("SELECT area_location, internal_external FROM job_takeoff_
 assert len(f_rows) == 1 and "floor area" not in str(f_rows[0].get("area_location") or "").lower(), f_rows
 print("[ok] publish_job_to_jobhub: floor-area row excluded from job_takeoff_rows and package lines")
 
+# 7c. JobHub base64-text blob discovery, fetch, decode and copy; unreachable metadata
+import base64
+pdf_bytes = b"%PDF-1.4 CI fake purchase order bytes " * 120
+b64 = base64.b64encode(pdf_bytes).decode("ascii")
+bridge.execute(
+    "INSERT INTO job_document_blobs(job_id,file_name,mime_type,doc_type,notes,blob_data,created_at) VALUES(?,?,?,?,?,?,?)",
+    (job_id, "PO-5569.pdf", "application/pdf", "Purchase order", "test", b64, app.now_stamp()),
+)
+recs = app.discover_jobhub_document_records(bridge, job_id)
+rec = next((r for r in recs if r.get("source_table") == "job_document_blobs" and r.get("file_name") == "PO-5569.pdf"), None)
+assert rec and rec.get("has_blob"), recs
+rec["file_blob"] = bridge.fetch_document_blob(rec["source_table"], int(rec["record_id"]))
+assert isinstance(rec["file_blob"], str) and rec["file_blob"].startswith("JVBER"), type(rec["file_blob"])
+ok, msg = app.copy_jobhub_document_to_workspace(rec, wid)
+assert ok, msg
+stored = app.lquery("SELECT file_name,path FROM documents WHERE workspace_id=? AND file_name='PO-5569.pdf'", (wid,))
+assert stored and Path(stored[0]["path"]).read_bytes() == pdf_bytes, stored
+bad = {"file_name": "Unreachable.pdf", "mime_type": "application/pdf", "storage_path": "/var/jobhub/files/Unreachable.pdf",
+       "file_url": "", "file_blob": None, "has_blob": False, "source_table": "job_documents", "record_id": 0}
+ok2, msg2 = app.copy_jobhub_document_to_workspace(bad, wid)
+assert not ok2 and "not reachable" in msg2 and "/var/jobhub" in msg2, msg2
+print("[ok] job_document_blobs base64 blob discovery + fetch + decode + copy; unreachable path reported clearly")
+
 print("CI SMOKE TEST PASSED")
 sys.exit(0)

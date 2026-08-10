@@ -601,6 +601,14 @@ def workspace_path(workspace_id: int) -> Path:
 # JobHub bridge
 # -----------------------------------------------------------------------------
 
+# Column names that can hold a document's file bytes. Discovery and per-file
+# fetch must agree on this list so a blob stored under any common name is read.
+_DOCUMENT_BLOB_COLUMNS = (
+    "blob_data", "file_data", "file_content", "filedata", "pdf_data", "pdf_file",
+    "document_data", "doc_data", "attachment", "attachments", "file", "content",
+    "data", "blob", "bytes", "binary_data", "raw_data", "object_data",
+)
+
 
 @dataclass
 class JobHubBridge:
@@ -708,7 +716,7 @@ class JobHubBridge:
                 mime_col = next((c for c in ["mime_type", "content_type", "file_type"] if c in cols), None)
                 path_col = next((c for c in ["storage_path", "file_path", "path", "local_path"] if c in cols), None)
                 url_col = next((c for c in ["download_url", "file_url", "url", "public_url"] if c in cols), None)
-                blob_col = next((c for c in ["blob_data", "file_data", "content", "data", "blob", "bytes"] if c in cols), None)
+                blob_col = next((c for c in _DOCUMENT_BLOB_COLUMNS if c in cols), None)
                 date_col = next((c for c in ["uploaded_at", "created_at", "date_uploaded"] if c in cols), None)
                 select_parts = [f"{id_col} AS record_id" if id_col else "NULL AS record_id"]
                 select_parts.append(f"{name_col} AS file_name" if name_col else "'' AS file_name")
@@ -731,11 +739,13 @@ class JobHubBridge:
                     records.append(record)
         return records
 
-    def fetch_document_blob(self, table: str, record_id: int) -> Optional[bytes]:
-        """Return a single document's file_data bytes (or None if absent).
+    def fetch_document_blob(self, table: str, record_id: int) -> Optional[Any]:
+        """Return a single document's file bytes (or None if absent).
 
-        Fetched one document at a time so discovery never holds every PDF in
-        memory at once — the render free tier only has ~512 MB to work with.
+        Binary columns come back as ``bytes``; text columns (e.g. base64 stored
+        in ``job_document_blobs``) come back as ``str`` so the caller can decode
+        them. Fetched one document at a time so discovery never holds every PDF
+        in memory at once — the render free tier only has ~512 MB to work with.
         """
         if not record_id:
             return None
@@ -743,7 +753,7 @@ class JobHubBridge:
         with self.connect() as conn:
             cur = conn.cursor()
             cols = self._columns_for_connection(cur, safe)
-            blob_col = next((c for c in ["blob_data", "file_data", "content", "data", "blob", "bytes"] if c in cols), None)
+            blob_col = next((c for c in _DOCUMENT_BLOB_COLUMNS if c in cols), None)
             if not blob_col:
                 return None
             placeholder = "%s" if self.kind == "postgres" else "?"
@@ -754,6 +764,8 @@ class JobHubBridge:
             value = row[0]
             if isinstance(value, (bytes, bytearray, memoryview)):
                 return bytes(value)
+            if isinstance(value, str) and value.strip():
+                return value
             return None
 
     def _columns_for_connection(self, cur, table: str) -> List[str]:
@@ -890,7 +902,15 @@ def copy_jobhub_document_to_workspace(record: Dict[str, Any], workspace_id: int)
         elif source_path and Path(source_path).exists():
             data = Path(source_path).read_bytes()
         else:
-            return False, f"{file_name}: metadata found, but its file is not reachable from this app."
+            reasons = []
+            if record.get("has_blob"):
+                reasons.append("the JobHub record has a file column but no stored bytes")
+            if source_path:
+                reasons.append(f"stored path not reachable from this app: {source_path}")
+            if source_url:
+                reasons.append(f"stored URL not reachable from this app: {source_url}")
+            detail = " · ".join(reasons) if reasons else "no reachable file data (no blob, URL or local path)"
+            return False, f"{file_name}: metadata found, but its file is not reachable from this app — {detail}"
     except Exception as exc:
         return False, f"{file_name}: {exc}"
     digest = sha256_bytes(data)
