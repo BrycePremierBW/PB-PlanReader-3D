@@ -1752,13 +1752,63 @@ def _ai_page_bytes(path: Path, max_long_edge: int = _AI_IMAGE_LONG_EDGE_PX) -> b
         return buf.getvalue()
 
 
-def process_document(document_id: int, force: bool = False) -> Tuple[int, str]:
+def index_document_pages(document_id: int) -> Tuple[int, str]:
+    """Register a document's pages cheaply: PDFs list pages with extracted
+    text and classification but render nothing, so huge files never touch the
+    pixmap pipeline. Single-page image/office files are processed immediately
+    because they are small.
+    """
     docs = lquery("SELECT * FROM documents WHERE id=?", (document_id,))
     if not docs:
         return 0, "Document not found"
     doc = docs[0]
-    if not force and int(doc.get("page_count") or 0) > 0:
-        return int(doc["page_count"]), "Already processed"
+    path = Path(str(doc["path"]))
+    if not path.exists():
+        return 0, "File is missing from PlanReader storage"
+    workspace_id = int(doc["workspace_id"])
+    if path.suffix.lower() != ".pdf":
+        return process_document(document_id)
+
+    if fitz is None:
+        raise RuntimeError("PyMuPDF is not installed; PDFs cannot be processed.")
+    pdf = fitz.open(path)
+    extracted: List[str] = []
+    count = 0
+    for index, page in enumerate(pdf):
+        page_no = index + 1
+        text = page.get_text("text") or ""
+        extracted.append(text)
+        page_type, label = classify_page(text, path.name, page_no)
+        lexecute(
+            """INSERT INTO pages(document_id,workspace_id,page_no,page_label,page_type,scale_text,px_per_m,image_path,width_px,height_px,extracted_text,selected,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (document_id, workspace_id, page_no, label, page_type, "", None, "", 0, 0, text, 1, now_stamp()),
+        )
+        count += 1
+    pdf.close()
+    gc.collect()
+    lexecute(
+        "UPDATE documents SET page_count=?, extracted_text=? WHERE id=?",
+        (count, "\n\n".join(extracted)[:2_000_000], document_id),
+    )
+    return count, "Indexed"
+
+
+def process_document(document_id: int, force: bool = False, page_ids: Optional[Sequence[int]] = None) -> Tuple[int, str]:
+    """Render a document's page images. When page_ids is given, only those PDF
+    pages are rendered; existing page rows are updated in place.
+    """
+    docs = lquery("SELECT * FROM documents WHERE id=?", (document_id,))
+    if not docs:
+        return 0, "Document not found"
+    doc = docs[0]
+    if not force:
+        unrendered = lquery(
+            "SELECT COUNT(*) AS n FROM pages WHERE document_id=? AND (image_path='' OR image_path IS NULL)",
+            (document_id,),
+        )
+        if unrendered and int(unrendered[0]["n"] or 0) == 0:
+            return int(doc.get("page_count") or 0), "Already processed"
     path = Path(str(doc["path"]))
     if not path.exists():
         return 0, "File is missing from PlanReader storage"
@@ -1767,7 +1817,7 @@ def process_document(document_id: int, force: bool = False) -> Tuple[int, str]:
     suffix = path.suffix.lower()
     extracted_all: List[str] = []
     created = 0
-    if force:
+    if force and page_ids is None:
         for row in lquery("SELECT image_path FROM pages WHERE document_id=?", (document_id,)):
             try:
                 Path(str(row.get("image_path") or "")).unlink(missing_ok=True)
@@ -1781,6 +1831,8 @@ def process_document(document_id: int, force: bool = False) -> Tuple[int, str]:
         pdf = fitz.open(path)
         for index, page in enumerate(pdf):
             page_no = index + 1
+            if page_ids is not None and page_no not in page_ids:
+                continue
             text = page.get_text("text") or ""
             extracted_all.append(text)
             zoom = _pdf_render_zoom(page)
@@ -1788,27 +1840,18 @@ def process_document(document_id: int, force: bool = False) -> Tuple[int, str]:
             image_path = pages_dir / f"doc_{document_id}_page_{page_no}.png"
             pix.save(str(image_path))
             page_type, label = classify_page(text, path.name, page_no)
-            lexecute(
-                """
-                INSERT INTO pages(document_id,workspace_id,page_no,page_label,page_type,scale_text,px_per_m,image_path,width_px,height_px,extracted_text,selected,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    document_id,
-                    workspace_id,
-                    page_no,
-                    label,
-                    page_type,
-                    "",
-                    None,
-                    str(image_path),
-                    pix.width,
-                    pix.height,
-                    text,
-                    1,
-                    now_stamp(),
-                ),
-            )
+            existing = lquery("SELECT id FROM pages WHERE document_id=? AND page_no=?", (document_id, page_no))
+            if existing:
+                lexecute(
+                    "UPDATE pages SET image_path=?,width_px=?,height_px=?,page_label=?,page_type=?,extracted_text=?,selected=1 WHERE id=?",
+                    (str(image_path), pix.width, pix.height, label, page_type, text, existing[0]["id"]),
+                )
+            else:
+                lexecute(
+                    """INSERT INTO pages(document_id,workspace_id,page_no,page_label,page_type,scale_text,px_per_m,image_path,width_px,height_px,extracted_text,selected,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (document_id, workspace_id, page_no, label, page_type, "", None, str(image_path), pix.width, pix.height, text, 1, now_stamp()),
+                )
             created += 1
         pdf.close()
         gc.collect()
@@ -1874,9 +1917,11 @@ def process_document(document_id: int, force: bool = False) -> Tuple[int, str]:
         )
         created = 1
 
+    counted = lquery("SELECT COUNT(*) AS n FROM pages WHERE document_id=?", (document_id,))
+    page_total = int(counted[0]["n"]) if counted else created
     lexecute(
         "UPDATE documents SET page_count=?, extracted_text=? WHERE id=?",
-        (created, "\n\n".join(extracted_all)[:2_000_000], document_id),
+        (page_total, "\n\n".join(extracted_all)[:2_000_000], document_id),
     )
     seed_drawing_register(workspace_id)
     return created, "Processed"
@@ -4544,47 +4589,95 @@ def _page_thumb(path: str, mtime: float, max_w: int) -> Optional[bytes]:
 
 def page_preview_picker(workspace_id: int, doc_ids: Sequence[int]) -> None:
     pages = lquery(
-        "SELECT p.id,p.page_no,p.page_label,p.page_type,p.image_path,p.selected,d.file_name "
+        "SELECT p.id,p.document_id,p.page_no,p.page_label,p.page_type,p.image_path,p.extracted_text,p.selected,d.file_name "
         "FROM pages p JOIN documents d ON d.id=p.document_id "
         f"WHERE p.workspace_id=? AND p.document_id IN ({','.join('?' for _ in doc_ids)}) ORDER BY d.id,p.page_no",
         (workspace_id, *doc_ids),
     )
     if not pages:
-        st.info("No rendered pages to preview yet.")
+        st.info("No indexed pages to choose from yet.")
         return
-    st.markdown("#### Preview & select pages to use")
-    st.caption("Tick the pages you want to use in the take-off and 3D model, then save your selection.")
-    ncols = 4
-    cols = st.columns(ncols)
-    keys: List[Tuple[int, str]] = []
-    for i, pg in enumerate(pages):
-        with cols[i % ncols]:
-            thumb = page_thumbnail(str(pg.get("image_path") or ""))
-            if thumb:
-                st.image(thumb, use_container_width=True)
-            else:
-                st.caption("(no preview)")
-            st.caption(f"p{int(pg['page_no'])} · {pg.get('page_type')}")
-            key = f"use_page_{int(pg['id'])}"
-            keys.append((int(pg["id"]), key))
-            st.checkbox("Use this page", value=bool(pg.get("selected")), key=key)
+
+    st.markdown("#### Choose pages to keep")
+    st.caption("Tick only the pages you want rendered and shown. Unticked pages are ignored and never displayed.")
+    keep_default = st.session_state.get("_pb_picker_keep_default")
+    rows = []
+    for pg in pages:
+        has_img = bool(str(pg.get("image_path") or "").strip())
+        excerpt = " ".join(str(pg.get("extracted_text") or "").split())[:70]
+        if keep_default is None:
+            keep = has_img
+        elif keep_default:
+            keep = True
+        else:
+            keep = False
+        rows.append({
+            "Keep": keep,
+            "Page": int(pg["page_no"]),
+            "File": str(pg.get("file_name") or ""),
+            "Label": str(pg.get("page_label") or ""),
+            "Type": str(pg.get("page_type") or ""),
+            "Text": excerpt,
+            "Rendered": "yes" if has_img else "no",
+            "_pid": int(pg["id"]),
+            "_doc": int(pg["document_id"]),
+            "_no": int(pg["page_no"]),
+            "_img": has_img,
+        })
+    edited = st.data_editor(
+        pd.DataFrame(rows),
+        hide_index=True,
+        disabled=["Page", "File", "Label", "Type", "Text", "Rendered", "_pid", "_doc", "_no", "_img"],
+        column_config={
+            "Keep": st.column_config.CheckboxColumn("Keep"),
+            "Rendered": st.column_config.TextColumn("Rendered", width="small"),
+        },
+        use_container_width=True,
+    )
     c1, c2, c3, c4 = st.columns(4)
-    if c1.button("Save page selection", type="primary"):
-        for pid, key in keys:
-            lexecute("UPDATE pages SET selected=? WHERE id=?", (1 if st.session_state.get(key) else 0, pid))
-        st.success("Page selection saved.")
+    if c1.button("Render & show kept pages", type="primary"):
+        records = edited.to_dict("records")
+        for row in records:
+            lexecute("UPDATE pages SET selected=? WHERE id=?", (1 if row.get("Keep") else 0, row["_pid"]))
+        to_render: Dict[int, List[int]] = {}
+        for row in records:
+            if row.get("Keep") and not row.get("_img"):
+                to_render.setdefault(int(row["_doc"]), []).append(int(row["_no"]))
+        rendered_msgs = []
+        for doc_id, page_nos in to_render.items():
+            try:
+                count, msg = process_document(doc_id, page_ids=page_nos)
+                rendered_msgs.append(f"doc {doc_id}: {count} page(s) — {msg}")
+            except Exception as exc:
+                rendered_msgs.append(f"doc {doc_id}: ERROR — {exc}")
+        if rendered_msgs:
+            st.code("\n".join(rendered_msgs))
+        st.session_state.pop("pb_page_keep_editor", None)
+        st.success("Selection saved; kept pages rendered.")
         st.rerun()
-    if c2.button("Select all"):
-        for pid, key in keys:
-            st.session_state[key] = True
+    if c2.button("Keep all"):
+        st.session_state["_pb_picker_keep_default"] = True
         st.rerun()
-    if c3.button("Deselect all"):
-        for pid, key in keys:
-            st.session_state[key] = False
+    if c3.button("Keep none"):
+        st.session_state["_pb_picker_keep_default"] = False
         st.rerun()
     if c4.button("Done"):
         st.session_state.pop("preview_doc_ids", None)
+        st.session_state.pop("_pb_picker_keep_default", None)
+        st.session_state.pop("pb_page_keep_editor", None)
         st.rerun()
+
+    kept = [pg for pg in pages if bool(pg.get("selected")) and bool(str(pg.get("image_path") or "").strip())]
+    if kept:
+        st.markdown("#### Kept page previews")
+        ncols = 4
+        cols = st.columns(ncols)
+        for i, pg in enumerate(kept):
+            with cols[i % ncols]:
+                thumb = page_thumbnail(str(pg.get("image_path") or ""))
+                if thumb:
+                    st.image(thumb, use_container_width=True)
+                st.caption(f"p{int(pg['page_no'])} · {pg.get('page_type')}")
 
 
 def project_documents_page(workspace: Dict[str, Any], bridge: Optional[JobHubBridge], user: Dict[str, Any]) -> None:
@@ -4640,6 +4733,9 @@ def project_documents_page(workspace: Dict[str, Any], bridge: Optional[JobHubBri
         uploads = st.file_uploader("Upload plans, specifications, schedules and images", type=["pdf","png","jpg","jpeg","webp","docx","xlsx","xls","csv","txt"], accept_multiple_files=True)
         category = st.selectbox("Document category", ["Plans","Specifications","Schedules","Addenda","Scope / tender documents","Site photos","Other"])
         mirror = st.checkbox("Record these uploads as linked PlanReader documents in the shared JobHub database", value=bool(bridge and workspace.get("jobhub_job_id")))
+        total_bytes=sum((int(getattr(u,"size",0) or 0)) for u in uploads or [])
+        if uploads and total_bytes>200*1024*1024:
+            st.warning(f"Selected files total {total_bytes/1024/1024:.0f} MB. Uploads this large can exhaust this service's memory; split them into smaller batches.")
         if uploads and st.button("Save uploaded documents", type="primary"):
             added=0
             if bridge and mirror and workspace.get("jobhub_job_id"):
@@ -4657,11 +4753,11 @@ def project_documents_page(workspace: Dict[str, Any], bridge: Optional[JobHubBri
                     bridge.execute("INSERT INTO planreader_documents(job_id,file_name,mime_type,storage_path,source_app,uploaded_by,uploaded_at,notes) VALUES(?,?,?,?,?,?,?,?)", (workspace["jobhub_job_id"],upload.name,upload.type or "",str(target),"PlanReader",user.get("username",""),now_stamp(),"Stored on PlanReader service; metadata linked in JobHub database."))
                 new_ids.append(doc_id)
                 added+=1
-            with st.spinner("Rendering page previews..."):
+            with st.spinner("Indexing documents..."):
                 messages=[]
                 for doc_id in new_ids:
                     try:
-                        count,msg=process_document(doc_id)
+                        count,msg=index_document_pages(doc_id)
                         messages.append(f"#{doc_id}: {count} page(s) — {msg}")
                     except Exception as exc:
                         messages.append(f"#{doc_id}: ERROR — {exc}")
@@ -4670,6 +4766,7 @@ def project_documents_page(workspace: Dict[str, Any], bridge: Optional[JobHubBri
             st.success(f"Saved {added} new document(s).")
             if new_ids:
                 st.session_state["preview_doc_ids"]=new_ids
+                st.session_state["_pb_picker_keep_default"]=None
             st.rerun()
         if st.session_state.get("preview_doc_ids"):
             page_preview_picker(int(workspace["id"]), st.session_state["preview_doc_ids"])
