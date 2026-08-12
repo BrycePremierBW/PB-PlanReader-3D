@@ -23,22 +23,16 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt ruff
 
-      - name: Compile check
-        run: |
-          python -m py_compile \
-            pb_planreader_3d_app.py \
-            pb_takeoff_v12.py \
-            pb_jobhub_stability_v123.py \
-            planreader_line_mapper/__init__.py \
-            tradereader_app.py \
-            tradereader_v11_app.py \
-            tradereader_v12_app.py \
-            tradereader_trade_modules.py \
-            tradereader_trade_detection.py \
-            tradereader_universal_specialist.py \
-            tradereader_plastering.py
+      - name: Compile all Python code
+        run: python -m compileall -q .
+
+      - name: Check undefined names and local-scope errors
+        run: ruff check --select F821,F823 .
+
+      - name: PlanReader take-off accuracy tests
+        run: python tests/test_planreader_accuracy.py
 
       - name: TradeReader all-trade tests
         run: python -m unittest discover -s tests -p "test_tradereader_all_trades.py" -v
