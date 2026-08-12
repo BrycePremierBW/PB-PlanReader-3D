@@ -1,7 +1,8 @@
-"""Production entry point for Premier Brushworks PlanReader v1.2.4."""
+"""Production entry point for Premier Brushworks PlanReader v1.2.5."""
 import pb_planreader_3d_app as app
 from pb_takeoff_v11 import apply as apply_v11
 from pb_takeoff_v12 import apply as apply_v12
+from pb_takeoff_accuracy_v125 import apply as apply_accuracy_v125
 from pb_jobhub_connection_v122 import apply as apply_jobhub_v122
 from pb_jobhub_stability_v123 import apply as apply_jobhub_v123
 
@@ -9,7 +10,8 @@ apply_v11(app)
 apply_v12(app)
 apply_jobhub_v122(app)
 apply_jobhub_v123(app)
-app.APP_VERSION = "1.2.4"
+apply_accuracy_v125(app)
+app.APP_VERSION = "1.2.5"
 
 # Streamlit reruns this launcher while imported modules may stay cached. Preserve
 # originals once so reruns are idempotent instead of wrapping wrappers forever.
@@ -165,7 +167,7 @@ app.subscription_takeoff_page = _v124_subscription_takeoff_page
 
 def _v121_sidebar_workspace_selector(bridge):
     app.st.sidebar.markdown(
-        "<div class='pb-v12-live'><strong>PB TAKE-OFF v1.2.4 ACTIVE</strong><br>PB/JobHub stable connection + multi-line importer + take-off values</div>",
+        "<div class='pb-v12-live'><strong>PB TAKE-OFF v1.2.5 ACTIVE</strong><br>accuracy-gated measurements + stable JobHub connection + multi-line importer + take-off values</div>",
         unsafe_allow_html=True,
     )
 
