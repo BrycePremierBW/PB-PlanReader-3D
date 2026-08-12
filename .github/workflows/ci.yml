@@ -32,7 +32,7 @@ jobs:
         run: ruff check --select F821,F823 .
 
       - name: PlanReader take-off accuracy tests
-        run: python tests/test_planreader_accuracy.py
+        run: PYTHONPATH=. python tests/test_planreader_accuracy.py
 
       - name: TradeReader all-trade tests
         run: python -m unittest discover -s tests -p "test_tradereader_all_trades.py" -v
