@@ -1,4 +1,4 @@
-"""Production entry point for Premier Brushworks PlanReader v1.2.3."""
+"""Production entry point for Premier Brushworks PlanReader v1.2.4."""
 import pb_planreader_3d_app as app
 from pb_takeoff_v11 import apply as apply_v11
 from pb_takeoff_v12 import apply as apply_v12
@@ -9,7 +9,7 @@ apply_v11(app)
 apply_v12(app)
 apply_jobhub_v122(app)
 apply_jobhub_v123(app)
-app.APP_VERSION = "1.2.3"
+app.APP_VERSION = "1.2.4"
 
 # Streamlit reruns this launcher while imported modules may stay cached. Preserve
 # originals once so reruns are idempotent instead of wrapping wrappers forever.
@@ -19,10 +19,13 @@ if not hasattr(app, "_pb_original_sidebar_workspace_selector"):
     app._pb_original_sidebar_workspace_selector = app.sidebar_workspace_selector
 if not hasattr(app, "_pb_original_get_jobhub_bridge"):
     app._pb_original_get_jobhub_bridge = app.get_jobhub_bridge
+if not hasattr(app, "_pb_original_subscription_takeoff_page"):
+    app._pb_original_subscription_takeoff_page = app.subscription_takeoff_page
 
 _base_app_css = app._pb_original_app_css
 _base_sidebar_workspace_selector = app._pb_original_sidebar_workspace_selector
 _base_get_jobhub_bridge = app._pb_original_get_jobhub_bridge
+_base_subscription_takeoff_page = app._pb_original_subscription_takeoff_page
 
 
 def _v121_get_jobhub_bridge():
@@ -100,9 +103,69 @@ def _v121_app_css() -> None:
 app.app_css = _v121_app_css
 
 
+def _v124_subscription_takeoff_page(workspace, session_api_key, ai_provider="OpenAI"):
+    """Add a read-only calculated Total Value column to the editable take-off table.
+
+    The core app already calculates ``value_ex_gst`` in ``dataframe_for_takeoff``.
+    Reusing that calculation keeps floor-m2 pricing, floor-area reference rows and
+    ordinary quantity x rate pricing consistent with the Quantity Schedule and
+    quotation exports. The derived display column is removed from the editor result
+    before the base save routine persists take-off rows.
+    """
+    original_data_editor = app.st.data_editor
+
+    def _data_editor_with_total_value(data=None, *args, **kwargs):
+        if kwargs.get("key") != "takeoff_editor" or not isinstance(data, app.pd.DataFrame):
+            return original_data_editor(data, *args, **kwargs)
+
+        shown = data.copy()
+        try:
+            calculated = app.dataframe_for_takeoff(int(workspace["id"]))
+            values_by_id = {}
+            if not calculated.empty and {"id", "value_ex_gst"}.issubset(calculated.columns):
+                values_by_id = calculated.set_index("id")["value_ex_gst"].to_dict()
+
+            if "id" in shown.columns:
+                shown["total_value"] = shown["id"].map(values_by_id).fillna(0.0)
+            else:
+                shown["total_value"] = 0.0
+
+            ordered = list(shown.columns)
+            ordered.remove("total_value")
+            insert_at = ordered.index("rate_per_unit") + 1 if "rate_per_unit" in ordered else len(ordered)
+            ordered.insert(insert_at, "total_value")
+            shown = shown[ordered]
+
+            column_config = dict(kwargs.get("column_config") or {})
+            column_config["total_value"] = app.st.column_config.NumberColumn(
+                "Total Value",
+                help="Calculated line value ex GST using the project's selected pricing basis. Floor-area reference rows remain $0.",
+                format="$%.2f",
+                disabled=True,
+            )
+            kwargs["column_config"] = column_config
+        except Exception:
+            # Never block take-off editing if a derived display value cannot be built.
+            pass
+
+        edited = original_data_editor(shown, *args, **kwargs)
+        if isinstance(edited, app.pd.DataFrame):
+            edited = edited.drop(columns=["total_value"], errors="ignore")
+        return edited
+
+    app.st.data_editor = _data_editor_with_total_value
+    try:
+        return _base_subscription_takeoff_page(workspace, session_api_key, ai_provider)
+    finally:
+        app.st.data_editor = original_data_editor
+
+
+app.subscription_takeoff_page = _v124_subscription_takeoff_page
+
+
 def _v121_sidebar_workspace_selector(bridge):
     app.st.sidebar.markdown(
-        "<div class='pb-v12-live'><strong>PB TAKE-OFF v1.2.3 ACTIVE</strong><br>PB/JobHub stable connection + multi-line importer</div>",
+        "<div class='pb-v12-live'><strong>PB TAKE-OFF v1.2.4 ACTIVE</strong><br>PB/JobHub stable connection + multi-line importer + take-off values</div>",
         unsafe_allow_html=True,
     )
 
