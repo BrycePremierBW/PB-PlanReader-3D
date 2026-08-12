@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import gc
 import hashlib
 import io
 import json
@@ -1727,6 +1728,30 @@ def render_measurement_overlay(page: Dict[str, Any], lines: Sequence[Dict[str, A
     return Image.alpha_composite(img, overlay)
 
 
+_PDF_RENDER_LONG_EDGE_PX = 2400
+_AI_IMAGE_LONG_EDGE_PX = 1600
+
+
+def _pdf_render_zoom(page: Any) -> float:
+    """Zoom capped so a single rendered page can never exceed the long-edge limit."""
+    rect = page.rect
+    long_edge = max(float(rect.width), float(rect.height)) or 1.0
+    return min(1.7, _PDF_RENDER_LONG_EDGE_PX / long_edge)
+
+
+def _ai_page_bytes(path: Path, max_long_edge: int = _AI_IMAGE_LONG_EDGE_PX) -> bytes:
+    """PNG bytes for AI upload, downscaled so large pages stay small in memory."""
+    with Image.open(path) as img:
+        img = img.convert("RGB")
+        long_edge = max(img.width, img.height)
+        if long_edge > max_long_edge:
+            ratio = max_long_edge / float(long_edge)
+            img = img.resize((max(1, int(img.width * ratio)), max(1, int(img.height * ratio))))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+
 def process_document(document_id: int, force: bool = False) -> Tuple[int, str]:
     docs = lquery("SELECT * FROM documents WHERE id=?", (document_id,))
     if not docs:
@@ -1758,8 +1783,8 @@ def process_document(document_id: int, force: bool = False) -> Tuple[int, str]:
             page_no = index + 1
             text = page.get_text("text") or ""
             extracted_all.append(text)
-            matrix = fitz.Matrix(1.7, 1.7)
-            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            zoom = _pdf_render_zoom(page)
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
             image_path = pages_dir / f"doc_{document_id}_page_{page_no}.png"
             pix.save(str(image_path))
             page_type, label = classify_page(text, path.name, page_no)
@@ -1786,6 +1811,7 @@ def process_document(document_id: int, force: bool = False) -> Tuple[int, str]:
             )
             created += 1
         pdf.close()
+        gc.collect()
     elif suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
         img = Image.open(path).convert("RGB")
         image_path = pages_dir / f"doc_{document_id}_page_1.png"
@@ -2244,9 +2270,8 @@ def default_ai_model(provider: str) -> str:
 
 
 def image_data_url(path: Path) -> str:
-    mime = mimetypes.guess_type(path.name)[0] or "image/png"
-    data = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{data}"
+    data = base64.b64encode(_ai_page_bytes(path)).decode("ascii")
+    return f"data:image/png;base64,{data}"
 
 
 def ai_schema() -> Dict[str, Any]:
@@ -2377,8 +2402,7 @@ def _gemini_generate(api_key: str, model: str, prompt: str, blocks: List[Tuple[s
             parts.append({"text": value})
         else:
             path = Path(value)
-            mime = mimetypes.guess_type(path.name)[0] or "image/png"
-            parts.append({"inline_data": {"mime_type": mime, "data": base64.b64encode(path.read_bytes()).decode("ascii")}})
+            parts.append({"inline_data": {"mime_type": "image/png", "data": base64.b64encode(_ai_page_bytes(path)).decode("ascii")}})
     parts.append({"text": "Return a single valid JSON object matching this schema exactly, with no prose:\n" + json.dumps(schema)})
     body = {
         "contents": [{"role": "user", "parts": parts}],
