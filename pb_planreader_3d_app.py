@@ -371,6 +371,7 @@ def init_local_db() -> None:
             image_path TEXT,
             width_px INTEGER,
             height_px INTEGER,
+            render_zoom REAL,
             extracted_text TEXT,
             selected INTEGER DEFAULT 1,
             created_at TEXT,
@@ -520,6 +521,7 @@ def init_local_db() -> None:
     )
     _ensure_measurement_columns(conn)
     _ensure_takeoff_columns(conn)
+    _ensure_pages_columns(conn)
     conn.commit()
     conn.close()
 
@@ -552,6 +554,20 @@ def _ensure_takeoff_columns(conn: sqlite3.Connection) -> None:
     existing = {row[1] for row in conn.execute("PRAGMA table_info(takeoff_rows)").fetchall()}
     if "row_role" not in existing:
         conn.execute("ALTER TABLE takeoff_rows ADD COLUMN row_role TEXT DEFAULT ''")
+
+
+def _ensure_pages_columns(conn: sqlite3.Connection) -> None:
+    """Migrate existing ``pages`` tables to carry the PDF render zoom.
+
+    ``render_zoom`` records the zoom a page image was rasterised at, so the
+    detected drawing scale can be converted to pixels-per-metre exactly
+    (large sheets are capped below the historical 1.7x to bound memory).
+    Legacy rows predating the column were all rendered at 1.7x and fall back
+    to that in ``auto_detect_scale``.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(pages)").fetchall()}
+    if "render_zoom" not in existing:
+        conn.execute("ALTER TABLE pages ADD COLUMN render_zoom REAL")
 
 
 def lquery(sql: str, params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
@@ -1113,10 +1129,13 @@ _SCALE_IN_RE = re.compile(r"\b1\s*in\s*(\d{2,4})\b", re.IGNORECASE)
 def auto_detect_scale(page: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Estimate pixels-per-metre from a drawing scale annotation (e.g. 1:100).
 
-    Pages are rasterised from PDF points at 1.7x, so 1 px = 1/1.7 pt and
-    1 pt = 25.4/72 mm. At scale 1:N, 1 mm on the drawing equals N/1000 m real,
-    giving px_per_m = 1700 / (0.3528 * N). This is only a starting estimate -
-    the user confirms it in the mapper before measured quantities are trusted.
+    Pages are rasterised from PDF points at ``render_zoom`` (capped so a page's
+    long edge never exceeds 2400 px; small sheets stay at 1.7x). At that zoom
+    1 px = 1/zoom pt and 1 pt = 25.4/72 mm. At scale 1:N, 1 mm on the drawing
+    equals N/1000 m real, giving px_per_m = 2834.646 * render_zoom / N. Rows
+    recorded before the zoom was stored assume 1.7x, the historical default.
+    This is only a starting estimate - the user confirms it in the mapper
+    before measured quantities are trusted.
     """
     source = str(page.get("scale_text") or "")
     text = str(page.get("extracted_text") or "")
@@ -1126,7 +1145,8 @@ def auto_detect_scale(page: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     ratio = int(match.group(1))
     if not (10 <= ratio <= 2000):
         return None
-    px_per_m = 1700.0 / (0.352778 * ratio)
+    zoom = to_float(page.get("render_zoom")) or 1.7
+    px_per_m = 2834.6458 * zoom / ratio
     return {"ratio": ratio, "px_per_m": round(px_per_m, 3), "source": match.group(0).strip()}
 
 
@@ -1327,26 +1347,51 @@ def save_measurement_lines(workspace_id: int, page_id: int, lines: Sequence[Dict
             ),
         )
         saved += 1
-        if row_id is not None and (length_m > 0 or area_m2 > 0):
-            unit = normalise_line_unit(ln.get("unit"))
-            if unit == "m2" and area_m2 > 0:
-                value = round(area_m2, 3)
-                qty_for = ldf("SELECT section, element FROM takeoff_rows WHERE id=? AND workspace_id=?", (row_id, workspace_id))
-                if not qty_for.empty:
-                    el_key = f"{qty_for.iloc[0]['section'] or ''} {qty_for.iloc[0]['element'] or ''}".lower()
-                    if perimeter_m > 0 and ("external" in el_key or "cladding" in el_key or "render" in el_key):
-                        value = round(perimeter_m * WALL_HEIGHT_M, 3)
-                lexecute(
-                    "UPDATE takeoff_rows SET quantity=?, quantity_status='Mapped', updated_at=? WHERE id=? AND workspace_id=?",
-                    (value, now, row_id, workspace_id),
-                )
-                synced += 1
-            elif unit == "m" and length_m > 0:
-                lexecute(
-                    "UPDATE takeoff_rows SET quantity=?, quantity_status='Mapped', updated_at=? WHERE id=? AND workspace_id=?",
-                    (round(length_m, 3), now, row_id, workspace_id),
-                )
-                synced += 1
+
+    # Aggregate per take-off row so multiple shapes on the same row SUM to the
+    # row quantity (a wall drawn as several segments, or a floor as several
+    # polygons), matching the documented "sum line lengths / sum polygon areas".
+    agg: Dict[int, Dict[str, float]] = {}
+    for ln in lines or []:
+        row_id = ln.get("takeoff_row_id")
+        if row_id is not None:
+            try:
+                row_id = int(row_id)
+            except (TypeError, ValueError):
+                row_id = None
+            if row_id == 0:
+                row_id = None
+        if row_id is None:
+            continue
+        length_m = to_float(ln.get("length_m"))
+        area_m2 = to_float(ln.get("area_m2"))
+        perimeter_m = to_float(ln.get("perimeter_m"))
+        if length_m <= 0 and area_m2 <= 0:
+            continue
+        bucket = agg.setdefault(row_id, {"unit": normalise_line_unit(ln.get("unit")), "length_m": 0.0, "area_m2": 0.0, "perimeter_m": 0.0})
+        bucket["length_m"] += length_m
+        bucket["area_m2"] += area_m2
+        bucket["perimeter_m"] += perimeter_m
+    for row_id, b in agg.items():
+        unit = b["unit"]
+        if unit == "m2" and b["area_m2"] > 0:
+            value = round(b["area_m2"], 3)
+            qty_for = ldf("SELECT section, element FROM takeoff_rows WHERE id=? AND workspace_id=?", (row_id, workspace_id))
+            if not qty_for.empty:
+                el_key = f"{qty_for.iloc[0]['section'] or ''} {qty_for.iloc[0]['element'] or ''}".lower()
+                if b["perimeter_m"] > 0 and ("external" in el_key or "cladding" in el_key or "render" in el_key):
+                    value = round(b["perimeter_m"] * WALL_HEIGHT_M, 3)
+            lexecute(
+                "UPDATE takeoff_rows SET quantity=?, quantity_status='Mapped', updated_at=? WHERE id=? AND workspace_id=?",
+                (value, now, row_id, workspace_id),
+            )
+            synced += 1
+        elif unit == "m" and b["length_m"] > 0:
+            lexecute(
+                "UPDATE takeoff_rows SET quantity=?, quantity_status='Mapped', updated_at=? WHERE id=? AND workspace_id=?",
+                (round(b["length_m"], 3), now, row_id, workspace_id),
+            )
+            synced += 1
     return {"saved": saved, "synced": synced}
 
 
@@ -1780,9 +1825,9 @@ def index_document_pages(document_id: int) -> Tuple[int, str]:
         extracted.append(text)
         page_type, label = classify_page(text, path.name, page_no)
         lexecute(
-            """INSERT INTO pages(document_id,workspace_id,page_no,page_label,page_type,scale_text,px_per_m,image_path,width_px,height_px,extracted_text,selected,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (document_id, workspace_id, page_no, label, page_type, "", None, "", 0, 0, text, 1, now_stamp()),
+            """INSERT INTO pages(document_id,workspace_id,page_no,page_label,page_type,scale_text,px_per_m,image_path,width_px,height_px,render_zoom,extracted_text,selected,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (document_id, workspace_id, page_no, label, page_type, "", None, "", 0, 0, _pdf_render_zoom(page), text, 1, now_stamp()),
         )
         count += 1
     pdf.close()
@@ -1843,14 +1888,14 @@ def process_document(document_id: int, force: bool = False, page_ids: Optional[S
             existing = lquery("SELECT id FROM pages WHERE document_id=? AND page_no=?", (document_id, page_no))
             if existing:
                 lexecute(
-                    "UPDATE pages SET image_path=?,width_px=?,height_px=?,page_label=?,page_type=?,extracted_text=?,selected=1 WHERE id=?",
-                    (str(image_path), pix.width, pix.height, label, page_type, text, existing[0]["id"]),
+                    "UPDATE pages SET image_path=?,width_px=?,height_px=?,render_zoom=?,page_label=?,page_type=?,extracted_text=?,selected=1 WHERE id=?",
+                    (str(image_path), pix.width, pix.height, zoom, label, page_type, text, existing[0]["id"]),
                 )
             else:
                 lexecute(
-                    """INSERT INTO pages(document_id,workspace_id,page_no,page_label,page_type,scale_text,px_per_m,image_path,width_px,height_px,extracted_text,selected,created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (document_id, workspace_id, page_no, label, page_type, "", None, str(image_path), pix.width, pix.height, text, 1, now_stamp()),
+                    """INSERT INTO pages(document_id,workspace_id,page_no,page_label,page_type,scale_text,px_per_m,image_path,width_px,height_px,render_zoom,extracted_text,selected,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (document_id, workspace_id, page_no, label, page_type, "", None, str(image_path), pix.width, pix.height, zoom, text, 1, now_stamp()),
                 )
             created += 1
         pdf.close()

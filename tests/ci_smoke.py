@@ -224,5 +224,56 @@ ok2, msg2 = app.copy_jobhub_document_to_workspace(bad, wid)
 assert not ok2 and "not reachable" in msg2 and "/var/jobhub" in msg2, msg2
 print("[ok] job_document_blobs base64 blob discovery + fetch + decode + copy; unreachable path reported clearly")
 
+# 8. Scale detection honours the page's actual render zoom (large-sheet cap)
+det_a4 = app.auto_detect_scale({"scale_text": "1:100", "extracted_text": "", "render_zoom": 1.7})
+assert det_a4 and abs(det_a4["px_per_m"] - 48.189) < 0.05, det_a4
+det_a1 = app.auto_detect_scale({"scale_text": "1:100", "extracted_text": "", "render_zoom": 1.425})
+assert det_a1 and abs(det_a1["px_per_m"] - 40.394) < 0.05, det_a1
+det_legacy = app.auto_detect_scale({"scale_text": "1:200", "extracted_text": ""})
+assert det_legacy and abs(det_legacy["px_per_m"] - 24.094) < 0.05, det_legacy
+det_none = app.auto_detect_scale({"scale_text": "no scale", "extracted_text": ""})
+assert det_none is None
+print(f"[ok] auto_detect_scale: A4@1.7x {det_a4['px_per_m']:.3f} px/m, A1@1.425x {det_a1['px_per_m']:.3f} px/m, legacy 1:200 {det_legacy['px_per_m']:.3f} px/m")
+
+# 9. Drawn shapes SUM to row quantities; external footprint rows use perimeter x height
+m_wid = app.create_standalone_workspace("PB25004", "Mapper Sync Job", "b", "")
+m_doc = app.lexecute(
+    "INSERT INTO documents(workspace_id,file_name,path,page_count,extracted_text,uploaded_at) VALUES(?,?,?,?,?,?)",
+    (m_wid, "A1.1 plan.pdf", "/tmp/a1.pdf", 1, "", app.now_stamp()),
+)
+m_pid = app.lexecute(
+    """INSERT INTO pages(document_id,workspace_id,page_no,page_label,page_type,scale_text,px_per_m,image_path,width_px,height_px,render_zoom,extracted_text,selected,created_at)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+    (m_doc, m_wid, 1, "A1.1", "Plan", "", 48.189, "", 2000, 1400, 1.425, "", 1, app.now_stamp()),
+)
+def add_sync_row(section, element, unit):
+    return app.lexecute(
+        """INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,row_role,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (m_wid, section, element, "Level 1 · all areas", "Concrete floor", "Interior coatings", 0, unit, "To measure", "",
+         "", "INCLUSION", 3 if unit == "m²" else 2, 12, 8, 0, "To review", "", "", app.now_stamp(), app.now_stamp()),
+    )
+floor_row = add_sync_row("Internal", "Floor plan", "m²")
+skirt_row = add_sync_row("Internal", "Skirting", "lm")
+ext_row = add_sync_row("External", "External walls / cladding", "m²")
+sync_lines = [
+    {"takeoff_row_id": floor_row, "label": "floor poly 1", "unit": "m²", "kind": "polygon", "points": [[0, 0], [0, 10], [10, 10], [10, 0]], "area_m2": 10.0, "perimeter_m": 40.0, "length_m": 0.0},
+    {"takeoff_row_id": floor_row, "label": "floor poly 2", "unit": "m²", "kind": "polygon", "points": [[0, 0], [0, 15], [15, 15], [15, 0]], "area_m2": 15.0, "perimeter_m": 50.0, "length_m": 0.0},
+    {"takeoff_row_id": skirt_row, "label": "skirt a", "unit": "lm", "kind": "line", "x1": 1.0, "y1": 1.0, "x2": 2.0, "y2": 1.0, "length_m": 3.5, "area_m2": 0.0, "perimeter_m": 0.0},
+    {"takeoff_row_id": skirt_row, "label": "skirt b", "unit": "lm", "kind": "line", "x1": 2.0, "y1": 1.0, "x2": 3.0, "y2": 1.0, "length_m": 2.5, "area_m2": 0.0, "perimeter_m": 0.0},
+    {"takeoff_row_id": ext_row, "label": "ext footprint", "unit": "m²", "kind": "polygon", "points": [[0, 0], [0, 10], [10, 10], [10, 0]], "area_m2": 12.0, "perimeter_m": 40.0, "length_m": 0.0},
+]
+sync_out = app.save_measurement_lines(m_wid, m_pid, sync_lines)
+assert sync_out["saved"] == 5 and sync_out["synced"] == 3, sync_out
+qty_floor = app.ldf("SELECT quantity, quantity_status FROM takeoff_rows WHERE id=? AND workspace_id=?", (floor_row, m_wid))
+assert abs(float(qty_floor.iloc[0]["quantity"]) - 25.0) < 1e-6 and qty_floor.iloc[0]["quantity_status"] == "Mapped", qty_floor
+qty_skirt = app.ldf("SELECT quantity FROM takeoff_rows WHERE id=? AND workspace_id=?", (skirt_row, m_wid))
+assert abs(float(qty_skirt.iloc[0]["quantity"]) - 6.0) < 1e-6, qty_skirt
+qty_ext = app.ldf("SELECT quantity FROM takeoff_rows WHERE id=? AND workspace_id=?", (ext_row, m_wid))
+assert abs(float(qty_ext.iloc[0]["quantity"]) - 40.0 * app.WALL_HEIGHT_M) < 1e-6, qty_ext
+stored_shapes = app.ldf("SELECT COUNT(*) AS n FROM measurement_lines WHERE page_id=?", (m_pid,))
+assert int(stored_shapes.iloc[0]["n"]) == 5, stored_shapes
+print(f"[ok] save_measurement_lines: two floor polygons sum to 25.0 m², two skirting lines sum to 6.0 lm, external footprint = {float(qty_ext.iloc[0]['quantity']):.1f} m² (perimeter x wall height)")
+
 print("CI SMOKE TEST PASSED")
 sys.exit(0)
