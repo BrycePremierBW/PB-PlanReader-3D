@@ -9,13 +9,16 @@ import json
 import math
 import mimetypes
 import os
+import queue
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import zipfile
 from contextlib import contextmanager
@@ -23,7 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -1791,42 +1794,156 @@ _RENDER_PAGE_TIMEOUT_SEC = 180
 _RENDER_RETRY_ZOOM_RATIO = 0.5
 
 
-def _render_pdf_page_safely(
-    pdf_path: str, page_no: int, zoom: float, out_path: str
-) -> Tuple[bool, int, int, str]:
-    """Render one PDF page in a child process so MuPDF crashes cannot kill the app.
+class _RenderWorkerSession:
+    """One long-lived child process that renders pages from a single PDF.
 
-    A crashed or OOM-killed worker returns a non-zero exit code; the page is then
-    retried once at half zoom before being reported as a per-page failure. The
-    caller keeps running either way.
+    The child keeps the document open and rasterises one page at a time on
+    demand, so a whole batch costs a single Python/Fitz startup and the parent
+    never holds the document open while a page is being rendered. A crash or
+    memory spike in the MuPDF rasteriser kills only this worker, never the app.
     """
-    for attempt_zoom in (zoom, zoom * _RENDER_RETRY_ZOOM_RATIO):
+
+    def __init__(self, pdf_path: str) -> None:
+        self.pdf_path = pdf_path
+        self._queue: queue.Queue[str] = queue.Queue()
+        self._proc = subprocess.Popen(
+            [sys.executable, "-u", _RENDER_WORKER_PATH, pdf_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        self._alive = True
+        self._thread = threading.Thread(target=self._read_lines, daemon=True)
+        self._thread.start()
+
+    def _read_lines(self) -> None:
         try:
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    _RENDER_WORKER_PATH,
-                    str(pdf_path),
-                    str(page_no),
-                    str(attempt_zoom),
-                    str(out_path),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=_RENDER_PAGE_TIMEOUT_SEC,
-            )
-        except subprocess.TimeoutExpired:
-            continue
-        if proc.returncode == 0:
-            parts = (proc.stdout or "").strip().split()
-            if len(parts) == 2:
+            if self._proc.stdout is not None:
+                for line in self._proc.stdout:
+                    stripped = line.strip()
+                    if stripped:
+                        self._queue.put(stripped)
+        except Exception:
+            pass
+        finally:
+            self._queue.put("__EOF__")
+
+    def render(self, page_no: int, zoom: float, out_path: str, timeout: float) -> Tuple[bool, int, int, str]:
+        if not self._alive:
+            return False, 0, 0, "render worker is not running"
+        if self._proc.poll() is not None:
+            self._alive = False
+            return False, 0, 0, "render worker exited"
+        try:
+            if self._proc.stdin is not None:
+                self._proc.stdin.write(f"RENDER {page_no} {zoom} {shlex.quote(out_path)}\n")
+                self._proc.stdin.flush()
+        except Exception as exc:
+            self._alive = False
+            return False, 0, 0, f"could not reach render worker: {exc}"
+        try:
+            line = self._queue.get(timeout=timeout)
+        except queue.Empty:
+            self.close()
+            return False, 0, 0, f"page {page_no} render timed out after {int(timeout)}s"
+        if line == "__EOF__":
+            self._alive = False
+            return False, 0, 0, "render worker exited unexpectedly"
+        if line.startswith("OK "):
+            parts = line.split()
+            if len(parts) == 3:
                 try:
-                    return True, int(parts[0]), int(parts[1]), ""
+                    return True, int(parts[1]), int(parts[2]), ""
                 except ValueError:
                     pass
             return True, 0, 0, ""
-        last_error = (proc.stderr or proc.stdout or "").strip()[-300:]
-    return False, 0, 0, last_error or f"page {page_no} failed to render"
+        if line.startswith("ERR "):
+            return False, 0, 0, line[4:].strip()[-300:]
+        return False, 0, 0, line[-300:]
+
+    def close(self) -> None:
+        self._alive = False
+        try:
+            if self._proc.poll() is None:
+                if self._proc.stdin is not None:
+                    try:
+                        self._proc.stdin.write("QUIT\n")
+                        self._proc.stdin.flush()
+                    except Exception:
+                        pass
+                try:
+                    self._proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    self._proc.wait(timeout=5)
+        except Exception:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+        # Let the reader thread finish consuming the pipe before the wrapper is
+        # finalised, so the interpreter never reports "Exception ignored" on a
+        # half-closed pipe during shutdown.
+        try:
+            self._thread.join(timeout=5)
+        except Exception:
+            pass
+        for stream in (self._proc.stdout, self._proc.stdin):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
+
+
+def _render_pdf_pages_in_worker(
+    pdf_path: str,
+    jobs: Sequence[Tuple[int, float, str]],
+    timeout: float = _RENDER_PAGE_TIMEOUT_SEC,
+    progress_cb: Optional[Callable[[int, int, int], None]] = None,
+) -> List[Tuple[int, bool, int, int, str]]:
+    """Render a batch of PDF pages through one persistent child process.
+
+    Returns one ``(page_no, ok, width, height, error)`` entry per job, in
+    order. A failed or timed-out attempt is retried once at half zoom; if the
+    worker dies it is respawned for the retry and all remaining pages.
+    """
+    results: List[Tuple[int, bool, int, int, str]] = []
+    total = len(jobs)
+    session: Optional[_RenderWorkerSession] = None
+    try:
+        for idx, (page_no, zoom, out_path) in enumerate(jobs):
+            ok, width, height, error = False, 0, 0, ""
+            for attempt_zoom in (zoom, zoom * _RENDER_RETRY_ZOOM_RATIO):
+                if session is None or not session._alive:
+                    try:
+                        session = _RenderWorkerSession(pdf_path)
+                    except Exception as exc:
+                        error = f"could not start render worker: {exc}"
+                        break
+                ok, width, height, error = session.render(page_no, attempt_zoom, out_path, timeout)
+                if ok:
+                    break
+            if ok:
+                results.append((page_no, True, width, height, ""))
+            else:
+                results.append((page_no, False, 0, 0, error or f"page {page_no} failed to render"))
+            if progress_cb is not None:
+                progress_cb(idx + 1, total, page_no)
+    finally:
+        if session is not None:
+            session.close()
+    return results
+
+
+def _render_pdf_page_safely(
+    pdf_path: str, page_no: int, zoom: float, out_path: str
+) -> Tuple[bool, int, int, str]:
+    """Render one PDF page in a child process so MuPDF crashes cannot kill the app."""
+    results = _render_pdf_pages_in_worker(pdf_path, [(page_no, zoom, out_path)])
+    ok, width, height, error = results[0][1], results[0][2], results[0][3], results[0][4]
+    return ok, width, height, error
 
 
 def _ai_page_bytes(path: Path, max_long_edge: int = _AI_IMAGE_LONG_EDGE_PX) -> bytes:
@@ -1884,7 +2001,12 @@ def index_document_pages(document_id: int) -> Tuple[int, str]:
     return count, "Indexed"
 
 
-def process_document(document_id: int, force: bool = False, page_ids: Optional[Sequence[int]] = None) -> Tuple[int, str]:
+def process_document(
+    document_id: int,
+    force: bool = False,
+    page_ids: Optional[Sequence[int]] = None,
+    progress_cb: Optional[Callable[[int, int, int], None]] = None,
+) -> Tuple[int, str]:
     """Render a document's page images. When page_ids is given, only those PDF
     pages are rendered; existing page rows are updated in place.
     """
@@ -1918,8 +2040,8 @@ def process_document(document_id: int, force: bool = False, page_ids: Optional[S
     if suffix == ".pdf":
         if fitz is None:
             raise RuntimeError("PyMuPDF is not installed; PDFs cannot be processed.")
+        jobs: List[Tuple[int, float, str, str, str, str]] = []
         pdf = fitz.open(path)
-        failures: List[str] = []
         for index, page in enumerate(pdf):
             page_no = index + 1
             if page_ids is not None and page_no not in page_ids:
@@ -1927,29 +2049,39 @@ def process_document(document_id: int, force: bool = False, page_ids: Optional[S
             text = page.get_text("text") or ""
             extracted_all.append(text)
             zoom = _pdf_render_zoom(page)
+            page_type, label = classify_page(text, path.name, page_no)
             image_path = pages_dir / f"doc_{document_id}_page_{page_no}.png"
-            ok, width, height, render_error = _render_pdf_page_safely(
-                str(path), page_no, zoom, str(image_path)
-            )
+            jobs.append((page_no, zoom, str(image_path), text, page_type, label))
+        pdf.close()
+        gc.collect()
+        if not jobs:
+            return 0, "No pages selected"
+        results = _render_pdf_pages_in_worker(
+            str(path),
+            [(page_no, zoom, image_path) for page_no, zoom, image_path, _t, _ty, _l in jobs],
+            _RENDER_PAGE_TIMEOUT_SEC,
+            progress_cb,
+        )
+        result_by_page = {r[0]: r for r in results}
+        failures: List[str] = []
+        for page_no, zoom, image_path, text, page_type, label in jobs:
+            _pno, ok, width, height, render_error = result_by_page[page_no]
             if not ok:
                 failures.append(f"page {page_no}: {render_error}")
                 continue
-            page_type, label = classify_page(text, path.name, page_no)
             existing = lquery("SELECT id FROM pages WHERE document_id=? AND page_no=?", (document_id, page_no))
             if existing:
                 lexecute(
                     "UPDATE pages SET image_path=?,width_px=?,height_px=?,render_zoom=?,page_label=?,page_type=?,extracted_text=?,selected=1 WHERE id=?",
-                    (str(image_path), width, height, zoom, label, page_type, text, existing[0]["id"]),
+                    (image_path, width, height, zoom, label, page_type, text, existing[0]["id"]),
                 )
             else:
                 lexecute(
                     """INSERT INTO pages(document_id,workspace_id,page_no,page_label,page_type,scale_text,px_per_m,image_path,width_px,height_px,render_zoom,extracted_text,selected,created_at)
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (document_id, workspace_id, page_no, label, page_type, "", None, str(image_path), width, height, zoom, text, 1, now_stamp()),
+                    (document_id, workspace_id, page_no, label, page_type, "", None, image_path, width, height, zoom, text, 1, now_stamp()),
                 )
             created += 1
-        pdf.close()
-        gc.collect()
         if failures:
             return created, f"Processed with {len(failures)} page(s) that failed to render: {'; '.join(failures[:5])}"
     elif suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
@@ -4876,18 +5008,43 @@ def project_documents_page(workspace: Dict[str, Any], bridge: Optional[JobHubBri
             options={f"#{int(r.id)} — {r.file_name} ({int(r.page_count or 0)} pages)":int(r.id) for r in docs.itertuples()}
             selected=st.multiselect("Select documents",list(options.keys()),default=list(options.keys()))
             force=st.checkbox("Reprocess and replace existing rendered pages")
-            if selected and st.button("Process selected documents",type="primary"):
-                progress=st.progress(0)
-                messages=[]
-                for i,label in enumerate(selected):
+            if selected and st.button("Process selected documents", type="primary"):
+                progress = st.progress(0)
+                status = st.empty()
+                messages = []
+                selected_ids = [options[label] for label in selected]
+                page_rows = ldf(
+                    "SELECT id, page_count FROM documents WHERE id IN (%s)" % ",".join(["?"] * len(selected_ids)),
+                    selected_ids,
+                )
+                page_by_doc = {int(r.id): int(r.page_count or 0) for r in page_rows.itertuples()}
+                grand_total = max(1, sum(page_by_doc.values()))
+                done = [0]
+
+                def _render_progress(_completed, _total, page_no, doc_label):
+                    done[0] += 1
+                    progress.progress(min(done[0] / grand_total, 1.0))
+                    status.caption(f"{doc_label}: rendering page {page_no}")
+
+                for i, label in enumerate(selected):
+                    estimated = page_by_doc.get(options[label]) or 1
                     try:
-                        count,msg=process_document(options[label],force=force)
+                        count, msg = process_document(
+                            options[label],
+                            force=force,
+                            progress_cb=lambda c, t, p, l=label: _render_progress(c, t, p, l),
+                        )
                         messages.append(f"{label}: {count} page(s) — {msg}")
                     except Exception as exc:
                         messages.append(f"{label}: ERROR — {exc}")
-                    progress.progress((i+1)/len(selected))
-                st.code("\n".join(messages))
+                        done[0] += estimated
+                        progress.progress(min(done[0] / grand_total, 1.0))
+                progress.progress(1.0)
+                status.empty()
+                st.session_state["pb_process_messages"] = messages
                 st.rerun()
+            if st.session_state.get("pb_process_messages"):
+                st.code("\n".join(st.session_state["pb_process_messages"]))
     with tabs[4]:
         docs=ldf("SELECT id,file_name,source_type,category,page_count,uploaded_at,path FROM documents WHERE workspace_id=? ORDER BY id DESC", (workspace["id"],))
         st.dataframe(docs,use_container_width=True,hide_index=True)

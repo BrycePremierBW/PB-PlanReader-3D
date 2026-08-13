@@ -303,6 +303,14 @@ _ok, _w, _h, _err = app._render_pdf_page_safely(_pdf_path, 99, 1.7, os.path.join
 assert not _ok and _err, (_ok, _err)
 assert app._render_pdf_page_safely(os.path.join(_pdf_tmp, "missing.pdf"), 1, 1.7, os.path.join(_pdf_tmp, "m.png"))[0] is False
 print("[ok] _render_pdf_page_safely: bad page and missing file return per-page errors without killing the process")
+# A batch through one persistent worker: page 99 fails, the real pages still render, all in order.
+_batch = app._render_pdf_pages_in_worker(
+    _pdf_path,
+    [(1, 1.7, os.path.join(_pdf_tmp, "b1.png")), (99, 1.7, os.path.join(_pdf_tmp, "b99.png")), (2, 1.7, os.path.join(_pdf_tmp, "b2.png"))],
+)
+assert _batch[0][1] is True and _batch[1][1] is False and _batch[2][1] is True, _batch
+assert Path(_batch[0][2] and os.path.join(_pdf_tmp, "b1.png")).exists() and Path(os.path.join(_pdf_tmp, "b2.png")).exists()
+print("[ok] _render_pdf_pages_in_worker: one persistent worker handles a batch; a bad page fails without stopping later pages")
 
 print("CI SMOKE TEST PASSED")
 sys.exit(0)
