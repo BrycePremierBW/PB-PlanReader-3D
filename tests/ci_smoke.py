@@ -275,5 +275,34 @@ stored_shapes = app.ldf("SELECT COUNT(*) AS n FROM measurement_lines WHERE page_
 assert int(stored_shapes.iloc[0]["n"]) == 5, stored_shapes
 print(f"[ok] save_measurement_lines: two floor polygons sum to 25.0 m², two skirting lines sum to 6.0 lm, external footprint = {float(qty_ext.iloc[0]['quantity']):.1f} m² (perimeter x wall height)")
 
+# 10. PDF page rendering runs in an isolated child process and survives per-page failures
+import fitz as _fitz
+import subprocess as _subprocess
+_pdf_tmp = tempfile.mkdtemp(prefix="ci_render_")
+_pdf_path = os.path.join(_pdf_tmp, "render_plan.pdf")
+_pdf_doc = _fitz.open()
+for _i in range(2):
+    _p = _pdf_doc.new_page(width=841.89, height=595.28)
+    _p.insert_text((72, 72), f"Scale 1:100 sheet {_i + 1}")
+_pdf_doc.save(_pdf_path)
+_pdf_doc.close()
+r_wid = app.create_standalone_workspace("PB25005", "Render Isolation Job", "b", "")
+r_doc = app.lexecute(
+    "INSERT INTO documents(workspace_id,file_name,mime_type,path,page_count,extracted_text,uploaded_at) VALUES(?,?,?,?,?,?,?)",
+    (r_wid, "render_plan.pdf", "application/pdf", _pdf_path, 0, "", app.now_stamp()),
+)
+app.index_document_pages(r_doc)
+r_count, r_msg = app.process_document(r_doc, force=False)
+assert r_count == 2 and "Failed" not in r_msg, (r_count, r_msg)
+r_pages = app.lquery("SELECT page_no,render_zoom,width_px,height_px,image_path FROM pages WHERE document_id=?", (r_doc,))
+assert len(r_pages) == 2 and all(p["render_zoom"] and Path(p["image_path"]).exists() for p in r_pages), r_pages
+assert r_pages[0]["width_px"] > 0 and abs(r_pages[0]["render_zoom"] - 1.7) < 1e-9, r_pages[0]
+print(f"[ok] process_document: 2 PDF pages rendered in a child process, zoom={r_pages[0]['render_zoom']}, {r_pages[0]['width_px']}x{r_pages[0]['height_px']}")
+# A crashing page must be reported, never crash the app process.
+_ok, _w, _h, _err = app._render_pdf_page_safely(_pdf_path, 99, 1.7, os.path.join(_pdf_tmp, "out.png"))
+assert not _ok and _err, (_ok, _err)
+assert app._render_pdf_page_safely(os.path.join(_pdf_tmp, "missing.pdf"), 1, 1.7, os.path.join(_pdf_tmp, "m.png"))[0] is False
+print("[ok] _render_pdf_page_safely: bad page and missing file return per-page errors without killing the process")
+
 print("CI SMOKE TEST PASSED")
 sys.exit(0)

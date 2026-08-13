@@ -12,6 +12,8 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import textwrap
 import time
@@ -1784,6 +1786,49 @@ def _pdf_render_zoom(page: Any) -> float:
     return min(1.7, _PDF_RENDER_LONG_EDGE_PX / long_edge)
 
 
+_RENDER_WORKER_PATH = str(Path(__file__).resolve().parent / "pb_render_worker.py")
+_RENDER_PAGE_TIMEOUT_SEC = 180
+_RENDER_RETRY_ZOOM_RATIO = 0.5
+
+
+def _render_pdf_page_safely(
+    pdf_path: str, page_no: int, zoom: float, out_path: str
+) -> Tuple[bool, int, int, str]:
+    """Render one PDF page in a child process so MuPDF crashes cannot kill the app.
+
+    A crashed or OOM-killed worker returns a non-zero exit code; the page is then
+    retried once at half zoom before being reported as a per-page failure. The
+    caller keeps running either way.
+    """
+    for attempt_zoom in (zoom, zoom * _RENDER_RETRY_ZOOM_RATIO):
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    _RENDER_WORKER_PATH,
+                    str(pdf_path),
+                    str(page_no),
+                    str(attempt_zoom),
+                    str(out_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_RENDER_PAGE_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired:
+            continue
+        if proc.returncode == 0:
+            parts = (proc.stdout or "").strip().split()
+            if len(parts) == 2:
+                try:
+                    return True, int(parts[0]), int(parts[1]), ""
+                except ValueError:
+                    pass
+            return True, 0, 0, ""
+        last_error = (proc.stderr or proc.stdout or "").strip()[-300:]
+    return False, 0, 0, last_error or f"page {page_no} failed to render"
+
+
 def _ai_page_bytes(path: Path, max_long_edge: int = _AI_IMAGE_LONG_EDGE_PX) -> bytes:
     """PNG bytes for AI upload, downscaled so large pages stay small in memory."""
     with Image.open(path) as img:
@@ -1874,6 +1919,7 @@ def process_document(document_id: int, force: bool = False, page_ids: Optional[S
         if fitz is None:
             raise RuntimeError("PyMuPDF is not installed; PDFs cannot be processed.")
         pdf = fitz.open(path)
+        failures: List[str] = []
         for index, page in enumerate(pdf):
             page_no = index + 1
             if page_ids is not None and page_no not in page_ids:
@@ -1881,25 +1927,31 @@ def process_document(document_id: int, force: bool = False, page_ids: Optional[S
             text = page.get_text("text") or ""
             extracted_all.append(text)
             zoom = _pdf_render_zoom(page)
-            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
             image_path = pages_dir / f"doc_{document_id}_page_{page_no}.png"
-            pix.save(str(image_path))
+            ok, width, height, render_error = _render_pdf_page_safely(
+                str(path), page_no, zoom, str(image_path)
+            )
+            if not ok:
+                failures.append(f"page {page_no}: {render_error}")
+                continue
             page_type, label = classify_page(text, path.name, page_no)
             existing = lquery("SELECT id FROM pages WHERE document_id=? AND page_no=?", (document_id, page_no))
             if existing:
                 lexecute(
                     "UPDATE pages SET image_path=?,width_px=?,height_px=?,render_zoom=?,page_label=?,page_type=?,extracted_text=?,selected=1 WHERE id=?",
-                    (str(image_path), pix.width, pix.height, zoom, label, page_type, text, existing[0]["id"]),
+                    (str(image_path), width, height, zoom, label, page_type, text, existing[0]["id"]),
                 )
             else:
                 lexecute(
                     """INSERT INTO pages(document_id,workspace_id,page_no,page_label,page_type,scale_text,px_per_m,image_path,width_px,height_px,render_zoom,extracted_text,selected,created_at)
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (document_id, workspace_id, page_no, label, page_type, "", None, str(image_path), pix.width, pix.height, zoom, text, 1, now_stamp()),
+                    (document_id, workspace_id, page_no, label, page_type, "", None, str(image_path), width, height, zoom, text, 1, now_stamp()),
                 )
             created += 1
         pdf.close()
         gc.collect()
+        if failures:
+            return created, f"Processed with {len(failures)} page(s) that failed to render: {'; '.join(failures[:5])}"
     elif suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
         img = Image.open(path).convert("RGB")
         image_path = pages_dir / f"doc_{document_id}_page_1.png"
