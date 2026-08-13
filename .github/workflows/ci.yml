@@ -31,6 +31,9 @@ jobs:
       - name: Check undefined names and local-scope errors
         run: ruff check --select F821,F823 .
 
+      - name: Gemini auth and secret-redaction tests
+        run: PYTHONPATH=. python tests/test_gemini_auth.py
+
       - name: PlanReader take-off accuracy tests
         run: PYTHONPATH=. python tests/test_planreader_accuracy.py
 
