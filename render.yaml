@@ -4,7 +4,7 @@ services:
     runtime: python
     pythonVersion: "3.14"
     buildCommand: pip install -r requirements.txt
-    startCommand: streamlit run pb_planreader_v11_app.py --server.address 0.0.0.0 --server.port $PORT
+    startCommand: streamlit run pb_planreader_v126_app.py --server.address 0.0.0.0 --server.port $PORT
     envVars:
       - key: PLANREADER_DATA_DIR
         value: /var/data/planreader
