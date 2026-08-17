@@ -1,0 +1,13 @@
+# Premier Brushworks PlanReader 3D Application Dependencies
+streamlit>=1.35.0
+streamlit-option-menu>=0.3.0
+pandas>=2.1.0
+plotly>=5.15.0
+reportlab>=4.0.0
+pyyaml>=6.0.1
+sqlalchemy>=2.0.0
+psycopg2-binary>=3.1.0
+openpyxl>=3.1.0
+plotly>=5.15.0
+python-dotenv>=1.0.0
+reportlab-utils>=1.0.0
