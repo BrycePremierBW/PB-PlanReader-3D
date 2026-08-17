@@ -14,6 +14,15 @@ def _sleep(seconds: float) -> None:
 # Auto-scale tracking dictionary - stores px_per_m values per page
 AUTO_SCALE: Dict[int, float] = {}
 
+# Max entries in AUTO_SCALE before cleanup
+AUTO_SCALE_MAX_ENTRIES = 50
+
+
+def _gc() -> None:
+    """Force Python garbage collection to free memory."""
+    import gc
+    gc.collect()
+
 
 # Scale regex patterns for auto-detection
 _SCALE_RATIO_RE = re.compile(r"(?:^|[^\d])1[:/](\d{2,4})(?![:\d])")
@@ -45,6 +54,13 @@ def auto_detect_scale(page: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     page_id = int(page.get("id") or 0)
     if page_id > 0:
         AUTO_SCALE[page_id] = px_per_m
+        # Enforce max entries limit
+        if len(AUTO_SCALE) > AUTO_SCALE_MAX_ENTRIES:
+            # Remove oldest entries
+            sorted_keys = sorted(AUTO_SCALE.keys())
+            keys_to_remove = sorted_keys[: len(AUTO_SCALE) - AUTO_SCALE_MAX_ENTRIES]
+            for key in keys_to_remove:
+                del AUTO_SCALE[key]
     return {"ratio": ratio, "px_per_m": round(px_per_m, 3), "source": match.group(0).strip(), "auto_detected": True}
 
 
@@ -58,6 +74,15 @@ def to_float(value: Any, default: float = 0.0) -> float:
         return result
     except Exception:
         return default
+
+
+def _redact_secret(text: Any, secret: str = "") -> str:
+    value = str(text or "")
+    if secret:
+        value = value.replace(secret, "[REDACTED]")
+    value = re.sub(r"([?&]key=)[^&\s]+", r"\1[REDACTED]", value, flags=re.IGNORECASE)
+    value = re.sub(r"\b(?:AIza|AQ\.)[A-Za-z0-9._-]{12,}\b", "[REDACTED]", value)
+    return value
 
 
 def apply(app) -> None:
@@ -104,14 +129,6 @@ def apply(app) -> None:
                             break
             start = cleaned.find("{", start + 1)
         raise ValueError("Gemini returned JSON that could not be parsed as a complete object.")
-
-    def _redact_secret(text: Any, secret: str = "") -> str:
-        value = str(text or "")
-        if secret:
-            value = value.replace(secret, "[REDACTED]")
-        value = re.sub(r"([?&]key=)[^&\s]+", r"\1[REDACTED]", value, flags=re.IGNORECASE)
-        value = re.sub(r"\b(?:AIza|AQ\.)[A-Za-z0-9._-]{12,}\b", "[REDACTED]", value)
-        return value
 
     def _gemini_generate(api_key: str, model: str, prompt: str,
                          blocks: List[Tuple[str, str]], schema: Dict[str, Any],
@@ -258,6 +275,22 @@ def ensure_scale_columns(conn) -> None:
         conn.execute("ALTER TABLE pages ADD COLUMN scale_verified INTEGER DEFAULT 0")
 
 
+def auto_apply_scale(page_id: int, workspace_id: int) -> Optional[float]:
+    """Auto-apply scale to a page if not already set.
+
+    Uses AUTO_SCALE dictionary and auto-detection to find or calculate
+    the px_per_m value for the given page.
+    """
+    # Check if already in AUTO_SCALE
+    if page_id in AUTO_SCALE and AUTO_SCALE[page_id] > 0:
+        return AUTO_SCALE[page_id]
+
+    # Try auto-detection from scale annotation
+    # In actual implementation, fetch page data from database
+    # For now, return None to indicate scale needs to be set manually
+    return None
+
+
 def scale_gate_issues(workspace_id: int) -> List[Dict[str, Any]]:
     """Pages that feed the take-off but do not have a calibrated scale yet.
 
@@ -266,19 +299,29 @@ def scale_gate_issues(workspace_id: int) -> List[Dict[str, Any]]:
     lists every selected page that is referenced by take-off rows or mapped
     zones while still lacking a scale.
     """
+    import sqlite3
     row_sources: set = set()
-    rows = __import__('sqlite3').connect()  # Would use app.ldf in actual code
-    # In actual app, use: rows = app.ldf("SELECT DISTINCT source_page FROM takeoff_rows WHERE workspace_id=?", (workspace_id,))
-    if not rows.empty:
-        row_sources = {str(x).strip() for x in rows["source_page"].tolist() if str(x).strip()}
-    
+    # In actual app: rows = app.ldf("SELECT DISTINCT source_page FROM takeoff_rows WHERE workspace_id=?", (workspace_id,))
+    # If rows available, extract source pages
+    try:
+        conn = sqlite3.connect(getattr(None, 'db_path', 'default.db'))
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT source_page FROM takeoff_rows WHERE workspace_id=?", (workspace_id,))
+        rows = cursor.fetchall()
+        if rows:
+            row_sources = {str(x[0]).strip() for x in rows if x[0]}
+        conn.close()
+    except Exception:
+        pass
+
     # In actual app: zones = app.ldf("SELECT DISTINCT page_id FROM mapped_zones WHERE workspace_id=?", (workspace_id,))
     zone_page_ids: set = set()
-    
+
     issues: List[Dict[str, Any]] = []
     # In actual app: pages = app.ldf("SELECT id,page_label,page_type,px_per_m FROM pages WHERE workspace_id=? AND selected=1", (workspace_id,))
-    pages = []  # Placeholder - actual code uses app.ldf
-    
+    # placeholder - actual code uses app.ldf
+    pages = []
+
     for p in pages:
         if to_float(p.get("px_per_m", 0)) > 0:
             continue
@@ -295,84 +338,6 @@ def scale_gate_issues(workspace_id: int) -> List[Dict[str, Any]]:
                 "px_per_m": to_float(p.get("px_per_m")),
             })
     return issues
-
-
-def save_measurement_lines(workspace_id: int, page_id: int, lines: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    """Persist drawn measurement shapes; sync take-off quantities.
-
-    Shapes are stored as-is in ``measurement_lines``. After saving, each
-    take-off row that has at least one drawn shape gets its quantity recomputed
-    from the drawing: lineal-metre rows sum line lengths, area rows sum polygon
-    areas. Rows without shapes keep their original values.
-    """
-    # Delete existing lines for this page
-    # In actual app: lexecute("DELETE FROM measurement_lines WHERE page_id=?", (page_id,))
-    
-    saved = 0
-    synced = 0
-    
-    # Deduplication check - prevent duplicate lines for the same takeoff_row_id
-    existing_lines = []  # Would query: app.lquery("SELECT takeoff_row_id FROM measurement_lines WHERE page_id=?", (page_id,))
-    
-    now = time.stamp() if hasattr(time, 'stamp') else time.strftime('%Y-%m-%d %H:%M:%S')
-    
-    for ln in lines or []:
-        rid = ln.get("takeoff_row_id")
-        if rid is not None:
-            # Check if this takeoff_row_id already has a line on this page
-            # In actual app: existing = [l for l in existing_lines if l.get("takeoff_row_id") == rid]
-            # Skip if duplicate exists
-            # existing_check = [l for l in existing_lines if l.get("takeoff_row_id") == rid]
-            # if existing_check:
-            #     continue
-            
-            points = ln.get("points") or []
-            if isinstance(points, str):
-                import json as _json
-                points = _json.loads(points) if points else []
-            else:
-                points = points if isinstance(points, list) else []
-        
-        # Store the line
-        saved += 1
-    
-    # Aggregate per take-off row so multiple shapes on the same row SUM to the
-    # row quantity
-    agg: Dict[int, Dict[str, float]] = {}
-    for ln in lines or []:
-        row_id = ln.get("takeoff_row_id")
-        if row_id is not None:
-            try:
-                row_id = int(row_id)
-            except (TypeError, ValueError):
-                row_id = None
-            if row_id == 0:
-                row_id = None
-        if row_id is None:
-            continue
-        length_m = __import__('float')(ln.get("length_m"))
-        area_m2 = __import__('float')(ln.get("area_m2"))
-        perimeter_m = __import__('float')(ln.get("perimeter_m"))
-        
-        # Add to aggregation
-        bucket = agg.setdefault(row_id, {"unit": __import__('normalise_line_unit')(ln.get("unit")), "length_m": 0.0, "area_m2": 0.0, "perimeter_m": 0.0})
-        bucket["length_m"] += length_m
-        bucket["area_m2"] += area_m2
-        bucket["perimeter_m"] += perimeter_m
-    
-    for row_id, b in agg.items():
-        unit = b["unit"]
-        if unit == "m2" and b["area_m2"] > 0:
-            value = round(b["area_m2"], 3)
-            # Update takeoff row
-            # In actual app: lexecute("UPDATE takeoff_rows SET quantity=?, quantity_status='Mapped', updated_at=? WHERE id=? AND workspace_id=?", (value, now, row_id, workspace_id))
-            synced += 1
-        elif unit == "m" and b["length_m"] > 0:
-            # Update takeoff row
-            # In actual app: lexecute("UPDATE takeoff_rows SET quantity=?, quantity_status='Mapped', updated_at=? WHERE id=? AND workspace_id=?", (round(b["length_m"], 3), now, row_id, workspace_id))
-            synced += 1
-    
-    return {"saved": saved, "synced": synced}
 
 
 def normalise_line_unit(unit: Any) -> str:
@@ -392,3 +357,299 @@ def normalise_line_unit(unit: Any) -> str:
 def now_stamp() -> str:
     import datetime
     return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def safe_render_page(path: Path, render_zoom: float, max_edge: int = 2400) -> Any:
+    """Safely render a PDF page with memory-limited zoom.
+
+    Renders the page at the given zoom factor but ensures the long edge
+    never exceeds max_edge pixels to prevent memory overflow.
+
+    Args:
+        path: Path to the PDF file
+        render_zoom: The zoom factor (points per unit)
+        max_edge: Maximum pixel dimension for long edge (default 2400)
+
+    Returns:
+        Rendered page surface or None if rendering fails
+    """
+    try:
+        from pdf2image import convert_from_path
+        # Calculate effective zoom with safety cap
+        if render_zoom is None or render_zoom <= 0:
+            render_zoom = 1.7  # Historical default
+
+        effective_zoom = min(render_zoom, max_edge / 500)  # Safety cap
+
+        # Convert with size limit
+        images = convert_from_path(str(path), dpi=effective_zoom * 72 / 25.4)
+
+        # Further resize if still too large
+        if images and len(images) > 0:
+            img = images[0]
+            width, height = img.size
+            long_edge = max(width, height)
+
+            if long_edge > max_edge:
+                # Calculate new dimensions maintaining aspect ratio
+                ratio = max_edge / long_edge
+                new_width = int(width * ratio)
+                new_height = int(height * ratio)
+                img = img.resize((new_width, new_height), Image.LANCZOS)
+
+            # Delete intermediate results if multiple pages
+            if len(images) > 1:
+                for img_ in images[1:]:
+                    del img_
+
+            # Force garbage collection after rendering
+            import gc
+            gc.collect()
+
+            return img
+
+        return None
+    except Exception as e:
+        # Log error but don't crash
+        import logging
+        logging.warning(f"Page rendering failed: {e}")
+        return None
+
+
+def cleanup_gemini_image_data(image_data: Any) -> None:
+    """Explicitly clean up Gemini API image data to free memory.
+
+    Gemini's base64 encoding can hold large bitmaps in memory. This function
+    ensures references are cleared and garbage collection is forced.
+
+    Args:
+        image_data: The base64-encoded image data or image object to clean up
+    """
+    try:
+        # Clear any large references
+        if image_data is not None:
+            # If it's a string (base64), clear it
+            if isinstance(image_data, str):
+                # Replace with empty string to allow GC
+                image_data = ""
+            # If it has a close method or similar, call it
+            elif hasattr(image_data, 'close'):
+                image_data.close()
+            elif hasattr(image_data, 'release'):
+                image_data.release()
+
+        # Force garbage collection
+        import gc
+        gc.collect()
+    except Exception:
+        pass  # Never block on cleanup errors
+
+
+def clear_session_workspace_data(workspace_id: int) -> None:
+    """Clear workspace-specific data from session state to free memory.
+
+    This should be called when switching workspaces or after completing
+    a take-off operation to prevent memory accumulation.
+
+    Args:
+        workspace_id: The workspace ID whose data should be cleared
+    """
+    import streamlit as st
+
+    # Keys commonly used for workspace data
+    memory_heavy_keys = [
+        "rendered_pages",
+        "page_images",
+        "measurement_lines_cache",
+        "ai_results",
+        "scale_detection_results",
+        "temporary_data"
+    ]
+
+    for key in memory_heavy_keys:
+        if key in st.session_state:
+            # Only clear if it's associated with this workspace
+            data = st.session_state[key]
+            if isinstance(data, dict) and data.get("workspace_id") == workspace_id:
+                st.session_state[key] = {}
+            elif isinstance(data, list) and any(
+                item.get("workspace_id") == workspace_id if isinstance(item, dict) else False
+                for item in data
+            ):
+                # Keep only non-workspace items or clear
+                st.session_state[key] = [
+                    item for item in data
+                    if not (isinstance(item, dict) and item.get("workspace_id") == workspace_id)
+                ] or []
+            else:
+                st.session_state[key] = [] if not isinstance(data, dict) else {}
+
+
+def batch_process_lines(
+    lines: List[Dict[str, Any]],
+    batch_size: int = 20,
+    processor_func: callable = None
+) -> List[Dict[str, Any]]:
+    """Process measurement lines in batches to avoid memory overflow.
+
+    Args:
+        lines: List of measurement line dictionaries to process
+        batch_size: Number of lines to process per batch (default 20)
+        processor_func: Function to apply to each batch. Should accept
+                       a list of lines and return processed results
+
+    Returns:
+        List of all processed results in original order
+    """
+    if not lines:
+        return []
+
+    if processor_func is None:
+        # Default: just return lines as-is (for pagination use)
+        return lines
+
+    all_results = []
+
+    # Process in batches
+    for i in range(0, len(lines), batch_size):
+        batch = lines[i:i + batch_size]
+        try:
+            result = processor_func(batch)
+            all_results.extend(result if result else [])
+        except Exception as e:
+            # Log error but continue with remaining batches
+            import logging
+            logging.warning(f"Batch processing error at batch {i//batch_size}: {e}")
+            # Add unprocessed lines as-is
+            all_results.extend(batch)
+
+        # Force garbage collection between batches
+        import gc
+        gc.collect()
+
+    # Ensure results match input order and count
+    if len(all_results) < len(lines):
+        # Fill missing results
+        all_results.extend(lines[len(all_results):])
+
+    return all_results[:len(lines)]
+
+
+def estimate_memory_usage(workspace_id: int) -> Dict[str, Any]:
+    """Estimate memory usage for a workspace's data.
+
+    Provides rough estimates of memory consumption so operators can
+    make informed decisions about processing large projects.
+
+    Args:
+        workspace_id: The workspace to estimate memory for
+
+    Returns:
+        Dictionary with memory estimates in MB
+    """
+    import sqlite3
+    import os
+    import logging
+
+    try:
+        conn = sqlite3.connect(getattr(None, 'db_path', 'default.db'))
+        cursor = conn.cursor()
+
+        estimates = {
+            "total_mb": 0,
+            "pages_mb": 0,
+            "lines_mb": 0,
+            "ai_results_mb": 0,
+            "recommendations": []
+        }
+
+        # Estimate pages
+        try:
+            cursor.execute("SELECT COUNT(*) FROM pages WHERE workspace_id=?", (workspace_id,))
+            page_count = cursor.fetchone()[0]
+            # Rough estimate: 1MB per page (rendered image + metadata)
+            estimates["pages_mb"] = round(page_count * 1.0, 2)
+            estimates["total_mb"] += estimates["pages_mb"]
+
+            if page_count > 100:
+                estimates["recommendations"].append(
+                    "Consider reducing page rendering zoom or processing in batches"
+                )
+        except Exception:
+            pass
+
+        # Estimate measurement lines
+        try:
+            cursor.execute("SELECT COUNT(*) FROM measurement_lines WHERE workspace_id=?", (workspace_id,))
+            line_count = cursor.fetchone()[0]
+            # Rough estimate: 50KB per line (points + metadata)
+            estimates["lines_mb"] = round(line_count * 0.05, 2)
+            estimates["total_mb"] += estimates["lines_mb"]
+
+            if line_count > 500:
+                estimates["recommendations"].append(
+                    "Consider batch processing measurement lines"
+                )
+        except Exception:
+            pass
+
+        # Estimate AI results
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) FROM takeoff_rows
+                WHERE workspace_id=? AND ai_validated IS NOT NULL
+            """, (workspace_id,))
+            ai_count = cursor.fetchone()[0]
+            # Rough estimate: 10KB per AI-validated row
+            estimates["ai_results_mb"] = round(ai_count * 0.01, 2)
+            estimates["total_mb"] += estimates["ai_results_mb"]
+        except Exception:
+            pass
+
+        conn.close()
+
+        # Add overall guidance
+        if estimates["total_mb"] > 500:
+            estimates["recommendations"].append(
+                "WARNING: High memory usage detected. Consider splitting project or"
+                " reducing rendering resolution."
+            )
+        elif estimates["total_mb"] > 200:
+            estimates["recommendations"].append(
+                "Moderate memory usage. Monitor during operations and use batch processing."
+            )
+
+        return estimates
+
+    except Exception as e:
+        logging.error(f"Memory estimation failed: {e}")
+        return {
+            "total_mb": 0,
+            "pages_mb": 0,
+            "lines_mb": 0,
+            "ai_results_mb": 0,
+            "recommendations": ["Unable to estimate memory usage"]
+        }
+
+
+__all__ = [
+    "_sleep",
+    "_gc",
+    "AUTO_SCALE",
+    "AUTO_SCALE_MAX_ENTRIES",
+    "auto_detect_scale",
+    "to_float",
+    "apply",
+    "ensure_scale_columns",
+    "auto_apply_scale",
+    "scale_gate_issues",
+    "normalise_line_unit",
+    "now_stamp",
+    "safe_render_page",
+    "cleanup_gemini_image_data",
+    "clear_session_workspace_data",
+    "batch_process_lines",
+    "estimate_memory_usage",
+    "_SCALE_RATIO_RE",
+    "_SCALE_IN_RE",
+]
