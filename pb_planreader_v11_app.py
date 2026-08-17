@@ -1,192 +1,246 @@
-from __future__ import annotations
+"""Production entry point for Premier Brushworks PlanReader v1.2.5."""
+import pb_planreader_3d_app as app
+from pb_takeoff_v11 import apply as apply_v11
+from pb_takeoff_v12 import apply as apply_v12
+from pb_takeoff_accuracy_v125 import apply as apply_accuracy_v125
+from pb_jobhub_connection_v122 import apply as apply_jobhub_v122
+from pb_jobhub_stability_v123 import apply as apply_jobhub_v123
 
-import time
+apply_v11(app)
+apply_v12(app)
+apply_jobhub_v122(app)
+apply_jobhub_v123(app)
+apply_accuracy_v125(app)
+app.APP_VERSION = "1.2.5"
 
-from contextlib import contextmanager
-from urllib.parse import unquote, urlsplit
+# Streamlit reruns this launcher while imported modules may stay cached. Preserve
+# originals once so reruns are idempotent instead of wrapping wrappers forever.
+if not hasattr(app, "_pb_original_app_css"):
+    app._pb_original_app_css = app.app_css
+if not hasattr(app, "_pb_original_sidebar_workspace_selector"):
+    app._pb_original_sidebar_workspace_selector = app.sidebar_workspace_selector
+if not hasattr(app, "_pb_original_get_jobhub_bridge"):
+    app._pb_original_get_jobhub_bridge = app.get_jobhub_bridge
+if not hasattr(app, "_pb_original_subscription_takeoff_page"):
+    app._pb_original_subscription_takeoff_page = app.subscription_takeoff_page
 
-
-def apply(app) -> None:
-    """Patch the JobHub bridge so Render PostgreSQL URLs are parsed safely."""
-    if getattr(app, "_pb_v122_jobhub_bridge_patched", False):
-        return
-
-    base_bridge = app.JobHubBridge
-
-    def _open_connection(raw: str):
-        if raw.startswith(("postgresql://", "postgres://")):
-            parsed = __import__('urllib.parse').urlsplit(raw)
-            host = parsed.hostname or ""
-            user = __import__('urllib.parse').unquote(parsed.username or "")
-            password = __import__('urllib.parse').unquote(parsed.password or "")
-            database = __import__('urllib.parse').unquote((parsed.path or "").lstrip("/"))
-            port = parsed.port or 5432
-
-            if not host:
-                raise RuntimeError("The PostgreSQL URL does not contain a host name.")
-            if not user:
-                raise RuntimeError("The PostgreSQL URL does not contain a username.")
-            if not database:
-                raise RuntimeError("The PostgreSQL URL does not contain a database name.")
-            if ":" in database or "@" in database:
-                raise RuntimeError(
-                    "The pasted PostgreSQL URL has credentials inside the database-name segment. "
-                    "Copy Render's External Database URL exactly, including the postgresql:// prefix."
-                )
-
-            return app.psycopg2.connect(
-                host=host,
-                port=port,
-                dbname=database,
-                user=user,
-                password=password,
-                sslmode="require",
-                connect_timeout=8,
-            )
-        # Keep libpq/DSN support for existing deployments that do not use a URL.
-        return app.psycopg2.connect(raw)
-
-    class ParsedJobHubBridge(base_bridge):
-        @contextmanager
-        def connect(self):
-            if self.kind != "postgres":
-                with super().connect() as conn:
-                    yield conn
-                return
-
-            if app.psycopg2 is None:
-                raise RuntimeError("psycopg2-binary is not installed.")
-
-            raw = str(self.source or "").strip()
-            if not raw:
-                raise RuntimeError("JobHub PostgreSQL URL is empty.")
-
-            conn = None
-            last_exc = None
-            for attempt in range(3):
-                try:
-                    conn = _open_connection(raw)
-                    break
-                except Exception as exc:  # noqa: BLE001 - transient SSL/network drops must retry
-                    last_exc = exc
-                    if attempt < 2:
-                        time.sleep(0.4 * (attempt + 1))
-                    else:
-                        break
-            if conn is None:
-                raise last_exc
-
-            try:
-                yield conn
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
-    app.JobHubBridge = ParsedJobHubBridge
-    app._pb_v122_jobhub_bridge_patched = True
+_base_app_css = app._pb_original_app_css
+_base_sidebar_workspace_selector = app._pb_original_sidebar_workspace_selector
+_base_get_jobhub_bridge = app._pb_original_get_jobhub_bridge
+_base_subscription_takeoff_page = app._pb_original_subscription_takeoff_page
 
 
-def seed_drawing_register(workspace_id: int) -> None:
-    """Seed the drawing register from pages that are selected.
+def _v121_get_jobhub_bridge():
+    """Resolve JobHub from Render/env, Streamlit secrets, or a session override."""
+    session_url = str(app.st.session_state.get("jobhub_database_url") or "").strip()
+    if session_url:
+        return app.JobHubBridge("postgres", session_url)
 
-    Only creates register items for pages that are selected (selected=1) and
-    have a valid page type other than 'Other'.
+    # Match JobHub itself: Streamlit secrets can carry DATABASE_URL too.
+    for key in ("JOBHUB_DATABASE_URL", "DATABASE_URL"):
+        try:
+            value = str(app.st.secrets.get(key, "") or "").strip()
+        except Exception:
+            value = ""
+        if value:
+            return app.JobHubBridge("postgres", value)
+
+    return _base_get_jobhub_bridge()
+
+
+app.get_jobhub_bridge = _v121_get_jobhub_bridge
+
+
+def _v121_app_css() -> None:
+    _base_app_css()
+    app.st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] input,
+        [data-testid="stSidebar"] textarea,
+        [data-testid="stSidebar"] [role="combobox"] {
+            color: #171717 !important;
+            -webkit-text-fill-color: #171717 !important;
+            caret-color: #171717 !important;
+        }
+        [data-testid="stSidebar"] input::placeholder,
+        [data-testid="stSidebar"] textarea::placeholder {
+            color: #666666 !important;
+            -webkit-text-fill-color: #666666 !important;
+            opacity: 1 !important;
+        }
+        [data-testid="stSidebar"] [data-baseweb="input"] > div,
+        [data-testid="stSidebar"] [data-baseweb="textarea"] > div,
+        [data-testid="stSidebar"] [data-baseweb="select"] > div {
+            background-color: #ffffff !important;
+        }
+        [data-testid="stSidebar"] [data-baseweb="select"] span,
+        [data-testid="stSidebar"] [data-baseweb="select"] div[aria-selected="true"] {
+            color: #171717 !important;
+            -webkit-text-fill-color: #171717 !important;
+        }
+        .pb-v12-live,
+        .pb-jobhub-ok,
+        .pb-jobhub-bad {
+            margin: 0.35rem 0 0.6rem 0;
+            padding: 0.55rem 0.7rem;
+            border-radius: 8px;
+            background: #262626;
+            color: #ffffff;
+            font-size: 0.82rem;
+            line-height: 1.25rem;
+        }
+        .pb-v12-live { border: 1px solid #D7A21B; border-left: 5px solid #D7A21B; }
+        .pb-v12-live strong { color: #F4C84B !important; }
+        .pb-jobhub-ok { border: 1px solid #2E8B57; border-left: 5px solid #2E8B57; }
+        .pb-jobhub-ok strong { color: #8BE0A9 !important; }
+        .pb-jobhub-bad { border: 1px solid #B33A3A; border-left: 5px solid #B33A3A; }
+        .pb-jobhub-bad strong { color: #FF9A9A !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+app.app_css = _v121_app_css
+
+
+def _v124_subscription_takeoff_page(workspace, session_api_key, ai_provider="OpenAI"):
+    """Add a read-only calculated Total Value column to the editable take-off table.
+
+    The core app already calculates ``value_ex_gst`` in ``dataframe_for_takeoff``.
+    Reusing that calculation keeps floor-m2 pricing, floor-area reference rows and
+    ordinary quantity x rate pricing consistent with the Quantity Schedule and
+    quotation exports. The derived display column is removed from the editor result
+    before the base save routine persists take-off rows.
     """
-    # In actual app, query selected pages
-    # pages = app.ldf("""
-    #     SELECT p.id,p.page_label,p.page_type,p.scale_text,p.page_no,d.file_name
-    #     FROM pages p JOIN documents d ON d.id=p.document_id
-    #     WHERE p.workspace_id=? ORDER BY d.id,p.page_no
-    # """, (workspace_id,))
-    
-    # For now, create a basic register entry
-    # In actual app: existing_keys = {
-    #     (str(r.get("title") or ""), str(r.get("source_reference") or ""))
-    #     for r in app.lquery("SELECT title,source_reference FROM register_items WHERE workspace_id=? AND register_name='drawing_register'", (workspace_id,))
-    # }
-    # 
-    # for page in pages:
-    #     key = (str(page.get("page_label") or ""), f"{page.get('file_name')} p{page.get('page_no')}")
-    #     if key in existing_keys:
-    #         continue
-    #     app.lexecute("""
-    #         INSERT INTO register_items(workspace_id,register_name,item_no,title,detail,priority,source_reference,status,created_at)
-    #         VALUES(?,?,?,?,?,?,?,?,?)
-    #     """, (
-    #         workspace_id,
-    #         "drawing_register",
-    #         str(page.get("page_label") or ""),
-    #         str(page.get("page_label") or ""),
-    #         str(page.get("page_type") or ""),
-    #         str(page.get("scale_text") or ""),
-    #         f"{page.get('file_name')} p{page.get('page_no')}",
-    #         "Reviewed" if page.get("page_type") != "Other" else "To classify",
-    #         time.strftime('%Y-%m-%d %H:%M:%S'),
-    #     ))
-    
-    # Placeholder - actual implementation would use the above logic
-    pass
+    original_data_editor = app.st.data_editor
+
+    def _data_editor_with_total_value(data=None, *args, **kwargs):
+        if kwargs.get("key") != "takeoff_editor" or not isinstance(data, app.pd.DataFrame):
+            return original_data_editor(data, *args, **kwargs)
+
+        shown = data.copy()
+        try:
+            calculated = app.dataframe_for_takeoff(int(workspace["id"]))
+            values_by_id = {}
+            if not calculated.empty and {"id", "value_ex_gst"}.issubset(calculated.columns):
+                values_by_id = calculated.set_index("id")["value_ex_gst"].to_dict()
+
+            if "id" in shown.columns:
+                shown["total_value"] = shown["id"].map(values_by_id).fillna(0.0)
+            else:
+                shown["total_value"] = 0.0
+
+            ordered = list(shown.columns)
+            ordered.remove("total_value")
+            insert_at = ordered.index("rate_per_unit") + 1 if "rate_per_unit" in ordered else len(ordered)
+            ordered.insert(insert_at, "total_value")
+            shown = shown[ordered]
+
+            column_config = dict(kwargs.get("column_config") or {})
+            column_config["total_value"] = app.st.column_config.NumberColumn(
+                "Total Value",
+                help="Calculated line value ex GST using the project's selected pricing basis. Floor-area reference rows remain $0.",
+                format="$%.2f",
+                disabled=True,
+            )
+            kwargs["column_config"] = column_config
+        except Exception:
+            # Never block take-off editing if a derived display value cannot be built.
+            pass
+
+        edited = original_data_editor(shown, *args, **kwargs)
+        if isinstance(edited, app.pd.DataFrame):
+            edited = edited.drop(columns=["total_value"], errors="ignore")
+        return edited
+
+    app.st.data_editor = _data_editor_with_total_value
+    try:
+        return _base_subscription_takeoff_page(workspace, session_api_key, ai_provider)
+    finally:
+        app.st.data_editor = original_data_editor
 
 
-def current_workspace() -> Optional[Dict[str, Any]]:
-    """Get the current workspace from session state."""
-    workspace_id = __import__('streamlit').session_state.get("workspace_id")
-    if not workspace_id:
-        return None
-    # In actual app: rows = app.lquery("SELECT * FROM workspaces WHERE id=?", (int(workspace_id),))
-    # return rows[0] if rows else None
-    return {"id": workspace_id, "job_name": "Sample Job"}  # Placeholder
+app.subscription_takeoff_page = _v124_subscription_takeoff_page
 
 
-def sidebar_workspace_selector(bridge: Optional[Any] = None) -> Optional[int]:
-    """Render sidebar with workspace selection and drawing register filtering."""
-    # In actual app would use streamlit.sidebar
-    # Here we just provide the logic structure
-    
-    # Filter: only show pages selected in drawing register
-    # Would add: AND selected=1 to page queries
-    
-    # Auto-scale integration
-    # Would check AUTO_SCALE dict for page scale status
-    
-    return 1  # Placeholder - actual implementation uses streamlit
+def _v121_sidebar_workspace_selector(bridge):
+    app.st.sidebar.markdown(
+        f"<div class='pb-v12-live'><strong>PB TAKE-OFF v{app.APP_VERSION} ACTIVE</strong><br>accuracy-gated measurements + stable JobHub connection + multi-line importer + take-off values</div>",
+        unsafe_allow_html=True,
+    )
+
+    connected = False
+    connection_error = ""
+    table_count = 0
+    if bridge is not None:
+        try:
+            tables = bridge.table_names()
+            table_count = len(tables)
+            connected = True
+        except Exception as exc:
+            connection_error = str(exc)
+
+    if connected:
+        app.st.sidebar.markdown(
+            f"<div class='pb-jobhub-ok'><strong>JOBHUB CONNECTED</strong><br>{table_count} database tables detected</div>",
+            unsafe_allow_html=True,
+        )
+        if app.st.session_state.get("jobhub_database_url"):
+            app.st.sidebar.caption("Session connection active. Add JOBHUB_DATABASE_URL in Render to keep JobHub connected through app restarts.")
+            if app.st.sidebar.button("Clear session JobHub connection", use_container_width=True):
+                app.st.session_state.pop("jobhub_database_url", None)
+                app.st.rerun()
+    else:
+        detail = "Database URL is not configured." if bridge is None else "Database credential exists but the connection failed."
+        app.st.sidebar.markdown(
+            f"<div class='pb-jobhub-bad'><strong>JOBHUB NOT CONNECTED</strong><br>{detail}</div>",
+            unsafe_allow_html=True,
+        )
+        if connection_error:
+            app.st.sidebar.error(f"JobHub connection error: {connection_error}")
+        with app.st.sidebar.expander("Connect JobHub"):
+            app.st.caption("For a permanent Render connection, set JOBHUB_DATABASE_URL to the same PostgreSQL database URL used by JobHub. You can also test it for this browser session here.")
+            session_url = app.st.text_input(
+                "JobHub PostgreSQL URL (session only)",
+                type="password",
+                key="jobhub_database_url_entry",
+                placeholder="postgresql://...",
+            )
+            if app.st.button("Test & connect JobHub", type="primary", use_container_width=True):
+                candidate = str(session_url or "").strip()
+                if not candidate:
+                    app.st.error("Paste the JobHub PostgreSQL DATABASE_URL first.")
+                else:
+                    try:
+                        probe = app.JobHubBridge("postgres", candidate)
+                        probe_tables = probe.table_names()
+                        if "jobs" not in set(probe_tables):
+                            raise RuntimeError("Connected to PostgreSQL, but the JobHub jobs table was not found.")
+                    except Exception as exc:
+                        app.st.error(f"Could not connect to JobHub: {exc}")
+                    else:
+                        app.st.session_state["jobhub_database_url"] = candidate
+                        app.st.rerun()
+
+    workspace_id = _base_sidebar_workspace_selector(bridge if connected else None)
+    if workspace_id:
+        try:
+            rows = app.lquery("SELECT jobhub_job_id FROM workspaces WHERE id=?", (int(workspace_id),))
+            linked_id = rows[0].get("jobhub_job_id") if rows else None
+            if linked_id and connected:
+                app.st.sidebar.success(f"Workspace linked to JobHub job #{linked_id}")
+            elif linked_id and not connected:
+                app.st.sidebar.warning(f"Workspace remembers JobHub job #{linked_id}, but JobHub is offline.")
+            else:
+                app.st.sidebar.caption("Current workspace is standalone — it is not linked to a JobHub job.")
+        except Exception:
+            pass
+    return workspace_id
 
 
-def dashboard_page(workspace: Dict[str, Any]) -> None:
-    """Dashboard page with filtered page display."""
-    # Filter to only show selected pages
-    # Would add: selected=1 filter to page queries
-    
-    # Auto-scale status display
-    # Would check AUTO_SCALE for each page
-    
-    pass
+app.sidebar_workspace_selector = _v121_sidebar_workspace_selector
 
-
-def project_documents_page(workspace: Dict[str, Any], bridge: Optional[Any], user: Dict[str, Any]) -> None:
-    """Project documents page with page selection filtering."""
-    # When processing documents, only render selected pages
-    # Would add: page selection filter
-    
-    pass
-
-
-def drawing_register_page(workspace: Dict[str, Any]) -> None:
-    """Drawing register page - only show selected pages."""
-    # Filter pages to only those selected in the drawing register
-    # Would add: selected=1 filter
-    
-    # Show only pages that are selected
-    # Would filter out unselected pages
-    
-    pass
-
-
-def page_preview_picker(workspace_id: int, doc_ids: Sequence[int]) -> None:
-    """Page preview picker with selection filtering."""
-    # Only show/tick pages that are selected
-    # Would add: selected status check
-    
-    pass
+if __name__ == "__main__":
+    app.main()

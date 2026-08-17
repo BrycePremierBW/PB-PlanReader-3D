@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: premier-brushworks-planreader-3d
+    runtime: python
+    pythonVersion: "3.14"
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run pb_planreader_v126_app.py --server.address 0.0.0.0 --server.port $PORT
+    envVars:
+      - key: PLANREADER_DATA_DIR
+        value: /var/data/planreader
+      - key: JOBHUB_DATABASE_URL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-5.6
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: AI_PROVIDER
+        value: OpenAI
+    disk:
+      name: planreader-data
+      mountPath: /var/data
+      sizeGB: 10

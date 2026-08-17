@@ -1,0 +1,954 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PlanReader draw-first measurement mapper</title>
+<style>
+  body { margin: 0; font-family: -apple-system, 'Segoe UI', Roboto, Arial, sans-serif; background: #fff; color: #1f1f1f; }
+  .hint { color: #5f574f; font-size: 13px; line-height: 1.5; }
+  .toolbar { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+  .toolbar .row-pick { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .toolbar .row-pick select { padding: 6px 10px; border-radius: 8px; border: 1px solid #c9bfae; font-size: 14px; max-width: 460px; }
+  .toolbar .tb-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .toolbar .tb-left { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .toolbar .tb-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .toolbar button { padding: 8px 12px; border-radius: 999px; border: 1px solid #8B6F47; background: #fff; cursor: pointer; font-size: 14px; font-weight: 600; }
+  .toolbar button.danger { color: #b42318; border-color: #e6b4ae; }
+  .toolbar button.active { background: #8B6F47; color: #fff; }
+  .toolbar button:disabled { opacity: .45; cursor: not-allowed; }
+  .chip { font-weight: 700; font-size: 14px; padding: 5px 12px; border-radius: 999px; color: #fff; }
+  .chip.none { background: #8a8277; }
+  .scale-ok { color: #1f7a4d; font-weight: 600; font-size: 13px; }
+  .scale-none { color: #8a8277; font-size: 13px; }
+  .stage { position: relative; display: block; line-height: 0; max-width: 100%; max-height: 72vh; border: 1px solid #e3d8c6; border-radius: 8px; overflow: auto; }
+  .stage canvas { display: block; cursor: crosshair; touch-action: none; }
+  .zoombar { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .zoombar button { padding: 4px 12px; border-radius: 999px; border: 1px solid #8B6F47; background: #fff; cursor: pointer; font-size: 13px; font-weight: 600; }
+  .zoombar button.active { background: #8B6F47; color: #fff; }
+  .zoombar .zval { font-size: 13px; font-weight: 600; color: #1f1f1f; min-width: 54px; }
+  .zoombar .zhint { font-size: 12px; color: #8a8277; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; font-size: 12px; color: #5f574f; }
+  .legend .swatch { display: inline-block; width: 18px; height: 4px; vertical-align: middle; margin-right: 6px; border-radius: 2px; }
+  .legend .swatch.sq { width: 12px; height: 12px; border-radius: 3px; }
+  .legend .miss { color: #b42318; font-weight: 700; }
+  .legend .orphan { color: #8a8277; font-style: italic; }
+  .live { margin-top: 6px; font-size: 13px; font-weight: 600; color: #1f1f1f; min-height: 18px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+(function () {
+  var root = document.getElementById('root');
+  var state = {
+    imageKey: null, revision: -1, pxPerM: 0, lines: [], rows: [],
+    activeRowId: null, tool: 'line', drawing: null,
+    selectedId: null, hover: null, natW: 0, natH: 0, cw: 0, ch: 0, imgEl: null, review: false,
+    zoom: 1, fitW: 1100, labels: false, drag: null
+  };
+
+  function post(type, payload) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, payload), '*');
+  }
+  function num(v, fallback) { var n = parseFloat(v); return isNaN(n) ? fallback : n; }
+  function finiteNum(v, fallback) { var n = num(v, fallback); return (isFinite(n) && n === n) ? n : fallback; }
+  function r2(n) { return Math.round(num(n, 0) * 100) / 100; }
+  function clamp01(n) { return Math.max(0, Math.min(1, n)); }
+  function pctNum(n) { return Math.max(0, Math.min(100, num(n, 0))); }
+  function postValue() {
+    var value = state.lines.map(function (ln) {
+      var points = (ln.points || []).map(function (p) {
+        return [pctNum(p[0]), pctNum(p[1])];
+      });
+      return {
+        id: String(ln.id || ''),
+        takeoff_row_id: (ln.takeoff_row_id === undefined || ln.takeoff_row_id === null || ln.takeoff_row_id === '') ? null : ln.takeoff_row_id,
+        label: String(ln.label || ''),
+        unit: String(ln.unit || ''),
+        colour: /^#[0-9a-fA-F]{6}$/.test(String(ln.colour || '')) ? ln.colour : '#1f6fb2',
+        kind: String(ln.kind === 'polygon' ? 'polygon' : 'line'),
+        x1: finiteNum(ln.x1, 0), y1: finiteNum(ln.y1, 0),
+        x2: finiteNum(ln.x2, 0), y2: finiteNum(ln.y2, 0),
+        points: points,
+        length_m: finiteNum(ln.length_m, 0),
+        area_m2: finiteNum(ln.area_m2, 0),
+        perimeter_m: finiteNum(ln.perimeter_m, 0),
+        quantity_status: String(ln.quantity_status || 'Drawn'),
+        moved: ln.moved ? 1 : 0,
+        notes: String(ln.notes || '')
+      };
+    });
+    post('streamlit:setComponentValue', { value: value, dataType: 'json' });
+  }
+  function sanitize(ln) {
+    var id = String(ln.id || ('s' + Math.random().toString(36).slice(2, 10)));
+    var kind = String(ln.kind === 'polygon' ? 'polygon' : 'line');
+    var points = (ln.points || []).map(function (p) { return [pctNum(p[0]), pctNum(p[1])]; });
+    return {
+      id: id,
+      takeoff_row_id: (ln.takeoff_row_id === undefined || ln.takeoff_row_id === null || ln.takeoff_row_id === '') ? null : ln.takeoff_row_id,
+      label: String(ln.label || ''),
+      unit: String(ln.unit || ''),
+      colour: /^#[0-9a-fA-F]{6}$/.test(String(ln.colour || '')) ? ln.colour : '#1f6fb2',
+      kind: kind,
+      x1: pctNum(ln.x1), y1: pctNum(ln.y1),
+      x2: pctNum(ln.x2), y2: pctNum(ln.y2),
+      points: points,
+      length_m: num(ln.length_m, 0),
+      area_m2: num(ln.area_m2, 0),
+      perimeter_m: num(ln.perimeter_m, 0),
+      quantity_status: String(ln.quantity_status || 'Drawn'),
+      moved: ln.moved ? 1 : 0,
+      notes: String(ln.notes || '')
+    };
+  }
+  function activeRow() {
+    for (var i = 0; i < state.rows.length; i++) if (state.rows[i].id === state.activeRowId) return state.rows[i];
+    return null;
+  }
+  function rowById(id) {
+    for (var i = 0; i < state.rows.length; i++) if (state.rows[i].id === id) return state.rows[i];
+    return null;
+  }
+  function lineById(id) {
+    for (var i = 0; i < state.lines.length; i++) if (state.lines[i].id === id) return state.lines[i];
+    return null;
+  }
+  function ptPx(p) { return { x: p[0] / 100 * (state.natW || 1), y: p[1] / 100 * (state.natH || 1) }; }
+  function metres(px) { return state.pxPerM > 0 ? px / state.pxPerM : null; }
+  function segLengthPx(a, b) { return Math.hypot((b[0] - a[0]) / 100 * (state.natW || 1), (b[1] - a[1]) / 100 * (state.natH || 1)); }
+  function lineLengthM(x1, y1, x2, y2) { return metres(segLengthPx([x1, y1], [x2, y2])); }
+  function polygonAreaM2(pts) {
+    if (state.pxPerM <= 0 || !pts || pts.length < 3) return 0;
+    var a = 0;
+    for (var i = 0; i < pts.length; i++) {
+      var j = (i + 1) % pts.length;
+      var p = ptPx(pts[i]), q = ptPx(pts[j]);
+      a += p.x * q.y - q.x * p.y;
+    }
+    return Math.abs(a / 2) / (state.pxPerM * state.pxPerM);
+  }
+  function polygonPerimeterM(pts) {
+    if (state.pxPerM <= 0 || !pts || pts.length < 2) return 0;
+    var p = 0;
+    for (var i = 0; i < pts.length; i++) {
+      var j = (i + 1) % pts.length;
+      p += segLengthPx(pts[i], pts[j]);
+    }
+    return p / state.pxPerM;
+  }
+  function shapeLabel(ln) {
+    var base = ln.label || 'Measurement';
+    var m = finiteNum(ln.length_m, 0), a = finiteNum(ln.area_m2, 0), per = finiteNum(ln.perimeter_m, 0);
+    if (ln.kind === 'polygon' && a > 0) return base + ' · ' + r2(a) + ' m²';
+    if (m > 0) return base + ' · ' + r2(m) + ' m';
+    return base;
+  }
+
+  function canvasEl() { return document.getElementById('pr_canvas'); }
+
+  function fitDisplay(natW, natH) {
+    var maxSide = 3200;
+    var s = Math.min(1, maxSide / Math.max(natW, natH));
+    return { w: Math.max(1, Math.round(natW * s)), h: Math.max(1, Math.round(natH * s)) };
+  }
+
+  function applyZoom() {
+    var cv = canvasEl();
+    if (!cv) return;
+    cv.style.width = Math.round((state.fitW || 1100) * (state.zoom || 1)) + 'px';
+    var zv = document.getElementById('pr_zval');
+    if (zv) zv.textContent = Math.round((state.zoom || 1) * 100) + '%';
+  }
+
+  function recomputeShape(ln) {
+    if (ln.kind === 'polygon') {
+      ln.area_m2 = polygonAreaM2(ln.points || []);
+      ln.perimeter_m = polygonPerimeterM(ln.points || []);
+    } else {
+      ln.length_m = lineLengthM(ln.x1, ln.y1, ln.x2, ln.y2);
+    }
+    ln.moved = 1;
+  }
+
+  function shapeRefPoint(ln) {
+    if (ln.kind === 'polygon') {
+      var p0 = (ln.points || [])[0] || [0, 0];
+      return { x: p0[0], y: p0[1] };
+    }
+    return { x: ln.x1, y: ln.y1 };
+  }
+
+  function vertexAt(px, py, ln) {
+    var cv = canvasEl();
+    var w = cv.width || 1, h = cv.height || 1;
+    var thresh = 3.5 / 100 * Math.max(w, h);
+    var pts = ln.kind === 'polygon' ? (ln.points || []) : [[ln.x1, ln.y1], [ln.x2, ln.y2]];
+    for (var i = 0; i < pts.length; i++) {
+      var x = pts[i][0] / 100 * w, y = pts[i][1] / 100 * h;
+      if (Math.hypot(px / 100 * w - x, py / 100 * h - y) < thresh) return i;
+    }
+    return -1;
+  }
+
+  function pointInPolygon(px, py, pts) {
+    var inside = false;
+    for (var i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      var xi = pts[i][0], yi = pts[i][1], xj = pts[j][0], yj = pts[j][1];
+      var intersect = ((yi > py) !== (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  function setVertex(ln, idx, x, y) {
+    if (ln.kind === 'polygon') {
+      if (ln.points && ln.points[idx]) ln.points[idx] = [pctNum(x), pctNum(y)];
+    } else if (idx === 0) {
+      ln.x1 = pctNum(x); ln.y1 = pctNum(y);
+    } else {
+      ln.x2 = pctNum(x); ln.y2 = pctNum(y);
+    }
+    recomputeShape(ln);
+  }
+
+  function translateShape(ln, dx, dy) {
+    if (ln.kind === 'polygon') {
+      ln.points = (ln.points || []).map(function (p) {
+        return [pctNum(p[0] + dx), pctNum(p[1] + dy)];
+      });
+    } else {
+      ln.x1 = pctNum(ln.x1 + dx); ln.y1 = pctNum(ln.y1 + dy);
+      ln.x2 = pctNum(ln.x2 + dx); ln.y2 = pctNum(ln.y2 + dy);
+    }
+    recomputeShape(ln);
+  }
+
+  function draw() {
+    var cv = canvasEl();
+    if (!cv || !state.imgEl) return;
+    var ctx = cv.getContext('2d');
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    if (state.natW && state.natH) {
+      ctx.drawImage(state.imgEl, 0, 0, cv.width, cv.height);
+    }
+    var w = cv.width, h = cv.height;
+    state.lines.forEach(function (ln) {
+      var selected = ln.id === state.selectedId;
+      var col = ln.colour;
+      ctx.save();
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      if (ln.kind === 'polygon') {
+        var pts = (ln.points || []).map(function (p) { return [p[0] / 100 * w, p[1] / 100 * h]; });
+        if (pts.length >= 3) {
+          ctx.strokeStyle = col;
+          ctx.lineWidth = selected ? 6 : (state.review ? 4.5 : 3.5);
+          ctx.beginPath();
+          ctx.moveTo(pts[0][0], pts[0][1]);
+          for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+          ctx.closePath();
+          ctx.fillStyle = col + (state.review ? '88' : '33');
+          ctx.fill();
+          ctx.stroke();
+          pts.forEach(function (p) {
+            ctx.fillStyle = '#ffffff';
+            ctx.strokeStyle = col;
+            ctx.lineWidth = 2.5;
+            ctx.beginPath(); ctx.arc(p[0], p[1], selected ? 7 : 5, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+          });
+        }
+      } else {
+        var x1 = ln.x1 / 100 * w, y1 = ln.y1 / 100 * h;
+        var x2 = ln.x2 / 100 * w, y2 = ln.y2 / 100 * h;
+        ctx.strokeStyle = col;
+        ctx.lineWidth = selected ? 6 : (state.review ? 6 : 3.5);
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+        ctx.fillStyle = '#ffffff';
+        ctx.strokeStyle = col;
+        ctx.lineWidth = 2.5;
+        var r = selected ? 7 : 5;
+        ctx.beginPath(); ctx.arc(x1, y1, r, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+        ctx.beginPath(); ctx.arc(x2, y2, r, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+      }
+      ctx.restore();
+    });
+    if (state.labels) {
+      state.lines.forEach(function (ln) {
+        var text = shapeLabel(ln);
+        var cx, cy;
+        if (ln.kind === 'polygon') {
+          var pts = (ln.points || []).map(function (p) { return [p[0] / 100 * w, p[1] / 100 * h]; });
+          if (!pts.length) return;
+          var sx = 0, sy = 0;
+          pts.forEach(function (p) { sx += p[0]; sy += p[1]; });
+          cx = sx / pts.length; cy = sy / pts.length;
+        } else {
+          cx = (ln.x1 + ln.x2) / 2 / 100 * w;
+          cy = (ln.y1 + ln.y2) / 2 / 100 * h;
+        }
+        ctx.save();
+        ctx.font = '600 12px -apple-system, "Segoe UI", Roboto, Arial, sans-serif';
+        var tw = ctx.measureText(text).width;
+        var bx = cx - tw / 2 - 4, by = cy - 18;
+        bx = Math.max(2, Math.min(w - tw - 8, bx));
+        by = Math.max(2, by);
+        ctx.fillStyle = 'rgba(20,20,20,0.7)';
+        ctx.beginPath();
+        ctx.roundRect(bx, by, tw + 8, 17, 5);
+        ctx.fill();
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(text, bx + 4, by + 13);
+        ctx.restore();
+      });
+    }
+    if (state.tool === 'select' && state.selectedId) {
+      var sel = lineById(state.selectedId);
+      if (sel) {
+        var handles = sel.kind === 'polygon' ? (sel.points || []) : [[sel.x1, sel.y1], [sel.x2, sel.y2]];
+        handles.forEach(function (hp) {
+          ctx.save();
+          ctx.fillStyle = '#ffffff';
+          ctx.strokeStyle = sel.colour;
+          ctx.lineWidth = 3;
+          ctx.beginPath(); ctx.arc(hp[0] / 100 * w, hp[1] / 100 * h, 7, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+          ctx.restore();
+        });
+      }
+    }
+    if (state.drawing) {
+      var live = state.drawing;
+      var liveRow = rowById(live.rowId);
+      var col2 = liveRow ? liveRow.colour : '#1f6fb2';
+      ctx.save();
+      ctx.strokeStyle = col2;
+      ctx.lineWidth = 3;
+      ctx.setLineDash([7, 5]);
+      if (live.type === 'line' && live.p1 && state.hover) {
+        ctx.beginPath();
+        ctx.moveTo(live.p1[0] / 100 * w, live.p1[1] / 100 * h);
+        ctx.lineTo(state.hover.x / 100 * w, state.hover.y / 100 * h);
+        ctx.stroke();
+        ctx.fillStyle = '#ffffff';
+        ctx.strokeStyle = col2;
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(live.p1[0] / 100 * w, live.p1[1] / 100 * h, 6, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+      }
+      if (live.type === 'polygon' && live.pts.length) {
+        var all = live.pts.concat(state.hover ? [[state.hover.x, state.hover.y]] : []);
+        ctx.strokeStyle = col2;
+        ctx.fillStyle = col2 + '22';
+        ctx.beginPath();
+        ctx.moveTo(all[0][0] / 100 * w, all[0][1] / 100 * h);
+        for (var i = 1; i < all.length; i++) ctx.lineTo(all[i][0] / 100 * w, all[i][1] / 100 * h);
+        if (state.hover && live.pts.length >= 2) ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        live.pts.forEach(function (p) {
+          ctx.fillStyle = '#ffffff';
+          ctx.strokeStyle = col2;
+          ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.arc(p[0] / 100 * w, p[1] / 100 * h, 6, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+        });
+      }
+      ctx.restore();
+    }
+  }
+
+  function toPct(ev) {
+    var cv = canvasEl();
+    var rect = cv.getBoundingClientRect();
+    return {
+      x: clamp01((ev.clientX - rect.left) / rect.width) * 100,
+      y: clamp01((ev.clientY - rect.top) / rect.height) * 100
+    };
+  }
+
+  function distToSeg(px, py, ax, ay, bx, by) {
+    var dx = bx - ax, dy = by - ay;
+    var len2 = dx * dx + dy * dy;
+    if (len2 < 0.0001) return Math.hypot(px - ax, py - ay);
+    var t = ((px - ax) * dx + (py - ay) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+  }
+
+  function hitTest(px, py) {
+    var cv = canvasEl();
+    var w = cv.width, h = cv.height;
+    var thresh = 3.0 / 100 * Math.max(w, h);
+    var best = null, bestD = Infinity;
+    for (var i = 0; i < state.lines.length; i++) {
+      var ln = state.lines[i];
+      var d = Infinity;
+      if (ln.kind === 'polygon') {
+        var pts = (ln.points || []).map(function (p) { return [p[0] / 100 * w, p[1] / 100 * h]; });
+        if (pts.length >= 3) {
+          if (pointInPolygon(px, py, ln.points)) {
+            d = 0;
+          } else {
+            for (var k = 0; k < pts.length; k++) {
+              var a = pts[k], b = pts[(k + 1) % pts.length];
+              var dk = distToSeg(px, py, a[0], a[1], b[0], b[1]);
+              if (dk < d) d = dk;
+            }
+          }
+        } else if (pts.length === 1) {
+          d = Math.hypot(px - pts[0][0], py - pts[0][1]);
+        }
+      } else {
+        d = distToSeg(px, py, ln.x1 / 100 * w, ln.y1 / 100 * h, ln.x2 / 100 * w, ln.y2 / 100 * h);
+      }
+      if (d < thresh && d < bestD) { bestD = d; best = ln; }
+    }
+    return best;
+  }
+
+  function canvasClick(ev) {
+    var p = toPct(ev);
+    if (state.tool === 'select') return;
+    if (state.tool === 'line') {
+      if (!state.drawing) {
+        state.drawing = { type: 'line', p1: [p.x, p.y], rowId: state.activeRowId };
+        state.selectedId = null;
+      } else {
+        var row = rowById(state.drawing.rowId);
+        if (!row) { state.drawing = null; updateLive(); draw(); return; }
+        var ln = makeLine(p.x, p.y);
+        state.drawing = null;
+        state.lines.push(ln);
+        state.selectedId = ln.id;
+        postValue();
+      }
+      updateLive();
+      draw();
+      return;
+    }
+    if (state.tool === 'polygon') {
+      if (!state.drawing) {
+        state.drawing = { type: 'polygon', pts: [], rowId: state.activeRowId };
+        state.selectedId = null;
+      }
+      var first = state.drawing.pts[0];
+      var closePx = 1.4 / 100 * Math.max(state.natW || 1, state.natH || 1);
+      if (first && state.drawing.pts.length >= 3 && segLengthPx(first, [p.x, p.y]) < closePx) {
+        var shape = makePolygon();
+        if (shape) {
+          state.drawing = null;
+          state.lines.push(shape);
+          state.selectedId = shape.id;
+          postValue();
+        }
+      } else {
+        var pts = state.drawing.pts;
+        var last = pts.length ? pts[pts.length - 1] : null;
+        var minPx = 1.2 / 100 * Math.max(state.natW || 1, state.natH || 1);
+        if (!last || segLengthPx(last, [p.x, p.y]) >= minPx) {
+          pts.push([p.x, p.y]);
+        }
+      }
+      updateLive();
+      draw();
+      return;
+    }
+  }
+
+  function canvasDown(ev) {
+    ev.preventDefault();
+    var p = toPct(ev);
+    if (state.tool !== 'select') return;
+    var hit = hitTest(p.x, p.y);
+    state.selectedId = hit ? hit.id : null;
+    if (hit) {
+      var vidx = vertexAt(p.x, p.y, hit);
+      var ref = shapeRefPoint(hit);
+      if (vidx >= 0) {
+        state.drag = { type: 'vertex', id: hit.id, idx: vidx };
+      } else {
+        state.drag = { type: 'move', id: hit.id, dx: p.x - ref.x, dy: p.y - ref.y };
+      }
+    }
+    updateLive();
+    draw();
+  }
+
+  function canvasMove(ev) {
+    state.hover = toPct(ev);
+    if (state.drag) {
+      var ln = lineById(state.drag.id);
+      if (ln) {
+        if (state.drag.type === 'move') {
+          var ref = shapeRefPoint(ln);
+          translateShape(ln, state.hover.x - state.drag.dx - ref.x, state.hover.y - state.drag.dy - ref.y);
+        } else {
+          setVertex(ln, state.drag.idx, state.hover.x, state.hover.y);
+        }
+      }
+    }
+    updateLive();
+    draw();
+  }
+
+  function canvasUp(ev) {
+    if (state.drag) {
+      state.drag = null;
+      postValue();
+      updateLive();
+      draw();
+    }
+  }
+
+  function makeLine(x2, y2) {
+    var live = state.drawing;
+    var row = rowById(live.rowId);
+    var lengthM = lineLengthM(live.p1[0], live.p1[1], x2, y2);
+    return {
+      id: 'n' + Math.random().toString(36).slice(2, 10),
+      takeoff_row_id: live.rowId,
+      label: row ? row.label : 'Measurement',
+      unit: row ? row.unit : 'm',
+      colour: row ? row.colour : '#1f6fb2',
+      kind: 'line',
+      x1: pctNum(live.p1[0]), y1: pctNum(live.p1[1]),
+      x2: pctNum(x2), y2: pctNum(y2),
+      points: [],
+      length_m: finiteNum(lengthM, 0), area_m2: 0, perimeter_m: 0,
+      quantity_status: 'Drawn', moved: 1,
+      notes: 'Drawn on plan.'
+    };
+  }
+
+  function makePolygon() {
+    var live = state.drawing;
+    if (!live || live.pts.length < 3) return null;
+    var row = rowById(live.rowId);
+    var area = polygonAreaM2(live.pts);
+    var per = polygonPerimeterM(live.pts);
+    return {
+      id: 'n' + Math.random().toString(36).slice(2, 10),
+      takeoff_row_id: live.rowId,
+      label: row ? row.label : 'Measurement',
+      unit: row ? row.unit : 'm2',
+      colour: row ? row.colour : '#1f6fb2',
+      kind: 'polygon',
+      x1: live.pts[0][0], y1: live.pts[0][1], x2: 0, y2: 0,
+      points: live.pts.map(function (p) { return [pctNum(p[0]), pctNum(p[1])]; }),
+      length_m: 0, area_m2: finiteNum(area, 0), perimeter_m: finiteNum(per, 0),
+      quantity_status: 'Drawn', moved: 1,
+      notes: 'Drawn on plan.'
+    };
+  }
+
+  function canvasDblClick(ev) {
+    ev.preventDefault();
+    if (state.drawing && state.drawing.type === 'polygon') {
+      if (state.drawing.pts.length >= 3) {
+        var shape = makePolygon();
+        state.drawing = null;
+        state.lines.push(shape);
+        state.selectedId = shape.id;
+        postValue();
+        updateLive();
+        draw();
+      }
+    }
+  }
+
+  function updateLive() {
+    var el = document.getElementById('pr_live');
+    if (!el) return;
+    var txt = '';
+    if (state.drawing) {
+      var live = state.drawing;
+      var row = rowById(live.rowId);
+      var colour = row ? row.colour : '#1f6fb2';
+      if (live.type === 'line' && live.p1 && state.hover) {
+        var m = lineLengthM(live.p1[0], live.p1[1], state.hover.x, state.hover.y);
+        txt = (m === null ? 'Length unmeasured — calibrate scale' : 'Live length · ' + r2(m) + ' m');
+      } else if (live.type === 'polygon') {
+        var a = polygonAreaM2(live.pts.concat(state.hover ? [[state.hover.x, state.hover.y]] : []));
+        var per = polygonPerimeterM(live.pts.concat(state.hover ? [[state.hover.x, state.hover.y]] : []));
+        txt = live.pts.length + ' points · ';
+        if (a > 0) txt += r2(a) + ' m² · ';
+        if (per > 0) txt += r2(per) + ' m';
+        txt += (state.hover && live.pts.length >= 2 ? ' · double-click to close' : '');
+      }
+    } else {
+      if (state.tool === 'select' && state.selectedId) {
+        var sLn = lineById(state.selectedId);
+        if (sLn) {
+          txt = 'Selected · ' + shapeLabel(sLn) + (state.drag ? ' — drag to adjust' : ' — drag a dot to resize, the shape to move');
+        }
+      } else {
+        var row2 = activeRow();
+        txt = row2 ? ('Drawing for · ' + (row2.label || 'row') + ' · ' + (row2.unit || '')) : 'Pick a take-off row to draw';
+      }
+    }
+    el.textContent = txt;
+  }
+
+  function closeOutline() {
+    if (state.drawing && state.drawing.type === 'polygon' && state.drawing.pts.length >= 3) {
+      var shape = makePolygon();
+      state.drawing = null;
+      state.lines.push(shape);
+      state.selectedId = shape.id;
+      postValue();
+      updateLive();
+      draw();
+    }
+  }
+
+  function render() {
+    root.innerHTML = '';
+    if (!state.imageKey) {
+      var h0 = document.createElement('div');
+      h0.className = 'hint';
+      h0.textContent = 'Loading plan image…';
+      root.appendChild(h0);
+      return;
+    }
+    var toolbar = document.createElement('div');
+    toolbar.className = 'toolbar';
+
+    var rowPick = document.createElement('div');
+    rowPick.className = 'row-pick';
+    var rowLabel = document.createElement('span');
+    rowLabel.className = 'hint';
+    rowLabel.textContent = 'Take-off row:';
+    rowPick.appendChild(rowLabel);
+    var sel = document.createElement('select');
+    sel.id = 'pr_row_select';
+    if (!state.rows.length) {
+      var opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = 'No drawable take-off rows (create m or m² rows first)';
+      sel.appendChild(opt);
+    }
+    var groups = {};
+    state.rows.forEach(function (r) {
+      var g = String(r.group || '').trim() || 'Unassigned';
+      (groups[g] = groups[g] || []).push(r);
+    });
+    Object.keys(groups).sort().forEach(function (gname) {
+      var og = document.createElement('optgroup');
+      og.label = gname;
+      groups[gname].forEach(function (r) {
+        var o = document.createElement('option');
+        o.value = String(r.id);
+        o.textContent = r.label + ' · ' + (r.unit || '') + (r.quantity > 0 ? ' · ' + r2(r.quantity) : '');
+        if (String(r.id) === String(state.activeRowId)) o.selected = true;
+        og.appendChild(o);
+      });
+      sel.appendChild(og);
+    });
+    sel.addEventListener('change', function () {
+      state.activeRowId = sel.value ? parseInt(sel.value, 10) : null;
+      state.drawing = null;
+      render();
+    });
+    rowPick.appendChild(sel);
+    var chip = document.createElement('span');
+    chip.id = 'pr_chip';
+    rowPick.appendChild(chip);
+    toolbar.appendChild(rowPick);
+
+    var tbActions = document.createElement('div');
+    tbActions.className = 'tb-actions';
+    var tbLeft = document.createElement('div');
+    tbLeft.className = 'tb-left';
+    var hint = document.createElement('div');
+    hint.className = 'hint';
+    hint.textContent = state.review
+      ? 'Review map — every drawn shape is filled in its substrate colour and the legend below lists all take-off rows. Rows in red have nothing drawn yet, so you can spot missed substrates before saving.'
+      : (state.tool === 'line'
+      ? 'Line tool — click two points on the plan to draw a length (walls, doors, frames, skirting).'
+      : (state.tool === 'polygon'
+        ? 'Outline tool — click each corner, then double-click or press Close outline to finish (footprint, ceilings).'
+        : 'Select tool — click a shape to select it. Drag a corner dot to resize/reshape, drag the middle to move the whole shape, then Delete selected to remove it. Switch to Line or Outline to draw new measurements.'));
+    tbLeft.appendChild(hint);
+    var scaleInfo = document.createElement('span');
+    var pxpm = finiteNum(state.pxPerM, 0);
+    scaleInfo.className = pxpm > 0 ? 'scale-ok' : 'scale-none';
+    scaleInfo.textContent = pxpm > 0 ? ('Scale set · ' + Math.round(pxpm * 100) / 100 + ' px/m') : 'Scale not calibrated — lengths/areas unmeasured';
+    tbLeft.appendChild(scaleInfo);
+    tbActions.appendChild(tbLeft);
+
+    var btns = document.createElement('div');
+    btns.className = 'tb-btns';
+    var selBtn = document.createElement('button');
+    selBtn.type = 'button';
+    selBtn.textContent = 'Select';
+    selBtn.className = state.tool === 'select' ? 'active' : '';
+    selBtn.addEventListener('click', function () { state.tool = 'select'; state.drawing = null; render(); });
+    btns.appendChild(selBtn);
+    var reviewBtn = document.createElement('button');
+    reviewBtn.type = 'button';
+    reviewBtn.textContent = state.review ? 'Review map: ON' : 'Review map (coverage)';
+    reviewBtn.className = state.review ? 'active' : '';
+    reviewBtn.addEventListener('click', function () { state.review = !state.review; draw(); render(); });
+    btns.appendChild(reviewBtn);
+    var labelBtn = document.createElement('button');
+    labelBtn.type = 'button';
+    labelBtn.textContent = state.labels ? 'Labels: ON' : 'Labels';
+    labelBtn.className = state.labels ? 'active' : '';
+    labelBtn.addEventListener('click', function () { state.labels = !state.labels; draw(); render(); });
+    btns.appendChild(labelBtn);
+    var lineBtn = document.createElement('button');
+    lineBtn.type = 'button';
+    lineBtn.textContent = 'Line';
+    lineBtn.className = state.tool === 'line' ? 'active' : '';
+    lineBtn.addEventListener('click', function () { state.tool = 'line'; state.drawing = null; render(); });
+    btns.appendChild(lineBtn);
+    var polyBtn = document.createElement('button');
+    polyBtn.type = 'button';
+    polyBtn.textContent = 'Outline';
+    polyBtn.className = state.tool === 'polygon' ? 'active' : '';
+    polyBtn.addEventListener('click', function () { state.tool = 'polygon'; state.drawing = null; render(); });
+    btns.appendChild(polyBtn);
+    var closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.textContent = 'Close outline';
+    closeBtn.disabled = !(state.drawing && state.drawing.type === 'polygon' && state.drawing.pts.length >= 3);
+    closeBtn.addEventListener('click', closeOutline);
+    btns.appendChild(closeBtn);
+    var cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = 'Cancel drawing';
+    cancelBtn.disabled = !state.drawing;
+    cancelBtn.addEventListener('click', function () { state.drawing = null; updateLive(); draw(); });
+    btns.appendChild(cancelBtn);
+    var delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.className = 'danger';
+    delBtn.textContent = 'Delete selected';
+    delBtn.addEventListener('click', function () {
+      if (!state.selectedId) { alert('Click a shape on the plan to select it first.'); return; }
+      state.lines = state.lines.filter(function (l) { return l.id !== state.selectedId; });
+      state.selectedId = null;
+      postValue();
+      draw();
+    });
+    btns.appendChild(delBtn);
+    var clearBtn = document.createElement('button');
+    clearBtn.type = 'button';
+    clearBtn.className = 'danger';
+    clearBtn.textContent = 'Clear all shapes';
+    clearBtn.addEventListener('click', function () {
+      if (!state.lines.length) return;
+      if (!confirm('Remove every drawn shape on this page?')) return;
+      state.lines = [];
+      state.selectedId = null;
+      state.drawing = null;
+      postValue();
+      draw();
+    });
+    btns.appendChild(clearBtn);
+    tbActions.appendChild(btns);
+    toolbar.appendChild(tbActions);
+
+    var zbar = document.createElement('div');
+    zbar.className = 'zoombar';
+    var zminus = document.createElement('button');
+    zminus.type = 'button';
+    zminus.textContent = '−';
+    zminus.addEventListener('click', function () { state.zoom = Math.max(0.25, (state.zoom || 1) * 0.8); applyZoom(); });
+    zbar.appendChild(zminus);
+    var zplus = document.createElement('button');
+    zplus.type = 'button';
+    zplus.textContent = '+';
+    zplus.addEventListener('click', function () { state.zoom = Math.min(4, (state.zoom || 1) * 1.25); applyZoom(); });
+    zbar.appendChild(zplus);
+    var zfit = document.createElement('button');
+    zfit.type = 'button';
+    zfit.textContent = 'Fit';
+    zfit.addEventListener('click', function () { state.zoom = 1; applyZoom(); });
+    zbar.appendChild(zfit);
+    var zval = document.createElement('span');
+    zval.className = 'zval';
+    zval.id = 'pr_zval';
+    zval.textContent = Math.round((state.zoom || 1) * 100) + '%';
+    zbar.appendChild(zval);
+    var zhint = document.createElement('span');
+    zhint.className = 'zhint';
+    zhint.textContent = 'Zoom keeps the plan crisp — scroll inside the box to pan when zoomed.';
+    zbar.appendChild(zhint);
+    toolbar.appendChild(zbar);
+
+    var live = document.createElement('div');
+    live.className = 'live';
+    live.id = 'pr_live';
+    toolbar.appendChild(live);
+    root.appendChild(toolbar);
+
+    var stage = document.createElement('div');
+    stage.className = 'stage';
+    var cv = document.createElement('canvas');
+    cv.id = 'pr_canvas';
+    stage.appendChild(cv);
+    root.appendChild(stage);
+
+    var img = new Image();
+    img.onload = function () {
+      state.natW = img.naturalWidth || 0;
+      state.natH = img.naturalHeight || 0;
+      var fit = fitDisplay(state.natW, state.natH);
+      state.cw = fit.w; state.ch = fit.h;
+      cv.width = state.cw; cv.height = state.ch;
+      state.imgEl = img;
+      cv.addEventListener('click', canvasClick);
+      cv.addEventListener('dblclick', canvasDblClick);
+      cv.addEventListener('pointerdown', canvasDown);
+      cv.addEventListener('pointerup', canvasUp);
+      cv.addEventListener('pointermove', canvasMove);
+      cv.addEventListener('pointerleave', function () { state.hover = null; updateLive(); draw(); });
+      cv.addEventListener('pointercancel', function () { if (state.drag) { state.drag = null; postValue(); } state.hover = null; updateLive(); draw(); });
+      cv.addEventListener('touchstart', function (ev) { if (ev.touches.length === 1) ev.preventDefault(); }, { passive: false });
+      state.fitW = Math.min(1100, state.cw);
+      applyZoom();
+      updateChip();
+      updateLive();
+      draw();
+    };
+    img.src = state.imageKey;
+
+    var legend = document.createElement('div');
+    legend.className = 'legend';
+    if (state.review) {
+      var rl = buildLegend();
+      root.appendChild(rl);
+    } else {
+      var sl = buildSmallLegend();
+      if (state.lines.length) root.appendChild(sl);
+    }
+  }
+
+  function shapeCountsByRow() {
+    var c = {};
+    state.lines.forEach(function (ln) {
+      var k = String(ln.takeoff_row_id === null || ln.takeoff_row_id === undefined || ln.takeoff_row_id === '' ? 'orphan' : ln.takeoff_row_id);
+      c[k] = (c[k] || 0) + 1;
+    });
+    return c;
+  }
+
+  function buildLegend() {
+    var legend = document.createElement('div');
+    legend.className = 'legend';
+    var counts = shapeCountsByRow();
+    state.rows.forEach(function (r) {
+      var n = counts[String(r.id)] || 0;
+      var covered = n > 0;
+      var item = document.createElement('span');
+      var sw = document.createElement('span');
+      sw.className = 'swatch sq';
+      sw.style.background = r.colour;
+      item.appendChild(sw);
+      var txt = document.createElement('span');
+      txt.textContent = (r.label || 'row') + ' · ' + (r.unit || '') + ' · ' + n + ' shape' + (n === 1 ? '' : 's') + (covered ? ' drawn' : ' · NOT DRAWN');
+      if (!covered) {
+        txt.className = 'miss';
+      }
+      item.appendChild(txt);
+      legend.appendChild(item);
+    });
+    if (counts['orphan']) {
+      var oi = document.createElement('span');
+      oi.className = 'orphan';
+      oi.textContent = counts['orphan'] + ' unassigned shape(s) on plan';
+      legend.appendChild(oi);
+    }
+    return legend;
+  }
+
+  function buildSmallLegend() {
+    var legend = document.createElement('div');
+    legend.className = 'legend';
+    var shown = {};
+    var count = 0;
+    for (var i = 0; i < state.lines.length && count < 10; i++) {
+      var ln = state.lines[i];
+      var key = ln.colour + '|' + ln.unit;
+      if (shown[key]) continue;
+      shown[key] = true;
+      count++;
+      var item = document.createElement('span');
+      var sw = document.createElement('span');
+      sw.className = 'swatch';
+      sw.style.background = ln.colour;
+      item.appendChild(sw);
+      item.appendChild(document.createTextNode((ln.label || 'Measurement') + ' · ' + (ln.unit || '')));
+      legend.appendChild(item);
+    }
+    return legend;
+  }
+
+  function updateChip() {
+    var chip = document.getElementById('pr_chip');
+    if (!chip) return;
+    var row = activeRow();
+    if (row) {
+      chip.className = 'chip';
+      chip.style.background = row.colour;
+      chip.textContent = row.label + ' · ' + row.unit;
+    } else {
+      chip.className = 'chip none';
+      chip.textContent = 'No row selected';
+    }
+  }
+
+  window.addEventListener('message', function (event) {
+    var data = event.data;
+    if (!data || data.type !== 'streamlit:render') return;
+    var args = data.args || data;
+    var image = String(args.image || '');
+    var revision = num(args.revision, 0);
+    var newPx = num(args.px_per_m, 0);
+    var newActive = parseInt(args.active_row_id, 10);
+    if (!state.imageKey || image !== state.imageKey || revision !== state.revision) {
+      state.imageKey = image;
+      state.revision = revision;
+      state.pxPerM = newPx;
+      state.rows = (args.rows || []).map(function (r) {
+        return {
+          id: parseInt(r.id, 10),
+          label: String(r.label || ''),
+          unit: String(r.unit || ''),
+          colour: /^#[0-9a-fA-F]{6}$/.test(String(r.colour || '')) ? r.colour : '#1f6fb2',
+          quantity: finiteNum(r.quantity, 0)
+        };
+      });
+      state.lines = (args.lines || []).map(sanitize);
+      if (state.rows.length) {
+        var preferred = state.rows.some(function (r) { return r.id === newActive; }) ? newActive : null;
+        var stillActive = state.rows.some(function (r) { return r.id === state.activeRowId; });
+        if (preferred !== null) {
+          state.activeRowId = preferred;
+        } else if (!stillActive) {
+          state.activeRowId = state.rows[0].id;
+        }
+      } else {
+        state.activeRowId = null;
+      }
+      state.selectedId = null;
+      state.drawing = null;
+      state.hover = null;
+    } else if (state.pxPerM !== newPx) {
+      state.pxPerM = newPx;
+      updateLive();
+      draw();
+    }
+    render();
+  });
+
+  window.addEventListener('load', function () {
+    post('streamlit:componentReady', { apiVersion: 1 });
+  });
+})();
+</script>
+</body>
+</html>
