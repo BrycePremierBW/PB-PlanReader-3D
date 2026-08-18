@@ -40,6 +40,9 @@ jobs:
       - name: Floor mapper calibration tests
         run: PYTHONPATH=. python tests/test_floor_mapper_v127.py
 
+      - name: Editable polygon floor mapper tests
+        run: PYTHONPATH=. python tests/test_floor_mapper_polygon_v128.py
+
       - name: TradeReader all-trade tests
         run: python -m unittest discover -s tests -p "test_tradereader_all_trades.py" -v
 
