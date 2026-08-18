@@ -52,6 +52,9 @@ jobs:
       - name: Takeoff Studio image-path guard tests
         run: PYTHONPATH=. python tests/test_studio_path_guard_v1213.py
 
+      - name: Quick 3D workflow tests
+        run: PYTHONPATH=. python tests/test_3d_quickstart_v1213.py
+
       - name: Clickable 3D surface editor tests
         run: PYTHONPATH=. python tests/test_3d_surface_editor_v1212.py
 
