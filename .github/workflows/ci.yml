@@ -31,6 +31,9 @@ jobs:
       - name: Check undefined names and local-scope errors
         run: ruff check --select F821,F823 .
 
+      - name: Syntax-check Takeoff Studio JavaScript
+        run: node --check planreader_takeoff_studio/frontend/studio.js
+
       - name: Gemini auth and secret-redaction tests
         run: PYTHONPATH=. python tests/test_gemini_auth.py
 
@@ -42,6 +45,9 @@ jobs:
 
       - name: Editable polygon floor mapper tests
         run: PYTHONPATH=. python tests/test_floor_mapper_polygon_v128.py
+
+      - name: Takeoff Studio geometry and safety tests
+        run: PYTHONPATH=. python tests/test_takeoff_studio_v1211.py
 
       - name: Plan processing stability tests
         run: PYTHONPATH=. python tests/test_processing_stability_v129.py
