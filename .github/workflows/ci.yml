@@ -37,6 +37,9 @@ jobs:
       - name: PlanReader take-off accuracy tests
         run: PYTHONPATH=. python tests/test_planreader_accuracy.py
 
+      - name: Floor mapper calibration tests
+        run: PYTHONPATH=. python tests/test_floor_mapper_v127.py
+
       - name: TradeReader all-trade tests
         run: python -m unittest discover -s tests -p "test_tradereader_all_trades.py" -v
 

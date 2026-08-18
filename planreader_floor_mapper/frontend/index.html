@@ -1,0 +1,64 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#171717;background:#fff}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 10px}
+button{border:1px solid #8b6f47;background:#fff;border-radius:999px;padding:8px 12px;font-weight:700;cursor:pointer}
+button.primary{background:#8b6f47;color:#fff}button.danger{border-color:#c84040;color:#a22222}
+.note{font-size:13px;color:#665f56;margin:6px 0 10px;line-height:1.4}
+.stage{position:relative;display:inline-block;max-width:100%;line-height:0;user-select:none}
+.stage img{display:block;max-width:100%;height:auto;border-radius:8px}
+.box{position:absolute;border:2px solid #d7a21b;background:rgba(215,162,27,.18);box-sizing:border-box;cursor:move;touch-action:none;z-index:2}
+.box.selected{box-shadow:0 0 0 3px rgba(23,23,23,.55)}
+.box .chip{position:absolute;top:3px;left:3px;background:rgba(23,23,23,.86);color:#fff;border-radius:5px;padding:3px 6px;font-size:12px;line-height:1.2;max-width:calc(100% - 8px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.resize{position:absolute;right:-7px;bottom:-7px;width:15px;height:15px;border-radius:3px;background:#2e8b57;border:2px solid #fff;cursor:nwse-resize}
+.cal{position:absolute;height:3px;background:#b33a3a;transform-origin:left center;z-index:4;pointer-events:none}.cal:before,.cal:after{content:"";position:absolute;top:-4px;width:10px;height:10px;border-radius:50%;background:#b33a3a}.cal:before{left:-5px}.cal:after{right:-5px}
+.editor{margin-top:12px;border:1px solid #e0d8cc;border-radius:9px;padding:10px;max-width:620px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.full{grid-column:1/-1}label{font-size:12px;color:#6a625a;display:block;margin-bottom:3px}input{width:100%;box-sizing:border-box;padding:7px 8px;border:1px solid #ccc;border-radius:7px;font-size:14px}.metric{font-weight:700;margin-top:6px}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+(function(){
+const root=document.getElementById('root');
+const state={image:'',boxes:[],calibration:null,revision:-1,selected:null,mode:'',drag:null,natW:0,natH:0};
+function post(type,payload){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},payload||{}),'*')}
+function value(){post('streamlit:setComponentValue',{value:{boxes:state.boxes,calibration:state.calibration},dataType:'json'})}
+function n(v,d){v=parseFloat(v);return Number.isFinite(v)?v:d}
+function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
+function p2(v){return Math.round(v*100)/100}
+function stageImg(){return document.getElementById('bg')}
+function pos(ev){const r=stageImg().getBoundingClientRect();return{x:clamp((ev.clientX-r.left)/r.width*100,0,100),y:clamp((ev.clientY-r.top)/r.height*100,0,100)}}
+function pxPerM(){const c=state.calibration;if(!c||!state.natW||!state.natH||!(n(c.len_m,0)>0))return 0;const dx=(n(c.x2,0)-n(c.x1,0))/100*state.natW,dy=(n(c.y2,0)-n(c.y1,0))/100*state.natH;const px=Math.hypot(dx,dy);return px>1?px/n(c.len_m,1):0}
+function area(b){const ppm=pxPerM();if(!ppm)return n(b.manual_m2,0)||0;const w=n(b.w,0)/100*state.natW/ppm,h=n(b.h,0)/100*state.natH/ppm;return w*h}
+function chip(b){const a=area(b);return (b.label||'Floor area')+(a>0?' · '+p2(a)+' m²':'')}
+function addBox(){const i=state.boxes.length+1;const b={id:'floor-'+Date.now()+'-'+i,label:'Floor area '+i,x:15,y:15,w:35,h:30,manual_m2:0};state.boxes.push(b);state.selected=b.id;value();render()}
+function setCalibration(x1,y1,x2,y2){const metres=parseFloat(window.prompt('Known real-world distance in metres:','10'));if(!(metres>0)){state.mode='';state.drag=null;render();return}state.calibration={x1:p2(x1),y1:p2(y1),x2:p2(x2),y2:p2(y2),len_m:p2(metres)};state.mode='';state.drag=null;value();render()}
+function render(){
+ root.innerHTML='';
+ const tb=document.createElement('div');tb.className='toolbar';
+ const cal=document.createElement('button');cal.textContent='Calibrate scale';cal.className=state.mode==='cal'?'primary':'';cal.onclick=()=>{state.mode='cal';state.drag=null;render()};tb.appendChild(cal);
+ const add=document.createElement('button');add.textContent='Add floor area';add.onclick=addBox;tb.appendChild(add);
+ const clear=document.createElement('button');clear.textContent='Clear floor areas';clear.className='danger';clear.onclick=()=>{if(confirm('Clear all floor-area boxes on this page?')){state.boxes=[];state.selected=null;value();render()}};tb.appendChild(clear);
+ root.appendChild(tb);
+ const note=document.createElement('div');note.className='note';note.textContent=state.mode==='cal'?'Drag a line across a known dimension, then enter its real length.':'Calibrate once, then add and drag/resize floor-area boxes. Quantities recalculate automatically.';root.appendChild(note);
+ if(!state.image){return}
+ const stage=document.createElement('div');stage.className='stage';
+ const img=document.createElement('img');img.id='bg';img.src=state.image;img.onload=()=>{state.natW=img.naturalWidth;state.natH=img.naturalHeight;post('streamlit:setFrameHeight',{height:Math.max(860,document.body.scrollHeight+20)})};stage.appendChild(img);
+ state.boxes.forEach(b=>{const el=document.createElement('div');el.className='box'+(state.selected===b.id?' selected':'');el.style.left=n(b.x,0)+'%';el.style.top=n(b.y,0)+'%';el.style.width=n(b.w,10)+'%';el.style.height=n(b.h,10)+'%';el.dataset.id=b.id;const c=document.createElement('div');c.className='chip';c.textContent=chip(b);el.appendChild(c);const rh=document.createElement('div');rh.className='resize';el.appendChild(rh);el.onpointerdown=(ev)=>{if(ev.target===rh)return;ev.preventDefault();state.selected=b.id;const q=pos(ev);state.drag={kind:'move',id:b.id,ox:q.x-n(b.x,0),oy:q.y-n(b.y,0)};el.setPointerCapture(ev.pointerId);renderEditor()};rh.onpointerdown=(ev)=>{ev.preventDefault();ev.stopPropagation();state.selected=b.id;state.drag={kind:'resize',id:b.id,start:pos(ev)};rh.setPointerCapture(ev.pointerId);renderEditor()};stage.appendChild(el)});
+ if(state.calibration){const c=state.calibration;const line=document.createElement('div');line.className='cal';const rr=stage.getBoundingClientRect();const x1=n(c.x1,0)/100*rr.width,y1=n(c.y1,0)/100*rr.height,x2=n(c.x2,0)/100*rr.width,y2=n(c.y2,0)/100*rr.height,dx=x2-x1,dy=y2-y1;line.style.left=n(c.x1,0)+'%';line.style.top=n(c.y1,0)+'%';line.style.width=Math.hypot(dx,dy)+'px';line.style.transform='rotate('+Math.atan2(dy,dx)*180/Math.PI+'deg)';stage.appendChild(line)}
+ stage.onpointerdown=(ev)=>{if(state.mode!=='cal'||ev.target!==img)return;ev.preventDefault();const q=pos(ev);state.drag={kind:'cal',x1:q.x,y1:q.y,x2:q.x,y2:q.y}};
+ stage.onpointermove=(ev)=>{if(!state.drag)return;const q=pos(ev);if(state.drag.kind==='cal'){state.drag.x2=q.x;state.drag.y2=q.y;const old=stage.querySelector('.cal.live');if(old)old.remove();const l=document.createElement('div');l.className='cal live';const r=stage.getBoundingClientRect(),dx=(q.x-state.drag.x1)/100*r.width,dy=(q.y-state.drag.y1)/100*r.height;l.style.left=state.drag.x1+'%';l.style.top=state.drag.y1+'%';l.style.width=Math.hypot(dx,dy)+'px';l.style.transform='rotate('+Math.atan2(dy,dx)*180/Math.PI+'deg)';stage.appendChild(l);return}const b=state.boxes.find(x=>x.id===state.drag.id);if(!b)return;if(state.drag.kind==='move'){b.x=clamp(q.x-state.drag.ox,0,100-n(b.w,1));b.y=clamp(q.y-state.drag.oy,0,100-n(b.h,1))}else{b.w=clamp(q.x-n(b.x,0),1,100-n(b.x,0));b.h=clamp(q.y-n(b.y,0),1,100-n(b.y,0))}const el=stage.querySelector('[data-id="'+b.id+'"]');if(el){el.style.left=b.x+'%';el.style.top=b.y+'%';el.style.width=b.w+'%';el.style.height=b.h+'%';el.querySelector('.chip').textContent=chip(b)}renderEditor()};
+ stage.onpointerup=(ev)=>{if(!state.drag)return;if(state.drag.kind==='cal'){const d=state.drag;const dist=Math.hypot(d.x2-d.x1,d.y2-d.y1);if(dist>1)setCalibration(d.x1,d.y1,d.x2,d.y2);else{state.drag=null;render()}}else{state.drag=null;value();render()}};
+ root.appendChild(stage);renderEditor();post('streamlit:setFrameHeight',{height:Math.max(860,document.body.scrollHeight+20)})
+}
+function renderEditor(){let ed=document.getElementById('editor');if(ed)ed.remove();const b=state.boxes.find(x=>x.id===state.selected);if(!b)return;ed=document.createElement('div');ed.id='editor';ed.className='editor';ed.innerHTML='<div class="grid"><div class="full"><label>Area label / level</label><input id="lbl"></div><div><label>Manual m² override (optional)</label><input id="manual" type="number" min="0" step="0.01"></div><div><label>Measured area</label><div class="metric" id="mval"></div></div></div>';root.appendChild(ed);const lbl=ed.querySelector('#lbl');lbl.value=b.label||'';lbl.onchange=()=>{b.label=lbl.value;value();render()};const man=ed.querySelector('#manual');man.value=n(b.manual_m2,0)||'';man.onchange=()=>{b.manual_m2=n(man.value,0);value();render()};ed.querySelector('#mval').textContent=area(b)>0?p2(area(b))+' m²':'Calibrate scale first';post('streamlit:setFrameHeight',{height:Math.max(860,document.body.scrollHeight+20)})}
+window.addEventListener('message',ev=>{const d=ev.data;if(!d||d.type!=='streamlit:render')return;const a=d.args||d;const rev=n(a.revision,0);if(state.image!==String(a.image||'')||state.revision!==rev){state.image=String(a.image||'');state.revision=rev;state.boxes=Array.isArray(a.boxes)?a.boxes.map(x=>Object.assign({},x)):[];state.calibration=a.calibration||null;state.selected=state.boxes.length?state.boxes[0].id:null;state.mode='';state.drag=null}render()});
+window.addEventListener('load',()=>post('streamlit:componentReady',{apiVersion:1}));
+})();
+</script>
+</body>
+</html>
