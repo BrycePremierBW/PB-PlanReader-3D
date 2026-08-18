@@ -1,7 +1,4 @@
-# Pinned dependency set verified on Python 3.13 and 3.14.
-# opencv-python-headless 4.14+ and numpy 2.3+ both ship Python 3.14 wheels,
-# matching the Python 3.14 runtime the Render service currently runs.
-# Keep opencv-python-headless at 4.x (cv2 morphology APIs are stable).
+# Pinned dependencies - memory-optimized for Render free tier (512MB)
 streamlit==1.59.2
 pandas==2.3.3
 numpy==2.3.5
