@@ -7,6 +7,7 @@ from pb_processing_stability_v129 import apply as apply_processing_stability_v12
 from pb_takeoff_studio_v1211 import apply as apply_takeoff_studio_v1211
 from pb_3d_surface_editor_v1212 import apply as apply_3d_surface_editor_v1212
 from pb_studio_path_guard_v1213 import apply as apply_studio_path_guard_v1213
+from pb_3d_quickstart_v1213 import apply as apply_3d_quickstart_v1213
 
 
 apply_gemini_v126(launcher.app)
@@ -15,6 +16,7 @@ apply_processing_stability_v129(launcher.app)
 apply_takeoff_studio_v1211(launcher.app)
 apply_3d_surface_editor_v1212(launcher.app)
 apply_studio_path_guard_v1213(launcher.app)
+apply_3d_quickstart_v1213(launcher.app)
 launcher.app.APP_VERSION = "1.2.13"
 
 
