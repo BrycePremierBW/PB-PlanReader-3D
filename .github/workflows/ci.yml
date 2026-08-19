@@ -67,6 +67,9 @@ jobs:
       - name: One-time database init guard tests
         run: PYTHONPATH=. python tests/test_db_init_guard_v1215.py
 
+      - name: No-AI takeoff tests
+        run: PYTHONPATH=. python tests/test_no_ai_takeoff_v1216.py
+
       - name: Plan processing stability tests
         run: PYTHONPATH=. python tests/test_processing_stability_v129.py
 
