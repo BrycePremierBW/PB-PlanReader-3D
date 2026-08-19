@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw
 import pb_auto_geometry_v1219 as auto
 import pb_unit_floor_area_v1221 as unit
 import pb_unit_floor_area_gate_v1221 as gate
+import pb_unit_floor_area_textfix_v1221 as textfix
 
 
 class _DBApp:
@@ -44,7 +45,7 @@ class UnitFloorAreaV1221Tests(unittest.TestCase):
 
     def test_documented_area_can_be_three_lines_after_unit_label(self):
         text = "UNIT 501\nTYPE A\n2 BEDROOM\n84.6 m²\nUNIT 502\nTYPE B\n91.2 m2"
-        rows = unit.extract_unit_area_candidates(text)
+        rows = textfix.extract_unit_area_candidates(text)
         values = {row["label"]: row["area_m2"] for row in rows}
         self.assertEqual(values["Unit 501"], 84.6)
         self.assertEqual(values["Unit 502"], 91.2)
