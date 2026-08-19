@@ -1,4 +1,4 @@
-"""Production entry point for Premier Brushworks PlanReader v1.2.14."""
+"""Production entry point for Premier Brushworks PlanReader v1.2.15."""
 
 import pb_planreader_v11_app as launcher
 from pb_gemini_v126 import apply as apply_gemini_v126
@@ -9,6 +9,7 @@ from pb_3d_surface_editor_v1212 import apply as apply_3d_surface_editor_v1212
 from pb_studio_path_guard_v1213 import apply as apply_studio_path_guard_v1213
 from pb_3d_quickstart_v1213 import apply as apply_3d_quickstart_v1213
 from pb_3d_wrapper_guard_v1214 import apply as apply_3d_wrapper_guard_v1214
+from pb_performance_v1215 import apply as apply_performance_v1215
 
 
 apply_gemini_v126(launcher.app)
@@ -19,7 +20,8 @@ apply_3d_surface_editor_v1212(launcher.app)
 apply_studio_path_guard_v1213(launcher.app)
 apply_3d_quickstart_v1213(launcher.app)
 apply_3d_wrapper_guard_v1214(launcher.app)
-launcher.app.APP_VERSION = "1.2.14"
+apply_performance_v1215(launcher.app)
+launcher.app.APP_VERSION = "1.2.15"
 
 
 if __name__ == "__main__":
