@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
 import pb_auto_geometry_v1219 as auto
+import pb_auto_geometry_guard_v1219 as guard
 
 
 class _DBApp:
@@ -112,6 +114,51 @@ class AutoGeometryV1219Tests(unittest.TestCase):
         self.assertEqual(auto._page_face("EAST ELEV"), "right")
         self.assertEqual(auto._page_face("west elevation"), "left")
         self.assertEqual(auto._page_face("Elevation 1"), "")
+
+    def test_manual_scale_change_outranks_previous_auto_calibration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "db.sqlite"
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE workspace_settings(workspace_id INTEGER,key TEXT,value TEXT)")
+            report = {
+                "calibrations": [
+                    {"page_id": 5, "method": "Dimension line", "px_per_m": 100.0, "confidence": "High"}
+                ]
+            }
+            conn.execute(
+                "INSERT INTO workspace_settings VALUES(?,?,?)",
+                (2, auto.SETTING_KEY, json.dumps(report)),
+            )
+            conn.commit()
+            conn.close()
+            app = _DBApp(db)
+            unchanged = {"id": 5, "workspace_id": 2, "px_per_m": 100.0, "scale_text": "Auto dimension 3600 · High confidence"}
+            corrected = {"id": 5, "workspace_id": 2, "px_per_m": 104.0, "scale_text": "Auto dimension 3600 · High confidence"}
+            self.assertFalse(guard.is_manual_calibration_override(app, unchanged))
+            self.assertTrue(guard.is_manual_calibration_override(app, corrected))
+
+    def test_manual_takeoff_rows_are_detected_as_precedence_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "db.sqlite"
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "CREATE TABLE takeoff_rows(workspace_id INTEGER,section TEXT,element TEXT,location TEXT,source_page TEXT,source_reference TEXT,unit TEXT,row_role TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO takeoff_rows VALUES(?,?,?,?,?,?,?,?)",
+                [
+                    (3, "Internal", "Floor area", "Unit 101 floor area", "A101", "PB floor mapper v1.2.7", "m²", "floor_area"),
+                    (3, "External", "External walls / cladding", "North EC1", "A301", "PB Takeoff Studio v1.2.11", "m²", "studio_area"),
+                    (3, "Internal", "Ceiling", "Unit 101", "A101", "Manual", "m²", ""),
+                    (3, "Internal", "Floor area", "Unit 999", "A101", auto.SOURCE_PREFIX + " · unit:Unit 999", "m²", "floor_area"),
+                ],
+            )
+            conn.commit()
+            conn.close()
+            app = _DBApp(db)
+            self.assertIn("unit 101", guard._manual_floor_keys(app, 3))
+            self.assertNotIn("unit 999", guard._manual_floor_keys(app, 3))
+            self.assertEqual(guard._manual_external_pages(app, 3), {"A301"})
 
 
 if __name__ == "__main__":
