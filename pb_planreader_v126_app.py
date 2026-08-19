@@ -23,6 +23,7 @@ from pb_unit_floor_area_textfix_v1221 import apply as apply_unit_floor_area_text
 from pb_material_schedule_v1222 import apply as apply_material_schedule_v1222
 from pb_autopilot_v1223 import apply as apply_autopilot_v1223
 from pb_autopilot_upload_batch_v1223 import apply as apply_autopilot_upload_batch_v1223
+from pb_autopilot_accuracy_guard_v1223 import apply as apply_autopilot_accuracy_guard_v1223
 
 
 apply_gemini_v126(launcher.app)
@@ -48,6 +49,7 @@ apply_unit_floor_area_textfix_v1221(launcher.app)
 apply_material_schedule_v1222(launcher.app)
 apply_autopilot_v1223(launcher.app)
 apply_autopilot_upload_batch_v1223(launcher.app)
+apply_autopilot_accuracy_guard_v1223(launcher.app)
 launcher.app.APP_VERSION = "1.2.23"
 
 
