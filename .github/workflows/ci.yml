@@ -58,6 +58,9 @@ jobs:
       - name: Clickable 3D surface editor tests
         run: PYTHONPATH=. python tests/test_3d_surface_editor_v1212.py
 
+      - name: 3D wrapper duplicate-key regression tests
+        run: PYTHONPATH=. python tests/test_3d_wrapper_guard_v1214.py
+
       - name: Plan processing stability tests
         run: PYTHONPATH=. python tests/test_processing_stability_v129.py
 
