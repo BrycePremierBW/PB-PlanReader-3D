@@ -82,6 +82,9 @@ jobs:
       - name: Drawing media and memory stability tests
         run: PYTHONPATH=. python tests/test_memory_stability_v1220.py
 
+      - name: Automatic unit floor area tests
+        run: PYTHONPATH=. python tests/test_unit_floor_area_v1221.py
+
       - name: Plan processing stability tests
         run: PYTHONPATH=. python tests/test_processing_stability_v129.py
 
