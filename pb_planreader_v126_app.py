@@ -15,6 +15,7 @@ from pb_subscription_core_guard_v1218 import apply as apply_subscription_core_gu
 from pb_no_ai_takeoff_v1216 import apply as apply_no_ai_takeoff_v1216
 from pb_selected_pages_v1217 import apply as apply_selected_pages_v1217
 from pb_auto_geometry_v1219 import apply as apply_auto_geometry_v1219
+from pb_auto_geometry_guard_v1219 import apply as apply_auto_geometry_guard_v1219
 
 
 apply_gemini_v126(launcher.app)
@@ -32,6 +33,7 @@ apply_subscription_core_guard_v1218(launcher.app)
 apply_no_ai_takeoff_v1216(launcher.app)
 apply_selected_pages_v1217(launcher.app)
 apply_auto_geometry_v1219(launcher.app)
+apply_auto_geometry_guard_v1219(launcher.app)
 launcher.app.APP_VERSION = "1.2.19"
 
 
