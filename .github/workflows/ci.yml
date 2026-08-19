@@ -79,6 +79,9 @@ jobs:
       - name: Automatic page triage, calibration and geometry tests
         run: PYTHONPATH=. python tests/test_auto_geometry_v1219.py
 
+      - name: Drawing media and memory stability tests
+        run: PYTHONPATH=. python tests/test_memory_stability_v1220.py
+
       - name: Plan processing stability tests
         run: PYTHONPATH=. python tests/test_processing_stability_v129.py
 
