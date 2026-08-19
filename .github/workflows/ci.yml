@@ -73,6 +73,9 @@ jobs:
       - name: Selected-page takeoff tests
         run: PYTHONPATH=. python tests/test_selected_pages_v1217.py
 
+      - name: Subscription core startup regression tests
+        run: PYTHONPATH=. python tests/test_subscription_core_guard_v1218.py
+
       - name: Plan processing stability tests
         run: PYTHONPATH=. python tests/test_processing_stability_v129.py
 

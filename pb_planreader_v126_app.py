@@ -1,4 +1,4 @@
-"""Production entry point for Premier Brushworks PlanReader v1.2.17."""
+"""Production entry point for Premier Brushworks PlanReader v1.2.18."""
 
 import pb_planreader_v11_app as launcher
 from pb_gemini_v126 import apply as apply_gemini_v126
@@ -11,6 +11,7 @@ from pb_3d_quickstart_v1213 import apply as apply_3d_quickstart_v1213
 from pb_3d_wrapper_guard_v1214 import apply as apply_3d_wrapper_guard_v1214
 from pb_performance_v1215 import apply as apply_performance_v1215
 from pb_db_init_guard_v1215 import apply as apply_db_init_guard_v1215
+from pb_subscription_core_guard_v1218 import apply as apply_subscription_core_guard_v1218
 from pb_no_ai_takeoff_v1216 import apply as apply_no_ai_takeoff_v1216
 from pb_selected_pages_v1217 import apply as apply_selected_pages_v1217
 
@@ -25,9 +26,11 @@ apply_3d_quickstart_v1213(launcher.app)
 apply_3d_wrapper_guard_v1214(launcher.app)
 apply_performance_v1215(launcher.app)
 apply_db_init_guard_v1215(launcher.app)
+# Capture the original Subscription Take-off function before v1.2.16/v1.2.17 wrap it.
+apply_subscription_core_guard_v1218(launcher.app)
 apply_no_ai_takeoff_v1216(launcher.app)
 apply_selected_pages_v1217(launcher.app)
-launcher.app.APP_VERSION = "1.2.17"
+launcher.app.APP_VERSION = "1.2.18"
 
 
 if __name__ == "__main__":
