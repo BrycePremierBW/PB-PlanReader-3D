@@ -10,6 +10,7 @@ from pb_studio_path_guard_v1213 import apply as apply_studio_path_guard_v1213
 from pb_3d_quickstart_v1213 import apply as apply_3d_quickstart_v1213
 from pb_3d_wrapper_guard_v1214 import apply as apply_3d_wrapper_guard_v1214
 from pb_performance_v1215 import apply as apply_performance_v1215
+from pb_db_init_guard_v1215 import apply as apply_db_init_guard_v1215
 
 
 apply_gemini_v126(launcher.app)
@@ -21,6 +22,7 @@ apply_studio_path_guard_v1213(launcher.app)
 apply_3d_quickstart_v1213(launcher.app)
 apply_3d_wrapper_guard_v1214(launcher.app)
 apply_performance_v1215(launcher.app)
+apply_db_init_guard_v1215(launcher.app)
 launcher.app.APP_VERSION = "1.2.15"
 
 
