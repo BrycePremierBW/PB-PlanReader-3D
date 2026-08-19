@@ -9,6 +9,7 @@ from PIL import Image, ImageDraw
 
 import pb_auto_geometry_v1219 as auto
 import pb_unit_floor_area_v1221 as unit
+import pb_unit_floor_area_gate_v1221 as gate
 
 
 class _DBApp:
@@ -36,6 +37,10 @@ class UnitFloorAreaV1221Tests(unittest.TestCase):
         self.assertTrue(keep)
         self.assertIn("floor-area", reason)
         self.assertEqual(score, 100)
+        normalised = gate.normalise_unit_plan_pages([
+            {"page_type": "Partition Plan", "page_label": "Level 05", "extracted_text": "UNIT 501 UNIT 502"}
+        ])[0]
+        self.assertIn("Floor Plan", normalised["page_type"])
 
     def test_documented_area_can_be_three_lines_after_unit_label(self):
         text = "UNIT 501\nTYPE A\n2 BEDROOM\n84.6 m²\nUNIT 502\nTYPE B\n91.2 m2"
@@ -78,7 +83,7 @@ class UnitFloorAreaV1221Tests(unittest.TestCase):
             self.assertEqual([item["label"] for item in results], ["Unit 501", "Unit 502"])
             self.assertTrue(all(80.0 <= item["area_m2"] <= 110.0 for item in results))
 
-    def test_boundary_results_become_internal_floor_area_takeoff_rows(self):
+    def test_partition_boundary_results_become_internal_floor_area_takeoff_rows(self):
         page = {
             "id": 7,
             "page_type": "Partition Plan",
@@ -92,7 +97,7 @@ class UnitFloorAreaV1221Tests(unittest.TestCase):
                 {"label": "Unit 501", "area_m2": 84.6, "confidence": "Derived", "source": "test"}
             ]
             auto.extract_unit_area_candidates = lambda _text: []
-            rows, summary = auto._build_unit_rows(object(), 4, [page])
+            rows, summary = auto._build_unit_rows(object(), 4, gate.normalise_unit_plan_pages([page]))
         finally:
             auto._unit_boundary_candidates = original_boundary
             auto.extract_unit_area_candidates = original_extract
