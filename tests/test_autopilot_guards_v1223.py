@@ -71,9 +71,16 @@ class AutopilotGuardTests(unittest.TestCase):
             app = _DBApp(db)
             updates = accuracy.cross_page_calibration(app, 4)
             self.assertEqual([item["page_id"] for item in updates], [2])
+            # Both trusted same-size 1:100 donor sheets participate. The robust
+            # result is their median (100 and 98 => 99), not an arbitrary donor.
+            self.assertEqual(updates[0]["donor_page_ids"], [1, 3])
+            self.assertEqual(updates[0]["confidence"], "Cross-verified")
             rows = {row["id"]: row for row in app.lquery("SELECT id,px_per_m,scale_text FROM pages ORDER BY id")}
-            self.assertAlmostEqual(rows[2]["px_per_m"], 100.0)
+            self.assertAlmostEqual(rows[2]["px_per_m"], 99.0)
             self.assertIn("Auto cross-page 1:100", rows[2]["scale_text"])
+            # Trusted donors are evidence sources only and must not be changed.
+            self.assertAlmostEqual(rows[1]["px_per_m"], 100.0)
+            self.assertEqual(rows[1]["scale_text"], "Manual calibration")
             self.assertAlmostEqual(rows[3]["px_per_m"], 98.0)
             self.assertEqual(rows[3]["scale_text"], "Manual/existing")
 
