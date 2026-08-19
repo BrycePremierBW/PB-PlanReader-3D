@@ -1,4 +1,4 @@
-"""Production entry point for Premier Brushworks PlanReader v1.2.18."""
+"""Production entry point for Premier Brushworks PlanReader v1.2.19."""
 
 import pb_planreader_v11_app as launcher
 from pb_gemini_v126 import apply as apply_gemini_v126
@@ -14,6 +14,7 @@ from pb_db_init_guard_v1215 import apply as apply_db_init_guard_v1215
 from pb_subscription_core_guard_v1218 import apply as apply_subscription_core_guard_v1218
 from pb_no_ai_takeoff_v1216 import apply as apply_no_ai_takeoff_v1216
 from pb_selected_pages_v1217 import apply as apply_selected_pages_v1217
+from pb_auto_geometry_v1219 import apply as apply_auto_geometry_v1219
 
 
 apply_gemini_v126(launcher.app)
@@ -30,7 +31,8 @@ apply_db_init_guard_v1215(launcher.app)
 apply_subscription_core_guard_v1218(launcher.app)
 apply_no_ai_takeoff_v1216(launcher.app)
 apply_selected_pages_v1217(launcher.app)
-launcher.app.APP_VERSION = "1.2.18"
+apply_auto_geometry_v1219(launcher.app)
+launcher.app.APP_VERSION = "1.2.19"
 
 
 if __name__ == "__main__":
