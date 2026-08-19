@@ -18,6 +18,7 @@ from pb_auto_geometry_v1219 import apply as apply_auto_geometry_v1219
 from pb_auto_geometry_guard_v1219 import apply as apply_auto_geometry_guard_v1219
 from pb_memory_stability_v1220 import apply as apply_memory_stability_v1220
 from pb_unit_floor_area_v1221 import apply as apply_unit_floor_area_v1221
+from pb_unit_floor_area_gate_v1221 import apply as apply_unit_floor_area_gate_v1221
 
 
 apply_gemini_v126(launcher.app)
@@ -38,6 +39,7 @@ apply_auto_geometry_v1219(launcher.app)
 apply_auto_geometry_guard_v1219(launcher.app)
 apply_memory_stability_v1220(launcher.app)
 apply_unit_floor_area_v1221(launcher.app)
+apply_unit_floor_area_gate_v1221(launcher.app)
 launcher.app.APP_VERSION = "1.2.21"
 
 
