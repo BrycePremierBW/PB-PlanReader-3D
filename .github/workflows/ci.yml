@@ -70,6 +70,9 @@ jobs:
       - name: No-AI takeoff tests
         run: PYTHONPATH=. python tests/test_no_ai_takeoff_v1216.py
 
+      - name: Selected-page takeoff tests
+        run: PYTHONPATH=. python tests/test_selected_pages_v1217.py
+
       - name: Plan processing stability tests
         run: PYTHONPATH=. python tests/test_processing_stability_v129.py
 
