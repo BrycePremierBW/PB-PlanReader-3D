@@ -88,6 +88,9 @@ jobs:
       - name: Finishing schedule material resolver tests
         run: PYTHONPATH=. python tests/test_material_schedule_v1222.py
 
+      - name: End-to-end Autopilot tests
+        run: PYTHONPATH=. python tests/test_autopilot_v1223.py
+
       - name: Plan processing stability tests
         run: PYTHONPATH=. python tests/test_processing_stability_v129.py
 
