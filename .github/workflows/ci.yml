@@ -61,6 +61,9 @@ jobs:
       - name: 3D wrapper duplicate-key regression tests
         run: PYTHONPATH=. python tests/test_3d_wrapper_guard_v1214.py
 
+      - name: PlanReader performance optimisation tests
+        run: PYTHONPATH=. python tests/test_performance_v1215.py
+
       - name: Plan processing stability tests
         run: PYTHONPATH=. python tests/test_processing_stability_v129.py
 
