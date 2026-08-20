@@ -1,4 +1,4 @@
-"""Production entry point for Premier Brushworks PlanReader v1.2.26."""
+"""Production entry point for Premier Brushworks PlanReader v1.2.27."""
 
 import pb_planreader_v11_app as launcher
 from pb_gemini_v126 import apply as apply_gemini_v126
@@ -34,6 +34,7 @@ from pb_selection_lock_v1226 import apply as apply_selection_lock_v1226
 from pb_selected_evidence_floor_v1226 import apply as apply_selected_evidence_floor_v1226
 from pb_elevation_regions_v1226 import apply as apply_elevation_regions_v1226
 from pb_takeoff_review_v1226 import apply as apply_takeoff_review_v1226
+from pb_legend_register_v1227 import apply as apply_legend_register_v1227
 
 
 apply_gemini_v126(launcher.app)
@@ -64,14 +65,15 @@ apply_page_registration_v1225(launcher.app)
 apply_registration_priority_guard_v1225(launcher.app)
 apply_code_register_v1225(launcher.app)
 apply_premier_takeoff_v1225(launcher.app)
-# v1.2.26 is last so estimator-selected evidence and manual polygon/merge controls
-# outrank all earlier automatic wrappers without removing proven legacy tools.
 apply_drawing_reading_v1226(launcher.app)
 apply_selection_lock_v1226(launcher.app)
 apply_selected_evidence_floor_v1226(launcher.app)
 apply_elevation_regions_v1226(launcher.app)
 apply_takeoff_review_v1226(launcher.app)
-launcher.app.APP_VERSION = "1.2.26"
+# v1.2.27 is outermost: selected project legend/abbreviation evidence is built
+# before downstream geometry, material, take-off and 3D interpretation.
+apply_legend_register_v1227(launcher.app)
+launcher.app.APP_VERSION = "1.2.27"
 
 
 if __name__ == "__main__":
