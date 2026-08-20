@@ -1,4 +1,4 @@
-"""Production entry point for Premier Brushworks PlanReader v1.2.25."""
+"""Production entry point for Premier Brushworks PlanReader v1.2.26."""
 
 import pb_planreader_v11_app as launcher
 from pb_gemini_v126 import apply as apply_gemini_v126
@@ -29,6 +29,11 @@ from pb_page_registration_v1225 import apply as apply_page_registration_v1225
 from pb_registration_priority_guard_v1225 import apply as apply_registration_priority_guard_v1225
 from pb_code_register_v1225 import apply as apply_code_register_v1225
 from pb_premier_takeoff_v1225 import apply as apply_premier_takeoff_v1225
+from pb_drawing_reading_v1226 import apply as apply_drawing_reading_v1226
+from pb_selection_lock_v1226 import apply as apply_selection_lock_v1226
+from pb_selected_evidence_floor_v1226 import apply as apply_selected_evidence_floor_v1226
+from pb_elevation_regions_v1226 import apply as apply_elevation_regions_v1226
+from pb_takeoff_review_v1226 import apply as apply_takeoff_review_v1226
 
 
 apply_gemini_v126(launcher.app)
@@ -41,7 +46,6 @@ apply_3d_quickstart_v1213(launcher.app)
 apply_3d_wrapper_guard_v1214(launcher.app)
 apply_performance_v1215(launcher.app)
 apply_db_init_guard_v1215(launcher.app)
-# Capture the original Subscription Take-off function before v1.2.16/v1.2.17 wrap it.
 apply_subscription_core_guard_v1218(launcher.app)
 apply_no_ai_takeoff_v1216(launcher.app)
 apply_selected_pages_v1217(launcher.app)
@@ -56,13 +60,18 @@ apply_autopilot_v1223(launcher.app)
 apply_autopilot_upload_batch_v1223(launcher.app)
 apply_autopilot_accuracy_guard_v1223(launcher.app)
 apply_context_floorarea_v1224(launcher.app)
-# v1.2.25 is deliberately last: corrected sheet identity must feed mapper, code
-# resolution and the Premier Brushworks estimator view after all earlier wrappers.
 apply_page_registration_v1225(launcher.app)
 apply_registration_priority_guard_v1225(launcher.app)
 apply_code_register_v1225(launcher.app)
 apply_premier_takeoff_v1225(launcher.app)
-launcher.app.APP_VERSION = "1.2.25"
+# v1.2.26 is last so estimator-selected evidence and manual polygon/merge controls
+# outrank all earlier automatic wrappers without removing proven legacy tools.
+apply_drawing_reading_v1226(launcher.app)
+apply_selection_lock_v1226(launcher.app)
+apply_selected_evidence_floor_v1226(launcher.app)
+apply_elevation_regions_v1226(launcher.app)
+apply_takeoff_review_v1226(launcher.app)
+launcher.app.APP_VERSION = "1.2.26"
 
 
 if __name__ == "__main__":

@@ -100,6 +100,9 @@ jobs:
       - name: Reliable registration, quick code register and PB takeoff tests
         run: PYTHONPATH=. python tests/test_registration_pb_takeoff_v1225.py
 
+      - name: Drawing intelligence, selected evidence and takeoff review tests
+        run: PYTHONPATH=. python tests/test_drawing_intelligence_v1226.py
+
       - name: Plan processing stability tests
         run: PYTHONPATH=. python tests/test_processing_stability_v129.py
 
