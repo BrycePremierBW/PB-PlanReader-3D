@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 import tempfile
 from pathlib import Path
 
 import pb_code_register_v1225 as codes
 import pb_page_registration_v1225 as registration
 import pb_premier_takeoff_v1225 as pb
+import pb_registration_priority_guard_v1225 as priority
 
 
 def test_title_block_partition_plan_beats_elevation_references():
@@ -16,7 +16,7 @@ def test_title_block_partition_plan_beats_elevation_references():
     SECTION 4/A-502
     NORTH ELEVATION REFERENCE ONLY
     """
-    kind, confidence, evidence = registration.weighted_page_type(
+    kind, confidence, evidence = priority.weighted_page_type(
         full_text,
         "architectural_combined.pdf",
         "A-205\nLEVEL 05 PARTITION PLAN\nSCALE 1:100",
@@ -27,7 +27,7 @@ def test_title_block_partition_plan_beats_elevation_references():
 
 
 def test_title_block_rcp_beats_floor_plan_references():
-    kind, confidence, _ = registration.weighted_page_type(
+    kind, confidence, _ = priority.weighted_page_type(
         "REFER FLOOR PLAN A-201. CEILING DETAILS BELOW.",
         "plans.pdf",
         "A-401\nLEVEL 02 REFLECTED CEILING PLAN\n1:100",
@@ -42,8 +42,8 @@ def test_drawing_number_rejects_finish_code_but_accepts_issued_sheet_no():
 
 
 def test_fallback_classification_does_not_turn_partition_plan_into_elevation():
-    page_type, _label = registration.classify_page(
-        "LEVEL 03 PARTITION PLAN. Refer external elevation A301 and section A501.",
+    page_type, _label = priority.classify_page(
+        "LEVEL 03 PARTITION PLAN\nREFER EXTERNAL ELEVATION A301\nSEE SECTION A501",
         "architectural.pdf",
         8,
     )
