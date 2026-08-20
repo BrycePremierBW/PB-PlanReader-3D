@@ -1,4 +1,4 @@
-"""Production entry point for Premier Brushworks PlanReader v1.2.27."""
+"""Production entry point for Premier Brushworks PlanReader v1.2.28."""
 
 import pb_planreader_v11_app as launcher
 from pb_gemini_v126 import apply as apply_gemini_v126
@@ -35,6 +35,8 @@ from pb_selected_evidence_floor_v1226 import apply as apply_selected_evidence_fl
 from pb_elevation_regions_v1226 import apply as apply_elevation_regions_v1226
 from pb_takeoff_review_v1226 import apply as apply_takeoff_review_v1226
 from pb_legend_register_v1227 import apply as apply_legend_register_v1227
+from pb_plan_read_engine_v1228 import apply as apply_plan_read_engine_v1228
+from pb_mapper_hard_guard_v1228 import apply as apply_mapper_hard_guard_v1228
 
 
 apply_gemini_v126(launcher.app)
@@ -70,10 +72,12 @@ apply_selection_lock_v1226(launcher.app)
 apply_selected_evidence_floor_v1226(launcher.app)
 apply_elevation_regions_v1226(launcher.app)
 apply_takeoff_review_v1226(launcher.app)
-# v1.2.27 is outermost: selected project legend/abbreviation evidence is built
-# before downstream geometry, material, take-off and 3D interpretation.
 apply_legend_register_v1227(launcher.app)
-launcher.app.APP_VERSION = "1.2.27"
+# v1.2.28 rebuilds selected PDF text spatially before the complete automatic
+# evidence chain, then puts a hard regular-file gate around Plan Mapper.
+apply_plan_read_engine_v1228(launcher.app)
+apply_mapper_hard_guard_v1228(launcher.app)
+launcher.app.APP_VERSION = "1.2.28"
 
 
 if __name__ == "__main__":
