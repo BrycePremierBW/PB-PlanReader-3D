@@ -103,6 +103,9 @@ jobs:
       - name: Drawing intelligence, selected evidence and takeoff review tests
         run: PYTHONPATH=. python tests/test_drawing_intelligence_v1226.py
 
+      - name: Legend-first abbreviation and code interpretation tests
+        run: PYTHONPATH=. python tests/test_legend_register_v1227.py
+
       - name: Plan processing stability tests
         run: PYTHONPATH=. python tests/test_processing_stability_v129.py
 
