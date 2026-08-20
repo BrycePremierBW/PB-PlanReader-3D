@@ -23,6 +23,7 @@ _HEADING_RULES = (
     ("Section", ("building sections", "building section", "wall sections", "wall section", "cross section")),
     ("Render / Artist's Impression", ("artist's impression", "artists impression", "artist impression", "3d render", "perspective")),
 )
+_BASE_WEIGHTED_PAGE_TYPE = registration.weighted_page_type
 
 
 def _norm_line(value: Any) -> str:
@@ -56,10 +57,10 @@ def strong_heading_type(text: Any) -> Tuple[str, str]:
 
 
 def weighted_page_type(full_text: Any, file_name: Any = "", title_block: Any = ""):
-    base_type, confidence, evidence = registration._pb_v1225_base_weighted_page_type(full_text, file_name, title_block)
+    base_type, confidence, evidence = _BASE_WEIGHTED_PAGE_TYPE(full_text, file_name, title_block)
     # Native title-block evidence remains strongest and already receives a large
-    # score in the base classifier. Only improve the fallback when title-block
-    # text did not establish a concise heading.
+    # score in the base classifier. Only improve the fallback when a concise
+    # heading can be found.
     title_type, title_line = strong_heading_type(title_block)
     if title_type:
         return title_type, max(int(confidence), 94), f"title block heading: {title_line}"
@@ -79,8 +80,7 @@ def apply(app: Any) -> None:
     if getattr(app, "_pb_registration_priority_guard_v1225_applied", False):
         return
     app._pb_registration_priority_guard_v1225_applied = True
-    if not hasattr(registration, "_pb_v1225_base_weighted_page_type"):
-        registration._pb_v1225_base_weighted_page_type = registration.weighted_page_type
+    registration._pb_v1225_base_weighted_page_type = _BASE_WEIGHTED_PAGE_TYPE
     registration.weighted_page_type = weighted_page_type
     registration.classify_page = classify_page
     app.classify_page = classify_page
