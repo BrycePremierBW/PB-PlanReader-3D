@@ -102,6 +102,25 @@ def _near(a: Tuple[float, float], b: Tuple[float, float], tolerance: float) -> b
     return math.hypot(a[0] - b[0], a[1] - b[1]) <= tolerance
 
 
+def _point_segment_distance(
+    point: Tuple[float, float],
+    start: Tuple[float, float],
+    end: Tuple[float, float],
+) -> float:
+    """Shortest Euclidean distance from a point to a finite line segment."""
+    px, py = point
+    ax, ay = start
+    bx, by = end
+    dx, dy = bx - ax, by - ay
+    denom = dx * dx + dy * dy
+    if denom <= 1e-12:
+        return math.hypot(px - ax, py - ay)
+    t = ((px - ax) * dx + (py - ay) * dy) / denom
+    t = max(0.0, min(1.0, t))
+    cx, cy = ax + t * dx, ay + t * dy
+    return math.hypot(px - cx, py - cy)
+
+
 def _witness_count(base_line: Tuple[float, float, float, float], lines: Sequence[Tuple[float, float, float, float]]) -> int:
     x1, y1, x2, y2 = base_line
     horizontal = abs(x2 - x1) >= abs(y2 - y1)
@@ -120,7 +139,11 @@ def _witness_count(base_line: Tuple[float, float, float, float], lines: Sequence
             candidate_horizontal = abs(bx - ax) >= abs(by - ay)
             if candidate_horizontal == horizontal:
                 continue
-            if _near(endpoint, (ax, ay), tolerance) or _near(endpoint, (bx, by), tolerance):
+            # Witness / extension marks commonly CROSS the dimension endpoint.
+            # Their own endpoints can sit well above/below it, so compare the
+            # dimension endpoint to the whole candidate segment rather than only
+            # to the candidate segment's endpoints.
+            if _point_segment_distance(endpoint, (ax, ay), (bx, by)) <= tolerance:
                 found = True
                 break
         if found:
