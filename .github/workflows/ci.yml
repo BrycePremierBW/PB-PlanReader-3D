@@ -97,6 +97,9 @@ jobs:
       - name: Finish-code context and internal floor-area tests
         run: PYTHONPATH=. python tests/test_context_floorarea_v1224.py
 
+      - name: Reliable registration, quick code register and PB takeoff tests
+        run: PYTHONPATH=. python tests/test_registration_pb_takeoff_v1225.py
+
       - name: Plan processing stability tests
         run: PYTHONPATH=. python tests/test_processing_stability_v129.py
 

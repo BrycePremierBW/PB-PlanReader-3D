@@ -1,4 +1,4 @@
-"""Production entry point for Premier Brushworks PlanReader v1.2.24."""
+"""Production entry point for Premier Brushworks PlanReader v1.2.25."""
 
 import pb_planreader_v11_app as launcher
 from pb_gemini_v126 import apply as apply_gemini_v126
@@ -25,6 +25,10 @@ from pb_autopilot_v1223 import apply as apply_autopilot_v1223
 from pb_autopilot_upload_batch_v1223 import apply as apply_autopilot_upload_batch_v1223
 from pb_autopilot_accuracy_guard_v1223 import apply as apply_autopilot_accuracy_guard_v1223
 from pb_context_floorarea_v1224 import apply as apply_context_floorarea_v1224
+from pb_page_registration_v1225 import apply as apply_page_registration_v1225
+from pb_registration_priority_guard_v1225 import apply as apply_registration_priority_guard_v1225
+from pb_code_register_v1225 import apply as apply_code_register_v1225
+from pb_premier_takeoff_v1225 import apply as apply_premier_takeoff_v1225
 
 
 apply_gemini_v126(launcher.app)
@@ -52,7 +56,13 @@ apply_autopilot_v1223(launcher.app)
 apply_autopilot_upload_batch_v1223(launcher.app)
 apply_autopilot_accuracy_guard_v1223(launcher.app)
 apply_context_floorarea_v1224(launcher.app)
-launcher.app.APP_VERSION = "1.2.24"
+# v1.2.25 is deliberately last: corrected sheet identity must feed mapper, code
+# resolution and the Premier Brushworks estimator view after all earlier wrappers.
+apply_page_registration_v1225(launcher.app)
+apply_registration_priority_guard_v1225(launcher.app)
+apply_code_register_v1225(launcher.app)
+apply_premier_takeoff_v1225(launcher.app)
+launcher.app.APP_VERSION = "1.2.25"
 
 
 if __name__ == "__main__":
