@@ -106,6 +106,9 @@ jobs:
       - name: Legend-first abbreviation and code interpretation tests
         run: PYTHONPATH=. python tests/test_legend_register_v1227.py
 
+      - name: Spatial plan reading and mapper hard-guard tests
+        run: PYTHONPATH=. pytest -q tests/test_plan_read_engine_v1228.py
+
       - name: Plan processing stability tests
         run: PYTHONPATH=. python tests/test_processing_stability_v129.py
 
