@@ -95,6 +95,25 @@ try:
 except Exception:
     OpenAI = None
 
+# Offline plan reader (no AI needed)
+try:
+    from pb_planreader_offline import (
+        analyze_page_offline,
+        generate_takeoff_offline,
+        extract_text_offline,
+        detect_walls,
+        detect_dimensions,
+        detect_scale,
+        detect_rooms,
+        detect_materials,
+        detect_colours,
+        classify_page_offline,
+        generate_report,
+    )
+    OFFLINE_READER_AVAILABLE = True
+except Exception:
+    OFFLINE_READER_AVAILABLE = False
+
 try:
     import psycopg2
     import psycopg2.extras
@@ -5883,6 +5902,426 @@ def export_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],user:Dict[
     st.markdown("</div>",unsafe_allow_html=True)
 
 
+# ---------------------------------------------------------------------------
+# Offline Plan Reader (no AI)
+# ---------------------------------------------------------------------------
+
+def offline_plan_reader_page(workspace: Dict[str, Any]) -> None:
+    """Offline plan reading page - no AI required. Uses OCR, vector extraction, and pattern matching."""
+    st.markdown('<div class="pb-header"><h2>Offline Plan Reader</h2><p>No AI required - uses OCR, vector extraction, and pattern matching</p></div>', unsafe_allow_html=True)
+    
+    if not OFFLINE_READER_AVAILABLE:
+        st.error("Offline reader module not available. Please ensure pb_planreader_offline.py is installed.")
+        st.info("The offline reader uses PyMuPDF4LLM for OCR, PyMuPDF for vector extraction, and OpenCV for image processing.")
+        return
+    
+    # Get documents in workspace
+    docs = lquery("SELECT * FROM documents WHERE workspace_id=? ORDER BY created_at DESC", (workspace["id"],))
+    
+    if not docs:
+        st.warning("No documents uploaded yet. Go to **Job & Documents** to upload a plan.")
+        return
+    
+    # Document selector
+    doc_options = {f"{d['file_name']} (p{d.get('page_count', '?')})": d["id"] for d in docs}
+    selected_label = st.selectbox("Select document", list(doc_options.keys()))
+    doc_id = doc_options[selected_label]
+    doc = [d for d in docs if d["id"] == doc_id][0]
+    doc_path = Path(str(doc["path"]))
+    
+    if not doc_path.exists():
+        st.error("Document file not found on disk.")
+        return
+    
+    # Page selector
+    page_count = doc.get("page_count", 1) or 1
+    page_range = st.multiselect(
+        "Select pages to analyze",
+        list(range(1, page_count + 1)),
+        default=[1] if page_count >= 1 else [],
+        help="Select which pages to analyze",
+    )
+    
+    # OCR toggle
+    use_ocr = st.checkbox("Enable OCR (for scanned plans)", value=True, help="Uses PyMuPDF4LLM to extract text from scanned/image-based PDFs")
+    
+    # Analysis options
+    st.subheader("Analysis Options")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        analyze_dims = st.checkbox("Detect dimensions", value=True)
+    with col2:
+        analyze_walls = st.checkbox("Detect walls", value=True)
+    with col3:
+        analyze_rooms = st.checkbox("Detect rooms/areas", value=True)
+    
+    col4, col5, col6 = st.columns(3)
+    with col4:
+        analyze_materials = st.checkbox("Detect materials", value=True)
+    with col5:
+        analyze_colours = st.checkbox("Detect colours", value=True)
+    with col6:
+        analyze_grid = st.checkbox("Detect grid lines", value=True)
+    
+    # Run analysis button
+    if st.button("Analyze Pages", type="primary", use_container_width=True):
+        if not page_range:
+            st.error("Please select at least one page.")
+            return
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        results = []
+        takeoff_rows = []
+        
+        for i, page_no in enumerate(page_range):
+            status_text.text(f"Analyzing page {page_no}...")
+            progress_bar.progress((i + 1) / len(page_range))
+            
+            try:
+                # Run offline analysis
+                analysis = analyze_page_offline(
+                    str(doc_path), page_no, use_ocr=use_ocr
+                )
+                results.append(analysis)
+                
+                # Generate takeoff rows based on analysis
+                page_type = analysis.get("page_type", "Other")
+                label = analysis.get("label", f"Page {page_no}")
+                scale = analysis.get("scale")
+                scale_text = scale.get("text", "") if scale else ""
+                
+                # Floor Plan takeoff
+                if "Floor Plan" in page_type:
+                    walls = analysis.get("walls", [])
+                    if walls:
+                        total_length = sum(w["length"] for w in walls)
+                        takeoff_rows.append({
+                            "page_no": page_no,
+                            "drawing": label,
+                            "section": "Internal",
+                            "element": "Walls",
+                            "unit": "lm",
+                            "quantity": round(total_length / 1000, 2) if scale else total_length,
+                            "scale": scale_text,
+                            "notes": f"{len(walls)} wall segments detected",
+                            "status": "Auto-detected",
+                        })
+                    
+                    # Rooms
+                    for room in analysis.get("rooms", []):
+                        if room.get("type") == "text_label":
+                            takeoff_rows.append({
+                                "page_no": page_no,
+                                "drawing": label,
+                                "section": "Internal",
+                                "element": room["label"],
+                                "unit": "m2",
+                                "quantity": 0,
+                                "scale": scale_text,
+                                "notes": "Room label detected - area to measure",
+                                "status": "To measure",
+                            })
+                
+                # Elevation takeoff
+                elif "Elevation" in page_type:
+                    walls = analysis.get("walls", [])
+                    if walls:
+                        takeoff_rows.append({
+                            "page_no": page_no,
+                            "drawing": label,
+                            "section": "External",
+                            "element": "Walls",
+                            "unit": "m2",
+                            "quantity": 0,
+                            "scale": scale_text,
+                            "notes": f"{len(walls)} wall lines detected",
+                            "status": "To measure",
+                        })
+                    
+                    # Materials
+                    for mat in analysis.get("materials", []):
+                        takeoff_rows.append({
+                            "page_no": page_no,
+                            "drawing": label,
+                            "section": "External",
+                            "element": mat["keyword"].title(),
+                            "unit": "m2",
+                            "quantity": 0,
+                            "scale": scale_text,
+                            "notes": f"Material: {mat['text']}",
+                            "status": "To measure",
+                        })
+                
+                # Section takeoff
+                elif "Section" in page_type:
+                    for dim in analysis.get("dimensions", []):
+                        if dim["unit"] == "mm" and 100 <= dim["value"] <= 10000:
+                            takeoff_rows.append({
+                                "page_no": page_no,
+                                "drawing": label,
+                                "section": "Section",
+                                "element": "Dimension",
+                                "unit": "mm",
+                                "quantity": dim["value"],
+                                "scale": scale_text,
+                                "notes": f"Auto: {dim['text']}",
+                                "status": "Auto-detected",
+                            })
+                
+                # Schedule/Specification takeoff
+                elif "Schedule" in page_type or "Specification" in page_type:
+                    for word in analysis.get("words", []):
+                        text_lower = word.get("text", "").strip().lower()
+                        if any(kw in text_lower for kw in ["paint", "coat", "primer", "sealer", "finish"]):
+                            takeoff_rows.append({
+                                "page_no": page_no,
+                                "drawing": label,
+                                "section": "Schedule",
+                                "element": word["text"].strip(),
+                                "unit": "item",
+                                "quantity": 1,
+                                "scale": scale_text,
+                                "notes": "Schedule item",
+                                "status": "To verify",
+                            })
+            
+            except Exception as e:
+                st.error(f"Error analyzing page {page_no}: {e}")
+        
+        progress_bar.empty()
+        status_text.empty()
+        
+        # Store results in session state
+        st.session_state["offline_results"] = results
+        st.session_state["offline_takeoff"] = takeoff_rows
+        st.session_state["offline_doc_name"] = doc["file_name"]
+        
+        st.success(f"Analysis complete! Analyzed {len(results)} pages, found {len(takeoff_rows)} takeoff items.")
+    
+    # Display results if available
+    if "offline_results" in st.session_state and st.session_state.get("offline_doc_name") == doc["file_name"]:
+        results = st.session_state["offline_results"]
+        takeoff_rows = st.session_state["offline_takeoff"]
+        
+        # Tabs for different views
+        tab1, tab2, tab3, tab4 = st.tabs(["Takeoff", "Page Analysis", "Raw Data", "Export"])
+        
+        with tab1:
+            st.subheader("Auto-Generated Takeoff")
+            
+            if takeoff_rows:
+                takeoff_df = pd.DataFrame(takeoff_rows)
+                
+                # Summary stats
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Total Items", len(takeoff_rows))
+                with col2:
+                    st.metric("Auto-detected", len([r for r in takeoff_rows if r["status"] == "Auto-detected"]))
+                with col3:
+                    st.metric("To measure", len([r for r in takeoff_rows if r["status"] == "To measure"]))
+                with col4:
+                    st.metric("To verify", len([r for r in takeoff_rows if r["status"] == "To verify"]))
+                
+                st.dataframe(takeoff_df, use_container_width=True)
+                
+                # Export button
+                csv = takeoff_df.to_csv(index=False)
+                st.download_button(
+                    "Download Takeoff CSV",
+                    csv,
+                    f"{doc['file_name']}_offline_takeoff.csv",
+                    "text/csv",
+                    use_container_width=True,
+                )
+            else:
+                st.info("No takeoff items generated. Try selecting different pages or adjusting analysis options.")
+        
+        with tab2:
+            st.subheader("Page-by-Page Analysis")
+            
+            for analysis in results:
+                with st.expander(f"Page {analysis['page_no']} - {analysis['page_type']} ({analysis['label']})", expanded=False):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.markdown("**Classification:**")
+                        st.write(f"- Type: {analysis['page_type']}")
+                        st.write(f"- Label: {analysis['label']}")
+                        
+                        if analysis.get("scale"):
+                            st.write(f"- Scale: {analysis['scale']['text']}")
+                        
+                        st.markdown("**Vector Graphics:**")
+                        st.write(f"- Lines: {analysis['line_count']}")
+                        st.write(f"- Rectangles: {analysis['rect_count']}")
+                        st.write(f"- Walls detected: {analysis['wall_count']}")
+                        st.write(f"- Grid detected: {'Yes' if analysis['grid']['grid_detected'] else 'No'}")
+                    
+                    with col2:
+                        st.markdown("**Extracted Data:**")
+                        st.write(f"- Words: {analysis['word_count']}")
+                        st.write(f"- Dimensions: {len(analysis['dimensions'])}")
+                        st.write(f"- Rooms: {len(analysis['rooms'])}")
+                        st.write(f"- Materials: {len(analysis['materials'])}")
+                        st.write(f"- Colours: {len(analysis['colours'])}")
+                    
+                    if analysis["dimensions"]:
+                        st.markdown("**Dimensions Found:**")
+                        dims = [{"Text": d["text"], "Value": f"{d['value']:.0f} {d['unit']}", "Confidence": "High" if d.get("confidence") != "low" else "Low"} for d in analysis["dimensions"][:10]]
+                        st.dataframe(pd.DataFrame(dims), use_container_width=True)
+                    
+                    if analysis["rooms"]:
+                        st.markdown("**Rooms/Areas:**")
+                        rooms = [{"Label": r["label"], "Type": r["type"]} for r in analysis["rooms"]]
+                        st.dataframe(pd.DataFrame(rooms), use_container_width=True)
+                    
+                    if analysis["materials"]:
+                        st.markdown("**Materials:**")
+                        mats = [{"Keyword": m["keyword"], "Text": m["text"]} for m in analysis["materials"]]
+                        st.dataframe(pd.DataFrame(mats), use_container_width=True)
+        
+        with tab3:
+            st.subheader("Raw Extracted Data")
+            
+            selected_page = st.selectbox("Select page for raw data", [r["page_no"] for r in results])
+            analysis = [r for r in results if r["page_no"] == selected_page][0]
+            
+            # Text preview
+            st.markdown("**Extracted Text (first 2000 chars):**")
+            st.text_area("Text", analysis["text"][:2000], height=200, disabled=True)
+            
+            # Walls
+            if analysis["walls"]:
+                st.markdown("**Detected Walls:**")
+                walls_df = pd.DataFrame([
+                    {
+                        "Start": f"({w['start'][0]:.0f}, {w['start'][1]:.0f})",
+                        "End": f"({w['end'][0]:.0f}, {w['end'][1]:.0f})",
+                        "Length": f"{w['length']:.0f} pts",
+                        "Width": f"{w['width']:.2f}",
+                    }
+                    for w in analysis["walls"][:20]
+                ])
+                st.dataframe(walls_df, use_container_width=True)
+            
+            # Dimensions
+            if analysis["dimensions"]:
+                st.markdown("**Detected Dimensions:**")
+                dims_df = pd.DataFrame([
+                    {
+                        "Text": d["text"],
+                        "Value": f"{d['value']:.0f}",
+                        "Unit": d["unit"],
+                        "Position": f"({d['position']['x0']:.0f}, {d['position']['y0']:.0f})",
+                    }
+                    for d in analysis["dimensions"]
+                ])
+                st.dataframe(dims_df, use_container_width=True)
+        
+        with tab4:
+            st.subheader("Export Options")
+            
+            if results:
+                # Full report
+                full_report = ""
+                for analysis in results:
+                    full_report += generate_report(analysis)
+                    full_report += "\n\n" + "=" * 80 + "\n\n"
+                
+                st.download_button(
+                    "Download Full Analysis Report",
+                    full_report,
+                    f"{doc['file_name']}_offline_report.txt",
+                    "text/plain",
+                    use_container_width=True,
+                )
+            
+            if takeoff_rows:
+                takeoff_df = pd.DataFrame(takeoff_rows)
+                
+                # Excel export
+                excel_buffer = io.BytesIO()
+                with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                    takeoff_df.to_excel(writer, index=False, sheet_name='Takeoff')
+                
+                st.download_button(
+                    "Download Takeoff Excel",
+                    excel_buffer.getvalue(),
+                    f"{doc['file_name']}_offline_takeoff.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            
+            st.info("Export includes all auto-detected items. Review 'To measure' items manually.")
+    
+    # Instructions
+    with st.expander("How the Offline Reader Works", expanded=False):
+        st.markdown("""
+        ### Offline Plan Reader Features
+        
+        **No AI Required** - Everything runs locally on the server.
+        
+        #### Text Extraction
+        - Uses PyMuPDF4LLM for OCR on scanned plans
+        - Falls back to PyMuPDF for text-based PDFs
+        - Extracts text with position coordinates
+        
+        #### Vector Graphics Analysis
+        - Detects wall lines (dark, medium-width lines)
+        - Finds grid lines (dashed, light lines)
+        - Extracts all line segments and rectangles
+        
+        #### Dimension Detection
+        - Recognizes: 1200, 3.5m, 10'-6", 1:100, etc.
+        - Filters reasonable ranges (10mm to 100m)
+        - Associates dimensions with positions
+        
+        #### Room/Area Detection
+        - Identifies room labels (bedroom, kitchen, etc.)
+        - Detects enclosed rectangles as potential rooms
+        
+        #### Material/Colour Detection
+        - Recognizes: render, brick, timber, concrete, etc.
+        - Detects: white, charcoal, cream, etc.
+        
+        #### Page Classification
+        - Floor Plans, Elevations, Sections, Schedules
+        - Uses text content and visual features
+        - Detects scale indicators
+        
+        #### Auto Takeoff Generation
+        - Creates takeoff rows from detected elements
+        - Marks items as auto-detected or to-measure
+        - Exports to CSV/Excel for further use
+        """)
+    
+    with st.expander("Tips for Best Results", expanded=False):
+        st.markdown("""
+        #### For Scanned Plans
+        - Enable OCR (checked by default)
+        - Ensure scans are clear and straight
+        - Minimum 300 DPI recommended
+        
+        #### For Vector PDFs
+        - Most architectural PDFs have vector text
+        - Wall detection works best with standard line weights
+        - Grid lines are detected automatically
+        
+        #### Dimension Detection
+        - Looks for numbers with units (mm, m, etc.)
+        - Also finds bare numbers in reasonable ranges
+        - Scale ratios (1:100) are detected automatically
+        
+        #### After Analysis
+        - Review "To measure" items manually
+        - Verify "Auto-detected" quantities
+        - Export to Excel for editing
+        """)
+
+
 def settings_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],session_api_key:str,ai_provider:str="OpenAI") -> None:
     hero(workspace)
     st.write(f"App version: `{APP_VERSION}`")
@@ -5952,7 +6391,7 @@ def main() -> None:
     if not workspace:
         st.session_state.pop("workspace_id",None)
         st.rerun()
-    menu=st.sidebar.radio("Menu",["Dashboard","Job & Documents","Drawing Register","Subscription Take-off","Plan Mapper","3D Building Model","Quantity Schedule","Export / JobHub","Settings"])
+    menu=st.sidebar.radio("Menu",["Dashboard","Job & Documents","Drawing Register","Subscription Take-off","Plan Mapper","3D Building Model","Quantity Schedule","Offline Plan Reader","Export / JobHub","Settings"])
     if menu=="Dashboard": dashboard_page(workspace)
     elif menu=="Job & Documents": project_documents_page(workspace,bridge,user)
     elif menu=="Drawing Register": drawing_register_page(workspace)
@@ -5960,6 +6399,7 @@ def main() -> None:
     elif menu=="Plan Mapper": plan_mapper_page(workspace)
     elif menu=="3D Building Model": model_3d_page(workspace,session_api_key,ai_provider)
     elif menu=="Quantity Schedule": quantity_schedule_page(workspace)
+    elif menu=="Offline Plan Reader": offline_plan_reader_page(workspace)
     elif menu=="Export / JobHub": export_page(workspace,bridge,user)
     else: settings_page(workspace,bridge,session_api_key,ai_provider)
 
