@@ -1,4 +1,4 @@
-"""Production entry point for Premier Brushworks PlanReader v1.2.23."""
+"""Production entry point for Premier Brushworks PlanReader v1.2.24."""
 
 import pb_planreader_v11_app as launcher
 from pb_gemini_v126 import apply as apply_gemini_v126
@@ -24,6 +24,7 @@ from pb_material_schedule_v1222 import apply as apply_material_schedule_v1222
 from pb_autopilot_v1223 import apply as apply_autopilot_v1223
 from pb_autopilot_upload_batch_v1223 import apply as apply_autopilot_upload_batch_v1223
 from pb_autopilot_accuracy_guard_v1223 import apply as apply_autopilot_accuracy_guard_v1223
+from pb_context_floorarea_v1224 import apply as apply_context_floorarea_v1224
 
 
 apply_gemini_v126(launcher.app)
@@ -50,7 +51,8 @@ apply_material_schedule_v1222(launcher.app)
 apply_autopilot_v1223(launcher.app)
 apply_autopilot_upload_batch_v1223(launcher.app)
 apply_autopilot_accuracy_guard_v1223(launcher.app)
-launcher.app.APP_VERSION = "1.2.23"
+apply_context_floorarea_v1224(launcher.app)
+launcher.app.APP_VERSION = "1.2.24"
 
 
 if __name__ == "__main__":
