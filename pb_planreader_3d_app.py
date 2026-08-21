@@ -5916,7 +5916,7 @@ def offline_plan_reader_page(workspace: Dict[str, Any]) -> None:
         return
     
     # Get documents in workspace
-    docs = lquery("SELECT * FROM documents WHERE workspace_id=? ORDER BY created_at DESC", (workspace["id"],))
+    docs = lquery("SELECT * FROM documents WHERE workspace_id=? ORDER BY uploaded_at DESC", (workspace["id"],))
     
     if not docs:
         st.warning("No documents uploaded yet. Go to **Job & Documents** to upload a plan.")
