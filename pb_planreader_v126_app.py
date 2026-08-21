@@ -1,4 +1,4 @@
-"""Production entry point for Premier Brushworks PlanReader v1.2.28."""
+"""Production entry point for Premier Brushworks PlanReader v1.2.29."""
 
 import pb_planreader_v11_app as launcher
 from pb_gemini_v126 import apply as apply_gemini_v126
@@ -37,6 +37,7 @@ from pb_takeoff_review_v1226 import apply as apply_takeoff_review_v1226
 from pb_legend_register_v1227 import apply as apply_legend_register_v1227
 from pb_plan_read_engine_v1228 import apply as apply_plan_read_engine_v1228
 from pb_mapper_hard_guard_v1228 import apply as apply_mapper_hard_guard_v1228
+from pb_persistent_login_v1229 import apply as apply_persistent_login_v1229
 
 
 apply_gemini_v126(launcher.app)
@@ -77,7 +78,10 @@ apply_legend_register_v1227(launcher.app)
 # evidence chain, then puts a hard regular-file gate around Plan Mapper.
 apply_plan_read_engine_v1228(launcher.app)
 apply_mapper_hard_guard_v1228(launcher.app)
-launcher.app.APP_VERSION = "1.2.28"
+# v1.2.29 adds a revocable, device-local stay-signed-in option. Passwords are
+# never persisted in the browser.
+apply_persistent_login_v1229(launcher.app)
+launcher.app.APP_VERSION = "1.2.29"
 
 
 if __name__ == "__main__":
