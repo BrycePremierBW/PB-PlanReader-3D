@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import secrets
-from typing import Any, Optional
+from typing import Optional
 
 _STORAGE_KEY = "pb_planreader_remember_token_v1"
 _REMEMBER_KEY = "_pb_planreader_remember_login"
@@ -273,11 +273,12 @@ def apply(app) -> None:
 
         # Intercept the existing Sign out button just long enough to revoke the
         # remembered token before the base function clears session_state/reruns.
-        sidebar = st.sidebar
-        base_button = sidebar.button
+        from streamlit.delta_generator import DeltaGenerator
 
-        def button_with_revoke(label, *args, **kwargs):
-            clicked = base_button(label, *args, **kwargs)
+        base_button = DeltaGenerator.button
+
+        def button_with_revoke(self, label, *args, **kwargs):
+            clicked = base_button(self, label, *args, **kwargs)
             if clicked and str(label) == "Sign out":
                 token = str(st.session_state.get(_TOKEN_KEY) or "").strip()
                 delete_token(bridge, token)
@@ -286,13 +287,10 @@ def apply(app) -> None:
                 st.session_state[_CLEAR_KEY] = True
             return clicked
 
+        DeltaGenerator.button = button_with_revoke
         try:
-            sidebar.button = button_with_revoke
             return base_sidebar_selector(bridge)
         finally:
-            try:
-                sidebar.button = base_button
-            except Exception:
-                pass
+            DeltaGenerator.button = base_button
 
     app.sidebar_workspace_selector = sidebar_with_persistence
