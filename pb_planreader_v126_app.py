@@ -1,4 +1,4 @@
-"""Production entry point for Premier Brushworks PlanReader v1.2.29."""
+"""Production entry point for Premier Brushworks PlanReader v1.3.0."""
 
 import pb_planreader_v11_app as launcher
 from pb_gemini_v126 import apply as apply_gemini_v126
@@ -38,6 +38,9 @@ from pb_legend_register_v1227 import apply as apply_legend_register_v1227
 from pb_plan_read_engine_v1228 import apply as apply_plan_read_engine_v1228
 from pb_mapper_hard_guard_v1228 import apply as apply_mapper_hard_guard_v1228
 from pb_persistent_login_v1229 import apply as apply_persistent_login_v1229
+from pb_vector_geometry_v130 import apply as apply_vector_geometry_v130
+from pb_accuracy_benchmark_v130 import apply as apply_accuracy_benchmark_v130
+from pb_accuracy_ui_v130 import apply as apply_accuracy_ui_v130
 
 
 apply_gemini_v126(launcher.app)
@@ -74,14 +77,16 @@ apply_selected_evidence_floor_v1226(launcher.app)
 apply_elevation_regions_v1226(launcher.app)
 apply_takeoff_review_v1226(launcher.app)
 apply_legend_register_v1227(launcher.app)
-# v1.2.28 rebuilds selected PDF text spatially before the complete automatic
-# evidence chain, then puts a hard regular-file gate around Plan Mapper.
 apply_plan_read_engine_v1228(launcher.app)
 apply_mapper_hard_guard_v1228(launcher.app)
-# v1.2.29 adds a revocable, device-local stay-signed-in option. Passwords are
-# never persisted in the browser.
 apply_persistent_login_v1229(launcher.app)
-launcher.app.APP_VERSION = "1.2.29"
+# v1.3.0 introduces the measurable accuracy foundation. Native PDF vectors are
+# converted into a geometry graph; scale is solved from independent evidence;
+# estimator-verified ground truth is stored separately and scored by category.
+apply_vector_geometry_v130(launcher.app)
+apply_accuracy_benchmark_v130(launcher.app)
+apply_accuracy_ui_v130(launcher.app)
+launcher.app.APP_VERSION = "1.3.0"
 
 
 if __name__ == "__main__":
