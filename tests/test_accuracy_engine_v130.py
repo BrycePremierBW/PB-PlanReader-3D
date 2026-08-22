@@ -87,6 +87,15 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(report["categories"]["door_count"]["matched_rate"], 0.0)
         self.assertEqual(report["details"][0]["error"], "missing_prediction")
 
+    def test_manual_correction_becomes_ground_truth(self):
+        benchmark.record_prediction(app, self.wid, "external_area", "east-render", predicted_numeric=145.2, unit="m²", confidence=70, method="vector", engine_version="1.3.0")
+        benchmark.record_correction(app, self.wid, "external_area", "east-render", predicted_numeric=145.2, corrected_numeric=127.4, unit="m²", reason="Estimator checked elevation", corrected_by="tester")
+        report = benchmark.evaluate_workspace(app, self.wid, "1.3.0")
+        self.assertEqual(report["correction_count"], 1)
+        self.assertAlmostEqual(report["details"][0]["expected"], 127.4, places=2)
+        exported = benchmark.export_truth(app, self.wid)
+        self.assertEqual(len(exported["corrections"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
