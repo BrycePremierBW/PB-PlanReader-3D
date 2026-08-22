@@ -1,13 +1,14 @@
-"""PlanReader v1.3.0 benchmark framework.
+"""PlanReader v1.3.0 benchmark and correction-learning framework.
 
-Stores estimator-verified ground truth separately from predictions and reports
-category-specific error instead of one misleading global accuracy percentage.
+Stores estimator-verified ground truth separately from predictions, records manual
+corrections as reusable evidence, and reports category-specific error instead of one
+misleading global accuracy percentage.
 """
 from __future__ import annotations
 
 import json
 import math
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional
 
 VERSION = "1.3.0"
 TARGETS = {
@@ -70,8 +71,26 @@ def ensure_schema(app: Any) -> None:
                 engine_version TEXT,
                 created_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS accuracy_corrections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace_id INTEGER NOT NULL,
+                page_id INTEGER,
+                category TEXT NOT NULL,
+                item_key TEXT NOT NULL,
+                predicted_numeric REAL,
+                corrected_numeric REAL,
+                predicted_text TEXT,
+                corrected_text TEXT,
+                unit TEXT,
+                reason TEXT,
+                source_reference TEXT,
+                corrected_by TEXT,
+                engine_version TEXT,
+                created_at TEXT
+            );
             CREATE INDEX IF NOT EXISTS idx_accuracy_truth_workspace ON accuracy_ground_truth(workspace_id, category);
             CREATE INDEX IF NOT EXISTS idx_accuracy_predictions_workspace ON accuracy_predictions(workspace_id, category, engine_version);
+            CREATE INDEX IF NOT EXISTS idx_accuracy_corrections_workspace ON accuracy_corrections(workspace_id, category);
             """
         )
         conn.commit()
@@ -119,6 +138,29 @@ def record_prediction(app: Any, workspace_id: int, category: str, item_key: str,
         conn.close()
 
 
+def record_correction(app: Any, workspace_id: int, category: str, item_key: str, *, predicted_numeric: Optional[float] = None,
+                      corrected_numeric: Optional[float] = None, predicted_text: str = "", corrected_text: str = "", unit: str = "",
+                      page_id: Optional[int] = None, reason: str = "", source_reference: str = "", corrected_by: str = "",
+                      engine_version: str = VERSION) -> None:
+    """Persist a manual correction and promote the corrected value to ground truth."""
+    ensure_schema(app)
+    conn = app.local_connect()
+    try:
+        conn.execute(
+            """INSERT INTO accuracy_corrections(workspace_id,page_id,category,item_key,predicted_numeric,corrected_numeric,
+                     predicted_text,corrected_text,unit,reason,source_reference,corrected_by,engine_version,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (int(workspace_id), page_id, str(category), str(item_key), predicted_numeric, corrected_numeric,
+             str(predicted_text or ""), str(corrected_text or ""), str(unit or ""), str(reason or ""),
+             str(source_reference or ""), str(corrected_by or ""), str(engine_version), app.now_stamp()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    upsert_truth(app, workspace_id, category, item_key, expected_numeric=corrected_numeric, expected_text=corrected_text,
+                 unit=unit, page_id=page_id, source_reference=source_reference, verified_by=corrected_by, notes=reason)
+
+
 def _latest_predictions(app: Any, workspace_id: int, engine_version: Optional[str] = None) -> List[Dict[str, Any]]:
     ensure_schema(app)
     params: List[Any] = [int(workspace_id)]
@@ -126,13 +168,12 @@ def _latest_predictions(app: Any, workspace_id: int, engine_version: Optional[st
     if engine_version:
         where += " AND engine_version=?"
         params.append(str(engine_version))
-    rows = app.lquery(
+    return app.lquery(
         f"""SELECT p.* FROM accuracy_predictions p
              JOIN (SELECT category,item_key,MAX(id) AS max_id FROM accuracy_predictions WHERE {where} GROUP BY category,item_key) latest
              ON p.id=latest.max_id ORDER BY p.category,p.item_key""",
         tuple(params),
     )
-    return rows
 
 
 def evaluate_workspace(app: Any, workspace_id: int, engine_version: Optional[str] = None) -> Dict[str, Any]:
@@ -149,42 +190,34 @@ def evaluate_workspace(app: Any, workspace_id: int, engine_version: Optional[str
         entry["count"] += 1
         detail = {"category": category, "item_key": key, "matched": bool(p), "expected": t.get("expected_numeric") if t.get("expected_numeric") is not None else t.get("expected_text")}
         if not p:
-            detail["error"] = "missing_prediction"
-            details.append(detail)
-            continue
+            detail["error"] = "missing_prediction"; details.append(detail); continue
         entry["matched"] += 1
         if t.get("expected_numeric") is not None:
-            expected = _num(t.get("expected_numeric"))
-            predicted = _num(p.get("predicted_numeric"))
+            expected = _num(t.get("expected_numeric")); predicted = _num(p.get("predicted_numeric"))
             abs_error = abs(predicted - expected)
             pct_error = abs_error / abs(expected) if abs(expected) > 1e-9 else (0.0 if abs(predicted) <= 1e-9 else 1.0)
             entry["abs_pct_errors"].append(pct_error)
             detail.update({"predicted": predicted, "absolute_error": abs_error, "percent_error": pct_error * 100.0})
         else:
-            expected = str(t.get("expected_text") or "").strip().casefold()
-            predicted = str(p.get("predicted_text") or "").strip().casefold()
-            correct = expected == predicted
-            entry["correct"] += 1 if correct else 0
+            expected = str(t.get("expected_text") or "").strip().casefold(); predicted = str(p.get("predicted_text") or "").strip().casefold()
+            correct = expected == predicted; entry["correct"] += 1 if correct else 0
             detail.update({"predicted": p.get("predicted_text"), "correct": correct})
-        detail["confidence"] = _num(p.get("confidence"))
-        detail["method"] = p.get("method")
-        details.append(detail)
+        detail["confidence"] = _num(p.get("confidence")); detail["method"] = p.get("method"); details.append(detail)
 
     summary = {}
     for category, raw in categories.items():
-        count = max(1, int(raw["count"]))
-        matched_rate = raw["matched"] / count
+        count = max(1, int(raw["count"])); matched_rate = raw["matched"] / count
         mape = sum(raw["abs_pct_errors"]) / len(raw["abs_pct_errors"]) if raw["abs_pct_errors"] else None
-        accuracy = raw["correct"] / len([d for d in details if d["category"] == category and "correct" in d]) if any(d["category"] == category and "correct" in d for d in details) else None
-        target = TARGETS.get(category)
-        passes = None
+        text_details = [d for d in details if d["category"] == category and "correct" in d]
+        accuracy = raw["correct"] / len(text_details) if text_details else None
+        target = TARGETS.get(category); passes = None
         if target:
-            if target["metric"] == "mape" and mape is not None:
-                passes = mape <= target["target"]
-            elif target["metric"] == "accuracy" and accuracy is not None:
-                passes = accuracy >= target["target"]
+            if target["metric"] == "mape" and mape is not None: passes = mape <= target["target"]
+            elif target["metric"] == "accuracy" and accuracy is not None: passes = accuracy >= target["target"]
         summary[category] = {"count": raw["count"], "matched_rate": matched_rate, "mape": mape, "accuracy": accuracy, "target": target, "passes_target": passes}
-    return {"workspace_id": int(workspace_id), "engine_version": engine_version or "latest", "categories": summary, "details": details, "ground_truth_count": len(truth)}
+    correction_count = app.lquery("SELECT COUNT(*) AS c FROM accuracy_corrections WHERE workspace_id=?", (int(workspace_id),))
+    return {"workspace_id": int(workspace_id), "engine_version": engine_version or "latest", "categories": summary, "details": details,
+            "ground_truth_count": len(truth), "correction_count": int(correction_count[0]["c"] or 0) if correction_count else 0}
 
 
 def record_vector_analysis(app: Any, workspace_id: int, page_id: int, analysis: Dict[str, Any]) -> None:
@@ -199,7 +232,8 @@ def record_vector_analysis(app: Any, workspace_id: int, page_id: int, analysis: 
 def export_truth(app: Any, workspace_id: int) -> Dict[str, Any]:
     ensure_schema(app)
     rows = app.lquery("SELECT page_id,category,item_key,expected_numeric,expected_text,unit,source_reference,verified_by,verification_notes FROM accuracy_ground_truth WHERE workspace_id=? ORDER BY category,item_key", (int(workspace_id),))
-    return {"schema": "pb-planreader-ground-truth-v1", "workspace_id": int(workspace_id), "items": rows}
+    corrections = app.lquery("SELECT page_id,category,item_key,predicted_numeric,corrected_numeric,predicted_text,corrected_text,unit,reason,source_reference,corrected_by,engine_version,created_at FROM accuracy_corrections WHERE workspace_id=? ORDER BY id", (int(workspace_id),))
+    return {"schema": "pb-planreader-ground-truth-v1", "workspace_id": int(workspace_id), "items": rows, "corrections": corrections}
 
 
 def import_truth(app: Any, workspace_id: int, payload: Dict[str, Any]) -> int:
@@ -213,12 +247,11 @@ def import_truth(app: Any, workspace_id: int, payload: Dict[str, Any]) -> int:
 
 
 def apply(app: Any) -> None:
-    if getattr(app, "_pb_accuracy_benchmark_v130_applied", False):
-        return
-    app._pb_accuracy_benchmark_v130_applied = True
-    ensure_schema(app)
+    if getattr(app, "_pb_accuracy_benchmark_v130_applied", False): return
+    app._pb_accuracy_benchmark_v130_applied = True; ensure_schema(app)
     app.accuracy_upsert_truth_v130 = lambda *args, **kwargs: upsert_truth(app, *args, **kwargs)
     app.accuracy_record_prediction_v130 = lambda *args, **kwargs: record_prediction(app, *args, **kwargs)
+    app.accuracy_record_correction_v130 = lambda *args, **kwargs: record_correction(app, *args, **kwargs)
     app.accuracy_evaluate_workspace_v130 = lambda *args, **kwargs: evaluate_workspace(app, *args, **kwargs)
     app.accuracy_record_vector_analysis_v130 = lambda *args, **kwargs: record_vector_analysis(app, *args, **kwargs)
     app.accuracy_export_truth_v130 = lambda workspace_id: export_truth(app, workspace_id)
