@@ -1,4 +1,4 @@
-"""Production entry point for Premier Brushworks PlanReader v1.3.4."""
+"""Production entry point for Premier Brushworks PlanReader v1.3.5."""
 
 import pb_planreader_v11_app as launcher
 from pb_gemini_v126 import apply as apply_gemini_v126
@@ -44,6 +44,7 @@ from pb_accuracy_ui_v130 import apply as apply_accuracy_ui_v130
 from pb_substrate_qa_v131 import apply as apply_substrate_qa_v131
 from pb_precision_3d_v132 import apply as apply_precision_3d_v132
 from pb_opening_deductions_v134 import apply as apply_opening_deductions_v134
+from pb_elevation_registration_v135 import apply as apply_elevation_registration_v135
 
 
 apply_gemini_v126(launcher.app)
@@ -88,11 +89,12 @@ apply_accuracy_benchmark_v130(launcher.app)
 apply_accuracy_ui_v130(launcher.app)
 apply_substrate_qa_v131(launcher.app)
 apply_precision_3d_v132(launcher.app)
-# v1.3.4 makes each door/window opening an estimator-selectable deduction.
-# Detection and deduction policy stay separate: an opening may remain visible in
-# the model without automatically reducing paint area.
 apply_opening_deductions_v134(launcher.app)
-launcher.app.APP_VERSION = "1.3.4"
+# v1.3.5 registers elevation drawings back to the calibrated plan footprint.
+# Plan geometry supplies X/Y wall lengths; elevations become cross-view evidence
+# for orientation, vertical geometry, openings and substrate assignment.
+apply_elevation_registration_v135(launcher.app)
+launcher.app.APP_VERSION = "1.3.5"
 
 
 if __name__ == "__main__":
