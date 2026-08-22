@@ -1,12 +1,10 @@
-"""Production entry point for PlanReader v1.3.3 simplified bright workflow."""
+"""Production entry point for PlanReader bright UI on full reconstruction stack."""
 
-import pb_planreader_v126_app as base
+import pb_planreader_reconstruction_v139_app as base
 from pb_simple_ui_v133 import apply as apply_simple_ui_v133
 
-
-apply_simple_ui_v133(base.launcher.app)
-base.launcher.app.APP_VERSION = "1.3.3"
-
+apply_simple_ui_v133(base.base.launcher.app)
+base.base.launcher.app.APP_VERSION = "1.4.3"
 
 if __name__ == "__main__":
-    base.launcher.app.main()
+    base.base.launcher.app.main()
