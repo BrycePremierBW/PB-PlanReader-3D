@@ -1,4 +1,4 @@
-"""Production entry point for Premier Brushworks PlanReader v1.3.2."""
+"""Production entry point for Premier Brushworks PlanReader v1.3.4."""
 
 import pb_planreader_v11_app as launcher
 from pb_gemini_v126 import apply as apply_gemini_v126
@@ -43,6 +43,7 @@ from pb_accuracy_benchmark_v130 import apply as apply_accuracy_benchmark_v130
 from pb_accuracy_ui_v130 import apply as apply_accuracy_ui_v130
 from pb_substrate_qa_v131 import apply as apply_substrate_qa_v131
 from pb_precision_3d_v132 import apply as apply_precision_3d_v132
+from pb_opening_deductions_v134 import apply as apply_opening_deductions_v134
 
 
 apply_gemini_v126(launcher.app)
@@ -82,20 +83,16 @@ apply_legend_register_v1227(launcher.app)
 apply_plan_read_engine_v1228(launcher.app)
 apply_mapper_hard_guard_v1228(launcher.app)
 apply_persistent_login_v1229(launcher.app)
-# v1.3.0 introduces the measurable accuracy foundation. Native PDF vectors are
-# converted into a geometry graph; scale is solved from independent evidence;
-# estimator-verified ground truth is stored separately and scored by category.
 apply_vector_geometry_v130(launcher.app)
 apply_accuracy_benchmark_v130(launcher.app)
 apply_accuracy_ui_v130(launcher.app)
-# v1.3.1 adds close-up polygon editing and a whole-building substrate QA model.
-# Elevations/finish schedules remain authoritative; artist impressions are only
-# secondary visual evidence and conflicts remain flagged for estimator checking.
 apply_substrate_qa_v131(launcher.app)
-# v1.3.2 makes the visible 3D building use the same calibrated editable plan
-# polygons as floor take-off, instead of reducing irregular plans to cuboids.
 apply_precision_3d_v132(launcher.app)
-launcher.app.APP_VERSION = "1.3.2"
+# v1.3.4 makes each door/window opening an estimator-selectable deduction.
+# Detection and deduction policy stay separate: an opening may remain visible in
+# the model without automatically reducing paint area.
+apply_opening_deductions_v134(launcher.app)
+launcher.app.APP_VERSION = "1.3.4"
 
 
 if __name__ == "__main__":
