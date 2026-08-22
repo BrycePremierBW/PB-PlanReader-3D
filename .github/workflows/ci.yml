@@ -34,6 +34,16 @@ jobs:
       - name: Syntax-check Takeoff Studio JavaScript
         run: node --check planreader_takeoff_studio/frontend/studio.js
 
+      - name: Syntax-check zoomable polygon mapper JavaScript
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('planreader_floor_mapper_v131/frontend/index.html').read_text(encoding='utf-8')
+          script = text.split('<script>', 1)[1].split('</script>', 1)[0]
+          Path('/tmp/planreader_floor_mapper_v131.js').write_text(script, encoding='utf-8')
+          PY
+          node --check /tmp/planreader_floor_mapper_v131.js
+
       - name: Gemini auth and secret-redaction tests
         run: PYTHONPATH=. python tests/test_gemini_auth.py
 
@@ -45,6 +55,9 @@ jobs:
 
       - name: Editable polygon floor mapper tests
         run: PYTHONPATH=. python tests/test_floor_mapper_polygon_v128.py
+
+      - name: Substrate QA and zoom routing tests
+        run: PYTHONPATH=. pytest -q tests/test_substrate_qa_v131.py
 
       - name: Takeoff Studio geometry and safety tests
         run: PYTHONPATH=. python tests/test_takeoff_studio_v1211.py

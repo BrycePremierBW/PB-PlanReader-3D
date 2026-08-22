@@ -1,4 +1,4 @@
-"""Production entry point for Premier Brushworks PlanReader v1.3.0."""
+"""Production entry point for Premier Brushworks PlanReader v1.3.1."""
 
 import pb_planreader_v11_app as launcher
 from pb_gemini_v126 import apply as apply_gemini_v126
@@ -41,6 +41,7 @@ from pb_persistent_login_v1229 import apply as apply_persistent_login_v1229
 from pb_vector_geometry_v130 import apply as apply_vector_geometry_v130
 from pb_accuracy_benchmark_v130 import apply as apply_accuracy_benchmark_v130
 from pb_accuracy_ui_v130 import apply as apply_accuracy_ui_v130
+from pb_substrate_qa_v131 import apply as apply_substrate_qa_v131
 
 
 apply_gemini_v126(launcher.app)
@@ -86,7 +87,11 @@ apply_persistent_login_v1229(launcher.app)
 apply_vector_geometry_v130(launcher.app)
 apply_accuracy_benchmark_v130(launcher.app)
 apply_accuracy_ui_v130(launcher.app)
-launcher.app.APP_VERSION = "1.3.0"
+# v1.3.1 adds close-up polygon editing and a whole-building substrate QA model.
+# Elevations/finish schedules remain authoritative; artist impressions are only
+# secondary visual evidence and conflicts remain flagged for estimator checking.
+apply_substrate_qa_v131(launcher.app)
+launcher.app.APP_VERSION = "1.3.1"
 
 
 if __name__ == "__main__":
