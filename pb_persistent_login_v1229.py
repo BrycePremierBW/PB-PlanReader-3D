@@ -11,6 +11,7 @@ fall back to JobHub when the local persistent-disk copy is unavailable.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 from typing import Optional
@@ -21,6 +22,11 @@ _TOKEN_KEY = "_pb_planreader_auth_token"
 _CLEAR_KEY = "_pb_planreader_clear_remember"
 _SAVED_SESSION_KEY = "_pb_planreader_auth_token_saved_this_session"
 _PREFIX = "planreader_auth_token:"
+
+
+def _hash_token(token: str) -> str:
+    """SHA-256 hash a token for safe storage. Never store raw tokens in DB."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def apply(app) -> None:
@@ -129,10 +135,11 @@ def apply(app) -> None:
         ensure_local_table()
         conn = app.local_connect()
         try:
-            conn.execute("DELETE FROM persistent_login_tokens WHERE token=?", (token,))
+            token_hash = _hash_token(token)
+            conn.execute("DELETE FROM persistent_login_tokens WHERE token=?", (token_hash,))
             conn.execute(
                 "INSERT INTO persistent_login_tokens (token, user_json, created_at) VALUES (?, ?, ?)",
-                (token, payload, app.now_stamp()),
+                (token_hash, payload, app.now_stamp()),
             )
             conn.commit()
         finally:
@@ -143,9 +150,10 @@ def apply(app) -> None:
             ensure_local_table()
             conn = app.local_connect()
             try:
+                token_hash = _hash_token(token)
                 row = conn.execute(
                     "SELECT user_json FROM persistent_login_tokens WHERE token=?",
-                    (token,),
+                    (token_hash,),
                 ).fetchone()
                 if row:
                     user = json.loads(str(row[0] or "{}"))
@@ -163,7 +171,8 @@ def apply(app) -> None:
         if bridge is not None:
             try:
                 if "app_settings" in set(bridge.table_names()):
-                    key = f"{_PREFIX}{token}"
+                    token_hash = _hash_token(token)
+                    key = f"{_PREFIX}{token_hash}"
                     bridge.execute("DELETE FROM app_settings WHERE setting_key=?", (key,))
                     bridge.execute(
                         "INSERT INTO app_settings (setting_key, setting_value) VALUES (?, ?)",
@@ -188,9 +197,10 @@ def apply(app) -> None:
         if bridge is not None:
             try:
                 if "app_settings" in set(bridge.table_names()):
+                    token_hash = _hash_token(token)
                     rows = bridge.query(
                         "SELECT setting_value FROM app_settings WHERE setting_key=?",
-                        (f"{_PREFIX}{token}",),
+                        (f"{_PREFIX}{token_hash}",),
                     )
                     if rows:
                         user = json.loads(str(rows[0].get("setting_value") or "{}"))
@@ -204,11 +214,12 @@ def apply(app) -> None:
     def delete_token(bridge, token: str) -> None:
         if not token:
             return
+        token_hash = _hash_token(token)
         try:
             ensure_local_table()
             conn = app.local_connect()
             try:
-                conn.execute("DELETE FROM persistent_login_tokens WHERE token=?", (token,))
+                conn.execute("DELETE FROM persistent_login_tokens WHERE token=?", (token_hash,))
                 conn.commit()
             finally:
                 conn.close()
@@ -221,7 +232,7 @@ def apply(app) -> None:
                 if "app_settings" in set(bridge.table_names()):
                     bridge.execute(
                         "DELETE FROM app_settings WHERE setting_key=?",
-                        (f"{_PREFIX}{token}",),
+                        (f"{_PREFIX}{token_hash}",),
                     )
             except Exception:
                 pass
