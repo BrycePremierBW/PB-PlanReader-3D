@@ -5,6 +5,17 @@ Extracts text, dimensions, walls, and room data from construction plans
 using only PyMuPDF, PyMuPDF4LLM (OCR), and OpenCV.
 
 No OpenAI, no Gemini, no API keys needed.
+
+Measurement pipeline:
+    PDF geometry → page-space distance → calibrated drawing scale → real-world distance → metres
+
+Wall lengths are converted through:
+    PDF points × (25.4 / 72) = page mm
+    page mm ÷ mm_per_real_m = real metres
+
+Where mm_per_real_m is derived from the detected scale:
+    - Ratio scale 1:N → mm_per_real_m = N
+    - Metric scale "10 mm = 1 m" → mm_per_real_m = 10
 """
 
 from __future__ import annotations
@@ -24,6 +35,60 @@ try:
     import pymupdf4llm
 except ImportError:
     pymupdf4llm = None
+
+# ---------------------------------------------------------------------------
+# Unit conversion constants and helpers
+# ---------------------------------------------------------------------------
+
+# 1 PDF point = 1/72 inch = 25.4/72 mm ≈ 0.352778 mm
+PDF_PT_TO_MM = 25.4 / 72.0
+
+
+def _mm_per_real_metre(scale: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Extract 'millimetres on paper per real metre' from a scale dict.
+
+    Returns None when scale is absent or unrecognised, so callers can
+    preserve uncertainty rather than silently producing a wrong number.
+    """
+    if not scale:
+        return None
+    scale_type = str(scale.get("type") or "").lower()
+    if scale_type == "ratio":
+        # 1:100 → 100 mm on paper represents 1 m in reality
+        ratio = scale.get("ratio")
+        if ratio and ratio > 0:
+            return float(ratio)
+    elif scale_type == "metric":
+        # "10 mm = 1 m" → mm_per_m already stored
+        mm = scale.get("mm_per_m")
+        if mm and mm > 0:
+            return float(mm)
+    return None
+
+
+def wall_length_real_m(
+    length_pt: float,
+    scale: Optional[Dict[str, Any]] = None,
+) -> Optional[float]:
+    """Convert a PDF-point line length to real-world metres.
+
+    Pipeline:  PDF pt → page mm → real metres
+
+    For ratio scale 1:N  (e.g. 1:100):
+        N mm on paper  =  N × N mm in reality  =  N² / 1000 m  ← WRONG
+        Actually: 1 mm on paper = N mm in reality
+        So:  page_mm × N / 1000 = real metres
+
+    For metric scale "10 mm = 1 m":
+        page_mm × mm_per_m / 1000 = real metres
+
+    Returns None when scale is unknown so callers preserve uncertainty.
+    """
+    mm_per_m = _mm_per_real_metre(scale)
+    if mm_per_m is None or mm_per_m <= 0:
+        return None
+    page_mm = length_pt * PDF_PT_TO_MM
+    return (page_mm * mm_per_m) / 1000.0
 
 try:
     import cv2
@@ -115,14 +180,46 @@ def extract_text_offline(
         
         md_text = pymupdf4llm.to_markdown(str(pdf_path), **kwargs)
         
-        # Split by page markers if available
-        result = {}
+        # Split by page markers: PyMuPDF4LLM emits "<!-- page N -->" (0-indexed)
+        result: Dict[int, str] = {}
+        # Always split by markers so each page gets only its own text
+        page_sections: Dict[int, str] = {}
+        current_page: Optional[int] = None
+        current_parts: list = []
+        
+        for line in md_text.split("\n"):
+            marker_match = re.match(r"<!--\s*page\s+(\d+)\s*-->", line, re.IGNORECASE)
+            if marker_match:
+                # Save previous page's content
+                if current_page is not None:
+                    page_sections[current_page] = "\n".join(current_parts).strip()
+                current_page = int(marker_match.group(1))  # 0-indexed
+                current_parts = [line]
+            else:
+                current_parts.append(line)
+        
+        # Save last page
+        if current_page is not None:
+            page_sections[current_page] = "\n".join(current_parts).strip()
+        
+        # Map 0-indexed sections to 1-indexed page numbers
         if pages:
             for page_no in pages:
-                # Try to extract page-specific content
-                result[page_no] = md_text[:50000]  # Limit per page
+                idx = page_no - 1  # 0-indexed
+                result[page_no] = page_sections.get(idx, "")
         else:
-            result[1] = md_text
+            # All pages: map from 0-indexed keys to 1-indexed
+            for idx, text in page_sections.items():
+                result[idx + 1] = text
+        
+        # Fallback: if no markers found, assign full text to requested pages
+        if not result or all(not v for v in result.values()):
+            result = {}
+            if pages:
+                for page_no in pages:
+                    result[page_no] = md_text[:50000]
+            else:
+                result[1] = md_text
         
         return result
     
@@ -866,6 +963,22 @@ def generate_takeoff_offline(
         if "Floor Plan" in page_type:
             # Internal walls
             if walls:
+                # Convert wall lengths from PDF points to real metres
+                mm_per_m = _mm_per_real_metre(scale)
+                if mm_per_m:
+                    total_lm = sum(
+                        (w["length"] * PDF_PT_TO_MM * mm_per_m) / 1000.0
+                        for w in walls
+                    )
+                    scale_note = f"Scale {scale.get('text', '?')}"
+                    status = "Auto-detected"
+                else:
+                    # No reliable scale: preserve raw page-space length as
+                    # a fallback with explicit uncertainty.
+                    total_lm = sum(w["length"] * PDF_PT_TO_MM for w in walls)
+                    scale_note = "NO SCALE — length is page-space mm, NOT real metres"
+                    status = "Uncalibrated"
+
                 takeoff_rows.append({
                     "page_no": page_no,
                     "page_type": page_type,
@@ -874,9 +987,10 @@ def generate_takeoff_offline(
                     "element": "Walls",
                     "description": f"Internal walls - {len(walls)} wall segments detected",
                     "unit": "lm",
-                    "quantity": sum(w["length"] for w in walls),
+                    "quantity": round(total_lm, 3),
                     "scale": scale.get("text", "") if scale else "",
-                    "notes": f"{len(walls)} walls, {len(dimensions)} dimensions found",
+                    "notes": f"{len(walls)} walls, {len(dimensions)} dimensions. {scale_note}",
+                    "status": status,
                 })
             
             # Rooms
@@ -1120,10 +1234,15 @@ def generate_report(
     
     lines.append("\n--- Walls ---")
     for wall in analysis["walls"][:5]:
-        length_m = wall["length"] / (analysis["scale"]["scale_ratio"] * 1000) if analysis["scale"] else wall["length"]
+        real_m = wall_length_real_m(wall["length"], analysis.get("scale"))
+        if real_m is not None:
+            length_str = f"~{real_m:.2f} m"
+        else:
+            page_mm = wall["length"] * PDF_PT_TO_MM
+            length_str = f"~{page_mm:.0f} mm (page-space, no scale)"
         lines.append(
             f"  - {wall['length']:.0f} pts "
-            f"({'~{:.1f}m'.format(length_m) if analysis['scale'] else ''})"
+            f"({length_str})"
         )
     
     # Summary
