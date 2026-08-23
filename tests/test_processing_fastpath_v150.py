@@ -159,4 +159,4 @@ def test_small_pdf_batch_stays_serial(monkeypatch):
 def test_production_entry_enables_v150_fast_path():
     text = Path("pb_planreader_v133_app.py").read_text(encoding="utf-8")
     assert "apply_processing_fastpath_v150" in text
-    assert 'APP_VERSION = "1.5.0"' in text
+    assert 'APP_VERSION = "1.5.1"' in text
