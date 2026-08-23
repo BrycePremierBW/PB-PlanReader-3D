@@ -1,0 +1,27 @@
+name: Performance Fastpath CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  fastpath:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-ci-v1228.txt
+      - name: Compile performance modules
+        run: python -m py_compile pb_runtime_performance_v149.py pb_processing_fastpath_v150.py pb_planreader_v133_app.py
+      - name: Runtime rerun fastpath tests
+        run: PYTHONPATH=. pytest -q tests/test_runtime_performance_v149.py
+      - name: Processing parallelism, caching and ETA tests
+        run: PYTHONPATH=. pytest -q tests/test_processing_fastpath_v150.py
