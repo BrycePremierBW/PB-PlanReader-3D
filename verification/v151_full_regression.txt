@@ -1,0 +1,3 @@
+PlanReader v1.5.1 full regression verification marker.
+
+This non-production marker exists only to trigger PR-based CI against the exact current main application code after the cold-start performance fixes.
