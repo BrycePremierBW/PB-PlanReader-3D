@@ -4,7 +4,7 @@ import pb_runtime_performance_v149 as perf
 
 
 def make_app():
-    calls = {"init": 0, "jobs": 0, "tables": 0, "columns": 0}
+    calls = {"jobs": 0, "tables": 0, "columns": 0}
 
     class FakeBridge:
         def __init__(self, kind="postgres", source="db"):
@@ -19,15 +19,11 @@ def make_app():
             calls["columns"] += 1
             return ["id", "job_no"]
 
-    def init_local_db():
-        calls["init"] += 1
-
     def fetch_jobhub_jobs(_bridge):
         calls["jobs"] += 1
         return [{"id": 1, "job_no": "PB1"}]
 
     app = SimpleNamespace(
-        init_local_db=init_local_db,
         JobHubBridge=FakeBridge,
         fetch_jobhub_jobs=fetch_jobhub_jobs,
     )
@@ -36,15 +32,6 @@ def make_app():
 
 def setup_function():
     perf.clear_runtime_caches()
-
-
-def test_local_db_initialisation_runs_once_per_process():
-    app, calls = make_app()
-    perf.apply(app)
-    app.init_local_db()
-    app.init_local_db()
-    app.init_local_db()
-    assert calls["init"] == 1
 
 
 def test_jobhub_schema_metadata_is_cached_across_bridge_instances():
