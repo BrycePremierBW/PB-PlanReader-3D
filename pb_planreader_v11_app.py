@@ -171,20 +171,15 @@ def _v121_sidebar_workspace_selector(bridge):
         unsafe_allow_html=True,
     )
 
-    connected = False
-    connection_error = ""
-    table_count = 0
-    if bridge is not None:
-        try:
-            tables = bridge.table_names()
-            table_count = len(tables)
-            connected = True
-        except Exception as exc:
-            connection_error = str(exc)
+    # Cold-start rule: do not open a remote Postgres connection merely to paint
+    # the sidebar connection badge. The base workspace selector performs the real
+    # job-list query and reports an error if JobHub is unreachable. This removes a
+    # duplicate connection setup from every first page load/rerun.
+    configured = bridge is not None
 
-    if connected:
+    if configured:
         app.st.sidebar.markdown(
-            f"<div class='pb-jobhub-ok'><strong>JOBHUB CONNECTED</strong><br>{table_count} database tables detected</div>",
+            "<div class='pb-jobhub-ok'><strong>JOBHUB CONFIGURED</strong><br>Connection is checked when shared job data is loaded.</div>",
             unsafe_allow_html=True,
         )
         if app.st.session_state.get("jobhub_database_url"):
@@ -193,13 +188,10 @@ def _v121_sidebar_workspace_selector(bridge):
                 app.st.session_state.pop("jobhub_database_url", None)
                 app.st.rerun()
     else:
-        detail = "Database URL is not configured." if bridge is None else "Database credential exists but the connection failed."
         app.st.sidebar.markdown(
-            f"<div class='pb-jobhub-bad'><strong>JOBHUB NOT CONNECTED</strong><br>{detail}</div>",
+            "<div class='pb-jobhub-bad'><strong>JOBHUB NOT CONFIGURED</strong><br>Database URL is not configured.</div>",
             unsafe_allow_html=True,
         )
-        if connection_error:
-            app.st.sidebar.error(f"JobHub connection error: {connection_error}")
         with app.st.sidebar.expander("Connect JobHub"):
             app.st.caption("For a permanent Render connection, set JOBHUB_DATABASE_URL to the same PostgreSQL database URL used by JobHub. You can also test it for this browser session here.")
             session_url = app.st.text_input(
@@ -224,15 +216,15 @@ def _v121_sidebar_workspace_selector(bridge):
                         app.st.session_state["jobhub_database_url"] = candidate
                         app.st.rerun()
 
-    workspace_id = _base_sidebar_workspace_selector(bridge if connected else None)
+    workspace_id = _base_sidebar_workspace_selector(bridge if configured else None)
     if workspace_id:
         try:
             rows = app.lquery("SELECT jobhub_job_id FROM workspaces WHERE id=?", (int(workspace_id),))
             linked_id = rows[0].get("jobhub_job_id") if rows else None
-            if linked_id and connected:
+            if linked_id and configured:
                 app.st.sidebar.success(f"Workspace linked to JobHub job #{linked_id}")
-            elif linked_id and not connected:
-                app.st.sidebar.warning(f"Workspace remembers JobHub job #{linked_id}, but JobHub is offline.")
+            elif linked_id and not configured:
+                app.st.sidebar.warning(f"Workspace remembers JobHub job #{linked_id}, but JobHub is not configured.")
             else:
                 app.st.sidebar.caption("Current workspace is standalone — it is not linked to a JobHub job.")
         except Exception:
