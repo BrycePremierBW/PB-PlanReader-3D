@@ -5,6 +5,17 @@ Extracts text, dimensions, walls, and room data from construction plans
 using only PyMuPDF, PyMuPDF4LLM (OCR), and OpenCV.
 
 No OpenAI, no Gemini, no API keys needed.
+
+Measurement pipeline:
+    PDF geometry → page-space distance → calibrated drawing scale → real-world distance → metres
+
+Wall lengths are converted through:
+    PDF points × (25.4 / 72) = page mm
+    page mm ÷ mm_per_real_m = real metres
+
+Where mm_per_real_m is derived from the detected scale:
+    - Ratio scale 1:N → mm_per_real_m = N
+    - Metric scale "10 mm = 1 m" → mm_per_real_m = 10
 """
 
 from __future__ import annotations
@@ -24,6 +35,62 @@ try:
     import pymupdf4llm
 except ImportError:
     pymupdf4llm = None
+
+# ---------------------------------------------------------------------------
+# Unit conversion constants and helpers
+# ---------------------------------------------------------------------------
+
+# 1 PDF point = 1/72 inch = 25.4/72 mm ≈ 0.352778 mm
+PDF_PT_TO_MM = 25.4 / 72.0
+
+
+def real_metres_per_page_mm(scale: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Return the factor that converts 1 page-mm to real-world metres.
+
+    For ratio scale 1:N  (e.g. 1:100):
+        1 mm on paper = N mm in reality = N/1000 m
+        → factor = N / 1000
+
+    For metric scale "10 mm = 1 m":
+        10 page-mm represents 1 real metre
+        → factor = 1 / 10 = 0.1
+
+    Returns None when scale is absent or unrecognised so callers can
+    preserve uncertainty rather than silently producing a wrong number.
+    """
+    if not scale:
+        return None
+    scale_type = str(scale.get("type") or "").lower()
+    if scale_type == "ratio":
+        ratio = scale.get("ratio")
+        if ratio and ratio > 0:
+            return float(ratio) / 1000.0
+    elif scale_type == "metric":
+        mm = scale.get("mm_per_m")
+        if mm and mm > 0:
+            return 1.0 / float(mm)
+    return None
+
+
+def wall_length_real_m(
+    length_pt: float,
+    scale: Optional[Dict[str, Any]] = None,
+) -> Optional[float]:
+    """Convert a PDF-point line length to real-world metres.
+
+    Pipeline:  PDF pt → page mm → real metres
+
+    Uses real_metres_per_page_mm() which is unambiguous:
+        ratio 1:100  →  100/1000 = 0.1  (1 page-mm = 0.1 real-m)
+        metric "10 mm = 1 m"  →  1/10 = 0.1  (same physical scale)
+
+    Returns None when scale is unknown so callers preserve uncertainty.
+    """
+    factor = real_metres_per_page_mm(scale)
+    if factor is None or factor <= 0:
+        return None
+    page_mm = length_pt * PDF_PT_TO_MM
+    return page_mm * factor
 
 try:
     import cv2
@@ -106,30 +173,140 @@ def extract_text_offline(
         Dict mapping page_no -> extracted text
     """
     pdf_path = Path(pdf_path)
-    
+    result: Dict[int, str] = {}
+
+    # ------------------------------------------------------------------
+    # OCR path (pymupdf4llm)
+    # Strategy:
+    #   1. page_chunks=True      (supported, per-page dicts)
+    #   2. page_separators=True  (supported, "--- end of page=n ---")
+    #   3. "<!-- page N -->"     (undocumented convention, secondary)
+    # Never silently assign an entire multi-page document to page 1.
+    # ------------------------------------------------------------------
     if pymupdf4llm is not None and use_ocr:
-        # Use PyMuPDF4LLM for OCR-aware extraction
-        kwargs = {}
-        if pages is not None:
-            kwargs["pages"] = [p - 1 for p in pages]  # 0-indexed
-        
-        md_text = pymupdf4llm.to_markdown(str(pdf_path), **kwargs)
-        
-        # Split by page markers if available
-        result = {}
-        if pages:
-            for page_no in pages:
-                # Try to extract page-specific content
-                result[page_no] = md_text[:50000]  # Limit per page
-        else:
-            result[1] = md_text
-        
-        return result
-    
-    elif fitz is not None:
-        # Fallback to basic PyMuPDF
+        target_idx = [p - 1 for p in pages] if pages else None
+
+        # ---- Strategy 1: page_chunks=True (supported per-page API) ----
+        try:
+            chunk_kwargs: Dict[str, Any] = {}
+            if target_idx is not None:
+                chunk_kwargs["pages"] = target_idx
+            chunks = pymupdf4llm.to_markdown(
+                str(pdf_path),
+                page_chunks=True,
+                **chunk_kwargs,
+            )
+            for chunk in chunks:
+                meta = chunk.get("metadata", {})
+                text = chunk.get("text", "")
+
+                # Prefer documented 1-based page_number
+                page_no: Optional[int] = None
+                if "page_number" in meta:
+                    page_no = int(meta["page_number"])  # 1-based
+                elif "page" in meta:
+                    # Older versions: "page" is 0-based index
+                    page_no = int(meta["page"]) + 1
+
+                if page_no is not None:
+                    if pages is None or page_no in pages:
+                        result[page_no] = text
+
+            if result:
+                return result
+        except TypeError:
+            # page_chunks not supported by installed version
+            pass
+        except Exception:
+            pass
+
+        # ---- Strategy 2: page_separators=True (supported separator API) ----
+        md_text: Optional[str] = None
+        try:
+            sep_kwargs: Dict[str, Any] = {"page_separators": True}
+            if target_idx is not None:
+                sep_kwargs["pages"] = target_idx
+            md_text = pymupdf4llm.to_markdown(str(pdf_path), **sep_kwargs)
+        except TypeError:
+            # page_separators not supported; try without it
+            pass
+        except Exception:
+            pass
+
+        if md_text is None:
+            # ---- Strategy 3: plain call, look for undocumented markers ----
+            try:
+                plain_kwargs: Dict[str, Any] = {}
+                if target_idx is not None:
+                    plain_kwargs["pages"] = target_idx
+                md_text = pymupdf4llm.to_markdown(str(pdf_path), **plain_kwargs)
+            except Exception:
+                md_text = ""
+
+        if md_text:
+            sections: Dict[int, str] = {}
+            buffer_parts: list = []
+            last_page_no: Optional[int] = None
+
+            def _flush_buffer() -> None:
+                """Assign accumulated buffer to last_page_no."""
+                nonlocal buffer_parts
+                if last_page_no is not None and buffer_parts:
+                    text = "\n".join(buffer_parts).strip()
+                    if text:
+                        sections[last_page_no] = text
+                buffer_parts = []
+
+            for line in md_text.split("\n"):
+                # Strategy 2: official page_separators pattern
+                # "--- end of page=n ---" where n is 0-based
+                # This separator appears at the END of page n.
+                # Text accumulated BEFORE this separator belongs to page n+1.
+                sep_match = re.match(
+                    r"---\s*end\s+of\s+page\s*=\s*(\d+)\s*---",
+                    line, re.IGNORECASE,
+                )
+                if sep_match:
+                    page_idx = int(sep_match.group(1))  # 0-based
+                    last_page_no = page_idx + 1  # → 1-based PlanReader page
+                    _flush_buffer()
+                    continue
+
+                # Strategy 3: "<!-- page N -->" secondary convention (0-based)
+                marker_match = re.match(
+                    r"<!--\s*page\s+(\d+)\s*-->", line, re.IGNORECASE,
+                )
+                if marker_match:
+                    _flush_buffer()
+                    last_page_no = int(marker_match.group(1)) + 1  # 0→1-based
+                    buffer_parts = [line]  # include marker in this page's text
+                    continue
+
+                buffer_parts.append(line)
+
+            # Flush remaining buffer
+            _flush_buffer()
+
+            if sections:
+                if pages:
+                    for page_no in pages:
+                        result[page_no] = sections.get(page_no, "")
+                else:
+                    for pg, txt in sections.items():
+                        result[pg] = txt
+                return result
+
+            # ---- No markers found on multi-page document ----
+            # Do NOT assign entire markdown to page 1.
+            # Fall through to per-page PyMuPDF extraction below.
+
+    # ------------------------------------------------------------------
+    # Per-page PyMuPDF fallback — no OCR, but correct page boundaries.
+    # Used when: pymupdf4llm unavailable, OCR disabled, or OCR produced
+    # no structured result (e.g. multi-page without markers).
+    # ------------------------------------------------------------------
+    if not result and fitz is not None:
         pdf = fitz.open(str(pdf_path))
-        result = {}
         
         target_pages = pages or list(range(1, len(pdf) + 1))
         
@@ -142,9 +319,11 @@ def extract_text_offline(
         
         pdf.close()
         return result
-    
-    else:
+
+    if not result:
         raise RuntimeError("No PDF library available. Install PyMuPDF or pymupdf4llm.")
+
+    return result
 
 
 def extract_text_blocks_with_positions(
@@ -866,6 +1045,23 @@ def generate_takeoff_offline(
         if "Floor Plan" in page_type:
             # Internal walls
             if walls:
+                # Convert wall lengths from PDF points to real metres
+                factor = real_metres_per_page_mm(scale)
+                if factor is not None:
+                    total_lm = sum(
+                        w["length"] * PDF_PT_TO_MM * factor
+                        for w in walls
+                    )
+                    scale_note = f"Scale {scale.get('text', '?')}"
+                    status = "Auto-detected"
+                else:
+                    # No reliable scale: do NOT produce a real-world lm
+                    # quantity.  Set to None so downstream cannot sum
+                    # page-space mm as metres.
+                    total_lm = None
+                    scale_note = "NO SCALE — real-world quantity unavailable"
+                    status = "Uncalibrated"
+
                 takeoff_rows.append({
                     "page_no": page_no,
                     "page_type": page_type,
@@ -873,10 +1069,11 @@ def generate_takeoff_offline(
                     "section": "Internal",
                     "element": "Walls",
                     "description": f"Internal walls - {len(walls)} wall segments detected",
-                    "unit": "lm",
-                    "quantity": sum(w["length"] for w in walls),
+                    "unit": "lm" if total_lm is not None else "",
+                    "quantity": round(total_lm, 3) if total_lm is not None else None,
                     "scale": scale.get("text", "") if scale else "",
-                    "notes": f"{len(walls)} walls, {len(dimensions)} dimensions found",
+                    "notes": f"{len(walls)} walls, {len(dimensions)} dimensions. {scale_note}",
+                    "status": status,
                 })
             
             # Rooms
@@ -1120,10 +1317,15 @@ def generate_report(
     
     lines.append("\n--- Walls ---")
     for wall in analysis["walls"][:5]:
-        length_m = wall["length"] / (analysis["scale"]["scale_ratio"] * 1000) if analysis["scale"] else wall["length"]
+        real_m = wall_length_real_m(wall["length"], analysis.get("scale"))
+        if real_m is not None:
+            length_str = f"~{real_m:.2f} m"
+        else:
+            page_mm = wall["length"] * PDF_PT_TO_MM
+            length_str = f"~{page_mm:.0f} mm (page-space, no scale)"
         lines.append(
             f"  - {wall['length']:.0f} pts "
-            f"({'~{:.1f}m'.format(length_m) if analysis['scale'] else ''})"
+            f"({length_str})"
         )
     
     # Summary

@@ -109,6 +109,9 @@ try:
         detect_colours,
         classify_page_offline,
         generate_report,
+        wall_length_real_m,
+        real_metres_per_page_mm,
+        PDF_PT_TO_MM,
     )
     OFFLINE_READER_AVAILABLE = True
 except Exception:
@@ -5996,17 +5999,31 @@ def offline_plan_reader_page(workspace: Dict[str, Any]) -> None:
                 if "Floor Plan" in page_type:
                     walls = analysis.get("walls", [])
                     if walls:
-                        total_length = sum(w["length"] for w in walls)
+                        # Convert wall lengths: PDF pts → page mm → real metres
+                        real_m = wall_length_real_m(
+                            sum(w["length"] for w in walls), scale
+                        )
+                        if real_m is not None:
+                            total_length = round(real_m, 3)
+                            scale_note = f"Scale {scale_text}"
+                            status = "Auto-detected"
+                        else:
+                            # No scale: do NOT produce a real-world lm
+                            # quantity that could be summed as metres.
+                            total_length = None
+                            scale_note = "NO SCALE — real-world quantity unavailable"
+                            status = "Uncalibrated"
+
                         takeoff_rows.append({
                             "page_no": page_no,
                             "drawing": label,
                             "section": "Internal",
                             "element": "Walls",
-                            "unit": "lm",
-                            "quantity": round(total_length / 1000, 2) if scale else total_length,
+                            "unit": "lm" if total_length is not None else "",
+                            "quantity": total_length,
                             "scale": scale_text,
-                            "notes": f"{len(walls)} wall segments detected",
-                            "status": "Auto-detected",
+                            "notes": f"{len(walls)} wall segments detected. {scale_note}",
+                            "status": status,
                         })
                     
                     # Rooms
