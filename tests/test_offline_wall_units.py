@@ -235,207 +235,171 @@ class TestNoDoubleConversion(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestOCRPageSlicing(unittest.TestCase):
-    """Verify extract_text_offline assigns text to the correct page
-    using the documented page_chunks API structure."""
+    """Integration tests: mock pymupdf4llm.to_markdown, call the REAL
+    extract_text_offline(), verify arguments and page mappings."""
 
-    # ---- page_chunks: documented page_number (1-based) ----
+    # ---- page_chunks path ----
 
-    def test_page_chunks_documented_structure(self):
-        """page_chunks with documented metadata['page_number'] (1-based)."""
-        fake_chunks = [
-            {"metadata": {"page_number": 1}, "text": "Ground floor plan"},
-            {"metadata": {"page_number": 2}, "text": "First floor plan"},
-            {"metadata": {"page_number": 3}, "text": "Section A-A"},
-            {"metadata": {"page_number": 4}, "text": "Elevation"},
+    @patch("pb_planreader_offline.pymupdf4llm")
+    def test_page_chunks_subset_mapping(self, mock_p4l):
+        """page_chunks=True with page_number 1-based; subset [2,4]."""
+        mock_p4l.to_markdown.return_value = [
+            {"metadata": {"page_number": 1}, "text": "PAGE ONE"},
+            {"metadata": {"page_number": 2}, "text": "PAGE TWO"},
+            {"metadata": {"page_number": 3}, "text": "PAGE THREE"},
+            {"metadata": {"page_number": 4}, "text": "PAGE FOUR"},
         ]
-        result: Dict[int, str] = {}
-        pages_requested = [2, 4]
-        for chunk in fake_chunks:
-            meta = chunk.get("metadata", {})
-            page_no = int(meta["page_number"])  # 1-based, documented
-            text = chunk.get("text", "")
-            if page_no in pages_requested:
-                result[page_no] = text
-        self.assertEqual(result.get(2), "First floor plan")
-        self.assertEqual(result.get(4), "Elevation")
-        self.assertNotIn(1, result)
-        self.assertNotIn(3, result)
+        from pb_planreader_offline import extract_text_offline
+        result = extract_text_offline("dummy.pdf", pages=[2, 4], use_ocr=True)
 
-    def test_page_chunks_subset_mapping(self):
-        """Requested subset [2, 4] maps correctly with 1-based page_number."""
-        fake_chunks = [
-            {"metadata": {"page_number": 1}, "text": "Page 1 content"},
-            {"metadata": {"page_number": 2}, "text": "Page 2 content"},
-            {"metadata": {"page_number": 3}, "text": "Page 3 content"},
-            {"metadata": {"page_number": 4}, "text": "Page 4 content"},
+        self.assertEqual(result, {2: "PAGE TWO", 4: "PAGE FOUR"})
+        # Verify page_chunks=True was actually requested
+        mock_p4l.to_markdown.assert_called_once()
+        call_kwargs = mock_p4l.to_markdown.call_args
+        self.assertTrue(call_kwargs.kwargs.get("page_chunks") or
+                        (len(call_kwargs.args) > 0 and "page_chunks" in str(call_kwargs)))
+
+    @patch("pb_planreader_offline.pymupdf4llm")
+    def test_page_chunks_uses_page_number_field(self, mock_p4l):
+        """page_chunks with documented page_number (1-based), not page (0-based)."""
+        mock_p4l.to_markdown.return_value = [
+            {"metadata": {"page_number": 5}, "text": "Fifth page"},
         ]
-        result: Dict[int, str] = {}
-        pages_requested = [2, 4]
-        for chunk in fake_chunks:
-            meta = chunk.get("metadata", {})
-            page_no = int(meta["page_number"])
-            text = chunk.get("text", "")
-            if page_no in pages_requested:
-                result[page_no] = text
-        self.assertEqual(result, {2: "Page 2 content", 4: "Page 4 content"})
+        from pb_planreader_offline import extract_text_offline
+        result = extract_text_offline("dummy.pdf", pages=[5], use_ocr=True)
 
-    def test_no_cross_page_leakage(self):
-        """Page 1 text must not appear in page 2's result."""
-        fake_chunks = [
-            {"metadata": {"page_number": 1}, "text": "SECRET_PAGE_1"},
-            {"metadata": {"page_number": 2}, "text": "SECRET_PAGE_2"},
-        ]
-        result: Dict[int, str] = {}
-        for chunk in fake_chunks:
-            meta = chunk.get("metadata", {})
-            page_no = int(meta["page_number"])
-            result[page_no] = chunk.get("text", "")
-        self.assertNotIn("SECRET_PAGE_1", result.get(2, ""))
-        self.assertNotIn("SECRET_PAGE_2", result.get(1, ""))
+        self.assertEqual(result, {5: "Fifth page"})
 
-    # ---- page_chunks: older metadata['page'] (0-based) fallback ----
-
-    def test_older_page_field_fallback(self):
-        """Older versions use metadata['page'] (0-based); should map to 1-based."""
-        fake_chunks = [
+    @patch("pb_planreader_offline.pymupdf4llm")
+    def test_page_chunks_older_page_field_fallback(self, mock_p4l):
+        """Older version uses metadata['page'] (0-based); should map to 1-based."""
+        mock_p4l.to_markdown.return_value = [
             {"metadata": {"page": 0}, "text": "First"},
             {"metadata": {"page": 1}, "text": "Second"},
         ]
-        result: Dict[int, str] = {}
-        for chunk in fake_chunks:
-            meta = chunk.get("metadata", {})
-            # Simulate the fallback logic from extract_text_offline
-            if "page_number" in meta:
-                page_no = int(meta["page_number"])
-            elif "page" in meta:
-                page_no = int(meta["page"]) + 1  # 0-based → 1-based
-            else:
-                page_no = None
-            if page_no is not None:
-                result[page_no] = chunk.get("text", "")
+        from pb_planreader_offline import extract_text_offline
+        result = extract_text_offline("dummy.pdf", use_ocr=True)
+
         self.assertEqual(result.get(1), "First")
         self.assertEqual(result.get(2), "Second")
 
-    def test_page_number_takes_precedence_over_page(self):
-        """If both page_number and page exist, page_number wins."""
-        fake_chunks = [
+    @patch("pb_planreader_offline.pymupdf4llm")
+    def test_page_chunks_page_number_precedence(self, mock_p4l):
+        """When both page_number and page exist, page_number wins."""
+        mock_p4l.to_markdown.return_value = [
             {"metadata": {"page_number": 5, "page": 0}, "text": "Doc wins"},
         ]
-        for chunk in fake_chunks:
-            meta = chunk.get("metadata", {})
-            if "page_number" in meta:
-                page_no = int(meta["page_number"])
-            else:
-                page_no = int(meta.get("page", 0)) + 1
-            self.assertEqual(page_no, 5)
+        from pb_planreader_offline import extract_text_offline
+        result = extract_text_offline("dummy.pdf", pages=[5], use_ocr=True)
+
+        self.assertEqual(result, {5: "Doc wins"})
+
+    @patch("pb_planreader_offline.pymupdf4llm")
+    def test_page_chunks_no_cross_page_leakage(self, mock_p4l):
+        """Page 1 text must not appear in page 2's result."""
+        mock_p4l.to_markdown.return_value = [
+            {"metadata": {"page_number": 1}, "text": "SECRET_PAGE_1"},
+            {"metadata": {"page_number": 2}, "text": "SECRET_PAGE_2"},
+        ]
+        from pb_planreader_offline import extract_text_offline
+        result = extract_text_offline("dummy.pdf", use_ocr=True)
+
+        self.assertNotIn("SECRET_PAGE_1", result.get(2, ""))
+        self.assertNotIn("SECRET_PAGE_2", result.get(1, ""))
 
     # ---- page_separators fallback ----
 
-    def test_separator_parser_end_of_page(self):
-        """Separator '--- end of page=n ---' is 0-based, END of page.
+    @patch("pb_planreader_offline.pymupdf4llm")
+    def test_separator_fallback_enabled(self, mock_p4l):
+        """When page_chunks raises TypeError, page_separators=True is tried."""
+        # First call (page_chunks) raises TypeError; second call (separators) returns data
+        mock_p4l.to_markdown.side_effect = [
+            TypeError("page_chunks not supported"),
+            "PAGE ONE\n--- end of page=0 ---\nPAGE TWO\n--- end of page=1 ---\n",
+        ]
+        from pb_planreader_offline import extract_text_offline
+        result = extract_text_offline("dummy.pdf", use_ocr=True)
 
-        Text BEFORE the separator belongs to page n+1.
-        """
-        md_text = (
-            "GROUND FLOOR PLAN\n"
-            "walls and doors\n"
-            "--- end of page=0 ---\n"
-            "FIRST FLOOR PLAN\n"
-            "balcony details\n"
-            "--- end of page=1 ---\n"
-            "SECTION A-A\n"
-            "cut through roof\n"
-            "--- end of page=2 ---\n"
+        self.assertEqual(result.get(1), "PAGE ONE")
+        self.assertEqual(result.get(2), "PAGE TWO")
+        # Verify page_separators=True was actually passed on second call
+        self.assertEqual(mock_p4l.to_markdown.call_count, 2)
+        second_call_kwargs = mock_p4l.to_markdown.call_args.kwargs
+        self.assertTrue(second_call_kwargs.get("page_separators"))
+
+    @patch("pb_planreader_offline.pymupdf4llm")
+    def test_separator_fallback_no_shift(self, mock_p4l):
+        """Separator '--- end of page=n ---' assigns text BEFORE to page n+1."""
+        mock_p4l.to_markdown.side_effect = [
+            TypeError("page_chunks not supported"),
+            "PAGE ONE TEXT\n--- end of page=0 ---\nPAGE TWO TEXT\n--- end of page=1 ---\n",
+        ]
+        from pb_planreader_offline import extract_text_offline
+        result = extract_text_offline("dummy.pdf", use_ocr=True)
+
+        self.assertEqual(result.get(1), "PAGE ONE TEXT")
+        self.assertEqual(result.get(2), "PAGE TWO TEXT")
+
+    @patch("pb_planreader_offline.pymupdf4llm")
+    def test_separator_fallback_three_pages(self, mock_p4l):
+        """3-page separator parsing with no leakage."""
+        md = (
+            "GROUND FLOOR\nwalls\n--- end of page=0 ---\n"
+            "FIRST FLOOR\nbalcony\n--- end of page=1 ---\n"
+            "SECTION A-A\nroof\n--- end of page=2 ---\n"
         )
-        import re as _re
-        sections: Dict[int, str] = {}
-        buffer_parts: list = []
-        last_page_no: Optional[int] = None
+        mock_p4l.to_markdown.side_effect = [
+            TypeError("page_chunks not supported"),
+            md,
+        ]
+        from pb_planreader_offline import extract_text_offline
+        result = extract_text_offline("dummy.pdf", use_ocr=True)
 
-        def _flush():
-            nonlocal buffer_parts
-            if last_page_no is not None and buffer_parts:
-                text = "\n".join(buffer_parts).strip()
-                if text:
-                    sections[last_page_no] = text
-            buffer_parts = []
-
-        for line in md_text.split("\n"):
-            sep = _re.match(
-                r"---\s*end\s+of\s+page\s*=\s*(\d+)\s*---",
-                line, _re.IGNORECASE,
-            )
-            if sep:
-                last_page_no = int(sep.group(1)) + 1  # 0-based → 1-based
-                _flush()
-                continue
-            buffer_parts.append(line)
-        _flush()
-
-        # Page 1 (before page=0 separator) = GROUND FLOOR
-        self.assertIn(1, sections)
-        self.assertIn("GROUND FLOOR PLAN", sections[1])
-        self.assertIn("walls and doors", sections[1])
-        # Page 2 (before page=1 separator) = FIRST FLOOR
-        self.assertIn(2, sections)
-        self.assertIn("FIRST FLOOR PLAN", sections[2])
-        self.assertIn("balcony details", sections[2])
-        # Page 3 (before page=2 separator) = SECTION
-        self.assertIn(3, sections)
-        self.assertIn("SECTION A-A", sections[3])
-        self.assertIn("cut through roof", sections[3])
+        self.assertIn("GROUND FLOOR", result.get(1, ""))
+        self.assertIn("FIRST FLOOR", result.get(2, ""))
+        self.assertIn("SECTION A-A", result.get(3, ""))
         # No cross-page leakage
-        self.assertNotIn("FIRST FLOOR", sections.get(1, ""))
-        self.assertNotIn("GROUND FLOOR", sections.get(2, ""))
-        self.assertNotIn("SECTION", sections.get(1, ""))
+        self.assertNotIn("FIRST FLOOR", result.get(1, ""))
+        self.assertNotIn("GROUND FLOOR", result.get(2, ""))
 
-    def test_separator_no_shift(self):
-        """Prove the separator parser does NOT shift pages.
+    # ---- No unsafe multi-page collapse ----
 
-        Common bug: assigning text AFTER separator to its page number,
-        which shifts all pages by 1. The correct approach is assigning
-        text BEFORE separator to separator_page_index + 1.
+    @patch("pb_planreader_offline.fitz", None)
+    @patch("pb_planreader_offline.pymupdf4llm")
+    def test_no_multi_page_collapse(self, mock_p4l):
+        """Multi-page doc with no markers must NOT be assigned to page 1.
+
+        When all structured methods fail and no PyMuPDF is available,
+        the function should raise RuntimeError rather than silently
+        assigning the entire document to page 1.
         """
-        md_text = (
-            "PAGE ONE TEXT\n"
-            "--- end of page=0 ---\n"
-            "PAGE TWO TEXT\n"
-            "--- end of page=1 ---\n"
-        )
-        import re as _re
-        sections: Dict[int, str] = {}
-        buffer_parts: list = []
-        last_page_no: Optional[int] = None
+        # page_chunks returns empty list, separator call returns unparseable text
+        mock_p4l.to_markdown.side_effect = [
+            [],  # page_chunks returns empty list
+            "Page one and two mixed together\nno separators here\n",
+        ]
+        from pb_planreader_offline import extract_text_offline
+        with self.assertRaises(RuntimeError):
+            extract_text_offline("dummy.pdf", use_ocr=True)
 
-        def _flush():
-            nonlocal buffer_parts
-            if last_page_no is not None and buffer_parts:
-                text = "\n".join(buffer_parts).strip()
-                if text:
-                    sections[last_page_no] = text
-            buffer_parts = []
+    # ---- Regex fallback ----
 
-        for line in md_text.split("\n"):
-            sep = _re.match(
-                r"---\s*end\s+of\s+page\s*=\s*(\d+)\s*---",
-                line, _re.IGNORECASE,
-            )
-            if sep:
-                last_page_no = int(sep.group(1)) + 1
-                _flush()
-                continue
-            buffer_parts.append(line)
-        _flush()
+    @patch("pb_planreader_offline.pymupdf4llm")
+    def test_marker_regex_fallback(self, mock_p4l):
+        """<!-- page N --> markers work when page_separators fails too."""
+        md = "<!-- page 0 -->\nPAGE ONE\n<!-- page 1 -->\nPAGE TWO\n"
+        mock_p4l.to_markdown.side_effect = [
+            TypeError("page_chunks not supported"),
+            TypeError("page_separators not supported"),
+            md,  # plain call returns marker-based markdown
+        ]
+        from pb_planreader_offline import extract_text_offline
+        result = extract_text_offline("dummy.pdf", use_ocr=True)
 
-        self.assertEqual(sections.get(1), "PAGE ONE TEXT")
-        self.assertEqual(sections.get(2), "PAGE TWO TEXT")
+        self.assertIn("PAGE ONE", result.get(1, ""))
+        self.assertIn("PAGE TWO", result.get(2, ""))
 
-    def test_marker_regex_fallback(self):
-        """The <!-- page N --> regex is still valid as a secondary fallback."""
-        import re as _re
-        for marker in ["<!-- page 0 -->", "<!-- page 3 -->", "<!-- PAGE 5 -->"]:
-            m = _re.match(r"<!--\s*page\s+(\d+)\s*-->", marker, _re.IGNORECASE)
-            self.assertIsNotNone(m, f"Failed to match: {marker}")
+    # ---- wall_length_real_m export ----
 
     def test_wall_length_real_m_exported(self):
         """The helper function is importable from the module."""

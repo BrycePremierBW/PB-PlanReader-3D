@@ -173,15 +173,17 @@ def extract_text_offline(
         Dict mapping page_no -> extracted text
     """
     pdf_path = Path(pdf_path)
-    
+    result: Dict[int, str] = {}
+
+    # ------------------------------------------------------------------
+    # OCR path (pymupdf4llm)
+    # Strategy:
+    #   1. page_chunks=True      (supported, per-page dicts)
+    #   2. page_separators=True  (supported, "--- end of page=n ---")
+    #   3. "<!-- page N -->"     (undocumented convention, secondary)
+    # Never silently assign an entire multi-page document to page 1.
+    # ------------------------------------------------------------------
     if pymupdf4llm is not None and use_ocr:
-        # Use PyMuPDF4LLM for OCR-aware extraction.
-        # Strategy:
-        #   1. page_chunks=True  (supported API, per-page dicts)
-        #   2. page_separators  (supported, "--- end of page=n ---")
-        #   3. "<!-- page N -->" (undocumented convention, secondary fallback)
-        result: Dict[int, str] = {}
-        # pages kwarg is 0-indexed page indices
         target_idx = [p - 1 for p in pages] if pages else None
 
         # ---- Strategy 1: page_chunks=True (supported per-page API) ----
@@ -194,9 +196,6 @@ def extract_text_offline(
                 page_chunks=True,
                 **chunk_kwargs,
             )
-            # Each chunk: {"metadata": {...}, "text": "..."}
-            # Documented field: metadata["page_number"] (1-based)
-            # Older versions may use metadata["page"] (0-based)
             for chunk in chunks:
                 meta = chunk.get("metadata", {})
                 text = chunk.get("text", "")
@@ -221,16 +220,28 @@ def extract_text_offline(
         except Exception:
             pass
 
-        # ---- Strategies 2 & 3: page_separators / marker fallback ----
-        # Call without page_chunks; split the combined markdown.
-        kwargs: Dict[str, Any] = {}
-        if target_idx is not None:
-            kwargs["pages"] = target_idx
-
+        # ---- Strategy 2: page_separators=True (supported separator API) ----
+        md_text: Optional[str] = None
         try:
-            md_text = pymupdf4llm.to_markdown(str(pdf_path), **kwargs)
+            sep_kwargs: Dict[str, Any] = {"page_separators": True}
+            if target_idx is not None:
+                sep_kwargs["pages"] = target_idx
+            md_text = pymupdf4llm.to_markdown(str(pdf_path), **sep_kwargs)
+        except TypeError:
+            # page_separators not supported; try without it
+            pass
         except Exception:
-            md_text = ""
+            pass
+
+        if md_text is None:
+            # ---- Strategy 3: plain call, look for undocumented markers ----
+            try:
+                plain_kwargs: Dict[str, Any] = {}
+                if target_idx is not None:
+                    plain_kwargs["pages"] = target_idx
+                md_text = pymupdf4llm.to_markdown(str(pdf_path), **plain_kwargs)
+            except Exception:
+                md_text = ""
 
         if md_text:
             sections: Dict[int, str] = {}
@@ -285,18 +296,17 @@ def extract_text_offline(
                         result[pg] = txt
                 return result
 
-            # Last resort: no markers found.  Only safe for a single page.
-            if pages and len(pages) == 1:
-                return {pages[0]: md_text}
-            elif not pages:
-                return {1: md_text}
+            # ---- No markers found on multi-page document ----
+            # Do NOT assign entire markdown to page 1.
+            # Fall through to per-page PyMuPDF extraction below.
 
-        return result
-    
-    elif fitz is not None:
-        # Fallback to basic PyMuPDF
+    # ------------------------------------------------------------------
+    # Per-page PyMuPDF fallback — no OCR, but correct page boundaries.
+    # Used when: pymupdf4llm unavailable, OCR disabled, or OCR produced
+    # no structured result (e.g. multi-page without markers).
+    # ------------------------------------------------------------------
+    if not result and fitz is not None:
         pdf = fitz.open(str(pdf_path))
-        result = {}
         
         target_pages = pages or list(range(1, len(pdf) + 1))
         
@@ -309,9 +319,11 @@ def extract_text_offline(
         
         pdf.close()
         return result
-    
-    else:
+
+    if not result:
         raise RuntimeError("No PDF library available. Install PyMuPDF or pymupdf4llm.")
+
+    return result
 
 
 def extract_text_blocks_with_positions(
