@@ -1,16 +1,15 @@
 """PlanReader v1.4.9 runtime fast path.
 
-Targets work that was still repeated on normal Streamlit reruns after the earlier
-v1.2.15 database/3D optimisation patch:
+Targets work still repeated on normal Streamlit reruns after the existing v1.2.15
+SQLite and 3D performance guards:
 
-* initialise/migrate the local SQLite schema once per Python process instead of
-  executing the full DDL/migration path on every click;
 * cache JobHub schema metadata (table/column discovery) for a short period so
   normal navigation does not repeatedly open remote Postgres connections; and
 * briefly cache the JobHub job list so several UI reruns caused by one user
   interaction do not refetch the same list from the network.
 
-The take-off, geometry, scope and benchmark maths are deliberately untouched.
+The take-off, geometry, scope, benchmark maths and existing database-init guard
+are deliberately untouched.
 """
 from __future__ import annotations
 
@@ -20,8 +19,6 @@ from typing import Any, Dict, List, Tuple
 
 VERSION = "1.4.9"
 
-_INIT_LOCK = threading.Lock()
-_INIT_DONE = False
 _META_LOCK = threading.Lock()
 _META_CACHE: Dict[Tuple[str, str, str, str], Tuple[float, Any]] = {}
 _JOB_LOCK = threading.Lock()
@@ -35,14 +32,11 @@ def _fresh(entry: Tuple[float, Any] | None, ttl: float) -> bool:
 
 
 def clear_runtime_caches() -> None:
-    """Clear only the small in-process performance caches."""
-    global _INIT_DONE
+    """Clear only the small in-process JobHub performance caches."""
     with _META_LOCK:
         _META_CACHE.clear()
     with _JOB_LOCK:
         _JOB_CACHE.clear()
-    with _INIT_LOCK:
-        _INIT_DONE = False
 
 
 def apply(app: Any) -> None:
@@ -50,20 +44,6 @@ def apply(app: Any) -> None:
     if getattr(app, "_pb_runtime_performance_v149_applied", False):
         return
     app._pb_runtime_performance_v149_applied = True
-
-    base_init_local_db = app.init_local_db
-
-    def init_local_db_once() -> None:
-        global _INIT_DONE
-        if _INIT_DONE:
-            return
-        with _INIT_LOCK:
-            if _INIT_DONE:
-                return
-            base_init_local_db()
-            _INIT_DONE = True
-
-    app.init_local_db = init_local_db_once
 
     bridge_cls = app.JobHubBridge
     base_table_names = bridge_cls.table_names
@@ -102,7 +82,6 @@ def apply(app: Any) -> None:
         with _JOB_LOCK:
             entry = _JOB_CACHE.get(key)
             if _fresh(entry, JOB_TTL_SECONDS):
-                # Return fresh dict objects so callers cannot mutate the cache.
                 return [dict(row) for row in entry[1]]
         rows = [dict(row) for row in base_fetch_jobhub_jobs(bridge)]
         with _JOB_LOCK:
