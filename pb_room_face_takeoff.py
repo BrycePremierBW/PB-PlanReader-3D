@@ -15,6 +15,7 @@ Never produce a confidently stated m² quantity from an uncalibrated polygon.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from math import atan2, pi
 from pathlib import Path
@@ -48,6 +49,74 @@ CONTAINMENT_OUTLINE_THRESHOLD = 0.50
 
 # Source prefix for take-off rows from this module
 SOURCE_PREFIX = "PB RoomFace v2"
+
+# ---------------------------------------------------------------------------
+# BLOCKER 1 — Semantic room label vocabulary
+# ---------------------------------------------------------------------------
+
+# Exact room-type words (case-insensitive matching)
+ROOM_LABEL_EXACT: set[str] = {
+    # Living / sleeping
+    "bedroom", "bed", "master", "guest", "lounge", "living", "family",
+    "rumpus", "media", "theatre", "theater", "snug",
+    # Eating / cooking
+    "kitchen", "dining", "breakfast", "pantry", "meals", "cafe",
+    # Wet areas
+    "bath", "bathroom", "ensuite", "ensuites", "wc", "toilet",
+    "powder", "shower", "laundry", "wash", "mud",
+    # Storage
+    "store", "storage", "linen", "cupboard", "robe", "wir",
+    "walk", "closet",
+    # Circulation
+    "corridor", "hall", "hallway", "entry", "foyer", "vestibule",
+    "passage", "landing", "stair", "stairs", "staircase",
+    "en-suite", "ensuite",
+    # Work
+    "office", "study", "library", "workshop", "studio",
+    # Utility
+    "garage", "carport", "shed", "plant", "mech", "mechanical",
+    "electrical", "server", "comms", "riser", "duct",
+    # Other rooms
+    "nursery", "playroom", "sunroom", "conservatory", "cellar",
+    "basement", "attic", "loft", "void",
+}
+
+# Prefix patterns — a word starting with these MAY be a room label
+# (e.g., "BEDROOMS" starts with "BEDROOM", "KITCHENETTE" starts with "KITCHEN")
+ROOM_LABEL_PREFIXES: tuple[str, ...] = (
+    "bedroom", "kitchen", "bathroom", "laundry", "garage",
+    "lounge", "dining", "office", "study", "store",
+    "pantry", "ensuite", "corridor", "hallway",
+)
+
+# Compiled regex: exact match or starts with a known prefix
+_ROOM_EXACT_RE = re.compile(
+    r"^(?:" + "|".join(re.escape(w) for w in sorted(ROOM_LABEL_EXACT)) + r")$",
+    re.IGNORECASE,
+)
+_ROOM_PREFIX_RE = re.compile(
+    r"^(?:" + "|".join(re.escape(p) for p in ROOM_LABEL_PREFIXES) + r")",
+    re.IGNORECASE,
+)
+
+# Patterns that are NEVER room labels (dimensions, tags, codes, annotations)
+_NOT_ROOM_RE = re.compile(
+    r"^("                                              # start of string
+    r"\d+[.,]?\d*\s*(mm|m|cm|ft|in|')?"               # pure numbers / dimensions
+    r"|[A-Z]{1,4}\d{1,4}"                             # finish codes: PT01, WD02, etc.
+    r"|[DdWwHhSs]\d{1,3}"                             # door/window tags: D01, W12, etc.
+    r"|[Rr][Ll]\s*[\d.+-]+"                           # levels: RL 12.345
+    r"|[+\-]?\d+[\d.]*\s*(mm|m|cm|ft)"               # dimensions with unit
+    r"|\d+\s*[xX×]\s*\d+"                             # dimensions: 2400x1200
+    r"|SHEET\s"                                        # sheet references
+    r"|[A-Z]{2,4}-\d{2,}"                             # drawing numbers: A-01.01
+    r"|ELEVATION|SECTION|DETAIL|PLAN|NOTES?"          # drawing type annotations
+    r"|SCALE\s"                                       # scale text
+    r"|[A-Z]\d+[A-Z]?"                               # short codes: A1, B2, etc.
+    r")$",
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -129,6 +198,133 @@ def _polygon_tuples(polygon: Sequence) -> Tuple[Tuple[float, float], ...]:
 
 
 # ---------------------------------------------------------------------------
+# BLOCKER 1 — Semantic room label candidate filtering
+# ---------------------------------------------------------------------------
+
+
+def _is_room_label_candidate(word: str) -> bool:
+    """Check if a single word is a credible room-label candidate.
+
+    Returns True only for words that could plausibly be room names.
+    Rejects pure numbers, dimensions, finish codes, door/window tags,
+    drawing annotations, etc.
+    """
+    w = word.strip()
+    if not w or len(w) < 2:
+        return False
+    # Reject obvious non-room patterns
+    if _NOT_ROOM_RE.match(w):
+        return False
+    # Accept exact room label matches
+    if _ROOM_EXACT_RE.match(w):
+        return True
+    # Accept words starting with known room prefixes (e.g., "BEDROOMS", "KITCHENETTE")
+    if _ROOM_PREFIX_RE.match(w):
+        return True
+    return False
+
+
+def filter_room_label_candidates(
+    words: List[Dict[str, Any]],
+    line_y_tolerance: float = 8.0,
+) -> List[Dict[str, Any]]:
+    """Filter PDF words to credible room-label candidates, handling multi-word labels.
+
+    Performs line-based grouping to reconstruct multi-word room labels like
+    "MASTER BEDROOM" or "WALK IN ROBE" from separate PDF words.
+
+    Args:
+        words: PDF word dicts with 'text' and 'bbox' keys.
+        line_y_tolerance: Max vertical distance (PDF pts) to consider words on same line.
+
+    Returns:
+        Filtered list of label dicts: [{"label": str, "x": float, "y": float, "confidence": float}].
+    """
+    if not words:
+        return []
+
+    # Group words into lines by vertical proximity
+    sorted_words = sorted(words, key=lambda w: (
+        float(w.get("bbox", [0, 0, 0, 0])[1]),  # sort by y0
+        float(w.get("bbox", [0, 0, 0, 0])[0]),  # then by x0
+    ))
+
+    lines: List[List[Dict[str, Any]]] = []
+    current_line: List[Dict[str, Any]] = []
+    current_y: float = -9999.0
+
+    for word in sorted_words:
+        bbox = word.get("bbox", [])
+        if len(bbox) < 4:
+            continue
+        text = str(word.get("text") or "").strip()
+        if not text:
+            continue
+        y0 = float(bbox[1])
+        if abs(y0 - current_y) > line_y_tolerance and current_line:
+            lines.append(current_line)
+            current_line = []
+        current_y = y0
+        current_line.append(word)
+    if current_line:
+        lines.append(current_line)
+
+    # For each line, try to find room label candidates
+    candidates: List[Dict[str, Any]] = []
+    for line_words in lines:
+        # Sort words left to right
+        line_words.sort(key=lambda w: float(w.get("bbox", [0, 0, 0, 0])[0]))
+
+        # Try the full line as a room label (e.g., "MASTER BEDROOM")
+        full_text = " ".join(str(w.get("text") or "").strip() for w in line_words)
+        if _is_room_label_candidate(full_text):
+            # Use the bounding box of the full line
+            all_bboxes = [w["bbox"] for w in line_words if len(w.get("bbox", [])) >= 4]
+            if all_bboxes:
+                x0 = min(float(b[0]) for b in all_bboxes)
+                y0 = min(float(b[1]) for b in all_bboxes)
+                x1 = max(float(b[2]) for b in all_bboxes)
+                y1 = max(float(b[3]) for b in all_bboxes)
+                # All words on this line are part of the room label
+                room_words = [w for w in line_words
+                              if _is_room_label_candidate(str(w.get("text") or "").strip())]
+                if room_words:
+                    # Use the room-label words specifically for position
+                    rw_bboxes = [w["bbox"] for w in room_words if len(w.get("bbox", [])) >= 4]
+                    if rw_bboxes:
+                        x0 = min(float(b[0]) for b in rw_bboxes)
+                        y0 = min(float(b[1]) for b in rw_bboxes)
+                        x1 = max(float(b[2]) for b in rw_bboxes)
+                        y1 = max(float(b[3]) for b in rw_bboxes)
+                cx = (x0 + x1) / 2.0
+                cy = (y0 + y1) / 2.0
+                candidates.append({
+                    "label": full_text.strip(),
+                    "x": cx, "y": cy,
+                    "confidence": 0.95,
+                })
+            continue
+
+        # Try individual words on this line
+        for word in line_words:
+            text = str(word.get("text") or "").strip()
+            if not text or not _is_room_label_candidate(text):
+                continue
+            bbox = word.get("bbox", [])
+            if len(bbox) < 4:
+                continue
+            cx = (float(bbox[0]) + float(bbox[2])) / 2.0
+            cy = (float(bbox[1]) + float(bbox[3])) / 2.0
+            candidates.append({
+                "label": text,
+                "x": cx, "y": cy,
+                "confidence": 0.85,
+            })
+
+    return candidates
+
+
+# ---------------------------------------------------------------------------
 # Calibration
 # ---------------------------------------------------------------------------
 
@@ -160,6 +356,89 @@ def calibrate_polygon_m(
     if scale is None:
         return None
     return [(round(x * scale, 4), round(y * scale, 4)) for x, y in polygon_pdf_pts]
+
+
+# ---------------------------------------------------------------------------
+# BLOCKER 2 — Production calibration adapter
+# ---------------------------------------------------------------------------
+
+
+def page_scale_info(page: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive the authoritative page calibration from a PlanReader page dict.
+
+    Uses the same `px_per_m` stored by PlanReader's registration/scale
+    pipeline.  Does NOT create a parallel scale representation.
+
+    Conversion:
+        real_metres_per_page_mm = px_per_m / (render_zoom × 10000)
+
+    This yields the same value that `real_metres_per_page_mm()` in
+    `pb_planreader_offline.py` produces for ratio 1:N → N/1000.
+
+    Args:
+        page: Page dict from database with px_per_m, render_zoom, scale_text.
+
+    Returns:
+        Dict with 'real_metres_per_page_mm', 'scale_text', 'px_per_m', etc.
+    """
+    px_per_m = float(page.get("px_per_m") or 0)
+    render_zoom = float(page.get("render_zoom") or 1.0)
+    if render_zoom <= 0:
+        render_zoom = 1.0
+
+    scale_text = str(page.get("scale_text") or "").strip()
+
+    if px_per_m > 0:
+        # Authoritative: derive real_metres_per_page_mm from stored px_per_m
+        # From auto_scale: px_per_m = zoom × 2834.646 / ratio
+        # Therefore: ratio = zoom × 2834.646 / px_per_m
+        # And: real_metres_per_page_mm = ratio / 1000 = zoom × 2.834646 / px_per_m
+        rpm = render_zoom * 2.834646 / px_per_m
+        return {
+            "real_metres_per_page_mm": rpm,
+            "px_per_m": px_per_m,
+            "render_zoom": render_zoom,
+            "scale_text": scale_text,
+            "source": "page.px_per_m",
+        }
+
+    # No px_per_m available — unknown scale
+    return {
+        "real_metres_per_page_mm": None,
+        "px_per_m": 0.0,
+        "render_zoom": render_zoom,
+        "scale_text": scale_text,
+        "source": "unknown",
+    }
+
+
+def vector_analysis_scale_info(app: Any, page_id: int) -> Optional[Dict[str, Any]]:
+    """Try to get calibration from stored v130 vector analysis.
+
+    Returns None if not available (caller should fall back to page_scale_info).
+    """
+    try:
+        setting_key = f"vector_analysis_{page_id}"
+        workspace_id = 0  # caller must provide or we skip
+        raw = getattr(app, "workspace_setting", lambda *a: "")(workspace_id, setting_key, "")
+        if not raw:
+            return None
+        import json
+        analysis = json.loads(raw)
+        scale = analysis.get("scale") or {}
+        px_per_m = float(scale.get("px_per_m") or 0)
+        if px_per_m <= 0:
+            return None
+        # Use the same conversion as page_scale_info
+        return {
+            "real_metres_per_page_mm": px_per_m / 10000.0,  # render_zoom already baked in
+            "px_per_m": px_per_m,
+            "render_zoom": 1.0,  # already accounted for in px_per_m
+            "scale_text": str(scale.get("label") or ""),
+            "source": "vector_analysis",
+        }
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -229,18 +508,6 @@ def filter_face(
     Area below thresholds is treated as confidence evidence, not unconditional
     rejection — a small polygon with a strong room label may be retained
     provisionally.
-
-    Args:
-        polygon_pdf_pts: Vertices in PDF point space.
-        scale_info: Scale calibration dict from Priority 1.
-        page_width_pt: Page width in PDF points.
-        page_height_pt: Page height in PDF points.
-        all_polygons: All extracted faces (for containment analysis).
-        label: Associated text label (if any).
-        polygon_index: Index of this polygon in all_polygons (for self-exclusion).
-
-    Returns:
-        FilterResult with is_room=True/False and reason.
     """
     # 1. Minimum vertex count
     if len(polygon_pdf_pts) < 3:
@@ -422,17 +689,14 @@ def _authoritative_scale_text(scale_info: Dict[str, Any]) -> str:
     Uses scale_text if available, falls back to constructing from known fields.
     Never derives display labels from inverse/internal factors.
     """
-    # Prefer explicit scale text from the calibration object
     text = str(scale_info.get("scale_text") or "").strip()
     if text:
         return text
 
-    # Fall back to ratio if explicitly stored as integer ratio
     ratio = scale_info.get("scale_ratio")
     if isinstance(ratio, (int, float)) and ratio > 0 and ratio == int(ratio):
         return f"1:{int(ratio)}"
 
-    # Fall back to metric if explicitly stored
     metric = scale_info.get("metric_scale")
     if metric:
         return str(metric)
@@ -459,7 +723,8 @@ def extract_and_calibrate_rooms(
         page_height_pt: Page height in PDF points.
         page_no: PlanReader page number.
         drawing_number: Drawing reference.
-        words: PDF word positions [{"text": str, "bbox": [x0,y0,x1,y1]}, ...].
+        words: PDF word positions [{text, bbox}, ...].  FILTERED to credible
+               room-label candidates before label association.
         min_area: Minimum face area in PDF points² for v145 extraction.
 
     Returns:
@@ -493,16 +758,9 @@ def extract_and_calibrate_rooms(
     if not raw_faces:
         return []
 
-    # Build label list from PDF words
-    label_dicts = []
-    if words:
-        for word in words:
-            text = str(word.get("text") or "").strip()
-            bbox = word.get("bbox", [])
-            if text and len(bbox) >= 4:
-                cx = (float(bbox[0]) + float(bbox[2])) / 2.0
-                cy = (float(bbox[1]) + float(bbox[3])) / 2.0
-                label_dicts.append({"label": text, "x": cx, "y": cy})
+    # BLOCKER 1: Filter PDF words to credible room-label candidates
+    # BEFORE passing to attach_room_labels.
+    label_dicts = filter_room_label_candidates(words or [])
 
     # Attach labels via point-in-polygon spatial association
     labelled = attach_room_labels(raw_faces, label_dicts)
@@ -666,15 +924,15 @@ def extract_room_faces_from_page(
 
     This is the production integration point.  It:
     1. Opens the original PDF
-    2. Extracts vector segments via pb_vector_geometry_v130
-    3. Extracts text positions for room labels
-    4. Gets page calibration (scale, dimensions)
+    2. Extracts vector segments
+    3. Extracts text positions (filtered to room labels)
+    4. Gets page calibration via page_scale_info()
     5. Runs v145 face extraction
     6. Calibrates and filters
 
     Args:
-        app: PlanReader app instance (needs fitz, lquery, workspace_setting).
-        page: Page dict from database (id, page_no, page_label, page_type, etc.)
+        app: PlanReader app instance (needs fitz, lquery).
+        page: Page dict from database (id, page_no, page_label, page_type, px_per_m, etc.)
 
     Returns:
         List of calibrated RoomFace objects.
@@ -735,7 +993,8 @@ def extract_room_faces_from_page(
                         a, b = pts[edge], pts[(edge + 1) % 4]
                         segments.append({"x1": a[0], "y1": a[1], "x2": b[0], "y2": b[1]})
 
-        # Extract text positions for room labels
+        # Extract ALL text positions (for label filtering — filter_room_label_candidates
+        # handles the semantic filtering internally)
         words_raw = pdf_page.get_text("words") or []
         words = []
         for word in words_raw:
@@ -754,46 +1013,8 @@ def extract_room_faces_from_page(
     if not segments:
         return []
 
-    # Get page calibration
-    workspace_id = int(page.get("workspace_id") or 0)
-    page_id = int(page.get("id") or 0)
-
-    # Try to get stored vector analysis result
-    scale_info: Dict[str, Any] = {"real_metres_per_page_mm": None}
-    try:
-        setting_key = f"vector_analysis_{page_id}"
-        raw = app.workspace_setting(workspace_id, setting_key, "")
-        if raw:
-            import json
-            analysis = json.loads(raw)
-            # Extract scale from the analysis
-            if "scale" in analysis:
-                scale_data = analysis["scale"]
-                rpm = scale_data.get("real_metres_per_page_mm")
-                if rpm is not None and rpm > 0:
-                    scale_info["real_metres_per_page_mm"] = rpm
-                ratio = scale_data.get("ratio")
-                if ratio:
-                    scale_info["scale_ratio"] = ratio
-                scale_info["scale_text"] = str(scale_data.get("text") or "")
-    except Exception:
-        pass
-
-    # Fallback: try to get px_per_m from page dict and derive scale
-    if scale_info.get("real_metres_per_page_mm") is None:
-        px_per_m = float(page.get("px_per_m") or 0)
-        if px_per_m > 0:
-            # px_per_m = real metres per page metre = 1000 / real_mm_per_page_mm
-            # real_metres_per_page_mm = 1000 / (px_per_m × 1000) = 1/px_per_m... no
-            # Actually: px_per_m = pixels per real metre
-            # We need: real_metres_per_page_mm = real metres per page mm
-            # page_m = pdf_pt × (25.4/72)
-            # real_m = page_m × real_metres_per_page_mm
-            # Also: real_m = pdf_pt × (25.4/72) × rpm
-            # From px_per_m: 1 real metre = px_per_m pixels
-            # But we need page mm → real metres, not pixels → real metres
-            # These are different: px_per_m is for image rendering, not page geometry
-            pass
+    # BLOCKER 2: Use authoritative page calibration
+    scale_info = page_scale_info(page)
 
     # Get drawing number
     drawing_number = str(page.get("page_label") or "")
@@ -811,26 +1032,39 @@ def extract_room_faces_from_page(
 
 
 # ---------------------------------------------------------------------------
-# Production wiring: monkey-patch into the takeoff generation pipeline
+# BLOCKER 3 — Production wiring
 # ---------------------------------------------------------------------------
 
 
 def apply(app: Any) -> None:
-    """Wire room face extraction into the PlanReader production pipeline."""
+    """Wire room face extraction into the PlanReader production pipeline.
+
+    Called from pb_planreader_v126_app.py startup chain, after
+    apply_vector_geometry_v130 (which registers extract_native_page etc.).
+    """
     if getattr(app, "_pb_room_face_takeoff_applied", False):
         return
     app._pb_room_face_takeoff_applied = True
 
-    # Store reference to this module for testing
-    app.room_face_takeoff_module = _get_module()
+    # Store module reference for testing
+    import pb_room_face_takeoff as _mod
+    app.room_face_takeoff = _mod
 
-    # Wire into _build_unit_rows to add room-face floor area rows
+    # Wire into _build_unit_rows to add room-face floor area rows.
+    # This follows the same monkey-patch pattern used by:
+    #   pb_unit_floor_area_gate_v1221
+    #   pb_selected_evidence_floor_v1226
+    #   pb_context_floorarea_v1224
     try:
         import pb_auto_geometry_v1219 as auto
         original_build = auto._build_unit_rows
 
-        def _build_unit_rows_with_room_faces(app_obj: Any, workspace_id: int, pages: Sequence[Dict[str, Any]]):
-            # Run original builder
+        def _build_unit_rows_with_room_faces(
+            app_obj: Any,
+            workspace_id: int,
+            pages: Sequence[Dict[str, Any]],
+        ):
+            # Run original builder (which may itself be wrapped by other modules)
             rows, summary = original_build(app_obj, workspace_id, pages)
 
             # Add room face rows for floor plan pages
@@ -875,12 +1109,6 @@ def apply(app: Any) -> None:
         auto._build_unit_rows = _build_unit_rows_with_room_faces
     except Exception:
         pass  # If auto_geometry not available, skip wiring
-
-
-def _get_module():
-    """Return this module for testing access."""
-    import pb_room_face_takeoff as mod
-    return mod
 
 
 # ---------------------------------------------------------------------------

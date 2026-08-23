@@ -45,6 +45,7 @@ from pb_substrate_qa_v131 import apply as apply_substrate_qa_v131
 from pb_precision_3d_v132 import apply as apply_precision_3d_v132
 from pb_opening_deductions_v134 import apply as apply_opening_deductions_v134
 from pb_elevation_registration_v135 import apply as apply_elevation_registration_v135
+from pb_room_face_takeoff import apply as apply_room_face_takeoff
 
 
 apply_gemini_v126(launcher.app)
@@ -85,6 +86,7 @@ apply_plan_read_engine_v1228(launcher.app)
 apply_mapper_hard_guard_v1228(launcher.app)
 apply_persistent_login_v1229(launcher.app)
 apply_vector_geometry_v130(launcher.app)
+apply_room_face_takeoff(launcher.app)
 apply_accuracy_benchmark_v130(launcher.app)
 apply_accuracy_ui_v130(launcher.app)
 apply_substrate_qa_v131(launcher.app)
