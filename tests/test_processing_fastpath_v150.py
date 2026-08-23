@@ -33,7 +33,6 @@ def test_eta_progress_adds_remaining_time_text():
     app = SimpleNamespace(st=st)
     fast._install_eta_progress(app)
     bar = app.st.progress(0)
-    # Backdate the proxy so an ETA can be inferred immediately in the test.
     bar._start -= 10
     bar.progress(0.5)
     assert "remaining" in st.targets[0].calls[-1][1]
@@ -99,6 +98,62 @@ def test_ai_page_bytes_cache_reuses_same_file(tmp_path):
     second = app._ai_page_bytes(page)
     assert first == second
     assert calls["encode"] == 1
+
+
+def test_envelope_detection_cache_reuses_unchanged_page(tmp_path):
+    calls = {"detect": 0}
+    page = tmp_path / "page.png"
+    page.write_bytes(b"fake-page")
+
+    def detect(path, min_area_pct=0.4, max_contours=3):
+        calls["detect"] += 1
+        return [{"points": [[1, 2], [3, 4]], "area_pct": 10.0}]
+
+    app = SimpleNamespace(auto_detect_building_envelope=detect)
+    fast._install_envelope_cache(app)
+    first = app.auto_detect_building_envelope(page)
+    second = app.auto_detect_building_envelope(page)
+    assert first == second
+    assert calls["detect"] == 1
+
+
+def test_large_pdf_batch_uses_parallel_workers_and_keeps_result_order(monkeypatch):
+    monkeypatch.setenv("PLANREADER_RENDER_WORKERS", "2")
+    calls = []
+
+    def render(pdf_path, jobs, timeout=90, progress_cb=None):
+        calls.append([j[0] for j in jobs])
+        out = []
+        for page_no, _zoom, _path in jobs:
+            if progress_cb:
+                progress_cb(1, len(jobs), page_no)
+            out.append((page_no, True, 100, 100, ""))
+        return out
+
+    app = SimpleNamespace(_render_pdf_pages_in_worker=render)
+    fast._install_parallel_pdf_rendering(app)
+    jobs = [(i, 1.0, f"{i}.png") for i in range(1, 7)]
+    progress = []
+    result = app._render_pdf_pages_in_worker("plans.pdf", jobs, 90, lambda c, t, p: progress.append((c, t, p)))
+    assert len(calls) == 2
+    assert [row[0] for row in result] == list(range(1, 7))
+    assert len(progress) == 6
+    assert progress[-1][0] == 6
+
+
+def test_small_pdf_batch_stays_serial(monkeypatch):
+    monkeypatch.setenv("PLANREADER_RENDER_WORKERS", "2")
+    calls = {"render": 0}
+
+    def render(pdf_path, jobs, timeout=90, progress_cb=None):
+        calls["render"] += 1
+        return [(j[0], True, 100, 100, "") for j in jobs]
+
+    app = SimpleNamespace(_render_pdf_pages_in_worker=render)
+    fast._install_parallel_pdf_rendering(app)
+    jobs = [(1, 1.0, "1.png"), (2, 1.0, "2.png")]
+    app._render_pdf_pages_in_worker("plans.pdf", jobs, 90, None)
+    assert calls["render"] == 1
 
 
 def test_production_entry_enables_v150_fast_path():
