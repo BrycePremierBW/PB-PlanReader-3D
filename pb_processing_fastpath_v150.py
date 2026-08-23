@@ -1,24 +1,24 @@
 """PlanReader v1.5.0 processing fast path and ETA progress display.
 
-Low-risk optimisations layered on top of the existing memory-stable PDF pipeline:
+Optimisations layered on top of the existing memory-stable PDF pipeline:
 
-* skip re-indexing an unchanged document when its complete page register already
-  exists (avoids reopening every PDF page and repeating text extraction/classification);
-* cache resized PNG bytes used for AI vision calls so retries/reviews of the same
-  rendered page do not repeatedly reopen, resize and recompress the image; and
-* wrap Streamlit progress bars so they display an estimated time remaining.
-
-No take-off, scope, geometry or benchmark maths is changed.
+* skip re-indexing unchanged documents whose page register is already complete;
+* render larger PDF selections with two bounded worker processes in parallel;
+* cache resized PNG bytes used for AI vision calls;
+* cache expensive building-envelope CV detection by immutable page-image fingerprint;
+* wrap Streamlit progress bars so they display estimated time remaining; and
+* retain the existing proven take-off, scope, geometry and benchmark maths.
 """
 from __future__ import annotations
 
-import io
-import math
+import os
+import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 VERSION = "1.5.0"
 _DURATION_LOCK = threading.Lock()
@@ -56,7 +56,6 @@ def _remember_duration(key: str, duration: float) -> None:
             return
         avg, count = previous
         count = min(count + 1, 8)
-        # Recent runs should matter more than ancient ones without making ETA jumpy.
         weight = 1.0 / count
         _DURATION_HISTORY[key] = (avg * (1.0 - weight) + duration * weight, count)
 
@@ -81,7 +80,6 @@ class _ETAProgress:
         elapsed = max(0.0, time.monotonic() - self._start)
         if fraction >= 0.999:
             return f"{base} · complete"
-        # Do not claim a numeric ETA until there is enough real progress to infer it.
         if elapsed < 0.35 or fraction < 0.02:
             return f"{base} · time remaining: estimating…"
         eta = elapsed * (1.0 - fraction) / max(fraction, 0.001)
@@ -114,10 +112,7 @@ def _install_eta_progress(app: Any) -> None:
     def progress_with_eta(value: Any, text: str | None = None, *args, **kwargs):
         fraction = _normalise_fraction(value)
         initial = text or "Loading"
-        if fraction >= 0.999:
-            label = f"{initial} · complete"
-        else:
-            label = f"{initial} · time remaining: estimating…"
+        label = f"{initial} · complete" if fraction >= 0.999 else f"{initial} · time remaining: estimating…"
         try:
             target = base_progress(value, text=label, *args, **kwargs)
         except TypeError:
@@ -132,8 +127,6 @@ def _install_ai_image_cache(app: Any) -> None:
 
     @lru_cache(maxsize=96)
     def _cached(path_text: str, mtime_ns: int, size: int, max_long_edge: int) -> bytes:
-        # The mtime/size values are intentionally part of the cache key so a
-        # replaced page image cannot reuse stale bytes.
         del mtime_ns, size
         return base_ai_page_bytes(Path(path_text), max_long_edge)
 
@@ -151,14 +144,37 @@ def _install_ai_image_cache(app: Any) -> None:
     app.clear_ai_image_cache = _cached.cache_clear
 
 
+def _install_envelope_cache(app: Any) -> None:
+    base_detector = app.auto_detect_building_envelope
+
+    @lru_cache(maxsize=64)
+    def _cached(path_text: str, mtime_ns: int, size: int, min_area_pct: float, max_contours: int):
+        del mtime_ns, size
+        result = base_detector(path_text, min_area_pct, max_contours)
+        # Return immutable-ish cached content; public wrapper copies dictionaries.
+        return tuple(tuple(sorted(item.items())) for item in result)
+
+    def cached_detector(image_path: Any, min_area_pct: float = 0.4, max_contours: int = 3):
+        path = Path(str(image_path or ""))
+        try:
+            stat = path.stat()
+            packed = _cached(
+                str(path), int(stat.st_mtime_ns), int(stat.st_size),
+                float(min_area_pct), int(max_contours),
+            )
+            return [dict(items) for items in packed]
+        except OSError:
+            return base_detector(image_path, min_area_pct, max_contours)
+
+    app.auto_detect_building_envelope = cached_detector
+    app.clear_envelope_detection_cache = _cached.cache_clear
+
+
 def _install_index_fastpath(app: Any) -> None:
     base_index = app.index_document_pages
 
     def fast_index_document_pages(document_id: int):
-        docs = app.lquery(
-            "SELECT id,page_count FROM documents WHERE id=?",
-            (int(document_id),),
-        )
+        docs = app.lquery("SELECT id,page_count FROM documents WHERE id=?", (int(document_id),))
         if docs:
             expected = int(docs[0].get("page_count") or 0)
             if expected > 0:
@@ -166,8 +182,6 @@ def _install_index_fastpath(app: Any) -> None:
                     "SELECT page_no,page_label,page_type,extracted_text FROM pages WHERE document_id=? ORDER BY page_no",
                     (int(document_id),),
                 )
-                # A full register with text/classification is deterministic for an
-                # immutable uploaded document, so rebuilding it only wastes time.
                 if len(rows) == expected and all(
                     int(r.get("page_no") or 0) > 0
                     and str(r.get("page_label") or "").strip()
@@ -180,21 +194,97 @@ def _install_index_fastpath(app: Any) -> None:
     app.index_document_pages = fast_index_document_pages
 
 
+def _render_worker_count(job_count: int) -> int:
+    raw = str(os.environ.get("PLANREADER_RENDER_WORKERS", "2") or "2").strip()
+    try:
+        requested = int(raw)
+    except ValueError:
+        requested = 2
+    # Render memory is deliberately bounded: never fan out beyond two workers by
+    # default. Very small batches stay serial because process startup dominates.
+    return 1 if job_count < 4 else max(1, min(requested, 2, job_count))
+
+
+def _install_parallel_pdf_rendering(app: Any) -> None:
+    base_render = app._render_pdf_pages_in_worker
+
+    def parallel_render(
+        pdf_path: str,
+        jobs: Sequence[Tuple[int, float, str]],
+        timeout: float = None,
+        progress_cb: Callable[[int, int, int], None] | None = None,
+    ):
+        jobs = list(jobs)
+        workers = _render_worker_count(len(jobs))
+        if workers <= 1:
+            if timeout is None:
+                return base_render(pdf_path, jobs, progress_cb=progress_cb)
+            return base_render(pdf_path, jobs, timeout, progress_cb)
+
+        # Split contiguous pages so each MuPDF process reads nearby pages and
+        # avoids excessive seeking. Background threads only enqueue progress;
+        # Streamlit callbacks are executed on the calling/main thread below.
+        chunks: List[List[Tuple[int, float, str]]] = [[] for _ in range(workers)]
+        chunk_size = (len(jobs) + workers - 1) // workers
+        for i in range(workers):
+            chunks[i] = jobs[i * chunk_size:(i + 1) * chunk_size]
+        chunks = [c for c in chunks if c]
+        events: queue.Queue[int] = queue.Queue()
+
+        def run_chunk(chunk):
+            def local_progress(_completed, _total, page_no):
+                events.put(int(page_no))
+            if timeout is None:
+                return base_render(pdf_path, chunk, progress_cb=local_progress)
+            return base_render(pdf_path, chunk, timeout, local_progress)
+
+        completed = 0
+        gathered = []
+        with ThreadPoolExecutor(max_workers=len(chunks), thread_name_prefix="pb-pdf-render") as pool:
+            futures = [pool.submit(run_chunk, chunk) for chunk in chunks]
+            while True:
+                alive = any(not future.done() for future in futures)
+                drained = False
+                while True:
+                    try:
+                        page_no = events.get_nowait()
+                    except queue.Empty:
+                        break
+                    drained = True
+                    completed += 1
+                    if progress_cb:
+                        progress_cb(completed, len(jobs), page_no)
+                if not alive:
+                    break
+                if not drained:
+                    time.sleep(0.03)
+            # Drain final progress events before returning.
+            while True:
+                try:
+                    page_no = events.get_nowait()
+                except queue.Empty:
+                    break
+                completed += 1
+                if progress_cb:
+                    progress_cb(completed, len(jobs), page_no)
+            for future in futures:
+                gathered.extend(future.result())
+
+        order = {int(job[0]): i for i, job in enumerate(jobs)}
+        gathered.sort(key=lambda row: order.get(int(row[0]), 10**9))
+        return gathered
+
+    app._render_pdf_pages_in_worker = parallel_render
+    app.PDF_RENDER_WORKERS = _render_worker_count(100)
+
+
 def _install_worker_eta(app: Any) -> None:
-    """Give indeterminate threaded operations a history-based ETA as well."""
     base = app._run_with_progress
 
     def run_with_eta(worker: Callable[[], Any], caption: str) -> Any:
-        # Keep the existing worker implementation so exception and threading
-        # behaviour remains proven. The global progress proxy handles the bar.
         start = time.monotonic()
         expected = _expected_duration(str(caption))
-        if expected:
-            # Seed the progress proxy's initial text through the normal caption;
-            # numeric ETA will continue updating as the existing bar advances.
-            caption_for_run = f"{caption} (typical {_format_seconds(expected)})"
-        else:
-            caption_for_run = caption
+        caption_for_run = f"{caption} (typical {_format_seconds(expected)})" if expected else caption
         try:
             return base(worker, caption_for_run)
         finally:
@@ -209,6 +299,8 @@ def apply(app: Any) -> None:
     app._pb_processing_fastpath_v150_applied = True
     _install_index_fastpath(app)
     _install_ai_image_cache(app)
+    _install_envelope_cache(app)
+    _install_parallel_pdf_rendering(app)
     _install_eta_progress(app)
     _install_worker_eta(app)
     app.PROCESSING_FASTPATH_VERSION = VERSION
