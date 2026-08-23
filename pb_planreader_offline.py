@@ -176,12 +176,15 @@ def extract_text_offline(
     
     if pymupdf4llm is not None and use_ocr:
         # Use PyMuPDF4LLM for OCR-aware extraction.
-        # Prefer the page_chunks API which returns per-page dicts
-        # without requiring undocumented marker parsing.
+        # Strategy:
+        #   1. page_chunks=True  (supported API, per-page dicts)
+        #   2. page_separators  (supported, "--- end of page=n ---")
+        #   3. "<!-- page N -->" (undocumented convention, secondary fallback)
         result: Dict[int, str] = {}
+        # pages kwarg is 0-indexed page indices
         target_idx = [p - 1 for p in pages] if pages else None
 
-        # Try page_chunks=True (supported API)
+        # ---- Strategy 1: page_chunks=True (supported per-page API) ----
         try:
             chunk_kwargs: Dict[str, Any] = {}
             if target_idx is not None:
@@ -191,28 +194,35 @@ def extract_text_offline(
                 page_chunks=True,
                 **chunk_kwargs,
             )
-            # chunks is a list of dicts, each with at least a "text" key
-            # and a "metadata" dict containing "page" (0-indexed).
+            # Each chunk: {"metadata": {...}, "text": "..."}
+            # Documented field: metadata["page_number"] (1-based)
+            # Older versions may use metadata["page"] (0-based)
             for chunk in chunks:
                 meta = chunk.get("metadata", {})
-                page_idx = meta.get("page")  # 0-indexed
                 text = chunk.get("text", "")
-                if page_idx is not None:
-                    page_no = int(page_idx) + 1  # → 1-indexed
+
+                # Prefer documented 1-based page_number
+                page_no: Optional[int] = None
+                if "page_number" in meta:
+                    page_no = int(meta["page_number"])  # 1-based
+                elif "page" in meta:
+                    # Older versions: "page" is 0-based index
+                    page_no = int(meta["page"]) + 1
+
+                if page_no is not None:
                     if pages is None or page_no in pages:
                         result[page_no] = text
 
             if result:
                 return result
         except TypeError:
-            # page_chunks not supported by installed version; fall through
+            # page_chunks not supported by installed version
             pass
         except Exception:
             pass
 
-        # Fallback: call without page_chunks, then split by supported
-        # page_separators if available, otherwise split by the common
-        # "<!-- page N -->" convention (undocumented but widely emitted).
+        # ---- Strategies 2 & 3: page_separators / marker fallback ----
+        # Call without page_chunks; split the combined markdown.
         kwargs: Dict[str, Any] = {}
         if target_idx is not None:
             kwargs["pages"] = target_idx
@@ -223,39 +233,48 @@ def extract_text_offline(
             md_text = ""
 
         if md_text:
-            # --- try official page_separators pattern first ---
             sections: Dict[int, str] = {}
-            current_page: Optional[int] = None
-            current_parts: list = []
+            buffer_parts: list = []
+            last_page_no: Optional[int] = None
+
+            def _flush_buffer() -> None:
+                """Assign accumulated buffer to last_page_no."""
+                nonlocal buffer_parts
+                if last_page_no is not None and buffer_parts:
+                    text = "\n".join(buffer_parts).strip()
+                    if text:
+                        sections[last_page_no] = text
+                buffer_parts = []
 
             for line in md_text.split("\n"):
+                # Strategy 2: official page_separators pattern
+                # "--- end of page=n ---" where n is 0-based
+                # This separator appears at the END of page n.
+                # Text accumulated BEFORE this separator belongs to page n+1.
                 sep_match = re.match(
                     r"---\s*end\s+of\s+page\s*=\s*(\d+)\s*---",
                     line, re.IGNORECASE,
                 )
                 if sep_match:
-                    if current_page is not None:
-                        sections[current_page] = "\n".join(current_parts).strip()
-                    current_page = int(sep_match.group(1))  # 1-indexed
-                    current_parts = []
+                    page_idx = int(sep_match.group(1))  # 0-based
+                    last_page_no = page_idx + 1  # → 1-based PlanReader page
+                    _flush_buffer()
                     continue
 
-                # Also handle "<!-- page N -->" as a secondary convention
+                # Strategy 3: "<!-- page N -->" secondary convention (0-based)
                 marker_match = re.match(
                     r"<!--\s*page\s+(\d+)\s*-->", line, re.IGNORECASE,
                 )
                 if marker_match:
-                    if current_page is not None:
-                        sections[current_page] = "\n".join(current_parts).strip()
-                    current_page = int(marker_match.group(1)) + 1  # 0-idx → 1-idx
-                    current_parts = [line]
+                    _flush_buffer()
+                    last_page_no = int(marker_match.group(1)) + 1  # 0→1-based
+                    buffer_parts = [line]  # include marker in this page's text
                     continue
 
-                current_parts.append(line)
+                buffer_parts.append(line)
 
-            # Save last section
-            if current_page is not None:
-                sections[current_page] = "\n".join(current_parts).strip()
+            # Flush remaining buffer
+            _flush_buffer()
 
             if sections:
                 if pages:
@@ -266,8 +285,7 @@ def extract_text_offline(
                         result[pg] = txt
                 return result
 
-            # If no markers/separators found, single-page fallback:
-            # only safe when requesting a single page or all pages as page 1.
+            # Last resort: no markers found.  Only safe for a single page.
             if pages and len(pages) == 1:
                 return {pages[0]: md_text}
             elif not pages:

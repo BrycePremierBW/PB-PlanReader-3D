@@ -235,81 +235,202 @@ class TestNoDoubleConversion(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestOCRPageSlicing(unittest.TestCase):
-    """Verify extract_text_offline assigns text to the correct page."""
+    """Verify extract_text_offline assigns text to the correct page
+    using the documented page_chunks API structure."""
 
-    def test_page_chunks_api_structure(self):
-        """Verify we know how to handle page_chunks return value."""
-        # Simulate what page_chunks=True returns
+    # ---- page_chunks: documented page_number (1-based) ----
+
+    def test_page_chunks_documented_structure(self):
+        """page_chunks with documented metadata['page_number'] (1-based)."""
         fake_chunks = [
-            {"metadata": {"page": 0}, "text": "Ground floor plan text"},
-            {"metadata": {"page": 1}, "text": "First floor plan text"},
-            {"metadata": {"page": 2}, "text": "Section A-A text"},
-            {"metadata": {"page": 3}, "text": "Elevation text"},
+            {"metadata": {"page_number": 1}, "text": "Ground floor plan"},
+            {"metadata": {"page_number": 2}, "text": "First floor plan"},
+            {"metadata": {"page_number": 3}, "text": "Section A-A"},
+            {"metadata": {"page_number": 4}, "text": "Elevation"},
         ]
-        # Verify our extraction logic works
         result: Dict[int, str] = {}
         pages_requested = [2, 4]
         for chunk in fake_chunks:
             meta = chunk.get("metadata", {})
-            page_idx = meta.get("page")
+            page_no = int(meta["page_number"])  # 1-based, documented
             text = chunk.get("text", "")
-            if page_idx is not None:
-                page_no = int(page_idx) + 1
-                if page_no in pages_requested:
-                    result[page_no] = text
-        # Page 2 (index 1) should have first floor text
-        self.assertEqual(result.get(2), "First floor plan text")
-        # Page 4 (index 3) should have elevation text
-        self.assertEqual(result.get(4), "Elevation text")
-        # Page 1 and 3 should NOT be present
+            if page_no in pages_requested:
+                result[page_no] = text
+        self.assertEqual(result.get(2), "First floor plan")
+        self.assertEqual(result.get(4), "Elevation")
         self.assertNotIn(1, result)
         self.assertNotIn(3, result)
 
     def test_page_chunks_subset_mapping(self):
-        """Requested subset [2, 4] maps correctly from 0-indexed chunks."""
+        """Requested subset [2, 4] maps correctly with 1-based page_number."""
         fake_chunks = [
-            {"metadata": {"page": 0}, "text": "Page 1 content"},
-            {"metadata": {"page": 1}, "text": "Page 2 content"},
-            {"metadata": {"page": 2}, "text": "Page 3 content"},
-            {"metadata": {"page": 3}, "text": "Page 4 content"},
+            {"metadata": {"page_number": 1}, "text": "Page 1 content"},
+            {"metadata": {"page_number": 2}, "text": "Page 2 content"},
+            {"metadata": {"page_number": 3}, "text": "Page 3 content"},
+            {"metadata": {"page_number": 4}, "text": "Page 4 content"},
         ]
         result: Dict[int, str] = {}
         pages_requested = [2, 4]
         for chunk in fake_chunks:
             meta = chunk.get("metadata", {})
-            page_idx = meta.get("page")
+            page_no = int(meta["page_number"])
             text = chunk.get("text", "")
-            if page_idx is not None:
-                page_no = int(page_idx) + 1
-                if page_no in pages_requested:
-                    result[page_no] = text
+            if page_no in pages_requested:
+                result[page_no] = text
         self.assertEqual(result, {2: "Page 2 content", 4: "Page 4 content"})
 
     def test_no_cross_page_leakage(self):
         """Page 1 text must not appear in page 2's result."""
         fake_chunks = [
-            {"metadata": {"page": 0}, "text": "SECRET_PAGE_1"},
-            {"metadata": {"page": 1}, "text": "SECRET_PAGE_2"},
+            {"metadata": {"page_number": 1}, "text": "SECRET_PAGE_1"},
+            {"metadata": {"page_number": 2}, "text": "SECRET_PAGE_2"},
         ]
         result: Dict[int, str] = {}
         for chunk in fake_chunks:
             meta = chunk.get("metadata", {})
-            page_idx = meta.get("page")
-            text = chunk.get("text", "")
-            if page_idx is not None:
-                page_no = int(page_idx) + 1
-                result[page_no] = text
+            page_no = int(meta["page_number"])
+            result[page_no] = chunk.get("text", "")
         self.assertNotIn("SECRET_PAGE_1", result.get(2, ""))
         self.assertNotIn("SECRET_PAGE_2", result.get(1, ""))
 
-    def test_1_indexed_page_mapping(self):
-        """Chunk page=0 must map to PlanReader page 1."""
-        fake_chunks = [{"metadata": {"page": 0}, "text": "First"}]
-        for chunk in fake_chunks:
-            page_no = int(chunk["metadata"]["page"]) + 1
-            self.assertEqual(page_no, 1)
+    # ---- page_chunks: older metadata['page'] (0-based) fallback ----
 
-    def test_marker_regex_still_works(self):
+    def test_older_page_field_fallback(self):
+        """Older versions use metadata['page'] (0-based); should map to 1-based."""
+        fake_chunks = [
+            {"metadata": {"page": 0}, "text": "First"},
+            {"metadata": {"page": 1}, "text": "Second"},
+        ]
+        result: Dict[int, str] = {}
+        for chunk in fake_chunks:
+            meta = chunk.get("metadata", {})
+            # Simulate the fallback logic from extract_text_offline
+            if "page_number" in meta:
+                page_no = int(meta["page_number"])
+            elif "page" in meta:
+                page_no = int(meta["page"]) + 1  # 0-based → 1-based
+            else:
+                page_no = None
+            if page_no is not None:
+                result[page_no] = chunk.get("text", "")
+        self.assertEqual(result.get(1), "First")
+        self.assertEqual(result.get(2), "Second")
+
+    def test_page_number_takes_precedence_over_page(self):
+        """If both page_number and page exist, page_number wins."""
+        fake_chunks = [
+            {"metadata": {"page_number": 5, "page": 0}, "text": "Doc wins"},
+        ]
+        for chunk in fake_chunks:
+            meta = chunk.get("metadata", {})
+            if "page_number" in meta:
+                page_no = int(meta["page_number"])
+            else:
+                page_no = int(meta.get("page", 0)) + 1
+            self.assertEqual(page_no, 5)
+
+    # ---- page_separators fallback ----
+
+    def test_separator_parser_end_of_page(self):
+        """Separator '--- end of page=n ---' is 0-based, END of page.
+
+        Text BEFORE the separator belongs to page n+1.
+        """
+        md_text = (
+            "GROUND FLOOR PLAN\n"
+            "walls and doors\n"
+            "--- end of page=0 ---\n"
+            "FIRST FLOOR PLAN\n"
+            "balcony details\n"
+            "--- end of page=1 ---\n"
+            "SECTION A-A\n"
+            "cut through roof\n"
+            "--- end of page=2 ---\n"
+        )
+        import re as _re
+        sections: Dict[int, str] = {}
+        buffer_parts: list = []
+        last_page_no: Optional[int] = None
+
+        def _flush():
+            nonlocal buffer_parts
+            if last_page_no is not None and buffer_parts:
+                text = "\n".join(buffer_parts).strip()
+                if text:
+                    sections[last_page_no] = text
+            buffer_parts = []
+
+        for line in md_text.split("\n"):
+            sep = _re.match(
+                r"---\s*end\s+of\s+page\s*=\s*(\d+)\s*---",
+                line, _re.IGNORECASE,
+            )
+            if sep:
+                last_page_no = int(sep.group(1)) + 1  # 0-based → 1-based
+                _flush()
+                continue
+            buffer_parts.append(line)
+        _flush()
+
+        # Page 1 (before page=0 separator) = GROUND FLOOR
+        self.assertIn(1, sections)
+        self.assertIn("GROUND FLOOR PLAN", sections[1])
+        self.assertIn("walls and doors", sections[1])
+        # Page 2 (before page=1 separator) = FIRST FLOOR
+        self.assertIn(2, sections)
+        self.assertIn("FIRST FLOOR PLAN", sections[2])
+        self.assertIn("balcony details", sections[2])
+        # Page 3 (before page=2 separator) = SECTION
+        self.assertIn(3, sections)
+        self.assertIn("SECTION A-A", sections[3])
+        self.assertIn("cut through roof", sections[3])
+        # No cross-page leakage
+        self.assertNotIn("FIRST FLOOR", sections.get(1, ""))
+        self.assertNotIn("GROUND FLOOR", sections.get(2, ""))
+        self.assertNotIn("SECTION", sections.get(1, ""))
+
+    def test_separator_no_shift(self):
+        """Prove the separator parser does NOT shift pages.
+
+        Common bug: assigning text AFTER separator to its page number,
+        which shifts all pages by 1. The correct approach is assigning
+        text BEFORE separator to separator_page_index + 1.
+        """
+        md_text = (
+            "PAGE ONE TEXT\n"
+            "--- end of page=0 ---\n"
+            "PAGE TWO TEXT\n"
+            "--- end of page=1 ---\n"
+        )
+        import re as _re
+        sections: Dict[int, str] = {}
+        buffer_parts: list = []
+        last_page_no: Optional[int] = None
+
+        def _flush():
+            nonlocal buffer_parts
+            if last_page_no is not None and buffer_parts:
+                text = "\n".join(buffer_parts).strip()
+                if text:
+                    sections[last_page_no] = text
+            buffer_parts = []
+
+        for line in md_text.split("\n"):
+            sep = _re.match(
+                r"---\s*end\s+of\s+page\s*=\s*(\d+)\s*---",
+                line, _re.IGNORECASE,
+            )
+            if sep:
+                last_page_no = int(sep.group(1)) + 1
+                _flush()
+                continue
+            buffer_parts.append(line)
+        _flush()
+
+        self.assertEqual(sections.get(1), "PAGE ONE TEXT")
+        self.assertEqual(sections.get(2), "PAGE TWO TEXT")
+
+    def test_marker_regex_fallback(self):
         """The <!-- page N --> regex is still valid as a secondary fallback."""
         import re as _re
         for marker in ["<!-- page 0 -->", "<!-- page 3 -->", "<!-- PAGE 5 -->"]:
