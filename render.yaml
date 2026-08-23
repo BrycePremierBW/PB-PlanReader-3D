@@ -8,6 +8,8 @@ services:
     envVars:
       - key: PLANREADER_DATA_DIR
         value: /var/data/planreader
+      - key: PGCONNECT_TIMEOUT
+        value: "5"
       - key: JOBHUB_DATABASE_URL
         sync: false
       - key: OPENAI_API_KEY
