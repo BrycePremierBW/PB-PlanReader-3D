@@ -44,25 +44,31 @@ except ImportError:
 PDF_PT_TO_MM = 25.4 / 72.0
 
 
-def _mm_per_real_metre(scale: Optional[Dict[str, Any]]) -> Optional[float]:
-    """Extract 'millimetres on paper per real metre' from a scale dict.
+def real_metres_per_page_mm(scale: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Return the factor that converts 1 page-mm to real-world metres.
 
-    Returns None when scale is absent or unrecognised, so callers can
+    For ratio scale 1:N  (e.g. 1:100):
+        1 mm on paper = N mm in reality = N/1000 m
+        → factor = N / 1000
+
+    For metric scale "10 mm = 1 m":
+        10 page-mm represents 1 real metre
+        → factor = 1 / 10 = 0.1
+
+    Returns None when scale is absent or unrecognised so callers can
     preserve uncertainty rather than silently producing a wrong number.
     """
     if not scale:
         return None
     scale_type = str(scale.get("type") or "").lower()
     if scale_type == "ratio":
-        # 1:100 → 100 mm on paper represents 1 m in reality
         ratio = scale.get("ratio")
         if ratio and ratio > 0:
-            return float(ratio)
+            return float(ratio) / 1000.0
     elif scale_type == "metric":
-        # "10 mm = 1 m" → mm_per_m already stored
         mm = scale.get("mm_per_m")
         if mm and mm > 0:
-            return float(mm)
+            return 1.0 / float(mm)
     return None
 
 
@@ -74,21 +80,17 @@ def wall_length_real_m(
 
     Pipeline:  PDF pt → page mm → real metres
 
-    For ratio scale 1:N  (e.g. 1:100):
-        N mm on paper  =  N × N mm in reality  =  N² / 1000 m  ← WRONG
-        Actually: 1 mm on paper = N mm in reality
-        So:  page_mm × N / 1000 = real metres
-
-    For metric scale "10 mm = 1 m":
-        page_mm × mm_per_m / 1000 = real metres
+    Uses real_metres_per_page_mm() which is unambiguous:
+        ratio 1:100  →  100/1000 = 0.1  (1 page-mm = 0.1 real-m)
+        metric "10 mm = 1 m"  →  1/10 = 0.1  (same physical scale)
 
     Returns None when scale is unknown so callers preserve uncertainty.
     """
-    mm_per_m = _mm_per_real_metre(scale)
-    if mm_per_m is None or mm_per_m <= 0:
+    factor = real_metres_per_page_mm(scale)
+    if factor is None or factor <= 0:
         return None
     page_mm = length_pt * PDF_PT_TO_MM
-    return (page_mm * mm_per_m) / 1000.0
+    return page_mm * factor
 
 try:
     import cv2
@@ -173,54 +175,104 @@ def extract_text_offline(
     pdf_path = Path(pdf_path)
     
     if pymupdf4llm is not None and use_ocr:
-        # Use PyMuPDF4LLM for OCR-aware extraction
-        kwargs = {}
-        if pages is not None:
-            kwargs["pages"] = [p - 1 for p in pages]  # 0-indexed
-        
-        md_text = pymupdf4llm.to_markdown(str(pdf_path), **kwargs)
-        
-        # Split by page markers: PyMuPDF4LLM emits "<!-- page N -->" (0-indexed)
+        # Use PyMuPDF4LLM for OCR-aware extraction.
+        # Prefer the page_chunks API which returns per-page dicts
+        # without requiring undocumented marker parsing.
         result: Dict[int, str] = {}
-        # Always split by markers so each page gets only its own text
-        page_sections: Dict[int, str] = {}
-        current_page: Optional[int] = None
-        current_parts: list = []
-        
-        for line in md_text.split("\n"):
-            marker_match = re.match(r"<!--\s*page\s+(\d+)\s*-->", line, re.IGNORECASE)
-            if marker_match:
-                # Save previous page's content
-                if current_page is not None:
-                    page_sections[current_page] = "\n".join(current_parts).strip()
-                current_page = int(marker_match.group(1))  # 0-indexed
-                current_parts = [line]
-            else:
+        target_idx = [p - 1 for p in pages] if pages else None
+
+        # Try page_chunks=True (supported API)
+        try:
+            chunk_kwargs: Dict[str, Any] = {}
+            if target_idx is not None:
+                chunk_kwargs["pages"] = target_idx
+            chunks = pymupdf4llm.to_markdown(
+                str(pdf_path),
+                page_chunks=True,
+                **chunk_kwargs,
+            )
+            # chunks is a list of dicts, each with at least a "text" key
+            # and a "metadata" dict containing "page" (0-indexed).
+            for chunk in chunks:
+                meta = chunk.get("metadata", {})
+                page_idx = meta.get("page")  # 0-indexed
+                text = chunk.get("text", "")
+                if page_idx is not None:
+                    page_no = int(page_idx) + 1  # → 1-indexed
+                    if pages is None or page_no in pages:
+                        result[page_no] = text
+
+            if result:
+                return result
+        except TypeError:
+            # page_chunks not supported by installed version; fall through
+            pass
+        except Exception:
+            pass
+
+        # Fallback: call without page_chunks, then split by supported
+        # page_separators if available, otherwise split by the common
+        # "<!-- page N -->" convention (undocumented but widely emitted).
+        kwargs: Dict[str, Any] = {}
+        if target_idx is not None:
+            kwargs["pages"] = target_idx
+
+        try:
+            md_text = pymupdf4llm.to_markdown(str(pdf_path), **kwargs)
+        except Exception:
+            md_text = ""
+
+        if md_text:
+            # --- try official page_separators pattern first ---
+            sections: Dict[int, str] = {}
+            current_page: Optional[int] = None
+            current_parts: list = []
+
+            for line in md_text.split("\n"):
+                sep_match = re.match(
+                    r"---\s*end\s+of\s+page\s*=\s*(\d+)\s*---",
+                    line, re.IGNORECASE,
+                )
+                if sep_match:
+                    if current_page is not None:
+                        sections[current_page] = "\n".join(current_parts).strip()
+                    current_page = int(sep_match.group(1))  # 1-indexed
+                    current_parts = []
+                    continue
+
+                # Also handle "<!-- page N -->" as a secondary convention
+                marker_match = re.match(
+                    r"<!--\s*page\s+(\d+)\s*-->", line, re.IGNORECASE,
+                )
+                if marker_match:
+                    if current_page is not None:
+                        sections[current_page] = "\n".join(current_parts).strip()
+                    current_page = int(marker_match.group(1)) + 1  # 0-idx → 1-idx
+                    current_parts = [line]
+                    continue
+
                 current_parts.append(line)
-        
-        # Save last page
-        if current_page is not None:
-            page_sections[current_page] = "\n".join(current_parts).strip()
-        
-        # Map 0-indexed sections to 1-indexed page numbers
-        if pages:
-            for page_no in pages:
-                idx = page_no - 1  # 0-indexed
-                result[page_no] = page_sections.get(idx, "")
-        else:
-            # All pages: map from 0-indexed keys to 1-indexed
-            for idx, text in page_sections.items():
-                result[idx + 1] = text
-        
-        # Fallback: if no markers found, assign full text to requested pages
-        if not result or all(not v for v in result.values()):
-            result = {}
-            if pages:
-                for page_no in pages:
-                    result[page_no] = md_text[:50000]
-            else:
-                result[1] = md_text
-        
+
+            # Save last section
+            if current_page is not None:
+                sections[current_page] = "\n".join(current_parts).strip()
+
+            if sections:
+                if pages:
+                    for page_no in pages:
+                        result[page_no] = sections.get(page_no, "")
+                else:
+                    for pg, txt in sections.items():
+                        result[pg] = txt
+                return result
+
+            # If no markers/separators found, single-page fallback:
+            # only safe when requesting a single page or all pages as page 1.
+            if pages and len(pages) == 1:
+                return {pages[0]: md_text}
+            elif not pages:
+                return {1: md_text}
+
         return result
     
     elif fitz is not None:
@@ -964,19 +1016,20 @@ def generate_takeoff_offline(
             # Internal walls
             if walls:
                 # Convert wall lengths from PDF points to real metres
-                mm_per_m = _mm_per_real_metre(scale)
-                if mm_per_m:
+                factor = real_metres_per_page_mm(scale)
+                if factor is not None:
                     total_lm = sum(
-                        (w["length"] * PDF_PT_TO_MM * mm_per_m) / 1000.0
+                        w["length"] * PDF_PT_TO_MM * factor
                         for w in walls
                     )
                     scale_note = f"Scale {scale.get('text', '?')}"
                     status = "Auto-detected"
                 else:
-                    # No reliable scale: preserve raw page-space length as
-                    # a fallback with explicit uncertainty.
-                    total_lm = sum(w["length"] * PDF_PT_TO_MM for w in walls)
-                    scale_note = "NO SCALE — length is page-space mm, NOT real metres"
+                    # No reliable scale: do NOT produce a real-world lm
+                    # quantity.  Set to None so downstream cannot sum
+                    # page-space mm as metres.
+                    total_lm = None
+                    scale_note = "NO SCALE — real-world quantity unavailable"
                     status = "Uncalibrated"
 
                 takeoff_rows.append({
@@ -986,8 +1039,8 @@ def generate_takeoff_offline(
                     "section": "Internal",
                     "element": "Walls",
                     "description": f"Internal walls - {len(walls)} wall segments detected",
-                    "unit": "lm",
-                    "quantity": round(total_lm, 3),
+                    "unit": "lm" if total_lm is not None else "",
+                    "quantity": round(total_lm, 3) if total_lm is not None else None,
                     "scale": scale.get("text", "") if scale else "",
                     "notes": f"{len(walls)} walls, {len(dimensions)} dimensions. {scale_note}",
                     "status": status,

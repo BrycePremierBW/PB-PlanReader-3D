@@ -110,6 +110,7 @@ try:
         classify_page_offline,
         generate_report,
         wall_length_real_m,
+        real_metres_per_page_mm,
         PDF_PT_TO_MM,
     )
     OFFLINE_READER_AVAILABLE = True
@@ -6007,12 +6008,10 @@ def offline_plan_reader_page(workspace: Dict[str, Any]) -> None:
                             scale_note = f"Scale {scale_text}"
                             status = "Auto-detected"
                         else:
-                            # No scale: fall back to page-space mm with
-                            # explicit uncertainty preserved.
-                            total_length = round(
-                                sum(w["length"] for w in walls) * PDF_PT_TO_MM, 2
-                            )
-                            scale_note = "NO SCALE — page-space mm"
+                            # No scale: do NOT produce a real-world lm
+                            # quantity that could be summed as metres.
+                            total_length = None
+                            scale_note = "NO SCALE — real-world quantity unavailable"
                             status = "Uncalibrated"
 
                         takeoff_rows.append({
@@ -6020,7 +6019,7 @@ def offline_plan_reader_page(workspace: Dict[str, Any]) -> None:
                             "drawing": label,
                             "section": "Internal",
                             "element": "Walls",
-                            "unit": "lm",
+                            "unit": "lm" if total_length is not None else "",
                             "quantity": total_length,
                             "scale": scale_text,
                             "notes": f"{len(walls)} wall segments detected. {scale_note}",
