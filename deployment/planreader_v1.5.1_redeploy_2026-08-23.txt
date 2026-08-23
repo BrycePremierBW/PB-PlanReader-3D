@@ -1,0 +1,4 @@
+PlanReader production redeploy trigger
+Version: 1.5.1
+Date: 2026-08-23
+Purpose: trigger the connected Render production service to rebuild from current main without changing application behaviour.
