@@ -61,4 +61,5 @@ def test_job_list_is_briefly_cached_and_returned_as_copies():
 def test_production_entry_enables_v149_fast_path():
     text = open("pb_planreader_v133_app.py", encoding="utf-8").read()
     assert "apply_runtime_performance_v149" in text
-    assert 'APP_VERSION = "1.4.9"' in text
+    assert "apply_processing_fastpath_v150" in text
+    assert 'APP_VERSION = "1.5.0"' in text
