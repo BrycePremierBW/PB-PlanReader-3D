@@ -1,8 +1,12 @@
 """Persistent browser login for Premier Brushworks PlanReader.
 
 Passwords are never stored in the browser. A random revocable token is saved in
-browser localStorage and mapped to the authenticated user in JobHub's
-``app_settings`` table when available, with a PlanReader-local fallback.
+browser localStorage and mapped to the authenticated user locally, with a
+best-effort JobHub mirror for cross-restart recovery.
+
+Startup rule: a remembered session must never write to JobHub on every Streamlit
+rerun. Tokens are persisted once when created, restored locally first, and only
+fall back to JobHub when the local persistent-disk copy is unavailable.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ _STORAGE_KEY = "pb_planreader_remember_token_v1"
 _REMEMBER_KEY = "_pb_planreader_remember_login"
 _TOKEN_KEY = "_pb_planreader_auth_token"
 _CLEAR_KEY = "_pb_planreader_clear_remember"
+_SAVED_SESSION_KEY = "_pb_planreader_auth_token_saved_this_session"
 _PREFIX = "planreader_auth_token:"
 
 
@@ -119,20 +124,8 @@ def apply(app) -> None:
         finally:
             conn.close()
 
-    def save_token(bridge, token: str, user: dict) -> None:
+    def save_local_token(token: str, user: dict) -> None:
         payload = json.dumps(user)
-        if bridge is not None:
-            try:
-                if "app_settings" in set(bridge.table_names()):
-                    key = f"{_PREFIX}{token}"
-                    bridge.execute("DELETE FROM app_settings WHERE setting_key=?", (key,))
-                    bridge.execute(
-                        "INSERT INTO app_settings (setting_key, setting_value) VALUES (?, ?)",
-                        (key, payload),
-                    )
-                    return
-            except Exception:
-                pass
         ensure_local_table()
         conn = app.local_connect()
         try:
@@ -145,31 +138,7 @@ def apply(app) -> None:
         finally:
             conn.close()
 
-    def load_token(bridge, token: str) -> Optional[dict]:
-        if not token:
-            return None
-        if bridge is not None:
-            try:
-                if "app_settings" in set(bridge.table_names()):
-                    rows = bridge.query(
-                        "SELECT setting_value FROM app_settings WHERE setting_key=?",
-                        (f"{_PREFIX}{token}",),
-                    )
-                    if rows:
-                        user = json.loads(str(rows[0].get("setting_value") or "{}"))
-                        username = str(user.get("username") or "").strip()
-                        if username and "app_users" in set(bridge.table_names()):
-                            cols = set(bridge.columns("app_users"))
-                            if "active" in cols:
-                                active_rows = bridge.query(
-                                    "SELECT active FROM app_users WHERE lower(username)=lower(?) LIMIT 1",
-                                    (username,),
-                                )
-                                if not active_rows or not bool(active_rows[0].get("active")):
-                                    return None
-                        return user if isinstance(user, dict) and user else None
-            except Exception:
-                pass
+    def load_local_token(token: str) -> Optional[dict]:
         try:
             ensure_local_table()
             conn = app.local_connect()
@@ -187,18 +156,54 @@ def apply(app) -> None:
             pass
         return None
 
-    def delete_token(bridge, token: str) -> None:
-        if not token:
-            return
+    def save_token(bridge, token: str, user: dict) -> None:
+        """Persist once locally; mirror to JobHub only when the token is created."""
+        save_local_token(token, user)
+        payload = json.dumps(user)
         if bridge is not None:
             try:
                 if "app_settings" in set(bridge.table_names()):
+                    key = f"{_PREFIX}{token}"
+                    bridge.execute("DELETE FROM app_settings WHERE setting_key=?", (key,))
                     bridge.execute(
-                        "DELETE FROM app_settings WHERE setting_key=?",
-                        (f"{_PREFIX}{token}",),
+                        "INSERT INTO app_settings (setting_key, setting_value) VALUES (?, ?)",
+                        (key, payload),
                     )
             except Exception:
+                # Local persistent-disk token remains fully usable.
                 pass
+
+    def load_token(bridge, token: str) -> Optional[dict]:
+        if not token:
+            return None
+
+        # Fast path: persistent PlanReader disk. This avoids a Postgres round-trip
+        # every time a remembered browser opens the app.
+        user = load_local_token(token)
+        if user:
+            return user
+
+        # Recovery path only: a token may have been created before this local
+        # database copy existed. Read the shared mirror once, then seed local.
+        if bridge is not None:
+            try:
+                if "app_settings" in set(bridge.table_names()):
+                    rows = bridge.query(
+                        "SELECT setting_value FROM app_settings WHERE setting_key=?",
+                        (f"{_PREFIX}{token}",),
+                    )
+                    if rows:
+                        user = json.loads(str(rows[0].get("setting_value") or "{}"))
+                        if isinstance(user, dict) and user:
+                            save_local_token(token, user)
+                            return user
+            except Exception:
+                pass
+        return None
+
+    def delete_token(bridge, token: str) -> None:
+        if not token:
+            return
         try:
             ensure_local_table()
             conn = app.local_connect()
@@ -209,6 +214,17 @@ def apply(app) -> None:
                 conn.close()
         except Exception:
             pass
+        # Sign-out is user-triggered, so it is fine to revoke the shared mirror
+        # here. Unlike the old code this is not run during ordinary page reruns.
+        if bridge is not None:
+            try:
+                if "app_settings" in set(bridge.table_names()):
+                    bridge.execute(
+                        "DELETE FROM app_settings WHERE setting_key=?",
+                        (f"{_PREFIX}{token}",),
+                    )
+            except Exception:
+                pass
 
     class RememberForm:
         def __init__(self, form):
@@ -247,6 +263,7 @@ def apply(app) -> None:
                 st.session_state["planreader_user"] = user
                 st.session_state[_TOKEN_KEY] = token
                 st.session_state[_REMEMBER_KEY] = True
+                st.session_state[_SAVED_SESSION_KEY] = True
                 st.rerun()
             delete_token(bridge, token)
             st.session_state[_CLEAR_KEY] = True
@@ -264,12 +281,17 @@ def apply(app) -> None:
                 token = secrets.token_urlsafe(32)
                 st.session_state[_TOKEN_KEY] = token
                 save_token(bridge, token, dict(user))
+                st.session_state[_SAVED_SESSION_KEY] = True
             if token:
                 if remember:
-                    save_token(bridge, token, dict(user))
+                    # Critical startup fix: do not DELETE+INSERT the same token in
+                    # remote JobHub on every Streamlit rerun.
+                    sync_browser_token(token)
                 else:
                     delete_token(bridge, token)
-                sync_browser_token(token)
+                    st.session_state.pop(_TOKEN_KEY, None)
+                    st.session_state.pop(_SAVED_SESSION_KEY, None)
+                    clear_browser_token()
 
         # Intercept the existing Sign out button just long enough to revoke the
         # remembered token before the base function clears session_state/reruns.
@@ -284,6 +306,7 @@ def apply(app) -> None:
                 delete_token(bridge, token)
                 st.session_state.pop(_TOKEN_KEY, None)
                 st.session_state.pop(_REMEMBER_KEY, None)
+                st.session_state.pop(_SAVED_SESSION_KEY, None)
                 st.session_state[_CLEAR_KEY] = True
             return clicked
 
