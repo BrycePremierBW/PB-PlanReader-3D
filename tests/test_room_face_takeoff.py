@@ -1252,5 +1252,144 @@ class TestStartupPatch(unittest.TestCase):
             auto._build_unit_rows = original_build
 
 
+# ---------------------------------------------------------------------------
+# FINAL BLOCKER: Unlabeled rooms must not be "Measured"
+# ---------------------------------------------------------------------------
+
+
+class TestUnlabeledRoomStatus(unittest.TestCase):
+    """FINAL BLOCKER: Unlabeled rooms are 'Provisional measured', not 'Measured'."""
+
+    def test_12m2_unlabeled_room_is_provisional(self):
+        """12 m² unlabeled room: retained, label='', status='Provisional measured'."""
+        s = SCALE_1_100_M_PER_PT
+        x0, y0 = 200.0, 200.0
+        w, h = 4.0/s, 3.0/s
+        segments = [
+            {"x1": x0, "y1": y0, "x2": x0+w, "y2": y0},
+            {"x1": x0+w, "y1": y0, "x2": x0+w, "y2": y0+h},
+            {"x1": x0+w, "y1": y0+h, "x2": x0, "y2": y0+h},
+            {"x1": x0, "y1": y0+h, "x2": x0, "y2": y0},
+        ]
+        rooms = extract_and_calibrate_rooms(
+            segments=segments, scale_info=SCALE_1_100,
+            page_width_pt=595, page_height_pt=842, page_no=1,
+            words=[],  # no room labels
+        )
+        self.assertTrue(len(rooms) >= 1, "Room should be retained from geometry")
+        room = rooms[0]
+        self.assertEqual(room.label, "", "Label should be empty (no semantic evidence)")
+        self.assertEqual(room.status, "Provisional measured",
+            "Unlabeled room must NOT be Measured")
+        # Check take-off row
+        rows = rooms_to_takeoff_rows(rooms, workspace_id=4)
+        self.assertTrue(len(rows) >= 1)
+        self.assertEqual(rows[0]["quantity_status"], "Provisional measured")
+        self.assertIn("No semantic room label found", rows[0]["notes"])
+
+    def test_12m2_kitchen_labelled_is_measured(self):
+        """Same 12 m² room labelled KITCHEN: status='Measured' when geometry/calibration strong."""
+        s = SCALE_1_100_M_PER_PT
+        x0, y0 = 200.0, 200.0
+        w, h = 4.0/s, 3.0/s
+        segments = [
+            {"x1": x0, "y1": y0, "x2": x0+w, "y2": y0},
+            {"x1": x0+w, "y1": y0, "x2": x0+w, "y2": y0+h},
+            {"x1": x0+w, "y1": y0+h, "x2": x0, "y2": y0+h},
+            {"x1": x0, "y1": y0+h, "x2": x0, "y2": y0},
+        ]
+        words = [{"text": "KITCHEN", "bbox": [x0+10, y0+10, x0+80, y0+30]}]
+        rooms = extract_and_calibrate_rooms(
+            segments=segments, scale_info=SCALE_1_100,
+            page_width_pt=595, page_height_pt=842, page_no=1,
+            words=words,
+        )
+        self.assertEqual(len(rooms), 1)
+        room = rooms[0]
+        self.assertEqual(room.label, "KITCHEN")
+        self.assertEqual(room.status, "Measured",
+            "Semantic label + strong geometry + strong calibration → Measured")
+        rows = rooms_to_takeoff_rows(rooms, workspace_id=4)
+        self.assertEqual(rows[0]["quantity_status"], "Measured")
+
+    def test_wc_small_room_measured(self):
+        """Small WC (1.4 m²) with semantic label: Measured (above soft-min threshold)."""
+        s = SCALE_1_100_M_PER_PT
+        # Use the same WC polygon dimensions as WC_PDF
+        # WC_PDF is a 1.4m x 1.0m polygon
+        x0, y0 = 200.0, 200.0
+        w, h = 1.4/s, 1.0/s
+        segments = [
+            {"x1": x0, "y1": y0, "x2": x0+w, "y2": y0},
+            {"x1": x0+w, "y1": y0, "x2": x0+w, "y2": y0+h},
+            {"x1": x0+w, "y1": y0+h, "x2": x0, "y2": y0+h},
+            {"x1": x0, "y1": y0+h, "x2": x0, "y2": y0},
+        ]
+        words = [{"text": "WC", "bbox": [x0+10, y0+10, x0+40, y0+30]}]
+        rooms = extract_and_calibrate_rooms(
+            segments=segments, scale_info=SCALE_1_100,
+            page_width_pt=595, page_height_pt=842, page_no=1,
+            words=words,
+        )
+        self.assertTrue(len(rooms) >= 1, "Labelled WC should be retained")
+        room = rooms[0]
+        self.assertEqual(room.label, "WC")
+        # WC at 1.4 m² is above SOFT_MIN (1.0 m²) → no confidence penalty
+        # Semantic label + strong geometry (0.98) + strong calibration (0.95) → Measured
+        self.assertEqual(room.status, "Measured",
+            "WC with semantic label above soft-min → Measured")
+
+    def test_very_small_labelled_room_provisional(self):
+        """0.6 m² labelled room: below SOFT_MIN → confidence penalty → Provisional measured."""
+        s = SCALE_1_100_M_PER_PT
+        # 0.6 m² polygon (below SOFT_MIN_ROOM_AREA_M2 = 1.0)
+        x0, y0 = 200.0, 200.0
+        w, h = 0.6/s, 1.0/s  # 0.6 m × 1.0 m = 0.6 m²
+        segments = [
+            {"x1": x0, "y1": y0, "x2": x0+w, "y2": y0},
+            {"x1": x0+w, "y1": y0, "x2": x0+w, "y2": y0+h},
+            {"x1": x0+w, "y1": y0+h, "x2": x0, "y2": y0+h},
+            {"x1": x0, "y1": y0+h, "x2": x0, "y2": y0},
+        ]
+        # Word bbox center must be INSIDE the polygon
+        words = [{"text": "WC", "bbox": [x0+5, y0+5, x0+20, y0+20]}]
+        rooms = extract_and_calibrate_rooms(
+            segments=segments, scale_info=SCALE_1_100,
+            page_width_pt=595, page_height_pt=842, page_no=1,
+            words=words,
+        )
+        self.assertTrue(len(rooms) >= 1, "Labelled 0.6m² room retained (above HARD_MIN)")
+        room = rooms[0]
+        self.assertEqual(room.label, "WC")
+        # 0.6 m² < SOFT_MIN (1.0) → -0.15 penalty → effective_conf ≈ 0.83
+        # 0.83 < 0.85 → Provisional measured
+        self.assertEqual(room.status, "Provisional measured",
+            "Very small labelled room gets confidence penalty → Provisional measured")
+
+    def test_synthetic_room1_never_measured(self):
+        """Synthetic 'Room 1' label must never lead to Measured status."""
+        s = SCALE_1_100_M_PER_PT
+        x0, y0 = 200.0, 200.0
+        w, h = 4.0/s, 3.0/s
+        segments = [
+            {"x1": x0, "y1": y0, "x2": x0+w, "y2": y0},
+            {"x1": x0+w, "y1": y0, "x2": x0+w, "y2": y0+h},
+            {"x1": x0+w, "y1": y0+h, "x2": x0, "y2": y0+h},
+            {"x1": x0, "y1": y0+h, "x2": x0, "y2": y0},
+        ]
+        # No words → v145 assigns "Room 1" → stripped → label="" → not Measured
+        rooms = extract_and_calibrate_rooms(
+            segments=segments, scale_info=SCALE_1_100,
+            page_width_pt=595, page_height_pt=842, page_no=1,
+            words=[],
+        )
+        self.assertTrue(len(rooms) >= 1)
+        room = rooms[0]
+        self.assertEqual(room.label, "")
+        self.assertNotEqual(room.status, "Measured",
+            "Synthetic 'Room 1' must never produce Measured status")
+        self.assertEqual(room.status, "Provisional measured")
+
+
 if __name__ == "__main__":
     unittest.main()

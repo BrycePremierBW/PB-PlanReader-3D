@@ -948,24 +948,29 @@ def extract_and_calibrate_rooms(
         if not result.is_room:
             continue
 
+        # Extract semantic label evidence BEFORE status determination
+        is_semantic = labelled_room.get("label_is_semantic", False)
+
         # Compute effective confidence
         base_geom_conf = labelled_room.get("geometry_confidence", 0.9)
         effective_conf = max(0.0, min(1.0, base_geom_conf + result.confidence_adjustment))
 
-        # Determine status based on confidence and voids
+        # Determine status based on confidence, voids, and semantic evidence
+        # Unlabeled faces MUST NOT be "Measured" — geometry alone is insufficient
         if result.has_voids:
             status = "Review"
-        elif effective_conf >= 0.85 and calibration_conf >= 0.9:
+        elif is_semantic and effective_conf >= 0.85 and calibration_conf >= 0.9:
             status = "Measured"
         else:
             status = "Provisional measured"
 
         evidence = list(labelled_room.get("evidence") or [])
-        is_semantic = labelled_room.get("label_is_semantic", False)
         if label and is_semantic:
             evidence.append(f"Room label '{label}' spatially associated via point-in-polygon")
         elif label:
             evidence.append(f"Label '{label}' assigned by spatial association (not verified semantic)")
+        else:
+            evidence.append("Closed calibrated face detected; no semantic room label found")
         if result.has_voids:
             evidence.append("Polygon contains internal voids — area may be overstated")
 
@@ -1041,6 +1046,10 @@ def rooms_to_takeoff_rows(
                 if room.perimeter_m is not None
                 else f"Room area from vector face extraction (uncalibrated). "
                      f"Scale: {room.scale_source}."
+            ) + (
+                " No semantic room label found — retained from geometry only."
+                if not room.label
+                else ""
             ),
             "row_role": "floor_area",
             "geometry_confidence": room.geometry_confidence,
