@@ -4,6 +4,7 @@ import pb_planreader_v126_app as base
 from pb_project_scope_v142 import apply as apply_project_scope_v142
 from pb_scope_read_gate_v142 import apply as apply_scope_read_gate_v142
 from pb_elevation_profile_v136 import apply as apply_elevation_profile_v136
+from pb_height_evidence_v150 import apply as apply_height_evidence_v150
 from pb_opening_geometry_v137 import apply as apply_opening_geometry_v137
 from pb_registered_substrates_v138 import apply as apply_registered_substrates_v138
 from pb_unified_building_v139 import apply as apply_unified_building_v139
@@ -16,6 +17,7 @@ from pb_accuracy_v13_engines_v145 import apply as apply_accuracy_v13_engines_v14
 apply_project_scope_v142(base.launcher.app)
 apply_scope_read_gate_v142(base.launcher.app)
 apply_elevation_profile_v136(base.launcher.app)
+apply_height_evidence_v150(base.launcher.app)  # patches v136 with enhanced resolver
 apply_opening_geometry_v137(base.launcher.app)
 apply_registered_substrates_v138(base.launcher.app)
 apply_unified_building_v139(base.launcher.app)
