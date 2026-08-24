@@ -1474,7 +1474,8 @@ def process_page_surface_evidence(
 
         # Store diagnostics — serialise AFTER updating storage fields so
         # the persisted JSON accurately reflects the evidence storage outcome.
-        diag.storage_ok = evidence_stored
+        diagnostics_stored = False
+        diag.storage_ok = evidence_stored  # accurate for persisted diag JSON
         try:
             diag_key = f"surface_evidence_v160_diag_page_{page_id}"
             diag_payload = json.dumps(diag.to_dict(), separators=(",", ":"))
@@ -1487,6 +1488,7 @@ def process_page_surface_evidence(
                     "VALUES (?, ?, ?, datetime('now'))",
                     (workspace_id, diag_key, diag_payload),
                 )
+            diagnostics_stored = True
         except Exception as exc:
             # Diagnostics storage failed — we still have the in-memory copy
             # but the persisted record may disagree.  Record this.
@@ -1494,13 +1496,19 @@ def process_page_surface_evidence(
                 f" | diagnostics: {type(exc).__name__}: {exc}"
             )
 
+        # Update storage_ok to reflect BOTH storage operations for the
+        # in-memory result (persisted JSON already has accurate evidence-
+        # storage status from the assignment above).
+        diag.storage_ok = evidence_stored and diagnostics_stored
+
         # Determine overall status
-        if diag.storage_ok and not measured_extraction_failed:
-            overall_status = "ok"
-        elif diag.storage_ok:
+        any_storage_error = bool(diag.storage_error)
+        if not evidence_stored:
+            overall_status = "error"
+        elif any_storage_error or measured_extraction_failed:
             overall_status = "partial"
         else:
-            overall_status = "error"
+            overall_status = "ok"
 
         return SurfaceProcessingResult(
             evidence=evidence_list,

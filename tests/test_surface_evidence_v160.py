@@ -1207,6 +1207,162 @@ class TestDiagnosticsPersistence(unittest.TestCase):
             self.assertTrue(diag.storage_ok)
 
 
+class TestStorageStatusAccuracy(unittest.TestCase):
+    """Overall status must accurately reflect evidence + diagnostics storage outcomes."""
+
+    def _make_real_pdf(self, tmpdir):
+        import fitz
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        shape = page.new_shape()
+        shape.draw_rect(fitz.Rect(50, 50, 250, 250))
+        shape.finish(fill=(1, 0, 0), color=(0, 0, 0), width=0.5)
+        shape.commit()
+        pdf_path = tmpdir / "test_plan.pdf"
+        doc.save(str(pdf_path))
+        doc.close()
+        return str(pdf_path)
+
+    def _make_fake_app(self, pdf_path, page_dict):
+        app = MagicMock()
+        stored_settings = {}
+        app.lquery.side_effect = [
+            [page_dict],
+            [{"path": pdf_path}],
+        ]
+        def fake_set_ws(workspace_id, key, value):
+            stored_settings[(workspace_id, key)] = value
+        app.set_workspace_setting.side_effect = fake_set_ws
+        def fake_get_ws(workspace_id, key, default="{}"):
+            return stored_settings.get((workspace_id, key), default)
+        app.workspace_setting.side_effect = fake_get_ws
+        app._stored_settings = stored_settings
+        return app
+
+    def test_evidence_succeeds_diagnostics_fails_status_partial(self):
+        """Evidence storage succeeds + diagnostics storage fails -> partial."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch, call
+        from pb_room_face_takeoff import RoomFace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            pdf_path = self._make_real_pdf(tmpdir)
+
+            page_dict = {
+                "id": 1, "document_id": 1, "page_no": 1,
+                "page_label": "Plan", "page_type": "plan",
+                "px_per_m": 28.346, "render_zoom": 1.0, "scale_text": "1:100",
+            }
+            app = self._make_fake_app(pdf_path, page_dict)
+
+            # First call (evidence) succeeds, second call (diagnostics) fails
+            call_count = [0]
+            original_set_ws = app.set_workspace_setting.side_effect
+            def selective_fail(workspace_id, key, value):
+                call_count[0] += 1
+                if call_count[0] == 2:
+                    raise RuntimeError("disk full for diag storage")
+                stored_settings = app._stored_settings
+                stored_settings[(workspace_id, key)] = value
+            app.set_workspace_setting.side_effect = selective_fail
+
+            fake_room = RoomFace(
+                room_ref="R01", label="KITCHEN",
+                polygon_pdf_pts=[(0, 0), (250, 0), (250, 250), (0, 250)],
+                polygon_m=None, floor_area_m2=40.0, area_page_pts2=62500.0,
+                perimeter_m=1000.0, geometry_confidence=0.95,
+                evidence=["Test"], source_page=1,
+                calibration_confidence=0.95, status="Measured",
+            )
+
+            with patch("pb_room_face_takeoff.extract_room_faces_from_page",
+                       return_value=[fake_room]):
+                result = process_page_surface_evidence(app, page_id=1, workspace_id=1)
+
+            self.assertIsInstance(result, SurfaceProcessingResult)
+            self.assertEqual(result.status, "partial")
+            self.assertTrue(result.diagnostics.storage_ok is False or
+                           "diagnostics" in result.diagnostics.storage_error)
+            self.assertGreater(len(result.evidence), 0)
+
+    def test_evidence_storage_fails_status_error(self):
+        """Evidence storage fails -> status=error."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from pb_room_face_takeoff import RoomFace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            pdf_path = self._make_real_pdf(tmpdir)
+
+            page_dict = {
+                "id": 1, "document_id": 1, "page_no": 1,
+                "page_label": "Plan", "page_type": "plan",
+                "px_per_m": 28.346, "render_zoom": 1.0, "scale_text": "1:100",
+            }
+            app = self._make_fake_app(pdf_path, page_dict)
+
+            # Evidence storage fails immediately
+            app.set_workspace_setting.side_effect = RuntimeError("DB full")
+
+            fake_room = RoomFace(
+                room_ref="R01", label="KITCHEN",
+                polygon_pdf_pts=[(0, 0), (250, 0), (250, 250), (0, 250)],
+                polygon_m=None, floor_area_m2=40.0, area_page_pts2=62500.0,
+                perimeter_m=1000.0, geometry_confidence=0.95,
+                evidence=["Test"], source_page=1,
+                calibration_confidence=0.95, status="Measured",
+            )
+
+            with patch("pb_room_face_takeoff.extract_room_faces_from_page",
+                       return_value=[fake_room]):
+                result = process_page_surface_evidence(app, page_id=1, workspace_id=1)
+
+            self.assertIsInstance(result, SurfaceProcessingResult)
+            self.assertEqual(result.status, "error")
+            self.assertFalse(result.diagnostics.storage_ok)
+            self.assertIn("evidence:", result.diagnostics.storage_error)
+
+    def test_both_storage_succeed_status_ok(self):
+        """Both evidence and diagnostics storage succeed -> status=ok."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from pb_room_face_takeoff import RoomFace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            pdf_path = self._make_real_pdf(tmpdir)
+
+            page_dict = {
+                "id": 1, "document_id": 1, "page_no": 1,
+                "page_label": "Plan", "page_type": "plan",
+                "px_per_m": 28.346, "render_zoom": 1.0, "scale_text": "1:100",
+            }
+            app = self._make_fake_app(pdf_path, page_dict)
+
+            fake_room = RoomFace(
+                room_ref="R01", label="KITCHEN",
+                polygon_pdf_pts=[(0, 0), (250, 0), (250, 250), (0, 250)],
+                polygon_m=None, floor_area_m2=40.0, area_page_pts2=62500.0,
+                perimeter_m=1000.0, geometry_confidence=0.95,
+                evidence=["Test"], source_page=1,
+                calibration_confidence=0.95, status="Measured",
+            )
+
+            with patch("pb_room_face_takeoff.extract_room_faces_from_page",
+                       return_value=[fake_room]):
+                result = process_page_surface_evidence(app, page_id=1, workspace_id=1)
+
+            self.assertIsInstance(result, SurfaceProcessingResult)
+            self.assertEqual(result.status, "ok")
+            self.assertTrue(result.diagnostics.storage_ok)
+            self.assertEqual(result.diagnostics.storage_error, "")
+
+
 # ---------------------------------------------------------------------------
 # Data quality — area non-negative
 # ---------------------------------------------------------------------------
