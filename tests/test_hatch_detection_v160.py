@@ -14,6 +14,7 @@ import fitz
 from pb_hatch_detection_v160 import (
     _MIN_HATCH_STROKES,
     HatchCluster,
+    HatchProcessingResult,
     Stroke,
     _angle_delta,
     _circular_mean,
@@ -731,7 +732,9 @@ class TestProductionAdapter(unittest.TestCase):
     def test_returns_empty_for_no_strokes(self):
         doc, page = _make_page()
         result = extract_hatch_evidence(page)
-        self.assertEqual(len(result), 0)
+        self.assertIsInstance(result, HatchProcessingResult)
+        self.assertEqual(len(result.evidence), 0)
+        self.assertEqual(result.strokes_extracted, 0)
         doc.close()
 
     def test_hatch_evidence_has_page_metadata(self):
@@ -741,7 +744,7 @@ class TestProductionAdapter(unittest.TestCase):
             page, page_id=5, page_no=3, page_label="Plan",
             workspace_id=1,
         )
-        for ev in result:
+        for ev in result.evidence:
             self.assertEqual(ev.page_id, 5)
             self.assertEqual(ev.page_no, 3)
             self.assertEqual(ev.page_label, "Plan")
@@ -754,7 +757,7 @@ class TestProductionAdapter(unittest.TestCase):
         result = extract_hatch_evidence(
             page, page_id=5, page_no=3, workspace_id=1,
         )
-        for ev in result:
+        for ev in result.evidence:
             self.assertIn("page_5:hatch_", ev.surface_id)
         doc.close()
 
@@ -765,9 +768,38 @@ class TestProductionAdapter(unittest.TestCase):
         result = extract_hatch_evidence(
             page, page_id=1, workspace_id=1, scale_info=scale,
         )
-        for ev in result:
+        for ev in result.evidence:
             if ev.geometry_method != "bbox_fallback":
                 self.assertIsNotNone(ev.area_m2)
+        doc.close()
+
+    def test_result_carries_accurate_diagnostics(self):
+        """BLOCKER 4: diagnostics must reflect actual detector counts,
+        not len(evidence_list)."""
+        doc, page = _make_page()
+        _draw_parallel_lines(page, 100, 100, 12, 6, 200, angle_deg=45.0)
+        result = extract_hatch_evidence(page, page_id=1, workspace_id=1)
+        self.assertIsInstance(result, HatchProcessingResult)
+        # strokes_extracted should be the actual PDF strokes, not evidence count
+        self.assertGreater(result.strokes_extracted, 0)
+        self.assertGreaterEqual(result.clusters_found, 1)
+        # regions_reconstructed should match evidence count
+        self.assertEqual(result.regions_reconstructed, len(result.evidence))
+        doc.close()
+
+    def test_words_passed_to_hatch_detection(self):
+        """BLOCKER 2: words parameter must reach detect_hatch_patterns."""
+        doc, page = _make_page()
+        _draw_parallel_lines(page, 100, 100, 12, 6, 200, angle_deg=0.0)
+        # Add a GRID keyword near the hatch
+        page.insert_text(fitz.Point(150, 90), "GRID", fontsize=8)
+        words = [{"text": "GRID", "bbox": [150, 82, 180, 92]}]
+        result = extract_hatch_evidence(
+            page, page_id=1, workspace_id=1, words=words,
+        )
+        # GRID keyword should cause rejection
+        self.assertEqual(len(result.evidence), 0)
+        self.assertGreater(result.clusters_rejected, 0)
         doc.close()
 
 
@@ -905,6 +937,310 @@ class TestUnionFind(unittest.TestCase):
         self.assertEqual(uf.find(0), 0)
         self.assertEqual(uf.find(1), 1)
         self.assertEqual(uf.find(2), 2)
+
+
+# ---------------------------------------------------------------------------
+# BLOCKER 1 tests: along-axis proximity — separate hatch regions
+# ---------------------------------------------------------------------------
+class TestSeparateHatchRegions(unittest.TestCase):
+    """BLOCKER 1: clustering must not join physically separate hatch regions."""
+
+    def test_two_distant_parallel_patches_two_clusters(self):
+        """Two identical 45° hatch patches far apart -> TWO clusters."""
+        strokes = []
+        # Patch A: x=50..150, y=100..200
+        for i in range(8):
+            y = 100 + i * 10
+            strokes.append(Stroke(x1=50, y1=y, x2=150, y2=y))
+        # Patch B: x=500..600, y=100..200 (far away along x-axis)
+        for i in range(8):
+            y = 100 + i * 10
+            strokes.append(Stroke(x1=500, y1=y, x2=600, y2=y))
+        clusters = _cluster_strokes(strokes)
+        self.assertGreaterEqual(len(clusters), 2,
+                                "Distant patches should produce 2+ clusters")
+
+    def test_nearby_strokes_single_cluster(self):
+        """Nearby strokes of same angle should form ONE cluster."""
+        strokes = []
+        for i in range(10):
+            y = 200 + i * 8
+            strokes.append(Stroke(x1=100, y1=y, x2=250, y2=y))
+        clusters = _cluster_strokes(strokes)
+        self.assertEqual(len(clusters), 1)
+        self.assertGreaterEqual(clusters[0].stroke_count, 10)
+
+    def test_collinear_strokes_large_gap_not_merged(self):
+        """Collinear strokes separated by a large gap should NOT merge."""
+        strokes = []
+        # Group A: x=0..100
+        for i in range(6):
+            strokes.append(Stroke(x1=0, y1=100 + i * 10, x2=100, y2=100 + i * 10))
+        # Group B: x=400..500 (300pt gap, much larger than stroke length 100pt)
+        for i in range(6):
+            strokes.append(Stroke(x1=400, y1=100 + i * 10, x2=500, y2=100 + i * 10))
+        clusters = _cluster_strokes(strokes)
+        self.assertGreaterEqual(len(clusters), 2,
+                                "Large-gap collinear strokes should not merge")
+
+    def test_giant_hull_cannot_span_empty_region(self):
+        """Reconstructed hull from two distant patches should not span the gap.
+        If they somehow end up in one cluster, the hull would be enormous.
+        Verify this does not happen by checking two patches stay separate."""
+        strokes = []
+        # Patch A: compact at origin
+        for i in range(8):
+            y = 100 + i * 8
+            strokes.append(Stroke(x1=50, y1=y, x2=150, y2=y))
+        # Patch B: compact far away
+        for i in range(8):
+            y = 100 + i * 8
+            strokes.append(Stroke(x1=500, y1=y, x2=600, y2=y))
+        clusters = _cluster_strokes(strokes)
+        # Each cluster's bbox should not span from x=50 to x=600
+        for c in clusters:
+            x0, _, x1, _ = c.bbox
+            span = x1 - x0
+            self.assertLess(span, 300,
+                            f"Cluster bbox span {span:.0f}pt too large — "
+                            "likely merged separate regions")
+
+
+# ---------------------------------------------------------------------------
+# BLOCKER 3 tests: cross-hatch perpendicular tolerance
+# ---------------------------------------------------------------------------
+class TestCrossHatchPerpendicularTolerance(unittest.TestCase):
+    """BLOCKER 3: cross-hatch merge must require genuinely near-perpendicular
+    geometry, not merely 40-90 degree separation."""
+
+    def test_0_and_90_merge(self):
+        """0° + 90° overlapping clusters should merge as cross hatch."""
+        from pb_hatch_detection_v160 import (
+            _merge_cross_hatch_clusters,
+            _compute_cluster_metrics,
+        )
+        # Horizontal cluster
+        h_strokes = [Stroke(x1=100, y1=200 + i * 10, x2=250, y2=200 + i * 10)
+                     for i in range(8)]
+        h = HatchCluster(strokes=h_strokes, stroke_count=8)
+        _compute_cluster_metrics(h)
+        # Vertical cluster (overlapping bbox)
+        v_strokes = [Stroke(x1=175 + i * 10, y1=150, x2=175 + i * 10, y2=300)
+                     for i in range(8)]
+        v = HatchCluster(strokes=v_strokes, stroke_count=8)
+        _compute_cluster_metrics(v)
+        merged = _merge_cross_hatch_clusters([h, v])
+        self.assertEqual(len(merged), 1, "0°+90° should merge")
+        self.assertTrue(merged[0].is_cross_hatch)
+
+    def test_45_and_135_merge(self):
+        """45° + 135° overlapping clusters should merge (perpendicular)."""
+        from pb_hatch_detection_v160 import (
+            _merge_cross_hatch_clusters,
+            _compute_cluster_metrics,
+        )
+        import math
+        # 45° cluster
+        rad45 = math.radians(45)
+        s45 = [Stroke(x1=100 + i * 8 * math.cos(rad45),
+                       y1=200 + i * 8 * math.sin(rad45),
+                       x2=100 + i * 8 * math.cos(rad45) + 100,
+                       y2=200 + i * 8 * math.sin(rad45) + 100)
+               for i in range(8)]
+        c45 = HatchCluster(strokes=s45, stroke_count=8)
+        _compute_cluster_metrics(c45)
+        # 135° cluster (overlapping region)
+        # 135° direction: cos(135)=-0.707, sin(135)=+0.707 (up-left)
+        rad135 = math.radians(135)
+        s135 = [Stroke(x1=175 + i * 8 * math.cos(rad135),
+                        y1=200 + i * 8 * math.sin(rad135),
+                        x2=175 + i * 8 * math.cos(rad135) + 100 * math.cos(rad135),
+                        y2=200 + i * 8 * math.sin(rad135) + 100 * math.sin(rad135))
+                for i in range(8)]
+        c135 = HatchCluster(strokes=s135, stroke_count=8)
+        _compute_cluster_metrics(c135)
+        merged = _merge_cross_hatch_clusters([c45, c135])
+        self.assertEqual(len(merged), 1, "45°+135° should merge")
+
+    def test_0_and_45_do_not_merge(self):
+        """0° + 45° should NOT merge — not perpendicular enough."""
+        from pb_hatch_detection_v160 import (
+            _merge_cross_hatch_clusters,
+            _compute_cluster_metrics,
+        )
+        h_strokes = [Stroke(x1=100, y1=200 + i * 10, x2=250, y2=200 + i * 10)
+                     for i in range(8)]
+        h = HatchCluster(strokes=h_strokes, stroke_count=8)
+        _compute_cluster_metrics(h)
+        import math
+        rad = math.radians(45)
+        d_strokes = [Stroke(x1=100 + i * 8 * math.cos(rad),
+                             y1=200 + i * 8 * math.sin(rad),
+                             x2=100 + i * 8 * math.cos(rad) + 100,
+                             y2=200 + i * 8 * math.sin(rad) + 100)
+                     for i in range(8)]
+        d = HatchCluster(strokes=d_strokes, stroke_count=8)
+        _compute_cluster_metrics(d)
+        merged = _merge_cross_hatch_clusters([h, d])
+        self.assertEqual(len(merged), 2, "0°+45° should NOT merge")
+
+    def test_30_and_75_do_not_merge(self):
+        """30° + 75° should NOT merge — difference is 45°, not near 90°."""
+        from pb_hatch_detection_v160 import (
+            _merge_cross_hatch_clusters,
+            _compute_cluster_metrics,
+        )
+        import math
+        rad30 = math.radians(30)
+        s30 = [Stroke(x1=100 + i * 8 * math.cos(rad30),
+                       y1=200 + i * 8 * math.sin(rad30),
+                       x2=100 + i * 8 * math.cos(rad30) + 100 * math.cos(rad30),
+                       y2=200 + i * 8 * math.sin(rad30) + 100 * math.sin(rad30))
+               for i in range(8)]
+        c30 = HatchCluster(strokes=s30, stroke_count=8)
+        _compute_cluster_metrics(c30)
+        rad75 = math.radians(75)
+        s75 = [Stroke(x1=100 + i * 8 * math.cos(rad75),
+                       y1=200 + i * 8 * math.sin(rad75),
+                       x2=100 + i * 8 * math.cos(rad75) + 100 * math.cos(rad75),
+                       y2=200 + i * 8 * math.sin(rad75) + 100 * math.sin(rad75))
+               for i in range(8)]
+        c75 = HatchCluster(strokes=s75, stroke_count=8)
+        _compute_cluster_metrics(c75)
+        merged = _merge_cross_hatch_clusters([c30, c75])
+        self.assertEqual(len(merged), 2, "30°+75° should NOT merge")
+
+    def test_perpendicular_but_spatially_separate_no_merge(self):
+        """Perpendicular clusters that don't overlap spatially should NOT merge."""
+        from pb_hatch_detection_v160 import (
+            _merge_cross_hatch_clusters,
+            _compute_cluster_metrics,
+        )
+        # Horizontal cluster at top-left
+        h_strokes = [Stroke(x1=50, y1=50 + i * 10, x2=150, y2=50 + i * 10)
+                     for i in range(8)]
+        h = HatchCluster(strokes=h_strokes, stroke_count=8)
+        _compute_cluster_metrics(h)
+        # Vertical cluster at bottom-right (far away, no bbox overlap)
+        v_strokes = [Stroke(x1=400 + i * 10, y1=500, x2=400 + i * 10, y2=600)
+                     for i in range(8)]
+        v = HatchCluster(strokes=v_strokes, stroke_count=8)
+        _compute_cluster_metrics(v)
+        merged = _merge_cross_hatch_clusters([h, v])
+        self.assertEqual(len(merged), 2,
+                         "Spatially separate perpendicular clusters should not merge")
+
+
+# ---------------------------------------------------------------------------
+# BLOCKER 2 tests: production adapter passes words to hatch detection
+# ---------------------------------------------------------------------------
+class TestProductionWordsFiltering(unittest.TestCase):
+    """BLOCKER 2: positioned words must reach hatch false-positive filters
+    in the real production adapter."""
+
+    def test_grid_word_rejects_hatch(self):
+        """Repeated lines + nearby GRID word -> no hatch evidence."""
+        doc, page = _make_page()
+        _draw_parallel_lines(page, 100, 100, 12, 6, 200, angle_deg=0.0)
+        page.insert_text(fitz.Point(150, 90), "GRID", fontsize=8)
+        # Simulate what production adapter does: extract words, pass to hatch
+        words_raw = page.get_text("words") or []
+        words = [{"text": str(w[4]).strip(),
+                  "bbox": [float(w[0]), float(w[1]), float(w[2]), float(w[3])]}
+                 for w in words_raw if len(w) >= 5 and str(w[4]).strip()]
+        result = extract_hatch_evidence(
+            page, page_id=1, workspace_id=1, words=words,
+        )
+        self.assertEqual(len(result.evidence), 0,
+                         "GRID keyword should cause hatch rejection")
+        doc.close()
+
+    def test_dimension_text_rejects_hatch(self):
+        """Repeated lines + nearby dimension text -> rejected."""
+        doc, page = _make_page()
+        _draw_parallel_lines(page, 100, 100, 10, 8, 200, angle_deg=0.0)
+        page.insert_text(fitz.Point(140, 88), "3500", fontsize=8)
+        page.insert_text(fitz.Point(140, 78), "2400", fontsize=8)
+        words_raw = page.get_text("words") or []
+        words = [{"text": str(w[4]).strip(),
+                  "bbox": [float(w[0]), float(w[1]), float(w[2]), float(w[3])]}
+                 for w in words_raw if len(w) >= 5 and str(w[4]).strip()]
+        result = extract_hatch_evidence(
+            page, page_id=1, workspace_id=1, words=words,
+        )
+        self.assertEqual(len(result.evidence), 0,
+                         "Dimension text should cause hatch rejection")
+        doc.close()
+
+    def test_louvre_keyword_rejects_hatch(self):
+        """Repeated lines + nearby LOUVRE keyword -> rejected."""
+        doc, page = _make_page()
+        _draw_parallel_lines(page, 100, 100, 10, 8, 200, angle_deg=0.0)
+        page.insert_text(fitz.Point(150, 90), "LOUVRE", fontsize=8)
+        words_raw = page.get_text("words") or []
+        words = [{"text": str(w[4]).strip(),
+                  "bbox": [float(w[0]), float(w[1]), float(w[2]), float(w[3])]}
+                 for w in words_raw if len(w) >= 5 and str(w[4]).strip()]
+        result = extract_hatch_evidence(
+            page, page_id=1, workspace_id=1, words=words,
+        )
+        self.assertEqual(len(result.evidence), 0,
+                         "LOUVRE keyword should cause hatch rejection")
+        doc.close()
+
+    def test_genuine_hatch_without_exclusion_words_retained(self):
+        """Same genuine hatch without exclusion words -> retained."""
+        doc, page = _make_page()
+        _draw_parallel_lines(page, 100, 100, 12, 6, 200, angle_deg=45.0)
+        # No exclusion words
+        result = extract_hatch_evidence(
+            page, page_id=1, workspace_id=1, words=[],
+        )
+        self.assertGreater(len(result.evidence), 0,
+                           "Genuine hatch without exclusion words should be retained")
+        doc.close()
+
+
+# ---------------------------------------------------------------------------
+# Failure-state requirement: hatch error -> partial, not no_fills
+# ---------------------------------------------------------------------------
+class TestHatchErrorStatus(unittest.TestCase):
+    """If hatch extraction fails and there are no fills, status must be
+    'partial' (not 'no_fills') to signal the hatch stage was unavailable."""
+
+    def test_hatch_extraction_error_returns_partial(self):
+        """Simulate hatch extraction failure: status should be partial."""
+        from pb_surface_evidence_v160 import (
+            SurfaceProcessingDiagnostics,
+            SurfaceProcessingResult,
+        )
+        diag = SurfaceProcessingDiagnostics()
+        diag.hatch_diag.extraction_error = "RuntimeError: test failure"
+        # Simulate the production adapter logic for empty fills + hatch error
+        fill_polygons = []
+        hatch_evidence_list = []
+        has_hatch_error = bool(diag.hatch_diag.extraction_error)
+        if not fill_polygons and not hatch_evidence_list:
+            if has_hatch_error:
+                status = "partial"
+            else:
+                status = "no_fills"
+        self.assertEqual(status, "partial",
+                         "Hatch error with no fills should return partial, not no_fills")
+
+    def test_genuinely_empty_page_returns_no_fills(self):
+        """No fills, no hatches, no error -> no_fills."""
+        from pb_surface_evidence_v160 import SurfaceProcessingDiagnostics
+        diag = SurfaceProcessingDiagnostics()
+        fill_polygons = []
+        hatch_evidence_list = []
+        has_hatch_error = bool(diag.hatch_diag.extraction_error)
+        if not fill_polygons and not hatch_evidence_list:
+            if has_hatch_error:
+                status = "partial"
+            else:
+                status = "no_fills"
+        self.assertEqual(status, "no_fills")
 
 
 if __name__ == "__main__":

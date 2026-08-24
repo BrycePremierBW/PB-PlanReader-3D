@@ -341,13 +341,19 @@ def _cluster_strokes(
 
     Two strokes are merged when:
       1. Their angle difference <= angle_tol degrees, AND
-      2. Their perpendicular distance <= max_dist pt.
+      2. Their perpendicular distance <= max_dist pt, AND
+      3. Their projected intervals along the stroke direction overlap or the
+         gap is small relative to average stroke length (prevents joining
+         physically separate hatch regions across large empty spaces).
     """
     if len(strokes) < _MIN_HATCH_STROKES:
         return []
 
     n = len(strokes)
     uf = _UnionFind(n)
+
+    # Pre-compute average stroke length for gap threshold
+    avg_len = sum(s.length for s in strokes) / max(n, 1)
 
     # Angle-bucket acceleration: group strokes into angle buckets
     bucket_size = angle_tol * 2
@@ -382,9 +388,52 @@ def _cluster_strokes(
                 if _angle_delta(si.angle_deg, sj.angle_deg) > angle_tol:
                     continue
                 dist = _strokes_midpoint_distance(si, sj)
-                if dist <= max_dist:
+                if dist > max_dist:
+                    continue
+
+                # BLOCKER 1 fix: along-axis proximity check.
+                # Project both strokes onto their shared direction axis.
+                # Reject if their projected intervals don't overlap and the
+                # gap exceeds a threshold relative to stroke length.
+                if dist > 0.1:
+                    dir_x = sj.cx - si.cx
+                    dir_y = sj.cy - si.cy
+                    ln = math.hypot(dir_x, dir_y)
+                    if ln > 1e-6:
+                        dir_x /= ln
+                        dir_y /= ln
+                    else:
+                        dir_x = math.cos(math.radians(si.angle_deg))
+                        dir_y = math.sin(math.radians(si.angle_deg))
+                else:
+                    dir_x = math.cos(math.radians(si.angle_deg))
+                    dir_y = math.sin(math.radians(si.angle_deg))
+
+                # Project stroke endpoints onto direction axis
+                a_start = si.x1 * dir_x + si.y1 * dir_y
+                a_end = si.x2 * dir_x + si.y2 * dir_y
+                if a_start > a_end:
+                    a_start, a_end = a_end, a_start
+
+                b_start = sj.x1 * dir_x + sj.y1 * dir_y
+                b_end = sj.x2 * dir_x + sj.y2 * dir_y
+                if b_start > b_end:
+                    b_start, b_end = b_end, b_start
+
+                # Check overlap
+                overlap_start = max(a_start, b_start)
+                overlap_end = min(a_end, b_end)
+
+                if overlap_start <= overlap_end:
+                    # Intervals overlap — merge
                     uf.union(i, j)
                     merge_count += 1
+                else:
+                    # No overlap — check gap
+                    gap = b_start - a_end if b_start > a_end else a_start - b_end
+                    if gap <= avg_len * 1.5:
+                        uf.union(i, j)
+                        merge_count += 1
 
     # Collect clusters
     groups: Dict[int, List[int]] = {}
@@ -406,31 +455,59 @@ def _cluster_strokes(
     return clusters
 
 
+@dataclass
+class HatchProcessingResult:
+    """Structured result from extract_hatch_evidence().
+
+    Carries the actual detector diagnostics to the production adapter
+    so that diagnostic counts (strokes, clusters, etc.) are accurate
+    rather than reconstructed from final evidence count.
+    """
+
+    evidence: List[SurfaceEvidence] = field(default_factory=list)
+    clusters: List[HatchCluster] = field(default_factory=list)
+    strokes_extracted: int = 0
+    clusters_found: int = 0
+    clusters_rejected: int = 0
+    regions_reconstructed: int = 0
+    low_confidence_regions: int = 0
+    associated: int = 0
+    unassociated: int = 0
+    extraction_error: str = ""
+
+
 def _merge_cross_hatch_clusters(
     clusters: List[HatchCluster],
     max_merge_dist: float = 50.0,
+    cross_hatch_tol: float = 12.0,
 ) -> List[HatchCluster]:
     """Merge spatially-overlapping clusters with perpendicular angles.
 
     Cross-hatch patterns produce two separate clusters (one per angle).
     This post-processing step merges them when:
       1. Their bboxes overlap (within max_merge_dist pt margin)
-      2. Their dominant angles are approximately perpendicular (40–140°)
+      2. Their dominant angles are genuinely near-perpendicular:
+         abs(angle_delta - 90.0) <= cross_hatch_tol
+
+    The _angle_delta() function returns 0-90 degrees (mod 180), so we
+    require the result to be close to 90, not merely in a wide range.
     """
     if len(clusters) < 2:
         return clusters
 
-    merged = list(range(len(clusters)))  # union-find-like: index → cluster index
+    merged = list(range(len(clusters)))  # union-find-like: index -> cluster index
     for i in range(len(clusters)):
         for j in range(i + 1, len(clusters)):
             ci, cj = clusters[i], clusters[j]
             if merged[i] != i or merged[j] != j:
                 continue  # already merged into something else
 
-            # Check perpendicular angle
+            # BLOCKER 3 fix: require genuinely near-perpendicular geometry.
+            # _angle_delta returns 0-90 degrees (mod 180).
+            # For true perpendicular: angle_delta should be ~90.
             angle_diff = _angle_delta(ci.dominant_angle, cj.dominant_angle)
-            if angle_diff < 40.0 or angle_diff > 140.0:
-                continue  # not perpendicular
+            if abs(angle_diff - 90.0) > cross_hatch_tol:
+                continue  # not perpendicular enough
 
             # Check spatial overlap with margin
             ix0 = max(ci.bbox[0], cj.bbox[0]) - max_merge_dist
@@ -1049,40 +1126,53 @@ def extract_hatch_evidence(
     words: Optional[List[Dict[str, Any]]] = None,
     measured_surfaces: Optional[List[Dict[str, Any]]] = None,
     code_occurrences: Optional[List[Dict[str, Any]]] = None,
-) -> List[SurfaceEvidence]:
+) -> HatchProcessingResult:
     """High-level hatch extraction for production adapter.
 
     Detects hatch patterns, builds evidence, associates with measured surfaces,
-    and associates positioned codes.
+    and associates positioned codes.  Returns a HatchProcessingResult carrying
+    the actual detector diagnostics so production counts are accurate.
     """
     evidence_list, clusters, hatch_diag = detect_hatch_patterns(
         pdf_page, scale_info, words
     )
 
+    result = HatchProcessingResult(
+        evidence=evidence_list,
+        clusters=clusters,
+        strokes_extracted=hatch_diag.get("strokes_extracted", 0),
+        clusters_found=hatch_diag.get("clusters_found", 0),
+        clusters_rejected=hatch_diag.get("clusters_rejected", 0),
+        regions_reconstructed=hatch_diag.get("regions_reconstructed", 0),
+        low_confidence_regions=hatch_diag.get("low_confidence_regions", 0),
+        extraction_error=hatch_diag.get("extraction_error", ""),
+    )
+
     if not evidence_list:
-        return evidence_list
+        return result
 
     # Assign page metadata
-    for ev in evidence_list:
+    for idx, ev in enumerate(evidence_list):
         ev.workspace_id = workspace_id
         ev.page_id = page_id
         ev.page_no = page_no
         ev.page_label = page_label
-        ev.surface_id = f"page_{page_id}:hatch_{evidence_list.index(ev)}"
+        ev.surface_id = f"page_{page_id}:hatch_{idx}"
 
     # Associate with measured surfaces
     if measured_surfaces:
         evidence_list = associate_with_measured_surfaces(
             evidence_list, measured_surfaces, code_occurrences
         )
+        result.evidence = evidence_list
 
     # Count associations
     associated = sum(1 for e in evidence_list if e.association_method
                      and e.association_method != "none")
-    hatch_diag["associated"] = associated
-    hatch_diag["unassociated"] = len(evidence_list) - associated
+    result.associated = associated
+    result.unassociated = len(evidence_list) - associated
 
-    return evidence_list
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1098,5 +1188,6 @@ def apply(app: Any) -> None:
 
     app.extract_hatch_evidence_v160 = extract_hatch_evidence
     app.detect_hatch_patterns_v160 = detect_hatch_patterns
+    app.HatchProcessingResult = HatchProcessingResult
 
     app._pb_hatch_detection_v160_applied = True
