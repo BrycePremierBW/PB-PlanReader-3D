@@ -46,6 +46,7 @@ from pb_precision_3d_v132 import apply as apply_precision_3d_v132
 from pb_opening_deductions_v134 import apply as apply_opening_deductions_v134
 from pb_elevation_registration_v135 import apply as apply_elevation_registration_v135
 from pb_room_face_takeoff import apply as apply_room_face_takeoff
+from pb_surface_evidence_v160 import apply as apply_surface_evidence_v160
 
 
 apply_gemini_v126(launcher.app)
@@ -90,6 +91,7 @@ apply_room_face_takeoff(launcher.app)
 apply_accuracy_benchmark_v130(launcher.app)
 apply_accuracy_ui_v130(launcher.app)
 apply_substrate_qa_v131(launcher.app)
+apply_surface_evidence_v160(launcher.app)
 apply_precision_3d_v132(launcher.app)
 apply_opening_deductions_v134(launcher.app)
 # v1.3.5 registers elevation drawings back to the calibrated plan footprint.
