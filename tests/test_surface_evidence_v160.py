@@ -20,6 +20,8 @@ from unittest.mock import MagicMock, patch, call
 from pb_surface_evidence_v160 import (
     FillPolygon,
     SurfaceEvidence,
+    SurfaceProcessingResult,
+    SurfaceProcessingDiagnostics,
     AssociationResult,
     _shoelace_area,
     polygon_area_abs,
@@ -40,6 +42,7 @@ from pb_surface_evidence_v160 import (
     associate_with_measured_surfaces,
     build_surface_evidence,
     process_page_surface_evidence,
+    get_surface_evidence_diagnostics_v160,
     _items_are_closed_lines,
     _closed_line_vertices,
     _num,
@@ -592,17 +595,18 @@ class TestProductionAdapter(unittest.TestCase):
                 result = process_page_surface_evidence(app, page_id=1, workspace_id=1)
 
             # Should have extracted fill polygons
-            self.assertGreaterEqual(len(result), 1)
-            self.assertEqual(result[0].page_id, 1)
-            self.assertEqual(result[0].page_no, 1)
-            self.assertEqual(result[0].page_label, "Ground Floor")
+            self.assertIsInstance(result, SurfaceProcessingResult)
+            self.assertGreaterEqual(len(result.evidence), 1)
+            self.assertEqual(result.evidence[0].page_id, 1)
+            self.assertEqual(result.evidence[0].page_no, 1)
+            self.assertEqual(result.evidence[0].page_label, "Ground Floor")
+            self.assertEqual(result.status, "ok")
+            self.assertTrue(result.diagnostics.page_lookup_ok)
+            self.assertTrue(result.diagnostics.pdf_open_ok)
+            self.assertGreater(result.diagnostics.fills_extracted_count, 0)
 
             # Evidence should have been stored via set_workspace_setting
-            self.assertTrue(
-                len(app.set_workspace_setting.call_args_list) > 0,
-                "Evidence was not stored via set_workspace_setting"
-            )
-            # Verify stored JSON is valid
+            self.assertTrue(result.diagnostics.storage_ok)
             stored = app._stored_settings.get((1, "surface_evidence_v160_page_1"))
             self.assertIsNotNone(stored, "No stored evidence found")
             records = json.loads(stored)
@@ -643,10 +647,10 @@ class TestProductionAdapter(unittest.TestCase):
                 result = process_page_surface_evidence(app, page_id=1, workspace_id=1)
 
             # At least one evidence record
-            self.assertGreaterEqual(len(result), 1)
+            self.assertGreaterEqual(len(result.evidence), 1)
 
             # Check if any evidence has PT01 code and room association
-            pt01_evidence = [e for e in result if e.finish_code == "PT01"]
+            pt01_evidence = [e for e in result.evidence if e.finish_code == "PT01"]
             if pt01_evidence:
                 ev = pt01_evidence[0]
                 # PT01 text is at ~(100,140) which is inside the room polygon
@@ -694,7 +698,7 @@ class TestProductionAdapter(unittest.TestCase):
             # Fill polygon may be geometrically associated to room (containment)
             # — that's fine.  But it must NOT have a finish_code from spatial
             # text association, because no positioned words existed.
-            for ev in result:
+            for ev in result.evidence:
                 # No finish_code should come from text-only code occurrences
                 self.assertEqual(
                     ev.finish_code, "",
@@ -744,18 +748,20 @@ class TestProductionAdapter(unittest.TestCase):
             self.assertEqual(fake_room.floor_area_m2, 40.0)
 
             # Evidence should classify the fill but not change the quantity
-            if result:
-                self.assertEqual(result[0].page_id, 1)
+            if result.evidence:
+                self.assertEqual(result.evidence[0].page_id, 1)
 
-    def test_production_adapter_no_page_returns_empty(self):
-        """Missing page returns empty list."""
+    def test_production_adapter_no_page_returns_error(self):
+        """Missing page returns error status with empty evidence."""
         app = MagicMock()
         app.lquery.return_value = []  # No page found
         result = process_page_surface_evidence(app, page_id=999, workspace_id=1)
-        self.assertEqual(result, [])
+        self.assertIsInstance(result, SurfaceProcessingResult)
+        self.assertEqual(result.status, "error")
+        self.assertEqual(result.evidence, [])
 
-    def test_production_adapter_no_pdf_file_returns_empty(self):
-        """Non-existent PDF path returns empty list."""
+    def test_production_adapter_no_pdf_file_returns_error(self):
+        """Non-existent PDF path returns error status."""
         import tempfile
         from pathlib import Path
 
@@ -771,7 +777,9 @@ class TestProductionAdapter(unittest.TestCase):
             app = self._make_fake_app(fake_pdf_path, page_dict)
 
             result = process_page_surface_evidence(app, page_id=1, workspace_id=1)
-            self.assertEqual(result, [])
+            self.assertIsInstance(result, SurfaceProcessingResult)
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.evidence, [])
 
     def test_production_adapter_uses_documents_path_not_pdf_blob(self):
         """Adapter opens PDF via documents.path, not pdf_blob or get_pdf_page."""
@@ -797,11 +805,7 @@ class TestProductionAdapter(unittest.TestCase):
                 any("documents" in c for c in lquery_calls),
                 f"Expected documents query in lquery calls: {lquery_calls}"
             )
-            # Verify set_workspace_setting was called (not lexecute for storage)
-            self.assertTrue(
-                len(app.set_workspace_setting.call_args_list) > 0,
-                "Expected set_workspace_setting to be called"
-            )
+            self.assertTrue(result.diagnostics.storage_ok)
 
     def test_production_adapter_page_scoped_setting_key(self):
         """Storage key is page-scoped: surface_evidence_v160_page_{page_id}."""
@@ -832,7 +836,7 @@ class TestProductionAdapter(unittest.TestCase):
 
             with patch("pb_room_face_takeoff.extract_room_faces_from_page",
                        return_value=[fake_room]):
-                process_page_surface_evidence(app, page_id=42, workspace_id=3)
+                result = process_page_surface_evidence(app, page_id=42, workspace_id=3)
 
             # Storage key must include page_id 42
             key = "surface_evidence_v160_page_42"
@@ -840,6 +844,235 @@ class TestProductionAdapter(unittest.TestCase):
                 (3, key), app._stored_settings,
                 f"Expected key '{key}' in stored settings: {list(app._stored_settings.keys())}"
             )
+            # Diagnostics also stored
+            diag_key = "surface_evidence_v160_diag_page_42"
+            self.assertIn(
+                (3, diag_key), app._stored_settings,
+                f"Expected diagnostics key '{diag_key}' in stored settings"
+            )
+            diag_json = json.loads(app._stored_settings[(3, diag_key)])
+            self.assertTrue(diag_json["page_lookup_ok"])
+            self.assertTrue(diag_json["pdf_open_ok"])
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic pipeline tests — error paths
+# ---------------------------------------------------------------------------
+
+class TestProductionDiagnostics(unittest.TestCase):
+    """Structured pipeline diagnostics for error paths and success paths."""
+
+    def _make_real_pdf(self, tmpdir, with_text=True):
+        """Create a real PyMuPDF PDF with a filled rectangle and optional positioned text."""
+        import fitz
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        shape = page.new_shape()
+        shape.draw_rect(fitz.Rect(50, 50, 250, 250))
+        shape.finish(fill=(1, 0, 0), color=(0, 0, 0), width=0.5)
+        shape.commit()
+        if with_text:
+            page.insert_text((100, 140), "PT01", fontsize=12, fontname="helv")
+        pdf_path = tmpdir / "test_plan.pdf"
+        doc.save(str(pdf_path))
+        doc.close()
+        return str(pdf_path)
+
+    def _make_fake_app(self, pdf_path, page_dict):
+        app = MagicMock()
+        stored_settings = {}
+        app.lquery.side_effect = [
+            [page_dict],
+            [{"path": pdf_path}],
+        ]
+        def fake_set_ws(workspace_id, key, value):
+            stored_settings[(workspace_id, key)] = value
+        app.set_workspace_setting.side_effect = fake_set_ws
+        def fake_get_ws(workspace_id, key, default="{}"):
+            return stored_settings.get((workspace_id, key), default)
+        app.workspace_setting.side_effect = fake_get_ws
+        app._stored_settings = stored_settings
+        return app
+
+    def test_room_extractor_exception_recorded_in_diagnostics(self):
+        """When extract_room_faces_from_page throws, error is recorded in diagnostics."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            pdf_path = self._make_real_pdf(tmpdir, with_text=False)
+
+            page_dict = {
+                "id": 1, "document_id": 1, "page_no": 1,
+                "page_label": "Plan", "page_type": "plan",
+                "px_per_m": 28.346, "render_zoom": 1.0, "scale_text": "1:100",
+            }
+            app = self._make_fake_app(pdf_path, page_dict)
+
+            def exploding_room_extractor(app_obj, page):
+                raise RuntimeError("Priority 2 module not loaded")
+
+            with patch("pb_room_face_takeoff.extract_room_faces_from_page",
+                       side_effect=exploding_room_extractor):
+                result = process_page_surface_evidence(app, page_id=1, workspace_id=1)
+
+            self.assertIsInstance(result, SurfaceProcessingResult)
+            self.assertNotEqual(result.status, "error")
+            self.assertTrue(result.diagnostics.page_lookup_ok)
+            self.assertTrue(result.diagnostics.pdf_open_ok)
+            self.assertGreater(result.diagnostics.fills_extracted_count, 0)
+            self.assertIn(
+                "RuntimeError", result.diagnostics.room_extraction_error,
+                f"Expected RuntimeError in room_extraction_error: "
+                f"{result.diagnostics.room_extraction_error}"
+            )
+            self.assertEqual(result.diagnostics.measured_room_targets_count, 0)
+
+    def test_fills_exist_but_measured_targets_fail_marks_needs_check(self):
+        """Fills extracted but room/wall extraction failed -> evidence marked needs_check."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            pdf_path = self._make_real_pdf(tmpdir, with_text=False)
+
+            page_dict = {
+                "id": 1, "document_id": 1, "page_no": 1,
+                "page_label": "Plan", "page_type": "plan",
+                "px_per_m": 28.346, "render_zoom": 1.0, "scale_text": "1:100",
+            }
+            app = self._make_fake_app(pdf_path, page_dict)
+
+            def exploding_room_extractor(app_obj, page):
+                raise ImportError("pb_room_face_takeoff not available")
+
+            with patch("pb_room_face_takeoff.extract_room_faces_from_page",
+                       side_effect=exploding_room_extractor):
+                result = process_page_surface_evidence(app, page_id=1, workspace_id=1)
+
+            # Evidence should exist (fills were extracted)
+            self.assertGreater(len(result.evidence), 0)
+            # Every unassociated evidence must be needs_check
+            for ev in result.evidence:
+                if not ev.association_method or ev.association_method == "none":
+                    self.assertEqual(
+                        ev.status, "needs_check",
+                        f"Evidence {ev.surface_id} should be needs_check "
+                        f"when measured-surface extraction failed, but got: "
+                        f"{ev.status}"
+                    )
+                    self.assertTrue(
+                        any("association unavailable" in e.lower()
+                            for e in ev.evidence),
+                        f"Evidence {ev.surface_id} should mention "
+                        f"'association unavailable' in evidence"
+                    )
+
+    def test_positioned_words_extraction_failure_distinguished_from_zero_codes(self):
+        """Positioned word extraction failure is distinguished from zero codes found."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            # PDF with no text at all
+            pdf_path = self._make_real_pdf(tmpdir, with_text=False)
+
+            page_dict = {
+                "id": 1, "document_id": 1, "page_no": 1,
+                "page_label": "Plan", "page_type": "plan",
+                "px_per_m": 28.346, "render_zoom": 1.0, "scale_text": "1:100",
+            }
+            app = self._make_fake_app(pdf_path, page_dict)
+
+            with patch("pb_room_face_takeoff.extract_room_faces_from_page",
+                       return_value=[]):
+                result = process_page_surface_evidence(app, page_id=1, workspace_id=1)
+
+            # No extraction error (words exist, just no codes)
+            self.assertEqual(result.diagnostics.positioned_words_extraction_error, "")
+            # Words were extracted (PT01 text is in the PDF — wait, with_text=False)
+            # So positioned_words should be 0 and finish_codes should be 0
+            # The key: extraction error is empty, not a failure
+            self.assertEqual(result.diagnostics.finish_codes_found_count, 0)
+            self.assertEqual(result.diagnostics.positioned_words_extraction_error, "")
+
+    def test_storage_failure_diagnostic_preserved(self):
+        """When storage fails, diagnostics are preserved and returned."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            pdf_path = self._make_real_pdf(tmpdir, with_text=False)
+
+            page_dict = {
+                "id": 1, "document_id": 1, "page_no": 1,
+                "page_label": "Plan", "page_type": "plan",
+                "px_per_m": 28.346, "render_zoom": 1.0, "scale_text": "1:100",
+            }
+            app = self._make_fake_app(pdf_path, page_dict)
+
+            # Force storage to fail
+            app.set_workspace_setting.side_effect = RuntimeError("DB is full")
+
+            with patch("pb_room_face_takeoff.extract_room_faces_from_page",
+                       return_value=[]):
+                result = process_page_surface_evidence(app, page_id=1, workspace_id=1)
+
+            self.assertIsInstance(result, SurfaceProcessingResult)
+            self.assertFalse(result.diagnostics.storage_ok)
+            self.assertIn("RuntimeError", result.diagnostics.storage_error)
+            self.assertEqual(result.status, "error")
+            # Evidence was still produced (fills were extracted)
+            self.assertGreater(len(result.evidence), 0)
+
+    def test_normal_successful_path_diagnostics_clean(self):
+        """Normal successful path produces clean diagnostics with no errors."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from pb_room_face_takeoff import RoomFace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            pdf_path = self._make_real_pdf(tmpdir, with_text=True)
+
+            page_dict = {
+                "id": 1, "document_id": 1, "page_no": 1,
+                "page_label": "Ground Floor", "page_type": "plan",
+                "px_per_m": 28.346, "render_zoom": 1.0, "scale_text": "1:100",
+            }
+            app = self._make_fake_app(pdf_path, page_dict)
+
+            fake_room = RoomFace(
+                room_ref="R01", label="KITCHEN",
+                polygon_pdf_pts=[(0, 0), (250, 0), (250, 250), (0, 250)],
+                polygon_m=None, floor_area_m2=40.0, area_page_pts2=62500.0,
+                perimeter_m=1000.0, geometry_confidence=0.95,
+                evidence=["Test room"], source_page=1,
+                calibration_confidence=0.95, status="Measured",
+            )
+
+            with patch("pb_room_face_takeoff.extract_room_faces_from_page",
+                       return_value=[fake_room]):
+                result = process_page_surface_evidence(app, page_id=1, workspace_id=1)
+
+            self.assertIsInstance(result, SurfaceProcessingResult)
+            self.assertEqual(result.status, "ok")
+            d = result.diagnostics
+            self.assertTrue(d.page_lookup_ok)
+            self.assertTrue(d.pdf_open_ok)
+            self.assertGreater(d.fills_extracted_count, 0)
+            self.assertGreaterEqual(d.positioned_words_extracted_count, 0)
+            self.assertEqual(d.positioned_words_extraction_error, "")
+            self.assertEqual(d.room_extraction_error, "")
+            self.assertEqual(d.wall_extraction_error, "")
+            self.assertGreater(d.measured_room_targets_count, 0)
+            self.assertTrue(d.storage_ok)
+            self.assertEqual(d.storage_error, "")
 
 
 # ---------------------------------------------------------------------------

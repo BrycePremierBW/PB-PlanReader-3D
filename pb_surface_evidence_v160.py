@@ -173,6 +173,57 @@ class SurfaceEvidence:
         return d
 
 
+@dataclass
+class SurfaceProcessingDiagnostics:
+    """Structured diagnostics for one page's surface processing pipeline.
+
+    Records the outcome of every pipeline stage so that failures are visible
+    rather than silently folded into a normal-looking result.
+    """
+
+    # Stage outcomes (boolean = succeeded, str = error message if failed)
+    page_lookup_ok: bool = False
+    pdf_open_ok: bool = False
+    fills_extracted_count: int = 0
+    positioned_words_extracted_count: int = 0
+    positioned_words_extraction_error: str = ""  # empty = no error
+    finish_codes_found_count: int = 0
+    text_only_codes_found_count: int = 0
+    measured_room_targets_count: int = 0
+    measured_wall_targets_count: int = 0
+    room_extraction_error: str = ""   # empty = no error
+    wall_extraction_error: str = ""   # empty = no error
+    associated_count: int = 0
+    unassociated_count: int = 0
+    storage_ok: bool = False
+    storage_error: str = ""           # empty = no error
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {k: v for k, v in asdict(self).items()}
+
+
+@dataclass
+class SurfaceProcessingResult:
+    """Return type for process_page_surface_evidence().
+
+    Contains the evidence list plus structured diagnostics so callers can
+    distinguish "no evidence found" from "pipeline stage failed".
+    """
+
+    evidence: List[SurfaceEvidence] = field(default_factory=list)
+    diagnostics: SurfaceProcessingDiagnostics = field(
+        default_factory=SurfaceProcessingDiagnostics,
+    )
+    status: str = "ok"  # "ok" | "partial" | "error" | "no_fills"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "evidence": [ev.to_dict() for ev in self.evidence],
+            "diagnostics": self.diagnostics.to_dict(),
+            "status": self.status,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Geometry helpers
 # ---------------------------------------------------------------------------
@@ -1095,12 +1146,15 @@ def associate_with_measured_surfaces(
 
 def _get_measured_surfaces_for_page(
     app: Any, page_id: int, workspace_id: int, page: Dict[str, Any],
+    diagnostics: SurfaceProcessingDiagnostics,
 ) -> List[Dict[str, Any]]:
     """Retrieve existing measured surfaces (rooms/walls) for a page.
 
     Uses REAL production interfaces:
       - extract_room_faces_from_page() from pb_room_face_takeoff (Priority 2)
       - registered_wall_records_v135() from pb_elevation_registration_v135
+
+    Errors are captured into diagnostics rather than silently swallowed.
 
     Returns list of dicts with polygon, ref, type, area_m2 — compatible
     with associate_with_measured_surfaces() input contract.
@@ -1120,8 +1174,11 @@ def _get_measured_surfaces_for_page(
                     "type": "room",
                     "area_m2": rf.floor_area_m2,
                 })
-    except Exception:
-        pass
+        diagnostics.measured_room_targets_count = len([
+            s for s in surfaces if s["type"] == "room"
+        ])
+    except Exception as exc:
+        diagnostics.room_extraction_error = f"{type(exc).__name__}: {exc}"
 
     # 2. Registered wall data from v135 (only if source_polygon is real coords)
     try:
@@ -1137,8 +1194,11 @@ def _get_measured_surfaces_for_page(
                         "type": "wall",
                         "area_m2": wall.get("net_m2"),
                     })
-    except Exception:
-        pass
+        diagnostics.measured_wall_targets_count = len([
+            s for s in surfaces if s["type"] == "wall"
+        ])
+    except Exception as exc:
+        diagnostics.wall_extraction_error = f"{type(exc).__name__}: {exc}"
 
     return surfaces
 
@@ -1147,34 +1207,30 @@ def process_page_surface_evidence(
     app: Any,
     page_id: int,
     workspace_id: int,
-) -> List[SurfaceEvidence]:
+) -> SurfaceProcessingResult:
     """Production adapter: process one page through the full SurfaceEvidence chain.
 
     Uses ONLY real PlanReader production interfaces:
       - pages table: id, document_id, page_no, page_label, page_type, px_per_m
       - documents table: path (PDF file location)
-      - fitz.open(documents.path) → pdf[page_no - 1]
+      - fitz.open(documents.path) -> pdf[page_no - 1]
       - pdf_page.get_text("words") for positioned text
       - extract_room_faces_from_page() for Priority 2 measured surfaces
       - app.set_workspace_setting() for storage
       - app.registered_wall_records_v135() for wall data
 
-    Steps:
-      1. Query pages + documents tables (real schema)
-      2. Open PDF via documents.path → fitz.open → load_page
-      3. Extract filled polygons via get_drawings()
-      4. Build SurfaceEvidence with page calibration
-      5. Extract positioned finish codes via get_text("words")
-      6. Retrieve measured surfaces via real Priority 2 / v135 interfaces
-      7. Associate SurfaceEvidence with measured surfaces
-      8. Store results via app.set_workspace_setting()
-      9. Return evidence list
+    Returns a SurfaceProcessingResult containing:
+      - evidence: list of SurfaceEvidence records
+      - diagnostics: structured pipeline stage outcomes
+      - status: "ok" | "partial" | "error" | "no_fills"
 
-    This does NOT rewrite the takeoff pipeline — it only adds
-    classification metadata to existing authoritative quantities.
+    Diagnostics record every stage outcome so failures are never silently
+    hidden behind a normal-looking result.
     """
     import json
     from pathlib import Path
+
+    diag = SurfaceProcessingDiagnostics()
 
     # ------------------------------------------------------------------
     # Step 1: Query real pages + documents schema
@@ -1187,10 +1243,12 @@ def process_page_surface_evidence(
             (page_id,),
         )
         if not rows:
-            return []
+            return SurfaceProcessingResult(diagnostics=diag, status="error")
         r = rows[0]
-    except Exception:
-        return []
+        diag.page_lookup_ok = True
+    except Exception as exc:
+        diag.page_lookup_ok = False
+        return SurfaceProcessingResult(diagnostics=diag, status="error")
 
     doc_id = int(r.get("document_id") or 0)
     page_no = int(r.get("page_no") or 1)
@@ -1219,26 +1277,33 @@ def process_page_surface_evidence(
             "SELECT path FROM documents WHERE id=?", (doc_id,)
         )
         if not doc_rows:
-            return []
+            return SurfaceProcessingResult(diagnostics=diag, status="error")
         pdf_path = Path(str(doc_rows[0].get("path") or ""))
         if pdf_path.suffix.lower() != ".pdf" or not pdf_path.is_file():
-            return []
+            return SurfaceProcessingResult(diagnostics=diag, status="error")
         _pdf_doc = _fitz.open(pdf_path)
         page_idx = page_no - 1
         if page_idx < 0 or page_idx >= len(_pdf_doc):
-            return []
+            return SurfaceProcessingResult(diagnostics=diag, status="error")
         pdf_page = _pdf_doc[page_idx]
+        diag.pdf_open_ok = True
     except Exception:
-        return []
+        return SurfaceProcessingResult(diagnostics=diag, status="error")
 
     if pdf_page is None:
-        return []
+        return SurfaceProcessingResult(diagnostics=diag, status="error")
 
     try:
         # ------------------------------------------------------------------
         # Step 3: Extract filled polygons
         # ------------------------------------------------------------------
         fill_polygons = extract_filled_polygons(pdf_page)
+        diag.fills_extracted_count = len(fill_polygons)
+
+        if not fill_polygons:
+            return SurfaceProcessingResult(
+                diagnostics=diag, status="no_fills",
+            )
 
         # ------------------------------------------------------------------
         # Step 4: Build SurfaceEvidence with calibration
@@ -1261,7 +1326,7 @@ def process_page_surface_evidence(
         # We convert to dicts with "text" and "bbox" for our code extractor.
         #
         # IMPORTANT: plain-text fallback (get_text("text")) produces codes
-        # with NO bbox → they cannot spatially associate to polygons.
+        # with NO bbox -> they cannot spatially associate to polygons.
         # We retain them as text evidence only; they are NOT passed to
         # associate_with_measured_surfaces() as spatial code occurrences.
         # ------------------------------------------------------------------
@@ -1282,13 +1347,19 @@ def process_page_surface_evidence(
                 if text:
                     positioned_words.append({"text": text, "bbox": [x0, y0, x1, y1]})
 
+            diag.positioned_words_extracted_count = len(positioned_words)
+
             if positioned_words:
                 positioned_code_occurrences = extract_finish_codes_from_positions(
                     positioned_words, page_id=page_id, page_no=page_no,
                     page_label=page_label,
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            diag.positioned_words_extraction_error = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        diag.finish_codes_found_count = len(positioned_code_occurrences)
 
         # Text-only fallback: extract codes WITHOUT spatial info.
         # These are retained for metadata but NOT used for polygon association.
@@ -1302,14 +1373,18 @@ def process_page_surface_evidence(
         except Exception:
             pass
 
+        diag.text_only_codes_found_count = len(text_only_codes)
+
         # Use positioned codes for spatial association (have bbox).
-        # Text-only codes are metadata only — never pretend they have coordinates.
+        # Text-only codes are metadata only -- never pretend they have coordinates.
         code_occurrences = positioned_code_occurrences
 
         # ------------------------------------------------------------------
         # Step 6: Get measured surfaces via real Priority 2 / v135 interfaces
         # ------------------------------------------------------------------
-        measured = _get_measured_surfaces_for_page(app, page_id, workspace_id, page_dict)
+        measured = _get_measured_surfaces_for_page(
+            app, page_id, workspace_id, page_dict, diag,
+        )
 
         # ------------------------------------------------------------------
         # Step 7: Associate
@@ -1317,6 +1392,48 @@ def process_page_surface_evidence(
         evidence_list = associate_with_measured_surfaces(
             evidence_list, measured, code_occurrences=code_occurrences,
         )
+
+        # Count associated vs unassociated
+        diag.associated_count = sum(
+            1 for ev in evidence_list
+            if ev.association_method and ev.association_method != "none"
+        )
+        diag.unassociated_count = len(evidence_list) - diag.associated_count
+
+        # ------------------------------------------------------------------
+        # Accuracy-status requirement:
+        # If fills were extracted but measured-surface extraction failed,
+        # evidence must NOT look like a normal successful unassociated result.
+        # ------------------------------------------------------------------
+        measured_extraction_failed = bool(
+            diag.room_extraction_error or diag.wall_extraction_error
+        )
+        if measured_extraction_failed and diag.fills_extracted_count > 0:
+            for sev in evidence_list:
+                if not sev.association_method or sev.association_method == "none":
+                    sev.status = "needs_check"
+                    reasons = []
+                    if diag.room_extraction_error:
+                        reasons.append(
+                            f"room extraction failed: {diag.room_extraction_error}"
+                        )
+                    if diag.wall_extraction_error:
+                        reasons.append(
+                            f"wall extraction failed: {diag.wall_extraction_error}"
+                        )
+                    sev.evidence.append(
+                        "Measured-surface association unavailable: "
+                        + "; ".join(reasons)
+                    )
+
+        # Distinguish "no code found" from "code extraction unavailable"
+        if diag.positioned_words_extraction_error:
+            for sev in evidence_list:
+                if not sev.finish_code:
+                    sev.evidence.append(
+                        "Finish code extraction unavailable: "
+                        + diag.positioned_words_extraction_error
+                    )
 
         # Attach text-only code evidence as metadata (no spatial association)
         if text_only_codes and not positioned_code_occurrences:
@@ -1345,10 +1462,36 @@ def process_page_surface_evidence(
                     "VALUES (?, ?, ?, datetime('now'))",
                     (workspace_id, setting_key, payload),
                 )
-        except Exception:
-            pass
+            # Store diagnostics alongside evidence
+            diag_key = f"surface_evidence_v160_diag_page_{page_id}"
+            diag_payload = json.dumps(diag.to_dict(), separators=(",", ":"))
+            if hasattr(app, "set_workspace_setting"):
+                app.set_workspace_setting(int(workspace_id), diag_key, diag_payload)
+            else:
+                app.lexecute(
+                    "INSERT OR REPLACE INTO workspace_settings "
+                    "(workspace_id, setting_key, setting_value, updated_at) "
+                    "VALUES (?, ?, ?, datetime('now'))",
+                    (workspace_id, diag_key, diag_payload),
+                )
+            diag.storage_ok = True
+        except Exception as exc:
+            diag.storage_ok = False
+            diag.storage_error = f"{type(exc).__name__}: {exc}"
 
-        return evidence_list
+        # Determine overall status
+        if diag.storage_ok and not measured_extraction_failed:
+            overall_status = "ok"
+        elif diag.storage_ok:
+            overall_status = "partial"
+        else:
+            overall_status = "error"
+
+        return SurfaceProcessingResult(
+            evidence=evidence_list,
+            diagnostics=diag,
+            status=overall_status,
+        )
 
     finally:
         # Clean up PDF document
@@ -1357,6 +1500,27 @@ def process_page_surface_evidence(
                 _pdf_doc.close()
         except Exception:
             pass
+
+
+def get_surface_evidence_diagnostics_v160(
+    app: Any, page_id: int, workspace_id: int,
+) -> Optional[SurfaceProcessingDiagnostics]:
+    """Retrieve stored diagnostics for a page, or None if not found."""
+    try:
+        setting_key = f"surface_evidence_v160_diag_page_{page_id}"
+        if hasattr(app, "workspace_setting"):
+            raw = app.workspace_setting(int(workspace_id), setting_key, "{}")
+        else:
+            rows = app.lexecute(
+                "SELECT setting_value FROM workspace_settings "
+                "WHERE workspace_id=? AND setting_key=?",
+                (workspace_id, setting_key),
+            )
+            raw = rows[0][0] if rows else "{}"
+        parsed = json.loads(str(raw or "{}"))
+        return SurfaceProcessingDiagnostics(**parsed)
+    except Exception:
+        return None
 
 
 def apply(app: Any) -> None:
@@ -1380,6 +1544,8 @@ def apply(app: Any) -> None:
         "associate_surface_to_target": associate_surface_to_target,
         "page_scale_info": page_scale_info,
         "calibrate_area_m2": calibrate_area_m2,
+        "SurfaceProcessingResult": SurfaceProcessingResult,
+        "SurfaceProcessingDiagnostics": SurfaceProcessingDiagnostics,
     }
 
     # Expose key functions as app-level callables
@@ -1387,3 +1553,4 @@ def apply(app: Any) -> None:
     app.build_surface_evidence_v160 = build_surface_evidence
     app.associate_surface_evidence_v160 = associate_with_measured_surfaces
     app.process_page_surface_evidence_v160 = process_page_surface_evidence
+    app.get_surface_evidence_diagnostics_v160 = get_surface_evidence_diagnostics_v160
