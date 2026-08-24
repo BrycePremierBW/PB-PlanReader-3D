@@ -781,6 +781,7 @@ def resolve_height(
     allow_floor_to_floor: bool = True,
     wall_ref: str = "",
     side: str = "",
+    default_height: float = 2.7,
 ) -> Tuple[float, HeightEvidence]:
     """Resolve the best height from evidence, respecting type compatibility.
 
@@ -790,18 +791,19 @@ def resolve_height(
         allow_floor_to_floor: If False, reject floor-to-floor evidence.
         wall_ref: Optional wall reference for context logging.
         side: Optional building side for context logging.
+        default_height: Project-configured default wall height (metres).
 
     Returns:
         (height_m, best_evidence) — always returns a valid height.
     """
     if not evidence_list:
-        return 2.7, HeightEvidence(
+        return round(default_height, 4), HeightEvidence(
             id="", source_page_id=0, source_page_label="",
             height_type="generic", raw_text="project default",
-            height_m=2.7, extraction_method="default",
+            height_m=default_height, extraction_method="default",
             confidence=0.50, confidence_reason="No height evidence available",
             status="Default/fallback",
-            evidence=["Project default 2.7 m — no measured evidence"],
+            evidence=[f"Project default {default_height:.1f} m — no measured evidence"],
         )
 
     compatible: List[HeightEvidence] = []
@@ -823,14 +825,16 @@ def resolve_height(
     if not compatible:
         default_ev = HeightEvidence(
             id="", source_page_id=0, source_page_label="",
-            height_type="generic", raw_text="project default (no compatible evidence)",
-            height_m=2.7, extraction_method="default",
+            height_type="generic",
+            raw_text="project default (no compatible evidence)",
+            height_m=default_height, extraction_method="default",
             confidence=0.50,
             confidence_reason=f"No compatible evidence for {target_type}",
             status="Default/fallback",
-            evidence=[f"Project default 2.7 m — no evidence compatible with {target_type}"],
+            evidence=[f"Project default {default_height:.1f} m — "
+                      f"no evidence compatible with {target_type}"],
         )
-        return 2.7, default_ev
+        return round(default_height, 4), default_ev
 
     compatible.sort(key=lambda e: (e.priority, -e.confidence))
     best = compatible[0]
@@ -1007,6 +1011,17 @@ def get_default_height(app: Any, workspace_id: int) -> float:
         return 2.7
 
 
+def _get_room_heights(app: Any, workspace_id: int) -> Dict[str, Dict[str, Any]]:
+    """Retrieve stored per-room height map."""
+    try:
+        raw = app.workspace_setting(
+            int(workspace_id), "room_heights_v150", "{}",
+        )
+        return json.loads(str(raw or "{}"))
+    except Exception:
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # Startup wiring — patches v136 to use enhanced resolver
 # ---------------------------------------------------------------------------
@@ -1026,7 +1041,10 @@ def apply(app: Any) -> None:
 
     def _enhanced_solve(text: Any, default_height: float = 2.7) -> Dict[str, Any]:
         ev_list = extract_all_height_evidence(str(text or ""))
-        h, best = resolve_height(ev_list, target_type="generic")
+        h, best = resolve_height(
+            ev_list, target_type="generic",
+            default_height=default_height,
+        )
         # v150 is authoritative — NEVER resurrect old v136 RL/dimension results.
         # Build result from v150 exclusively.
         result: Dict[str, Any] = {
@@ -1155,6 +1173,7 @@ def apply(app: Any) -> None:
             h, best = resolve_height(
                 side_ev, target_type="generic",
                 allow_floor_to_floor=True, side=side,
+                default_height=default,
             )
             profiles.append({
                 "side": side,
@@ -1170,7 +1189,63 @@ def apply(app: Any) -> None:
                 "height_evidence_id": best.id,
             })
 
-        payload = {"version": VERSION, "profiles": profiles}
+        # --- BLOCKER 2: resolve per-room heights from Priority 2 polygons ---
+        room_height_map: Dict[str, Dict[str, Any]] = {}
+        try:
+            import pb_room_face_takeoff as _rft
+            for pid, page in pages.items():
+                page_type = str(page.get("page_type") or "").lower()
+                if "floor" not in page_type and "partition" not in page_type:
+                    continue
+                try:
+                    room_faces = _rft.extract_room_faces_from_page(app_obj, page)
+                    if not room_faces:
+                        continue
+                    # Convert RoomFace → dict format expected by resolve_room_heights
+                    rooms_for_resolver = []
+                    for rf in room_faces:
+                        rooms_for_resolver.append({
+                            "label": rf.label or rf.room_ref,
+                            "room_ref": rf.room_ref,
+                            "polygon": rf.polygon_pdf_pts,
+                        })
+                    # Get evidence for this page
+                    words = _page_words.get(pid)
+                    if words:
+                        page_ev = extract_all_height_evidence(
+                            words, page_id=pid,
+                            page_label=str(page.get("page_label") or ""),
+                            page_type=str(page.get("page_type") or ""),
+                        )
+                    else:
+                        page_ev = extract_all_height_evidence(
+                            str(page.get("extracted_text") or ""),
+                            page_id=pid,
+                            page_label=str(page.get("page_label") or ""),
+                            page_type=str(page.get("page_type") or ""),
+                        )
+                    resolved = resolve_room_heights(
+                        rooms_for_resolver, page_ev,
+                        default_height=default,
+                    )
+                    room_height_map.update(resolved)
+                except Exception:
+                    continue  # don't break production if room height resolution fails
+        except ImportError:
+            pass  # room_face_takeoff not available
+
+        # Store room height map for downstream consumers
+        if room_height_map:
+            app_obj.set_workspace_setting(
+                int(workspace_id), "room_heights_v150",
+                json.dumps(room_height_map, separators=(",", ":")),
+            )
+
+        payload = {
+            "version": VERSION,
+            "profiles": profiles,
+            "room_heights": room_height_map,
+        }
         app_obj.set_workspace_setting(
             int(workspace_id), "elevation_profiles_v136",
             json.dumps(payload, separators=(",", ":")),
@@ -1189,3 +1264,4 @@ def apply(app: Any) -> None:
         app, int(wid), records,
     )
     app.extract_section_heights_v150 = _extract_section_heights
+    app.get_room_heights_v150 = lambda wid: _get_room_heights(app, int(wid))

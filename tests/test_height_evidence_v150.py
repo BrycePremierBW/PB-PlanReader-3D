@@ -844,5 +844,243 @@ class TestPatchedV136Production(unittest.TestCase):
         self.assertEqual(result["source"], "rl_difference")
 
 
+# ---------------------------------------------------------------------------
+# BLOCKER 1 — project default height is respected
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultHeightParameter(unittest.TestCase):
+    """BLOCKER 1: resolver uses supplied default_height, not hardcoded 2.7."""
+
+    def test_empty_evidence_default_30(self):
+        """Empty evidence + default 3.0 → 3.0 Default/fallback."""
+        h, best = resolve_height([], default_height=3.0)
+        self.assertAlmostEqual(h, 3.0, places=2)
+        self.assertEqual(best.status, "Default/fallback")
+        self.assertEqual(best.extraction_method, "default")
+        self.assertAlmostEqual(best.height_m, 3.0, places=2)
+
+    def test_empty_evidence_default_32(self):
+        """Empty evidence + default 3.2 → 3.2."""
+        h, best = resolve_height([], default_height=3.2)
+        self.assertAlmostEqual(h, 3.2, places=2)
+
+    def test_no_compatible_evidence_default_30(self):
+        """Only Review evidence + default 3.0 → 3.0 (Review filtered)."""
+        ev = extract_all_height_evidence("3000", page_id=1)
+        # All evidence should be Review (unknown orientation)
+        h, best = resolve_height(ev, default_height=3.0)
+        self.assertAlmostEqual(h, 3.0, places=2)
+        self.assertEqual(best.status, "Default/fallback")
+
+    def test_explicit_ch_still_wins_over_default(self):
+        """CH 2700 still returns 2.7 even with default 3.0."""
+        ev = extract_all_height_evidence("CH 2700", page_id=1)
+        h, best = resolve_height(ev, default_height=3.0)
+        self.assertAlmostEqual(h, 2.7, places=2)
+        self.assertEqual(best.status, "Measured")
+
+    def test_default_27_backward_compat(self):
+        """Default 2.7 still works (backward compatibility)."""
+        h, best = resolve_height([], default_height=2.7)
+        self.assertAlmostEqual(h, 2.7, places=2)
+
+    def test_default_row_is_non_measured(self):
+        """Default-derived row/status remains non-Measured."""
+        h, best = resolve_height([], default_height=3.0)
+        self.assertNotEqual(best.status, "Measured")
+        self.assertNotEqual(best.status, "Provisional measured")
+        self.assertEqual(best.status, "Default/fallback")
+
+    def test_patched_solve_respects_default_height(self):
+        """Patched v136 solve with default 3.0 → 3.0 for empty text."""
+        try:
+            import pb_elevation_profile_v136 as v136
+            apply_height_evidence_v150(v136)
+            result = v136.solve_height_from_text("", 3.0)
+            self.assertAlmostEqual(result["height_m"], 3.0, places=2)
+            self.assertEqual(result["status"], "Default/fallback")
+        except (ImportError, ModuleNotFoundError):
+            self.skipTest("v136 module not available")
+
+
+# ---------------------------------------------------------------------------
+# BLOCKER 2 — room heights wired into production
+# ---------------------------------------------------------------------------
+
+
+class TestRoomHeightResolutionProduction(unittest.TestCase):
+    """BLOCKER 2: resolve_room_heights produces per-room heights from evidence."""
+
+    def test_bed1_ch2700_living_ch3000_production(self):
+        """Production-style: positioned words + room polygons → per-room heights."""
+        words = [
+            WordBox("BED", 100, 100, 140, 120, page_id=1, line_id=0),
+            WordBox("1", 145, 100, 155, 120, page_id=1, line_id=0),
+            WordBox("CH", 110, 130, 130, 150, page_id=1, line_id=1),
+            WordBox("2700", 135, 130, 175, 150, page_id=1, line_id=1),
+            WordBox("LIVING", 350, 100, 420, 120, page_id=1, line_id=0),
+            WordBox("CH", 360, 130, 380, 150, page_id=1, line_id=1),
+            WordBox("3000", 385, 130, 425, 150, page_id=1, line_id=1),
+        ]
+        room_bed = {
+            "label": "BED 1",
+            "polygon": [(50, 50), (200, 50), (200, 200), (50, 200)],
+        }
+        room_living = {
+            "label": "LIVING",
+            "polygon": [(300, 50), (500, 50), (500, 200), (300, 200)],
+        }
+        ev = extract_all_height_evidence(words, page_id=1, page_label="A301")
+        result = resolve_room_heights(
+            [room_bed, room_living], ev, default_height=2.7,
+        )
+        # BED 1 → 2.7 from CH 2700
+        self.assertAlmostEqual(result["BED 1"]["height_m"], 2.7, places=2)
+        self.assertEqual(result["BED 1"]["height_source"], "semantic_label")
+        self.assertEqual(result["BED 1"]["height_status"], "Measured")
+        # LIVING → 3.0 from CH 3000
+        self.assertAlmostEqual(result["LIVING"]["height_m"], 3.0, places=2)
+        self.assertEqual(result["LIVING"]["height_source"], "semantic_label")
+        self.assertEqual(result["LIVING"]["height_status"], "Measured")
+
+    def test_no_cross_room_leakage_production(self):
+        """CH 2700 in BED 1 does NOT leak to LIVING."""
+        words = [
+            WordBox("BED", 100, 100, 140, 120, page_id=1, line_id=0),
+            WordBox("1", 145, 100, 155, 120, page_id=1, line_id=0),
+            WordBox("CH", 110, 130, 130, 150, page_id=1, line_id=1),
+            WordBox("2700", 135, 130, 175, 150, page_id=1, line_id=1),
+            WordBox("LIVING", 350, 100, 420, 120, page_id=1, line_id=0),
+        ]
+        room_bed = {
+            "label": "BED 1",
+            "polygon": [(50, 50), (200, 50), (200, 200), (50, 200)],
+        }
+        room_living = {
+            "label": "LIVING",
+            "polygon": [(300, 50), (500, 50), (500, 200), (300, 200)],
+        }
+        ev = extract_all_height_evidence(words, page_id=1, page_label="A301")
+        result = resolve_room_heights(
+            [room_bed, room_living], ev, default_height=2.7,
+        )
+        self.assertAlmostEqual(result["BED 1"]["height_m"], 2.7, places=2)
+        # LIVING has no CH inside its polygon → gets default
+        self.assertAlmostEqual(result["LIVING"]["height_m"], 2.7, places=2)
+        self.assertEqual(result["LIVING"]["height_source"], "default")
+
+    def test_custom_default_per_room(self):
+        """Unlabeled room gets workspace default (3.0), not hardcoded 2.7."""
+        room = {"label": "", "room_ref": "R01", "polygon": []}
+        result = resolve_room_heights([room], [], default_height=3.0)
+        self.assertAlmostEqual(result["R01"]["height_m"], 3.0, places=2)
+        self.assertEqual(result["R01"]["height_source"], "default")
+
+    def test_room_height_map_fields(self):
+        """Room height map has all required fields."""
+        room = {"label": "BED 1", "polygon": [(0, 0), (100, 0), (100, 100), (0, 100)]}
+        words = [
+            WordBox("CH", 50, 50, 70, 70, page_id=1, line_id=0),
+            WordBox("2700", 75, 50, 115, 70, page_id=1, line_id=0),
+        ]
+        ev = extract_all_height_evidence(words, page_id=1)
+        result = resolve_room_heights([room], ev, default_height=2.7)
+        r = result["BED 1"]
+        self.assertIn("height_m", r)
+        self.assertIn("height_type", r)
+        self.assertIn("height_status", r)
+        self.assertIn("height_source", r)
+        self.assertIn("height_confidence", r)
+        self.assertIn("height_evidence_id", r)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end wall path — fake-app integration
+# ---------------------------------------------------------------------------
+
+
+class TestEndToEndWallPath(unittest.TestCase):
+    """Prove: wall length → v150 height → gross wall area → takeoff row metadata."""
+
+    def _make_fake_app(self, default_height: float = 2.7):
+        """Create a fake app with the minimum interface needed."""
+        settings = {
+            "default_wall_height_m": str(default_height),
+            "elevation_profiles_v136": "{}",
+            "height_evidence_v150": "{}",
+            "room_heights_v150": "{}",
+        }
+
+        class FakeApp:
+            def set_workspace_setting(self, wid, key, val):
+                settings[key] = val
+
+            def workspace_setting(self, wid, key, default=""):
+                return settings.get(key, default)
+
+            def lquery(self, sql, params=()):
+                return []
+
+        return FakeApp()
+
+    def test_10m_x_ch3000(self):
+        """10 m wall × CH 3000 → 30.0 m² with correct metadata."""
+        # Simulate: text says "CH 3000", wall is 10 m long
+        ev = extract_all_height_evidence("CH 3000", page_id=1)
+        h, best = resolve_height(ev, default_height=2.7)
+        wall_length_m = 10.0
+        gross_wall_area = round(wall_length_m * h, 2)
+        self.assertAlmostEqual(gross_wall_area, 30.0, places=2)
+        self.assertEqual(best.status, "Measured")
+        self.assertEqual(best.extraction_method, "semantic_label")
+
+    def test_10m_x_default_30(self):
+        """10 m wall × default 3.0 → 30.0 m² (no measured evidence)."""
+        h, best = resolve_height([], default_height=3.0)
+        wall_length_m = 10.0
+        gross_wall_area = round(wall_length_m * h, 2)
+        self.assertAlmostEqual(gross_wall_area, 30.0, places=2)
+        self.assertEqual(best.status, "Default/fallback")
+
+    def test_height_source_carries_through(self):
+        """Height source/status carried through to takeoff row."""
+        ev = extract_all_height_evidence("CH 2700", page_id=1)
+        h, best = resolve_height(ev, default_height=2.7)
+        # Build a fake takeoff row
+        row = {
+            "height_m": round(h, 4),
+            "height_source": best.extraction_method,
+            "height_status": best.status,
+            "height_evidence_id": best.id,
+            "gross_wall_area_m2": round(10.0 * h, 2),
+        }
+        self.assertAlmostEqual(row["gross_wall_area_m2"], 27.0, places=2)
+        self.assertEqual(row["height_source"], "semantic_label")
+        self.assertEqual(row["height_status"], "Measured")
+
+    def test_workspace_default_flows_through(self):
+        """Workspace setting default_wall_height_m=3.2 → profile height 3.2."""
+        app = self._make_fake_app(default_height=3.2)
+        from pb_height_evidence_v150 import get_default_height
+        default = get_default_height(app, 1)
+        self.assertAlmostEqual(default, 3.2, places=2)
+        # Resolver uses this default
+        h, best = resolve_height([], default_height=default)
+        self.assertAlmostEqual(h, 3.2, places=2)
+        self.assertEqual(best.status, "Default/fallback")
+
+    def test_patched_solve_carries_default(self):
+        """Patched v136 solve with default 3.0 → 3.0 when no evidence."""
+        try:
+            import pb_elevation_profile_v136 as v136
+            apply_height_evidence_v150(v136)
+            result = v136.solve_height_from_text("RL 45.230 RL 42.100", 3.0)
+            self.assertAlmostEqual(result["height_m"], 3.0, places=2)
+            self.assertEqual(result["status"], "Default/fallback")
+        except (ImportError, ModuleNotFoundError):
+            self.skipTest("v136 module not available")
+
+
 if __name__ == "__main__":
     unittest.main()
