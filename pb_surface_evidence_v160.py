@@ -175,6 +175,28 @@ class SurfaceEvidence:
 
 
 @dataclass
+class HatchDiagnostics:
+    """Hatch-stage diagnostics nested inside SurfaceProcessingDiagnostics.
+
+    Separated so that adding hatch fields does not change B1 field positions
+    in persisted JSON.  Constructed with ``**parsed`` which is backward-
+    compatible because every field has a default.
+    """
+
+    strokes_extracted: int = 0
+    clusters_found: int = 0
+    clusters_rejected: int = 0
+    regions_reconstructed: int = 0
+    low_confidence_regions: int = 0
+    associated: int = 0
+    unassociated: int = 0
+    extraction_error: str = ""   # empty = no error
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {k: v for k, v in asdict(self).items()}
+
+
+@dataclass
 class SurfaceProcessingDiagnostics:
     """Structured diagnostics for one page's surface processing pipeline.
 
@@ -199,8 +221,22 @@ class SurfaceProcessingDiagnostics:
     storage_ok: bool = False
     storage_error: str = ""           # empty = no error
 
+    # B2 hatch diagnostics (nested — backward-compatible via default)
+    hatch_diag: HatchDiagnostics = field(default_factory=HatchDiagnostics)
+
+    def __post_init__(self):
+        """Ensure nested hatch_diag is always a HatchDiagnostics instance."""
+        if isinstance(self.hatch_diag, dict):
+            self.hatch_diag = HatchDiagnostics(**self.hatch_diag)
+
     def to_dict(self) -> Dict[str, Any]:
-        return {k: v for k, v in asdict(self).items()}
+        d = {k: v for k, v in asdict(self).items()}
+        # Ensure nested hatch_diag serialises cleanly
+        if isinstance(d.get("hatch_diag"), dict):
+            pass  # asdict already flattened it
+        elif hasattr(self.hatch_diag, "to_dict"):
+            d["hatch_diag"] = self.hatch_diag.to_dict()
+        return d
 
 
 @dataclass
@@ -1296,12 +1332,32 @@ def process_page_surface_evidence(
 
     try:
         # ------------------------------------------------------------------
-        # Step 3: Extract filled polygons
+        # Step 3: Extract filled polygons + hatch strokes
         # ------------------------------------------------------------------
         fill_polygons = extract_filled_polygons(pdf_page)
         diag.fills_extracted_count = len(fill_polygons)
 
-        if not fill_polygons:
+        # Hatch extraction (B2) — runs in parallel with fills
+        hatch_evidence_list: List[SurfaceEvidence] = []
+        _hatch_diag_data: Dict[str, Any] = {}
+        try:
+            from pb_hatch_detection_v160 import extract_hatch_evidence
+            scale_for_hatch = page_scale_info(page_dict)
+            hatch_evidence_list = extract_hatch_evidence(
+                pdf_page, page_id=page_id, page_no=page_no,
+                page_label=page_label, workspace_id=workspace_id,
+                scale_info=scale_for_hatch,
+            )
+        except Exception as exc:
+            diag.hatch_diag.extraction_error = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        # Update hatch diagnostics
+        diag.hatch_diag.strokes_extracted = len(hatch_evidence_list)
+        diag.hatch_diag.regions_reconstructed = len(hatch_evidence_list)
+
+        if not fill_polygons and not hatch_evidence_list:
             return SurfaceProcessingResult(
                 diagnostics=diag, status="no_fills",
             )
@@ -1318,6 +1374,10 @@ def process_page_surface_evidence(
             workspace_id=workspace_id,
             scale_info=scale,
         )
+
+        # Append hatch evidence (B2) — these carry their own surface_ids
+        # and were already calibrated inside extract_hatch_evidence.
+        evidence_list.extend(hatch_evidence_list)
 
         # ------------------------------------------------------------------
         # Step 5: Extract positioned finish codes via get_text("words")
@@ -1403,13 +1463,17 @@ def process_page_surface_evidence(
 
         # ------------------------------------------------------------------
         # Accuracy-status requirement:
-        # If fills were extracted but measured-surface extraction failed,
-        # evidence must NOT look like a normal successful unassociated result.
+        # If fills or hatches were extracted but measured-surface extraction
+        # failed, evidence must NOT look like a normal successful result.
         # ------------------------------------------------------------------
         measured_extraction_failed = bool(
             diag.room_extraction_error or diag.wall_extraction_error
         )
-        if measured_extraction_failed and diag.fills_extracted_count > 0:
+        has_any_geometry = (
+            diag.fills_extracted_count > 0
+            or diag.hatch_diag.regions_reconstructed > 0
+        )
+        if measured_extraction_failed and has_any_geometry:
             for sev in evidence_list:
                 if not sev.association_method or sev.association_method == "none":
                     sev.status = "needs_check"
@@ -1445,6 +1509,15 @@ def process_page_surface_evidence(
                         f"Text-only codes on page (no spatial position): "
                         + ", ".join(codes_found)
                     )
+
+        # Update hatch association diagnostics
+        if hatch_evidence_list:
+            hatch_associated = sum(
+                1 for ev in hatch_evidence_list
+                if ev.association_method and ev.association_method != "none"
+            )
+            diag.hatch_diag.associated = hatch_associated
+            diag.hatch_diag.unassociated = len(hatch_evidence_list) - hatch_associated
 
         # ------------------------------------------------------------------
         # Step 8: Store results via app.set_workspace_setting()
