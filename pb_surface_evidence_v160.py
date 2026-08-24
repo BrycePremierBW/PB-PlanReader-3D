@@ -66,6 +66,7 @@ class FillPolygon:
     drawing_index: int = 0
     layer: str = ""
     item_types: Tuple[str, ...] = ()  # e.g. ("re",), ("l","l","l"), ("qu",)
+    geometry_method: str = "native_rectangle"  # native_rectangle/native_quad/closed_line_path/bbox_fallback
 
     @property
     def bbox(self) -> Tuple[float, float, float, float]:
@@ -78,8 +79,8 @@ class FillPolygon:
 
     @property
     def area_page_pts2(self) -> float:
-        """Signed area in PDF points squared (Shoelace formula)."""
-        return _shoelace_area(self.vertices)
+        """Absolute area in PDF points squared (non-negative regardless of winding)."""
+        return abs(_shoelace_area(self.vertices))
 
     @property
     def centroid(self) -> Tuple[float, float]:
@@ -123,6 +124,7 @@ class SurfaceEvidence:
 
     # Raw geometry evidence (from PDF)
     source_geometry_type: str = ""  # "filled_polygon", "fill_only", "fill_stroke"
+    geometry_method: str = ""       # native_rectangle/native_quad/closed_line_path/bbox_fallback
     polygon_pdf_pts: Tuple[Tuple[float, float], ...] = ()
     bbox: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     fill_colour: Optional[Tuple[float, float, float]] = None
@@ -207,6 +209,61 @@ def _point_in_polygon(px: float, py: float, polygon: Sequence[Tuple[float, float
             inside = not inside
         j = i
     return inside
+
+
+def _all_vertices_inside(
+    inner: Sequence[Tuple[float, float]],
+    outer: Sequence[Tuple[float, float]],
+) -> bool:
+    """Deterministic check: are ALL vertices of inner polygon inside outer?"""
+    return all(_point_in_polygon(px, py, outer) for px, py in inner)
+
+
+def _edges_cross_outside(
+    inner: Sequence[Tuple[float, float]],
+    outer: Sequence[Tuple[float, float]],
+    sample_count_per_edge: int = 5,
+) -> bool:
+    """Check if any edge of inner polygon crosses outside outer polygon.
+
+    Samples intermediate points along each edge and tests containment.
+    This catches cases where vertices are inside but edges bulge outside
+    (e.g., a rectangle with a protrusion).
+    """
+    n = len(inner)
+    if n < 3:
+        return False
+    for i in range(n):
+        x1, y1 = inner[i]
+        x2, y2 = inner[(i + 1) % n]
+        for k in range(1, sample_count_per_edge):
+            t = k / sample_count_per_edge
+            sx = x1 + t * (x2 - x1)
+            sy = y1 + t * (y2 - y1)
+            if not _point_in_polygon(sx, sy, outer):
+                return True
+    return False
+
+
+def _deterministic_containment(
+    inner: Sequence[Tuple[float, float]],
+    outer: Sequence[Tuple[float, float]],
+) -> bool:
+    """Deterministic full-containment test.
+
+    Returns True only if:
+      1. All vertices of inner are inside outer, AND
+      2. No edge of inner crosses outside outer (edge sampling).
+
+    This is strict — a rectangle with a small protrusion will NOT pass.
+    """
+    if not inner or not outer:
+        return False
+    if not _all_vertices_inside(inner, outer):
+        return False
+    if _edges_cross_outside(inner, outer):
+        return False
+    return True
 
 
 def _polygon_overlap_ratio(
@@ -482,6 +539,7 @@ def extract_filled_polygons(pdf_page: Any) -> List[FillPolygon]:
                 drawing_index=draw_idx,
                 layer=layer,
                 item_types=kinds,
+                geometry_method="native_rectangle",
             ))
 
         # Case 2: Single quad with fill
@@ -501,6 +559,7 @@ def extract_filled_polygons(pdf_page: Any) -> List[FillPolygon]:
                 drawing_index=draw_idx,
                 layer=layer,
                 item_types=kinds,
+                geometry_method="native_quad",
             ))
 
         # Case 3: Sequence of 'l' items forming a closed path with fill
@@ -519,18 +578,18 @@ def extract_filled_polygons(pdf_page: Any) -> List[FillPolygon]:
                     drawing_index=draw_idx,
                     layer=layer,
                     item_types=kinds,
+                    geometry_method="closed_line_path",
                 ))
 
         # Case 4: Mixed items or curves with fill -> Review (deferred)
-        # Only emit for drawings that have non-line items (curves, quads)
+        # Emit bbox fallback for drawings with curves, or mixed item types.
         # Pure line items that didn't close are open paths — skip them.
         elif fill is not None:
-            non_line_kinds = [k for k in kinds if k not in ("l",)]
             has_curves = any(k == "c" for k in kinds)
-            has_quads = any(k == "qu" for k in kinds)
-            # Only emit bbox fallback if there are curves, quads, or rects
-            # Pure unmatched line items = open path -> skip
-            if not non_line_kinds:
+            has_non_l = any(k != "l" for k in kinds)
+            # Emit bbox fallback if there are curves, or mixed (non-homogeneous) items
+            if not has_non_l:
+                # All items are lines but didn't form closed path -> open path, skip
                 continue
             all_pts: List[Tuple[float, float]] = []
             for it in items:
@@ -550,6 +609,12 @@ def extract_filled_polygons(pdf_page: Any) -> List[FillPolygon]:
                         all_pts.append(p1)
                     if p2:
                         all_pts.append(p2)
+                elif it[0] == "c":
+                    # Bezier curve: extract all 4 control points for bbox
+                    for idx in range(1, 5):
+                        pt = _extract_point(it, idx)
+                        if pt:
+                            all_pts.append(pt)
             if all_pts:
                 xs = [p[0] for p in all_pts]
                 ys = [p[1] for p in all_pts]
@@ -571,6 +636,7 @@ def extract_filled_polygons(pdf_page: Any) -> List[FillPolygon]:
                     drawing_index=draw_idx,
                     layer=layer,
                     item_types=kinds,
+                    geometry_method="bbox_fallback",
                 ))
 
     return results
@@ -690,10 +756,10 @@ def associate_surface_to_target(
 ) -> AssociationResult:
     """Associate a fill polygon with a measured geometry target.
 
-    Uses the hierarchy:
-      1. Full containment (100% of fill inside target) -> strongest
-      2. Majority overlap (>50% of fill inside target) -> strong
-      3. Significant intersection (>20%) -> moderate
+    Uses a strict hierarchy:
+      1. Deterministic full containment (all vertices + no edge crossings) -> strongest
+      2. Sampled majority overlap (>50%) -> strong
+      3. Sampled significant intersection (>20%) -> moderate
       4. Centroid containment -> moderate
       5. Proximity (centroid within threshold) -> weak / Review
 
@@ -709,40 +775,48 @@ def associate_surface_to_target(
 
     evidence_parts: List[str] = []
 
-    # Compute what fraction of fill polygon is inside target
+    # Method 1: Deterministic full containment
+    # Requires all vertices inside AND no edge crossings.
+    # A rectangle with a small protrusion will NOT pass this test.
+    is_deterministic_containment = _deterministic_containment(fill_verts, target_polygon)
+
+    # Sampled overlap (for non-containment classification)
     overlap = _polygon_overlap_ratio(fill_verts, target_polygon)
 
-    # Compute intersection area for additional signal
-    fill_area = polygon_area_abs(fill_verts)
-    target_area = polygon_area_abs(target_polygon)
+    # Cap max confidence for bbox_fallback geometry — it can never look authoritative
+    is_bbox_fallback = fill_polygon.geometry_method == "bbox_fallback"
+    max_geo_confidence = 0.40 if is_bbox_fallback else 1.0
 
-    # Method 1: Full containment (>95% overlap — allow for sampling noise)
-    if overlap >= 0.95:
-        evidence_parts.append(f"Fill fully contained in target ({overlap:.0%} overlap)")
+    if is_deterministic_containment:
+        evidence_parts.append(
+            "All fill vertices inside target, no edge crossings (deterministic containment)"
+        )
         return AssociationResult(
             target_type=target_type, target_ref=target_ref,
             method="containment", overlap_ratio=overlap,
-            confidence=0.95,
+            confidence=min(0.95, max_geo_confidence),
             evidence=evidence_parts,
         )
 
-    # Method 2: Majority overlap (>50%)
+    # Method 2: Majority overlap (>50%) — sampled
     if overlap >= 0.50:
-        evidence_parts.append(f"Majority overlap ({overlap:.0%} of fill inside target)")
+        base_conf = 0.75 + 0.20 * (overlap - 0.50)  # 0.75-0.95
+        evidence_parts.append(f"Majority overlap ({overlap:.0%} of fill inside target, sampled)")
         return AssociationResult(
             target_type=target_type, target_ref=target_ref,
             method="majority_overlap", overlap_ratio=overlap,
-            confidence=0.75 + 0.20 * (overlap - 0.50),  # 0.75-0.95
+            confidence=min(base_conf, max_geo_confidence),
             evidence=evidence_parts,
         )
 
-    # Method 3: Significant intersection (>20%)
+    # Method 3: Significant intersection (>20%) — sampled
     if overlap >= 0.20:
-        evidence_parts.append(f"Partial intersection ({overlap:.0%} overlap)")
+        base_conf = 0.50 + 0.25 * (overlap - 0.20)  # 0.50-0.75
+        evidence_parts.append(f"Partial intersection ({overlap:.0%} overlap, sampled)")
         return AssociationResult(
             target_type=target_type, target_ref=target_ref,
             method="intersection", overlap_ratio=overlap,
-            confidence=0.50 + 0.25 * (overlap - 0.20),  # 0.50-0.75
+            confidence=min(base_conf, max_geo_confidence),
             evidence=evidence_parts,
         )
 
@@ -753,7 +827,7 @@ def associate_surface_to_target(
         return AssociationResult(
             target_type=target_type, target_ref=target_ref,
             method="centroid", overlap_ratio=overlap,
-            confidence=0.40,
+            confidence=min(0.40, max_geo_confidence),
             evidence=evidence_parts,
         )
 
@@ -767,7 +841,7 @@ def associate_surface_to_target(
         return AssociationResult(
             target_type=target_type, target_ref=target_ref,
             method="proximity", overlap_ratio=overlap,
-            confidence=conf,
+            confidence=min(conf, max_geo_confidence),
             evidence=evidence_parts,
         )
 
@@ -836,11 +910,28 @@ def build_surface_evidence(
     """Convert extracted FillPolygons into SurfaceEvidence records.
 
     Applies calibration if scale_info is provided.
+    Bbox-fallback records get low confidence and area_m2=None.
     """
+    # Confidence by geometry extraction method
+    _METHOD_CONFIDENCE = {
+        "native_rectangle": 0.90,
+        "native_quad": 0.85,
+        "closed_line_path": 0.80,
+        "bbox_fallback": 0.30,
+    }
+
     results = []
     for idx, fp in enumerate(fill_polygons):
         area_pts2 = fp.area_page_pts2
-        area_m2 = calibrate_area_m2(fp.vertices, scale_info) if scale_info else None
+        is_bbox_fallback = fp.geometry_method == "bbox_fallback"
+
+        # Bbox fallback: never trust the area as real fill area
+        if is_bbox_fallback:
+            area_m2 = None
+        elif scale_info:
+            area_m2 = calibrate_area_m2(fp.vertices, scale_info)
+        else:
+            area_m2 = None
 
         # Determine source_geometry_type
         has_fill = fp.fill is not None
@@ -852,14 +943,11 @@ def build_surface_evidence(
         else:
             geom_type = "stroke_only"
 
-        # Geometry confidence based on polygon quality
-        n_verts = len(fp.vertices)
-        if n_verts >= 3 and fp.close_path:
-            geo_conf = 0.90
-        elif n_verts >= 3:
-            geo_conf = 0.75
-        else:
-            geo_conf = 0.50
+        # Geometry confidence based on extraction method
+        geo_conf = _METHOD_CONFIDENCE.get(fp.geometry_method, 0.50)
+
+        # Status: bbox_fallback always needs check
+        status = "needs_check" if is_bbox_fallback else "unreviewed"
 
         surface_id = f"page_{page_id}:fill_{idx}" if page_id else f"fill_{idx}"
 
@@ -870,6 +958,7 @@ def build_surface_evidence(
             page_label=page_label,
             surface_id=surface_id,
             source_geometry_type=geom_type,
+            geometry_method=fp.geometry_method,
             polygon_pdf_pts=fp.vertices,
             bbox=fp.bbox,
             fill_colour=fp.fill,
@@ -881,8 +970,8 @@ def build_surface_evidence(
             area_page_pts2=area_pts2,
             area_m2=area_m2,
             geometry_confidence=geo_conf,
-            status="unreviewed",
-            evidence=[f"Extracted from drawing {fp.drawing_index}, items={fp.item_types}"],
+            status=status,
+            evidence=[f"Extracted from drawing {fp.drawing_index}, method={fp.geometry_method}, items={fp.item_types}"],
         )
         results.append(ev)
 
@@ -932,7 +1021,7 @@ def associate_with_measured_surfaces(
             target_verts = tuple((float(p[0]), float(p[1])) for p in target_poly)
 
             result = associate_surface_to_target(
-                FillPolygon(vertices=sev.polygon_pdf_pts),
+                FillPolygon(vertices=sev.polygon_pdf_pts, geometry_method=sev.geometry_method),
                 target_verts,
                 target_type=target.get("type", ""),
                 target_ref=target.get("ref", ""),
@@ -956,46 +1045,247 @@ def associate_with_measured_surfaces(
             else:
                 sev.status = "needs_check"
 
-    # Phase 2: code association
+    # Phase 2: code association (deduplicate by normalised code)
     if code_occurrences:
         for sev in evidence_list:
             if not sev.polygon_pdf_pts:
                 continue
-            fp = FillPolygon(vertices=sev.polygon_pdf_pts, fill=sev.fill_colour)
-            associated_codes: List[str] = []
+            fp = FillPolygon(vertices=sev.polygon_pdf_pts, fill=sev.fill_colour, geometry_method=sev.geometry_method)
+            associated_raw: List[str] = []
             for code_occ in code_occurrences:
                 code_bbox = code_occ.get("bbox")
                 if not code_bbox:
                     continue
                 result = associate_code_to_polygon(code_bbox, fp)
                 if result["associated"]:
-                    associated_codes.append(code_occ.get("code", ""))
+                    associated_raw.append(code_occ.get("code", ""))
+
+            # Deduplicate: same code in multiple positions is NOT a conflict
+            distinct_codes: List[str] = sorted({c.upper() for c in associated_raw if c})
+            occurrence_count = len(associated_raw)
 
             # Apply code evidence
-            if len(associated_codes) == 1:
-                code = associated_codes[0].upper()
+            if len(distinct_codes) == 1:
+                code = distinct_codes[0]
                 sev.finish_code = code
                 sev.semantic_confidence = 0.70  # Code present but substrate unknown
-                sev.evidence.append(f"Finish code {code} found inside polygon")
+                sev.evidence.append(
+                    f"Finish code {code} found inside polygon"
+                    + (f" ({occurrence_count} occurrences)" if occurrence_count > 1 else "")
+                )
                 if not sev.substrate:
                     sev.substrate = "To confirm"
                     sev.status = "needs_check"
-            elif len(associated_codes) > 1:
-                # Conflict: multiple codes inside same polygon
+            elif len(distinct_codes) > 1:
+                # Conflict: multiple DISTINCT codes inside same polygon
                 sev.status = "conflict"
                 sev.semantic_confidence = 0.0
-                sev.notes = f"Multiple codes found: {', '.join(associated_codes)}"
+                sev.notes = f"Multiple distinct codes found: {', '.join(distinct_codes)}"
                 sev.evidence.append(
-                    f"CONFLICT: {len(associated_codes)} codes inside polygon: "
-                    + ", ".join(associated_codes)
+                    f"CONFLICT: {len(distinct_codes)} distinct codes inside polygon: "
+                    + ", ".join(distinct_codes)
                 )
 
     return evidence_list
 
 
 # ---------------------------------------------------------------------------
-# Apply function (monkey-patch pattern)
+# Production adapter: process page through full chain and store results
 # ---------------------------------------------------------------------------
+
+def _get_measured_surfaces_for_page(
+    app: Any, page_id: int, workspace_id: int
+) -> List[Dict[str, Any]]:
+    """Retrieve existing measured surfaces (rooms/walls) for a page.
+
+    Returns list of dicts with polygon, ref, type, area_m2 — compatible
+    with associate_with_measured_surfaces() input contract.
+    """
+    surfaces: List[Dict[str, Any]] = []
+
+    # Get room face takeoff data (rooms with calibrated polygons)
+    try:
+        room_data = app.get_room_face_takeoff and app.get_room_face_takeoff()
+        if room_data:
+            for room in room_data:
+                if room.get("page_id") == page_id:
+                    poly = room.get("polygon") or room.get("calibrated_polygon")
+                    if poly:
+                        surfaces.append({
+                            "polygon": poly,
+                            "ref": room.get("room_ref") or room.get("label", ""),
+                            "type": "room",
+                            "area_m2": room.get("area_m2"),
+                        })
+    except Exception:
+        pass
+
+    # Get registered wall data
+    try:
+        wall_data = app.get_registered_walls and app.get_registered_walls()
+        if wall_data:
+            for wall in wall_data:
+                if wall.get("page_id") == page_id:
+                    # Walls may have bbox but not polygon
+                    bbox = wall.get("bbox")
+                    if bbox:
+                        x0, y0, x1, y1 = bbox
+                        surfaces.append({
+                            "bbox": [x0, y0, x1, y1],
+                            "ref": wall.get("wall_ref") or wall.get("label", ""),
+                            "type": "wall",
+                            "area_m2": wall.get("gross_m2") or wall.get("area_m2"),
+                        })
+    except Exception:
+        pass
+
+    # Get takeoff rows as fallback measured surfaces
+    try:
+        rows = app.lexecute(
+            "SELECT id, location, substrate, quantity, unit, notes "
+            "FROM takeoff_rows WHERE workspace_id=? AND source_page=?",
+            (workspace_id, page_id),
+        )
+        if rows:
+            for row in rows:
+                # Only include rows that have an associated polygon in notes
+                # (e.g., from room face takeoff or floor mapper)
+                surfaces.append({
+                    "ref": row[1] or "",
+                    "type": "takeoff_row",
+                    "area_m2": row[3] if row[4] == "m²" else None,
+                })
+    except Exception:
+        pass
+
+    return surfaces
+
+
+def process_page_surface_evidence(
+    app: Any,
+    page_id: int,
+    workspace_id: int,
+) -> List[SurfaceEvidence]:
+    """Production adapter: process one page through the full SurfaceEvidence chain.
+
+    Steps:
+      1. Retrieve the PDF page object from the database
+      2. Extract filled polygons via get_drawings()
+      3. Build SurfaceEvidence with page calibration
+      4. Extract positioned finish codes from page text
+      5. Retrieve existing measured surfaces for this page
+      6. Associate SurfaceEvidence with measured surfaces
+      7. Store results in workspace settings
+      8. Return evidence list
+
+    This is the narrow production integration. It does NOT rewrite the
+    takeoff pipeline — it only adds classification metadata.
+    """
+    import json
+
+    # Step 1: Get page data and PDF object
+    try:
+        pages = app.lexecute(
+            "SELECT id, page_no, label, px_per_m, render_zoom, scale_text "
+            "FROM pages WHERE id=?", (page_id,)
+        )
+        if not pages:
+            return []
+        page_row = pages[0]
+    except Exception:
+        return []
+
+    page_dict = {
+        "id": page_row[0],
+        "page_no": page_row[1],
+        "label": page_row[2] or "",
+        "px_per_m": page_row[3],
+        "render_zoom": page_row[4],
+        "scale_text": page_row[5] or "",
+    }
+    page_no = page_dict["page_no"]
+    page_label = page_dict["label"]
+
+    # Step 2: Get PDF page object (PyMuPDF)
+    pdf_page = None
+    try:
+        if hasattr(app, "get_pdf_page"):
+            pdf_page = app.get_pdf_page(page_id)
+        elif hasattr(app, "lexecute"):
+            blobs = app.lexecute(
+                "SELECT pdf_blob FROM pages WHERE id=?", (page_id,)
+            )
+            if blobs and blobs[0][0]:
+                import fitz
+                doc = fitz.open(stream=blobs[0][0], filetype="pdf")
+                pdf_page = doc[0]
+    except Exception:
+        pass
+
+    if pdf_page is None:
+        return []
+
+    # Step 3: Extract filled polygons
+    fill_polygons = extract_filled_polygons(pdf_page)
+
+    # Step 4: Build SurfaceEvidence with calibration
+    scale = page_scale_info(page_dict)
+    evidence_list = build_surface_evidence(
+        fill_polygons,
+        page_id=page_id,
+        page_no=page_no,
+        page_label=page_label,
+        workspace_id=workspace_id,
+        scale_info=scale,
+    )
+
+    # Step 5: Extract positioned finish codes from page text
+    code_occurrences: List[Dict[str, Any]] = []
+    try:
+        if hasattr(pdf_page, "get_text"):
+            text = pdf_page.get_text("text") or ""
+            code_occurrences = extract_finish_codes_from_text(
+                text, page_id=page_id, page_no=page_no, page_label=page_label
+            )
+    except Exception:
+        pass
+
+    # Also try positioned word extraction
+    try:
+        if hasattr(app, "extract_words_with_positions"):
+            words = app.extract_words_with_positions(page_id)
+            if words:
+                positioned_codes = extract_finish_codes_from_positions(
+                    words, page_id=page_id, page_no=page_no, page_label=page_label
+                )
+                # Merge positioned codes (prefer positioned over text-based)
+                code_occurrences = positioned_codes or code_occurrences
+    except Exception:
+        pass
+
+    # Step 6: Get existing measured surfaces for this page
+    measured = _get_measured_surfaces_for_page(app, page_id, workspace_id)
+
+    # Step 7: Associate
+    evidence_list = associate_with_measured_surfaces(
+        evidence_list, measured, code_occurrences=code_occurrences
+    )
+
+    # Step 8: Store results in workspace settings
+    try:
+        setting_key = f"surface_evidence_v160_page_{page_id}"
+        records = [ev.to_dict() for ev in evidence_list]
+        app.lexecute(
+            "INSERT OR REPLACE INTO workspace_settings "
+            "(workspace_id, setting_key, setting_value, updated_at) "
+            "VALUES (?, ?, ?, datetime('now'))",
+            (workspace_id, setting_key, json.dumps(records)),
+        )
+    except Exception:
+        pass
+
+    return evidence_list
+
 
 def apply(app: Any) -> None:
     """Wire SurfaceEvidence extraction into the PlanReader app.
@@ -1024,3 +1314,4 @@ def apply(app: Any) -> None:
     app.extract_filled_polygons = extract_filled_polygons
     app.build_surface_evidence_v160 = build_surface_evidence
     app.associate_surface_evidence_v160 = associate_with_measured_surfaces
+    app.process_page_surface_evidence_v160 = process_page_surface_evidence
