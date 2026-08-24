@@ -1075,6 +1075,138 @@ class TestProductionDiagnostics(unittest.TestCase):
             self.assertEqual(d.storage_error, "")
 
 
+class TestDiagnosticsPersistence(unittest.TestCase):
+    """BLOCKER 1 + BLOCKER 2: persisted diagnostics must accurately report
+    storage_ok=True on success, and the accessor must work without NameError."""
+
+    def _make_real_pdf(self, tmpdir, with_text=True):
+        import fitz
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        shape = page.new_shape()
+        shape.draw_rect(fitz.Rect(50, 50, 250, 250))
+        shape.finish(fill=(1, 0, 0), color=(0, 0, 0), width=0.5)
+        shape.commit()
+        if with_text:
+            page.insert_text((100, 140), "PT01", fontsize=12, fontname="helv")
+        pdf_path = tmpdir / "test_plan.pdf"
+        doc.save(str(pdf_path))
+        doc.close()
+        return str(pdf_path)
+
+    def _make_fake_app(self, pdf_path, page_dict):
+        app = MagicMock()
+        stored_settings = {}
+        app.lquery.side_effect = [
+            [page_dict],
+            [{"path": pdf_path}],
+        ]
+        def fake_set_ws(workspace_id, key, value):
+            stored_settings[(workspace_id, key)] = value
+        app.set_workspace_setting.side_effect = fake_set_ws
+        def fake_get_ws(workspace_id, key, default="{}"):
+            return stored_settings.get((workspace_id, key), default)
+        app.workspace_setting.side_effect = fake_get_ws
+        app._stored_settings = stored_settings
+        return app
+
+    def test_persisted_diagnostics_storage_ok_is_true(self):
+        """Persisted diagnostics JSON reports storage_ok=True on success."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from pb_room_face_takeoff import RoomFace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            pdf_path = self._make_real_pdf(tmpdir, with_text=False)
+
+            page_dict = {
+                "id": 1, "document_id": 1, "page_no": 1,
+                "page_label": "Plan", "page_type": "plan",
+                "px_per_m": 28.346, "render_zoom": 1.0, "scale_text": "1:100",
+            }
+            app = self._make_fake_app(pdf_path, page_dict)
+
+            fake_room = RoomFace(
+                room_ref="R01", label="KITCHEN",
+                polygon_pdf_pts=[(0, 0), (250, 0), (250, 250), (0, 250)],
+                polygon_m=None, floor_area_m2=40.0, area_page_pts2=62500.0,
+                perimeter_m=1000.0, geometry_confidence=0.95,
+                evidence=["Test room"], source_page=1,
+                calibration_confidence=0.95, status="Measured",
+            )
+
+            with patch("pb_room_face_takeoff.extract_room_faces_from_page",
+                       return_value=[fake_room]):
+                result = process_page_surface_evidence(app, page_id=1, workspace_id=1)
+
+            # In-memory diagnostics say success
+            self.assertTrue(result.diagnostics.storage_ok)
+
+            # Retrieve diagnostics via accessor
+            retrieved = get_surface_evidence_diagnostics_v160(app, page_id=1, workspace_id=1)
+            self.assertIsNotNone(retrieved, "Accessor returned None")
+            self.assertIsInstance(retrieved, SurfaceProcessingDiagnostics)
+
+            # Persisted diagnostics must ALSO say storage_ok=True
+            self.assertTrue(
+                retrieved.storage_ok,
+                f"Persisted diagnostics report storage_ok={retrieved.storage_ok} "
+                f"but storage actually succeeded. storage_error={retrieved.storage_error!r}"
+            )
+
+            # Verify persisted JSON directly
+            diag_key = "surface_evidence_v160_diag_page_1"
+            raw = app._stored_settings.get((1, diag_key))
+            self.assertIsNotNone(raw)
+            parsed = json.loads(raw)
+            self.assertTrue(
+                parsed["storage_ok"],
+                f"Persisted JSON has storage_ok={parsed['storage_ok']}"
+            )
+
+    def test_accessor_returns_diagnostics_with_expected_fields(self):
+        """Accessor returns a SurfaceProcessingDiagnostics with populated fields."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from pb_room_face_takeoff import RoomFace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            pdf_path = self._make_real_pdf(tmpdir, with_text=False)
+
+            page_dict = {
+                "id": 1, "document_id": 1, "page_no": 1,
+                "page_label": "Plan", "page_type": "plan",
+                "px_per_m": 28.346, "render_zoom": 1.0, "scale_text": "1:100",
+            }
+            app = self._make_fake_app(pdf_path, page_dict)
+
+            fake_room = RoomFace(
+                room_ref="R01", label="KITCHEN",
+                polygon_pdf_pts=[(0, 0), (250, 0), (250, 250), (0, 250)],
+                polygon_m=None, floor_area_m2=40.0, area_page_pts2=62500.0,
+                perimeter_m=1000.0, geometry_confidence=0.95,
+                evidence=["Test room"], source_page=1,
+                calibration_confidence=0.95, status="Measured",
+            )
+
+            with patch("pb_room_face_takeoff.extract_room_faces_from_page",
+                       return_value=[fake_room]):
+                process_page_surface_evidence(app, page_id=1, workspace_id=1)
+
+            diag = get_surface_evidence_diagnostics_v160(app, page_id=1, workspace_id=1)
+            self.assertIsNotNone(diag)
+            self.assertTrue(diag.page_lookup_ok)
+            self.assertTrue(diag.pdf_open_ok)
+            self.assertGreater(diag.fills_extracted_count, 0)
+            self.assertEqual(diag.positioned_words_extraction_error, "")
+            self.assertEqual(diag.room_extraction_error, "")
+            self.assertTrue(diag.storage_ok)
+
+
 # ---------------------------------------------------------------------------
 # Data quality — area non-negative
 # ---------------------------------------------------------------------------

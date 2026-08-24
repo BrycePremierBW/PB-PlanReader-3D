@@ -14,6 +14,7 @@ Critical rules:
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 from dataclasses import dataclass, field, asdict
@@ -1447,7 +1448,11 @@ def process_page_surface_evidence(
 
         # ------------------------------------------------------------------
         # Step 8: Store results via app.set_workspace_setting()
+        #
+        # Order matters: set diagnostic fields BEFORE serialising, so the
+        # persisted JSON accurately reflects the storage outcome.
         # ------------------------------------------------------------------
+        evidence_stored = False
         try:
             setting_key = f"surface_evidence_v160_page_{page_id}"
             records = [ev.to_dict() for ev in evidence_list]
@@ -1455,14 +1460,22 @@ def process_page_surface_evidence(
             if hasattr(app, "set_workspace_setting"):
                 app.set_workspace_setting(int(workspace_id), setting_key, payload)
             else:
-                # Fallback for test environments without full app
+                # Test/compatibility fallback only — production always has
+                # set_workspace_setting.
                 app.lexecute(
                     "INSERT OR REPLACE INTO workspace_settings "
                     "(workspace_id, setting_key, setting_value, updated_at) "
                     "VALUES (?, ?, ?, datetime('now'))",
                     (workspace_id, setting_key, payload),
                 )
-            # Store diagnostics alongside evidence
+            evidence_stored = True
+        except Exception as exc:
+            diag.storage_error = f"evidence: {type(exc).__name__}: {exc}"
+
+        # Store diagnostics — serialise AFTER updating storage fields so
+        # the persisted JSON accurately reflects the evidence storage outcome.
+        diag.storage_ok = evidence_stored
+        try:
             diag_key = f"surface_evidence_v160_diag_page_{page_id}"
             diag_payload = json.dumps(diag.to_dict(), separators=(",", ":"))
             if hasattr(app, "set_workspace_setting"):
@@ -1474,10 +1487,12 @@ def process_page_surface_evidence(
                     "VALUES (?, ?, ?, datetime('now'))",
                     (workspace_id, diag_key, diag_payload),
                 )
-            diag.storage_ok = True
         except Exception as exc:
-            diag.storage_ok = False
-            diag.storage_error = f"{type(exc).__name__}: {exc}"
+            # Diagnostics storage failed — we still have the in-memory copy
+            # but the persisted record may disagree.  Record this.
+            diag.storage_error += (
+                f" | diagnostics: {type(exc).__name__}: {exc}"
+            )
 
         # Determine overall status
         if diag.storage_ok and not measured_extraction_failed:
