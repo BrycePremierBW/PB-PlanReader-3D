@@ -4,6 +4,10 @@
 **Baseline:** `f68102b` (main at merge of Priority 4 Phase B2)  
 **Status:** Investigation only — no production changes  
 
+**Review Status:** Amended per ChatGPT Phase A review — seven corrections applied (type mark vs instance, tolerances, quantity rule, deduction gating, count conflicts, louvre scope, dimension basis).
+
+---
+
 ---
 
 ## 1. Existing Architecture
@@ -156,7 +160,13 @@ by[sub]['net_m2'] = max(0, gross - deductions)
 - `v141` notes: "Gross X m²; selected opening deductions 0.00 m²"
 - No openings detected → gross wall area flows through unchanged
 
-### 2.5 Duplicate Deduction Risk
+### 2.5 Quantity x Geometry Inconsistency
+
+**Current issue:** v134 allows a single opening record with `quantity > 1`. v137 multiplies `area_m2` by that quantity. But v139 creates only **one rectangular wall cut per opening record**. So a record for four identical windows mathematically deducts four windows' area while visually cutting one hole in the 3D model.
+
+**Phase B rule:** Automatic geometric evidence must produce one record per physical opening, `quantity = 1`. Grouped commercial allowances remain a v134 estimator concept.
+
+### 2.6 Duplicate Deduction Risk
 
 **Current risk is LOW because there's only one active path.** However:
 
@@ -227,7 +237,8 @@ From typical architectural window schedules:
 | Door | YES — void area | Door leaf/frame painting (separate) |
 | Glazed opening | YES — void area | Glazing cleaning (separate) |
 | Curtain wall | MAYBE — depends on system | Usually separate trade |
-| Louvre | NO — treated as hatch/surface | Louvre painting (separate) |
+| Louvre panel (in wall opening) | YES — void area | Louvre panel painting (separate) |
+| Louvre pattern (hatch surface) | NO — surface treatment | Louvre painting (separate) |
 | Roller door | YES — void area | Door painting (separate) |
 | Garage door | YES — void area | Door painting (separate) |
 | Shopfront | MAYBE — depends on system | Usually separate trade |
@@ -376,21 +387,34 @@ The same physical window may appear on:
 - Schedule (as row with dimensions)
 - Detail drawing (as section)
 
-**Deduplication key (deterministic):**
+**Physical-instance identity (not type-mark identity):**
+
+A `type_mark` (W01, D01) identifies a window/door *type*, not a physical instance. The same type mark can appear many times — even on the same wall and level (e.g., four identical W01 windows in a row). Physical identity must use `opening_instance_id` (UUID-based) derived from geometric position and source instance.
+
+**Deduplication: matching across sources (same physical opening seen on plan + elevation + schedule):**
+
+Use explicit tolerance comparisons, not rounding:
 ```python
-dedup_key = (
-    mark,                    # D01, W01 (if available)
-    wall_ref,                # N03 (from plan or elevation)
-    round(width_m, 2),       # tolerance: 50mm
-    round(height_m, 2),      # tolerance: 50mm
-)
+def same_opening(a: OpeningEvidence, b: OpeningEvidence) -> bool:
+    # Must be same wall and same level
+    if a.wall_ref != b.wall_ref: return False
+    if a.level != b.level: return False
+    # Width and height within 50mm tolerance
+    if a.width_m and b.width_m:
+        if abs(a.width_m - b.width_m) > 0.05: return False
+    if a.height_m and b.height_m:
+        if abs(a.height_m - b.height_m) > 0.05: return False
+    # Position along wall within 200mm tolerance (plan vs elevation)
+    if a.position_along_wall_m is not None and b.position_along_wall_m is not None:
+        if abs(a.position_along_wall_m - b.position_along_wall_m) > 0.20: return False
+    return True
 ```
 
 **Deduplication rules:**
-1. If mark matches → same opening (merge evidence)
-2. If wall_ref + width + height match within tolerance → same opening
-3. If geometry position matches within tolerance → same opening
-4. Otherwise → different openings
+1. Same wall_ref + same level + dimensions within tolerance -> same opening (merge evidence)
+2. Same wall_ref + same level + position within tolerance -> same opening
+3. Different wall_ref or different level -> definitely different openings
+4. Otherwise -> uncertain, flag for review
 
 ---
 
@@ -402,25 +426,40 @@ dedup_key = (
 @dataclass
 class OpeningEvidence:
     # Identity
-    opening_id: str              # unique ID (mark-based if available)
+    opening_instance_id: str     # unique per-physical-opening ID (UUID-based)
+    type_mark: str               # D01, W01 — the TYPE mark, NOT physical identity.
+                                 # A type mark can repeat many times: multiple
+                                 # identical windows on the same wall, same level.
     workspace_id: int
     page_id: Optional[int]       # primary source page
     
     # Location
     wall_ref: str                # resolved wall reference
+    level: str                   # floor/storey (Ground, First, etc.)
     room_ref: str                # adjacent room (if known)
     elevation_side: str          # North/South/East/West
-    position_along_wall_m: float # distance from wall start
+    position_along_wall_m: float # distance from wall start (geometric centre)
     
     # Type
     opening_type: str            # "door", "window", "glazed_opening", etc.
-    mark: str                    # D01, W01 (from schedule or plan tag)
+    
+    # Quantity (always 1 for geometric evidence; grouped counts are commercial)
+    quantity: int                # MUST be 1 for auto-detected geometric evidence.
+                                 # Manual grouped allowances (e.g. "4x identical
+                                 # windows") are a separate commercial concept
+                                 # handled by v134, not geometric evidence.
     
     # Dimensions
     width_m: Optional[float]
     height_m: Optional[float]
+    dimension_basis: str         # "rough_opening" | "frame" | "leaf" |
+                                 # "clear_opening" | "unknown"
+                                 # For wall deduction we need the wall void.
+                                 # Schedule dimensions may be nominal frame,
+                                 # leaf size, structural opening, or rough
+                                 # opening. Unknown basis -> lower confidence.
     sill_m: float                # 0.0 for doors, 0.9 for windows (default)
-    area_m2: Optional[float]     # computed: width × height
+    area_m2: Optional[float]     # computed: width x height x quantity
     
     # Geometry
     plan_geometry: Optional[Dict]    # bbox/polygon from floor plan
@@ -442,7 +481,16 @@ class OpeningEvidence:
     notes: str
 ```
 
-### 8.2 Why Not Implement Schema Yet
+### 8.2 Critical: One Record Per Physical Opening
+
+Geometric evidence must create **one OpeningEvidence record per physical opening**, with `quantity = 1`. This is because:
+- v137 currently multiplies `area_m2` by quantity, but v139 creates only ONE rectangular wall cut per record
+- A single record with `quantity = 4` would mathematically deduct four windows while visually cutting one hole
+- Automatic geometric detection cannot group openings — it sees individual physical instances
+
+**Grouped commercial allowances** (e.g., "4x W01 on North elevation") remain a v134 estimator concept. The estimator can create a single v134 record with `quantity = 4` for pricing; geometric evidence should not do this.
+
+### 8.3 Why Not Implement Schema Yet
 
 The existing v134 register already stores the commercial fields (kind, width, height, deduct). The v145 `detect_openings()` already returns a richer record. Phase B should:
 1. Extend v145's output format to include the new fields
@@ -538,6 +586,7 @@ def merge_openings(existing: OpeningEvidence, new: OpeningEvidence) -> OpeningEv
    - Create an OpeningEvidence record
    - Set deduction_status = "review"
    - Wait for plan/elevation confirmation before deducting
+5. **Deduction gating is a Phase B0 safety contract, not a Phase B5 afterthought.** Detection (B1-B3) must initially create evidence only. An uncertain opening must never alter net m2. The `deduct` field defaults to `False` for all auto-detected evidence — only confirmed, wall-associated, dimension-known instances may set `deduct = True`.
 
 ### 11.2 Confidence Thresholds
 
@@ -621,10 +670,10 @@ Phase B should focus on **external openings only** (matching v135/v139 scope). I
 
 ### 14.2 Deduplication Rules
 
-1. **Same mark on same wall on same floor** → ONE opening (dedup by mark + wall + level)
-2. **Same mark on same wall on different floors** → ONE opening per floor (level-based)
-3. **Same mark on mirrored unit** → different wall_ref (orientation-based)
-4. **Schedule count vs plan count** → use the LESSER of the two (conservative)
+1. **Same physical opening detected on plan + elevation** -> merge into one instance
+2. **Same type mark on same wall on different floors** -> one instance per floor (level-based)
+3. **Same type mark on mirrored unit** -> different wall_ref (orientation-based)
+4. **Schedule count vs plan count conflict** -> report `count_conflict`, require reconciliation. Do NOT silently choose the lesser number — that hides a source error
 
 ### 14.3 Level Awareness
 
@@ -689,15 +738,54 @@ v139 — Registered wall model
     └─ Consumer: Opening deductions flow INTO v139 wall model
 ```
 
-### 16.2 New Module Structure
+### 16.2 Revised Phase B Order
 
 ```
-pb_opening_detection_vXXX.py      — Geometric detection from PDF vectors
-pb_opening_schedule_vXXX.py       — Schedule parsing for dimensions
-pb_opening_reconciliation_vXXX.py — Cross-source dedup and confidence
+B0 — OpeningEvidence contract + safety rules
+     Define OpeningEvidence, separate instance ID from type mark,
+     explicit tolerances, per-instance quantity=1, dimension_basis,
+     evidence provenance, confidence calculation, deduction gating.
+     Add seeded tests FIRST. No production changes.
+     
+B1 — Plan vector candidate detection
+     Door swings, jamb pairs, wall gaps, glazing pairs, nearby tags.
+     Output EVIDENCE CANDIDATES ONLY. No take-off changes.
+
+B2 — Door/window schedule parsing
+     Parse marks, dimensions, descriptions, counts as schedule evidence.
+     Schedule rows describe opening TYPES, not physical wall instances.
+
+B3 — Elevation candidate detection
+     Detect candidates inside registered facades. Do NOT treat
+     "rectangle inside facade" alone as high-confidence — facades
+     contain panels, grid lines, annotation boxes.
+
+B4 — Reconciliation + wall association
+     Merge plan/elevation/schedule evidence using explicit tolerance
+     checks and per-instance identity.
+
+B5 — Controlled deduction integration
+     ONLY NOW feed confirmed instances into v134/v137/v139.
+     High-confidence + wall-associated + dimension-known → deduct.
+     Everything else → Review, gross m² untouched.
+
+B6 — Benchmark verification
+     Prove exact opening count, deduction m², final net wall m²
+     on seeded fixtures and real benchmark drawings.
 ```
 
-### 16.3 Files to Modify (Phase B)
+**Core safety rule:** PlanReader can miss an uncertain deduction and flag it for review, but it must never confidently subtract an opening it cannot prove exists and belongs to that wall.
+
+### 16.3 New Module Structure
+
+```
+pb_opening_evidence_vXXX.py       — OpeningEvidence dataclass + safety contract (B0)
+pb_opening_detection_vXXX.py      — Geometric detection from PDF vectors (B1, B3)
+pb_opening_schedule_vXXX.py       — Schedule parsing for dimensions (B2)
+pb_opening_reconciliation_vXXX.py — Cross-source dedup and confidence (B4)
+```
+
+### 16.4 Files to Modify (Phase B)
 
 | File | Change |
 |------|--------|
@@ -709,7 +797,7 @@ pb_opening_reconciliation_vXXX.py — Cross-source dedup and confidence
 | `pb_page_registration_v1225.py` | Ensure door/window schedule pages are correctly classified |
 | `pb_plan_read_engine_v1228.py` | Add schedule parsing capability |
 
-### 16.4 Do NOT Create
+### 16.5 Do NOT Create
 
 - Do NOT create a parallel wall engine
 - Do NOT modify v139's wall model structure (it's working)
