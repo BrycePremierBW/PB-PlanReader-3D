@@ -36,6 +36,7 @@ from pb_height_evidence_v150 import (
     resolve_height,
     resolve_room_heights,
     get_default_height,
+    apply as apply_height_evidence_v150,
 )
 
 
@@ -224,8 +225,10 @@ class TestPositionedRoomAssociation(unittest.TestCase):
         ceil_ev = [e for e in ev if e.height_type == "floor_to_ceiling"]
         self.assertTrue(len(ceil_ev) >= 1)
         self.assertAlmostEqual(ceil_ev[0].height_m, 2.7, places=2)
-        # Position should be real bbox coords, not character offsets
-        self.assertTrue(ceil_ev[0].position[0] >= 100)
+        # bbox should be real PDF coords, not character offsets
+        self.assertTrue(len(ceil_ev[0].bbox) == 4)
+        self.assertTrue(ceil_ev[0].bbox[0] >= 100)
+        self.assertIsNotNone(ceil_ev[0].anchor)
 
     def test_no_cross_room_leakage(self):
         """CH 2700 in BED 1 does NOT leak to LIVING."""
@@ -270,8 +273,9 @@ class TestPositionedWordExtraction(unittest.TestCase):
         ev = _extract_with_positions(words, page_id=1)
         ceil_ev = [e for e in ev if e.height_type == "floor_to_ceiling"]
         self.assertTrue(len(ceil_ev) >= 1)
-        # Position should be real PDF coordinates (x >= 100)
-        self.assertGreaterEqual(ceil_ev[0].position[0], 100)
+        # bbox should be real PDF coordinates (x >= 100)
+        self.assertTrue(len(ceil_ev[0].bbox) == 4)
+        self.assertGreaterEqual(ceil_ev[0].bbox[0], 100)
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +401,8 @@ class TestPerRoomAssociation(unittest.TestCase):
             height_type="floor_to_ceiling", raw_text="CH 2700",
             height_m=2.7, extraction_method="semantic_label",
             confidence=0.95, confidence_reason="explicit",
-            status="Measured", evidence=[], position=[50, 50],
+            status="Measured", evidence=[],
+            anchor=(50.0, 50.0), bbox=[40.0, 40.0, 60.0, 60.0],
         )]
         result = resolve_room_heights(rooms, evidence)
         self.assertAlmostEqual(result["BED 1"]["height_m"], 2.7, places=2)
@@ -566,6 +571,277 @@ class TestPointInPolygon(unittest.TestCase):
     def test_outside(self):
         poly = [(0, 0), (100, 0), (100, 100), (0, 100)]
         self.assertFalse(_point_in_polygon((150, 50), poly))
+
+
+# ---------------------------------------------------------------------------
+# BLOCKER 1 — Review/unknown dimensions do NOT drive production height
+# ---------------------------------------------------------------------------
+
+
+class TestReviewDimensionNotSelected(unittest.TestCase):
+    """BLOCKER 1: unknown-orientation dimensions are retained but not selectable."""
+
+    def test_plain_3000_returns_default(self):
+        """Plain '3000' with no vertical context → resolver returns default."""
+        ev = extract_all_height_evidence("3000", page_id=1)
+        h, best = resolve_height(ev, target_type="generic")
+        self.assertAlmostEqual(h, 2.7, places=2)
+        self.assertEqual(best.status, "Default/fallback")
+
+    def test_review_dimension_recorded_but_rejected(self):
+        """Review dimension exists in evidence list but is filtered from selection."""
+        ev = extract_all_height_evidence("3000", page_id=1)
+        review_ev = [e for e in ev if e.status == "Review"]
+        # The review dimension should exist as evidence
+        self.assertTrue(len(review_ev) >= 1)
+        # But should NOT be selected by the resolver
+        h, best = resolve_height(ev, target_type="generic")
+        self.assertEqual(best.extraction_method, "default")
+
+    def test_vertical_3000_in_section_is_selectable(self):
+        """Vertical dimension in section context IS selectable."""
+        ev = extract_all_height_evidence(
+            "SECTION A-A  3000", page_id=1, page_type="Section",
+        )
+        h, best = resolve_height(ev, target_type="generic")
+        # Should select the section dimension, not default
+        self.assertGreater(h, 2.7)
+        self.assertIn(best.status, ("Provisional measured", "Measured"))
+
+
+# ---------------------------------------------------------------------------
+# BLOCKER 2 — v150 is authoritative, v136 RL solver is dead
+# ---------------------------------------------------------------------------
+
+
+class TestV150Authoritative(unittest.TestCase):
+    """BLOCKER 2: v150 result replaces v136; unrelated RLs never become Verified."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Patch v136 so the production function runs v150 logic."""
+        try:
+            import pb_elevation_profile_v136 as v136
+            cls._v136 = v136
+            apply_height_evidence_v150(v136)
+        except (ImportError, ModuleNotFoundError):
+            raise unittest.SkipTest("v136 module not available")
+
+    def test_patched_solve_rejects_unrelated_rls(self):
+        """The patched production function returns default for unrelated RLs."""
+        result = self._v136.solve_height_from_text("RL 45.230 RL 42.100", 2.7)
+        self.assertAlmostEqual(result["height_m"], 2.7, places=2)
+        self.assertNotEqual(result["status"], "Verified")
+        self.assertEqual(result["source"], "default")
+
+    def test_patched_solve_preserves_ch(self):
+        """The patched function still returns CH 2700 correctly."""
+        result = self._v136.solve_height_from_text("CH 2700", 2.7)
+        self.assertAlmostEqual(result["height_m"], 2.7, places=2)
+        self.assertEqual(result["status"], "Measured")
+
+    def test_patched_solve_returns_v150_metadata(self):
+        """The patched function returns v150 metadata, not v136 metadata."""
+        result = self._v136.solve_height_from_text("CH 3000", 2.7)
+        self.assertAlmostEqual(result["height_m"], 3.0, places=2)
+        self.assertEqual(result["source"], "semantic_label")
+        self.assertEqual(result.get("rls"), [])
+
+
+# ---------------------------------------------------------------------------
+# BLOCKER 3 — positioned room-height integration with production
+# ---------------------------------------------------------------------------
+
+
+class TestPositionedRoomIntegration(unittest.TestCase):
+    """BLOCKER 3: positioned words → room polygons → correct per-room heights."""
+
+    def test_bed1_ch2700_living_ch3000(self):
+        """Same page: BED 1 gets CH 2700, LIVING gets CH 3000, no leakage."""
+        words = [
+            WordBox("BED", 100, 100, 140, 120, page_id=1, line_id=0),
+            WordBox("1", 145, 100, 155, 120, page_id=1, line_id=0),
+            WordBox("CH", 110, 130, 130, 150, page_id=1, line_id=1),
+            WordBox("2700", 135, 130, 175, 150, page_id=1, line_id=1),
+            WordBox("LIVING", 350, 100, 420, 120, page_id=1, line_id=0),
+            WordBox("CH", 360, 130, 380, 150, page_id=1, line_id=1),
+            WordBox("3000", 385, 130, 425, 150, page_id=1, line_id=1),
+        ]
+        room_bed = {
+            "label": "BED 1",
+            "polygon": [(50, 50), (200, 50), (200, 200), (50, 200)],
+        }
+        room_living = {
+            "label": "LIVING",
+            "polygon": [(300, 50), (500, 50), (500, 200), (300, 200)],
+        }
+        ev = extract_all_height_evidence(words, page_id=1, page_label="A301")
+        result = resolve_room_heights(
+            [room_bed, room_living], ev, default_height=2.7,
+        )
+        self.assertAlmostEqual(result["BED 1"]["height_m"], 2.7, places=2)
+        self.assertEqual(result["BED 1"]["height_source"], "semantic_label")
+        self.assertAlmostEqual(result["LIVING"]["height_m"], 3.0, places=2)
+        self.assertEqual(result["LIVING"]["height_source"], "semantic_label")
+
+    def test_no_cross_room_leakage_positioned(self):
+        """CH 2700 in BED 1 polygon does NOT leak to LIVING polygon."""
+        words = [
+            WordBox("BED", 100, 100, 140, 120, page_id=1, line_id=0),
+            WordBox("1", 145, 100, 155, 120, page_id=1, line_id=0),
+            WordBox("CH", 110, 130, 130, 150, page_id=1, line_id=1),
+            WordBox("2700", 135, 130, 175, 150, page_id=1, line_id=1),
+            WordBox("LIVING", 350, 100, 420, 120, page_id=1, line_id=0),
+            # No CH for LIVING — should get default
+        ]
+        room_bed = {
+            "label": "BED 1",
+            "polygon": [(50, 50), (200, 50), (200, 200), (50, 200)],
+        }
+        room_living = {
+            "label": "LIVING",
+            "polygon": [(300, 50), (500, 50), (500, 200), (300, 200)],
+        }
+        ev = extract_all_height_evidence(words, page_id=1, page_label="A301")
+        result = resolve_room_heights(
+            [room_bed, room_living], ev, default_height=2.7,
+        )
+        self.assertAlmostEqual(result["BED 1"]["height_m"], 2.7, places=2)
+        # LIVING has no CH inside its polygon → gets default
+        self.assertAlmostEqual(result["LIVING"]["height_m"], 2.7, places=2)
+        self.assertEqual(result["LIVING"]["height_source"], "default")
+
+
+# ---------------------------------------------------------------------------
+# Position cleanup — bbox/anchor fields
+# ---------------------------------------------------------------------------
+
+
+class TestPositionFields(unittest.TestCase):
+    """Verify bbox/anchor are set correctly, position migrated for compat."""
+
+    def test_positioned_evidence_has_bbox_and_anchor(self):
+        """Evidence from positioned words has bbox and anchor."""
+        words = [
+            WordBox("CH", 100.0, 200.0, 120.0, 220.0, page_id=1, line_id=0),
+            WordBox("2700", 125.0, 200.0, 165.0, 220.0, page_id=1, line_id=0),
+        ]
+        ev = _extract_with_positions(words, page_id=1)
+        ceil_ev = [e for e in ev if e.height_type == "floor_to_ceiling"]
+        self.assertTrue(len(ceil_ev) >= 1)
+        self.assertEqual(len(ceil_ev[0].bbox), 4)
+        self.assertAlmostEqual(ceil_ev[0].bbox[0], 100.0, places=1)
+        self.assertIsNotNone(ceil_ev[0].anchor)
+        cx, cy = ceil_ev[0].anchor
+        self.assertAlmostEqual(cx, 110.0, places=1)  # (100+120)/2
+        self.assertAlmostEqual(cy, 210.0, places=1)  # (200+220)/2
+
+    def test_plain_text_evidence_has_text_span(self):
+        """Evidence from plain text has text_span, no bbox."""
+        ev = extract_all_height_evidence("CH 2700", page_id=1)
+        ceil_ev = [e for e in ev if e.height_type == "floor_to_ceiling"]
+        self.assertTrue(len(ceil_ev) >= 1)
+        self.assertTrue(len(ceil_ev[0].text_span) == 2)
+        self.assertEqual(len(ceil_ev[0].bbox), 0)
+        self.assertIsNone(ceil_ev[0].anchor)
+
+
+# ---------------------------------------------------------------------------
+# Level pairing safety — multi-level page
+# ---------------------------------------------------------------------------
+
+
+class TestMultiLevelPairing(unittest.TestCase):
+    """Multi-storey page: level refs pair within semantic level, not cross-level."""
+
+    def test_multi_level_pairs_correctly(self):
+        """LEVEL 1 FFL/FCL and LEVEL 2 FFL/FCL pair within level."""
+        text = (
+            "LEVEL 1 FFL 10.000  LEVEL 1 FCL 12.700  "
+            "LEVEL 2 FFL 13.200  LEVEL 2 FCL 15.900"
+        )
+        ev = extract_all_height_evidence(text, page_id=1)
+
+        # Should derive Level 1 F2C = 2.7, Level 2 F2C = 2.7
+        # and L1→L2 F2F = 3.2
+        f2c_ev = [e for e in ev if e.height_type == "floor_to_ceiling"
+                  and e.extraction_method == "rl_difference"]
+        f2f_ev = [e for e in ev if e.height_type == "floor_to_floor"
+                  and e.extraction_method == "rl_difference"]
+
+        # Should have at least one F2C derived height
+        self.assertTrue(len(f2c_ev) >= 1)
+        f2c_heights = sorted([e.height_m for e in f2c_ev])
+        self.assertAlmostEqual(f2c_heights[0], 2.7, places=2)
+
+        # Should have at least one F2F derived height (L1→L2)
+        self.assertTrue(len(f2f_ev) >= 1)
+        f2f_heights = sorted([e.height_m for e in f2f_ev])
+        self.assertAlmostEqual(f2f_heights[0], 3.2, places=2)
+
+    def test_no_cross_level_fcl_pairing(self):
+        """LEVEL 1 FFL must NOT pair with LEVEL 2 FCL across levels."""
+        text = (
+            "LEVEL 1 FFL 10.000  LEVEL 2 FCL 15.900"
+        )
+        ev = extract_all_height_evidence(text, page_id=1)
+        # The difference is 5.9m — this is a cross-level span, not a room height
+        # It should NOT produce a usable floor_to_ceiling height
+        f2c_ev = [e for e in ev
+                  if e.height_type == "floor_to_ceiling"
+                  and e.extraction_method == "rl_difference"
+                  and 1.8 <= e.height_m <= 6.0]
+        # 5.9m may appear as generic F2F, but should NOT be F2C for a room
+        for e in f2c_ev:
+            # If it appears, it should not be classified as a room ceiling height
+            self.assertNotAlmostEqual(e.height_m, 5.9, places=1)
+
+
+# ---------------------------------------------------------------------------
+# Production v136 tests — patched function
+# ---------------------------------------------------------------------------
+
+
+class TestPatchedV136Production(unittest.TestCase):
+    """Ensure patched v136 functions produce v150 results."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Patch v136 so the production function runs v150 logic."""
+        try:
+            import pb_elevation_profile_v136 as v136
+            cls._v136 = v136
+            apply_height_evidence_v150(v136)
+        except (ImportError, ModuleNotFoundError):
+            raise unittest.SkipTest("v136 module not available")
+
+    def test_ch_2700_via_patched_function(self):
+        """CH 2700 through patched solve_height_from_text → 2.7 Measured."""
+        result = self._v136.solve_height_from_text("CH 2700", 2.7)
+        self.assertAlmostEqual(result["height_m"], 2.7, places=2)
+        self.assertEqual(result["status"], "Measured")
+        self.assertEqual(result["source"], "semantic_label")
+
+    def test_empty_text_via_patched_function(self):
+        """Empty text through patched function → 2.7 Default/fallback."""
+        result = self._v136.solve_height_from_text("", 2.7)
+        self.assertAlmostEqual(result["height_m"], 2.7, places=2)
+        self.assertEqual(result["status"], "Default/fallback")
+        self.assertEqual(result["source"], "default")
+
+    def test_unrelated_rls_via_patched_function(self):
+        """Unrelated RLs through patched function → 2.7 not Verified."""
+        result = self._v136.solve_height_from_text("RL 45.230 RL 42.100", 2.7)
+        self.assertAlmostEqual(result["height_m"], 2.7, places=2)
+        self.assertNotEqual(result["status"], "Verified")
+        self.assertEqual(result["source"], "default")
+
+    def test_ffl_fcl_via_patched_function(self):
+        """FFL+FCL through patched function → 2.7 floor_to_ceiling."""
+        result = self._v136.solve_height_from_text("FFL 10.000 FCL 12.700", 2.7)
+        self.assertAlmostEqual(result["height_m"], 2.7, places=2)
+        self.assertEqual(result["status"], "Measured")
+        self.assertEqual(result["source"], "rl_difference")
 
 
 if __name__ == "__main__":
