@@ -91,14 +91,18 @@ class HeightEvidence:
 
 @dataclass
 class WordBox:
-    """Positioned text word from PDF extraction (bbox in PDF coordinates)."""
+    """Positioned text word from PDF extraction (bbox in PDF coordinates).
+
+    ``line_id`` is a composite key ``(block_no, line_no)`` so that words from
+    different PDF text blocks never merge into the same reconstructed line.
+    """
     text: str
     x0: float = 0.0
     y0: float = 0.0
     x1: float = 0.0
     y1: float = 0.0
     page_id: int = 0
-    line_id: int = 0
+    line_id: Any = (0, 0)  # (block_no, line_no) tuple
 
     @property
     def centre(self) -> Tuple[float, float]:
@@ -583,8 +587,12 @@ def _extract_section_heights(
 # ---------------------------------------------------------------------------
 
 def _words_to_text_with_map(words: Sequence[WordBox]) -> Tuple[str, List[WordBox]]:
-    """Reconstruct text from positioned words and build char→word mapping."""
-    lines: Dict[int, List[WordBox]] = {}
+    """Reconstruct text from positioned words and build char→word mapping.
+
+    Words are grouped by ``line_id`` which is a ``(block_no, line_no)`` tuple.
+    Different PDF text blocks with the same line number remain separate.
+    """
+    lines: Dict[Any, List[WordBox]] = {}
     for w in words:
         lines.setdefault(w.line_id, []).append(w)
     parts: List[str] = []
@@ -923,6 +931,7 @@ def resolve_room_heights(
 
         room_key = label or room.get("room_ref") or f"room_{len(results)}"
         results[room_key] = {
+            "label": label,
             "height_m": h,
             "height_type": room_type,
             "height_status": status,
@@ -1109,7 +1118,10 @@ def apply(app: Any) -> None:
                                 x0=float(w[0]), y0=float(w[1]),
                                 x1=float(w[2]), y1=float(w[3]),
                                 page_id=pid,
-                                line_id=int(w[6]) if len(w) > 6 else 0,
+                                line_id=(
+                                    int(w[5]) if len(w) > 5 else 0,
+                                    int(w[6]) if len(w) > 6 else 0,
+                                ),
                             )
                             for w in words_raw
                             if str(w[4]).strip()
@@ -1201,7 +1213,7 @@ def apply(app: Any) -> None:
                     room_faces = _rft.extract_room_faces_from_page(app_obj, page)
                     if not room_faces:
                         continue
-                    # Convert RoomFace → dict format expected by resolve_room_heights
+                    # Convert RoomFace -> dict format expected by resolve_room_heights
                     rooms_for_resolver = []
                     for rf in room_faces:
                         rooms_for_resolver.append({
@@ -1228,7 +1240,24 @@ def apply(app: Any) -> None:
                         rooms_for_resolver, page_ev,
                         default_height=default,
                     )
-                    room_height_map.update(resolved)
+                    # Store with page-scoped unique keys to avoid collisions
+                    page_no = int(page.get("page_no") or 0)
+                    page_label = str(page.get("page_label") or "")
+                    for room_key, room_data in resolved.items():
+                        unique_key = f"page_{pid}:{room_key}"
+                        room_height_map[unique_key] = {
+                            "page_id": pid,
+                            "page_no": page_no,
+                            "page_label": page_label,
+                            "room_ref": room_key,
+                            "room_label": room_data.get("label", room_key),
+                            "height_m": room_data.get("height_m"),
+                            "height_type": room_data.get("height_type", ""),
+                            "height_source": room_data.get("height_source", ""),
+                            "height_status": room_data.get("height_status", ""),
+                            "height_confidence": room_data.get("height_confidence", ""),
+                            "height_evidence_id": room_data.get("height_evidence_id", ""),
+                        }
                 except Exception:
                     continue  # don't break production if room height resolution fails
         except ImportError:
