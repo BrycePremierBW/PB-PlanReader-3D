@@ -929,7 +929,8 @@ def resolve_room_heights(
             conf = 0.50
             ev_id = ""
 
-        room_key = label or room.get("room_ref") or f"room_{len(results)}"
+        room_ref = str(room.get("room_ref") or "")
+        room_key = room_ref if room_ref else f"room_{len(results)}"
         results[room_key] = {
             "label": label,
             "height_m": h,

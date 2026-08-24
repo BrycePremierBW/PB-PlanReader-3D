@@ -395,7 +395,7 @@ class TestSectionEvidence(unittest.TestCase):
 
 class TestPerRoomAssociation(unittest.TestCase):
     def test_labelled_room_gets_semantic_height(self):
-        rooms = [{"label": "BED 1", "polygon": [(0, 0), (100, 0), (100, 100), (0, 100)]}]
+        rooms = [{"label": "BED 1", "room_ref": "R01", "polygon": [(0, 0), (100, 0), (100, 100), (0, 100)]}]
         evidence = [HeightEvidence(
             id="H1", source_page_id=1, source_page_label="",
             height_type="floor_to_ceiling", raw_text="CH 2700",
@@ -405,8 +405,8 @@ class TestPerRoomAssociation(unittest.TestCase):
             anchor=(50.0, 50.0), bbox=[40.0, 40.0, 60.0, 60.0],
         )]
         result = resolve_room_heights(rooms, evidence)
-        self.assertAlmostEqual(result["BED 1"]["height_m"], 2.7, places=2)
-        self.assertEqual(result["BED 1"]["height_source"], "semantic_label")
+        self.assertAlmostEqual(result["R01"]["height_m"], 2.7, places=2)
+        self.assertEqual(result["R01"]["height_source"], "semantic_label")
 
     def test_unlabelled_room_gets_default(self):
         rooms = [{"label": "", "room_ref": "R01", "polygon": []}]
@@ -668,21 +668,21 @@ class TestPositionedRoomIntegration(unittest.TestCase):
             WordBox("3000", 385, 130, 425, 150, page_id=1, line_id=(0, 1)),
         ]
         room_bed = {
-            "label": "BED 1",
+            "label": "BED 1", "room_ref": "R01",
             "polygon": [(50, 50), (200, 50), (200, 200), (50, 200)],
         }
         room_living = {
-            "label": "LIVING",
+            "label": "LIVING", "room_ref": "R02",
             "polygon": [(300, 50), (500, 50), (500, 200), (300, 200)],
         }
         ev = extract_all_height_evidence(words, page_id=1, page_label="A301")
         result = resolve_room_heights(
             [room_bed, room_living], ev, default_height=2.7,
         )
-        self.assertAlmostEqual(result["BED 1"]["height_m"], 2.7, places=2)
-        self.assertEqual(result["BED 1"]["height_source"], "semantic_label")
-        self.assertAlmostEqual(result["LIVING"]["height_m"], 3.0, places=2)
-        self.assertEqual(result["LIVING"]["height_source"], "semantic_label")
+        self.assertAlmostEqual(result["R01"]["height_m"], 2.7, places=2)
+        self.assertEqual(result["R01"]["height_source"], "semantic_label")
+        self.assertAlmostEqual(result["R02"]["height_m"], 3.0, places=2)
+        self.assertEqual(result["R02"]["height_source"], "semantic_label")
 
     def test_no_cross_room_leakage_positioned(self):
         """CH 2700 in BED 1 polygon does NOT leak to LIVING polygon."""
@@ -695,21 +695,21 @@ class TestPositionedRoomIntegration(unittest.TestCase):
             # No CH for LIVING — should get default
         ]
         room_bed = {
-            "label": "BED 1",
+            "label": "BED 1", "room_ref": "R01",
             "polygon": [(50, 50), (200, 50), (200, 200), (50, 200)],
         }
         room_living = {
-            "label": "LIVING",
+            "label": "LIVING", "room_ref": "R02",
             "polygon": [(300, 50), (500, 50), (500, 200), (300, 200)],
         }
         ev = extract_all_height_evidence(words, page_id=1, page_label="A301")
         result = resolve_room_heights(
             [room_bed, room_living], ev, default_height=2.7,
         )
-        self.assertAlmostEqual(result["BED 1"]["height_m"], 2.7, places=2)
+        self.assertAlmostEqual(result["R01"]["height_m"], 2.7, places=2)
         # LIVING has no CH inside its polygon → gets default
-        self.assertAlmostEqual(result["LIVING"]["height_m"], 2.7, places=2)
-        self.assertEqual(result["LIVING"]["height_source"], "default")
+        self.assertAlmostEqual(result["R02"]["height_m"], 2.7, places=2)
+        self.assertEqual(result["R02"]["height_source"], "default")
 
 
 # ---------------------------------------------------------------------------
@@ -924,25 +924,25 @@ class TestRoomHeightResolutionProduction(unittest.TestCase):
             WordBox("3000", 385, 130, 425, 150, page_id=1, line_id=(0, 1)),
         ]
         room_bed = {
-            "label": "BED 1",
+            "label": "BED 1", "room_ref": "R01",
             "polygon": [(50, 50), (200, 50), (200, 200), (50, 200)],
         }
         room_living = {
-            "label": "LIVING",
+            "label": "LIVING", "room_ref": "R02",
             "polygon": [(300, 50), (500, 50), (500, 200), (300, 200)],
         }
         ev = extract_all_height_evidence(words, page_id=1, page_label="A301")
         result = resolve_room_heights(
             [room_bed, room_living], ev, default_height=2.7,
         )
-        # BED 1 → 2.7 from CH 2700
-        self.assertAlmostEqual(result["BED 1"]["height_m"], 2.7, places=2)
-        self.assertEqual(result["BED 1"]["height_source"], "semantic_label")
-        self.assertEqual(result["BED 1"]["height_status"], "Measured")
-        # LIVING → 3.0 from CH 3000
-        self.assertAlmostEqual(result["LIVING"]["height_m"], 3.0, places=2)
-        self.assertEqual(result["LIVING"]["height_source"], "semantic_label")
-        self.assertEqual(result["LIVING"]["height_status"], "Measured")
+        # BED 1 -> 2.7 from CH 2700
+        self.assertAlmostEqual(result["R01"]["height_m"], 2.7, places=2)
+        self.assertEqual(result["R01"]["height_source"], "semantic_label")
+        self.assertEqual(result["R01"]["height_status"], "Measured")
+        # LIVING -> 3.0 from CH 3000
+        self.assertAlmostEqual(result["R02"]["height_m"], 3.0, places=2)
+        self.assertEqual(result["R02"]["height_source"], "semantic_label")
+        self.assertEqual(result["R02"]["height_status"], "Measured")
 
     def test_no_cross_room_leakage_production(self):
         """CH 2700 in BED 1 does NOT leak to LIVING."""
@@ -954,21 +954,21 @@ class TestRoomHeightResolutionProduction(unittest.TestCase):
             WordBox("LIVING", 350, 100, 420, 120, page_id=1, line_id=(0, 0)),
         ]
         room_bed = {
-            "label": "BED 1",
+            "label": "BED 1", "room_ref": "R01",
             "polygon": [(50, 50), (200, 50), (200, 200), (50, 200)],
         }
         room_living = {
-            "label": "LIVING",
+            "label": "LIVING", "room_ref": "R02",
             "polygon": [(300, 50), (500, 50), (500, 200), (300, 200)],
         }
         ev = extract_all_height_evidence(words, page_id=1, page_label="A301")
         result = resolve_room_heights(
             [room_bed, room_living], ev, default_height=2.7,
         )
-        self.assertAlmostEqual(result["BED 1"]["height_m"], 2.7, places=2)
-        # LIVING has no CH inside its polygon → gets default
-        self.assertAlmostEqual(result["LIVING"]["height_m"], 2.7, places=2)
-        self.assertEqual(result["LIVING"]["height_source"], "default")
+        self.assertAlmostEqual(result["R01"]["height_m"], 2.7, places=2)
+        # LIVING has no CH inside its polygon -> gets default
+        self.assertAlmostEqual(result["R02"]["height_m"], 2.7, places=2)
+        self.assertEqual(result["R02"]["height_source"], "default")
 
     def test_custom_default_per_room(self):
         """Unlabeled room gets workspace default (3.0), not hardcoded 2.7."""
@@ -979,14 +979,14 @@ class TestRoomHeightResolutionProduction(unittest.TestCase):
 
     def test_room_height_map_fields(self):
         """Room height map has all required fields."""
-        room = {"label": "BED 1", "polygon": [(0, 0), (100, 0), (100, 100), (0, 100)]}
+        room = {"label": "BED 1", "room_ref": "R01", "polygon": [(0, 0), (100, 0), (100, 100), (0, 100)]}
         words = [
             WordBox("CH", 50, 50, 70, 70, page_id=1, line_id=(0, 0)),
             WordBox("2700", 75, 50, 115, 70, page_id=1, line_id=(0, 0)),
         ]
         ev = extract_all_height_evidence(words, page_id=1)
         result = resolve_room_heights([room], ev, default_height=2.7)
-        r = result["BED 1"]
+        r = result["R01"]
         self.assertIn("height_m", r)
         self.assertIn("height_type", r)
         self.assertIn("height_status", r)
@@ -1104,7 +1104,7 @@ class TestRoomHeightMapPageScopedKeys(unittest.TestCase):
             WordBox("CH", 110, 130, 130, 150, page_id=20, line_id=(0, 1)),
             WordBox("3000", 135, 130, 180, 150, page_id=20, line_id=(0, 1)),
         ]
-        room = {"label": "BED 1", "polygon": [(50, 50), (200, 50), (200, 200), (50, 200)]}
+        room = {"label": "BED 1", "room_ref": "R01", "polygon": [(50, 50), (200, 50), (200, 200), (50, 200)]}
         ev_a = extract_all_height_evidence(words_a, page_id=10, page_label="A101")
         ev_b = extract_all_height_evidence(words_b, page_id=20, page_label="A102")
         r_a = resolve_room_heights([room], ev_a, default_height=2.7)
@@ -1117,8 +1117,8 @@ class TestRoomHeightMapPageScopedKeys(unittest.TestCase):
             room_height_map[f"page_20:{room_key}"] = {"height_m": room_data["height_m"], "page_id": 20}
         # Both survive — no overwrite
         self.assertEqual(len(room_height_map), 2)
-        self.assertAlmostEqual(room_height_map["page_10:BED 1"]["height_m"], 2.7, places=2)
-        self.assertAlmostEqual(room_height_map["page_20:BED 1"]["height_m"], 3.0, places=2)
+        self.assertAlmostEqual(room_height_map["page_10:R01"]["height_m"], 2.7, places=2)
+        self.assertAlmostEqual(room_height_map["page_20:R01"]["height_m"], 3.0, places=2)
 
     def test_duplicate_room_names_in_two_units(self):
         """BED 1 in unit A and BED 1 in unit B do not overwrite each other."""
@@ -1134,7 +1134,7 @@ class TestRoomHeightMapPageScopedKeys(unittest.TestCase):
             WordBox("CH", 110, 130, 130, 150, page_id=15, line_id=(0, 1)),
             WordBox("3200", 135, 130, 180, 150, page_id=15, line_id=(0, 1)),
         ]
-        room = {"label": "BED 1", "polygon": [(50, 50), (200, 50), (200, 200), (50, 200)]}
+        room = {"label": "BED 1", "room_ref": "R01", "polygon": [(50, 50), (200, 50), (200, 200), (50, 200)]}
         ev_a = extract_all_height_evidence(words_a, page_id=5)
         ev_b = extract_all_height_evidence(words_b, page_id=15)
         r_a = resolve_room_heights([room], ev_a)
@@ -1145,8 +1145,8 @@ class TestRoomHeightMapPageScopedKeys(unittest.TestCase):
         for rk, rd in r_b.items():
             room_height_map[f"page_15:{rk}"] = {"height_m": rd["height_m"]}
         self.assertEqual(len(room_height_map), 2)
-        self.assertAlmostEqual(room_height_map["page_5:BED 1"]["height_m"], 2.7, places=2)
-        self.assertAlmostEqual(room_height_map["page_15:BED 1"]["height_m"], 3.2, places=2)
+        self.assertAlmostEqual(room_height_map["page_5:R01"]["height_m"], 2.7, places=2)
+        self.assertAlmostEqual(room_height_map["page_15:R01"]["height_m"], 3.2, places=2)
 
     def test_three_rooms_two_pages_full_metadata(self):
         """Page 1: BED 1 + LIVING, Page 2: BED 1 — all 3 records with metadata."""
@@ -1165,8 +1165,8 @@ class TestRoomHeightMapPageScopedKeys(unittest.TestCase):
             WordBox("CH", 110, 130, 130, 150, page_id=2, line_id=(0, 1)),
             WordBox("3200", 135, 130, 180, 150, page_id=2, line_id=(0, 1)),
         ]
-        room_bed = {"label": "BED 1", "polygon": [(50, 50), (200, 50), (200, 200), (50, 200)]}
-        room_living = {"label": "LIVING", "polygon": [(300, 50), (500, 50), (500, 200), (300, 200)]}
+        room_bed = {"label": "BED 1", "room_ref": "R01", "polygon": [(50, 50), (200, 50), (200, 200), (50, 200)]}
+        room_living = {"label": "LIVING", "room_ref": "R02", "polygon": [(300, 50), (500, 50), (500, 200), (300, 200)]}
         ev1 = extract_all_height_evidence(words_p1, page_id=1, page_label="A301")
         ev2 = extract_all_height_evidence(words_p2, page_id=2, page_label="A302")
         r1 = resolve_room_heights([room_bed, room_living], ev1)
@@ -1191,14 +1191,60 @@ class TestRoomHeightMapPageScopedKeys(unittest.TestCase):
                 "height_evidence_id": rd["height_evidence_id"],
             }
         self.assertEqual(len(room_height_map), 3)
-        self.assertAlmostEqual(room_height_map["page_1:BED 1"]["height_m"], 2.7, places=2)
-        self.assertAlmostEqual(room_height_map["page_1:LIVING"]["height_m"], 3.0, places=2)
-        self.assertAlmostEqual(room_height_map["page_2:BED 1"]["height_m"], 3.2, places=2)
+        self.assertAlmostEqual(room_height_map["page_1:R01"]["height_m"], 2.7, places=2)
+        self.assertAlmostEqual(room_height_map["page_1:R02"]["height_m"], 3.0, places=2)
+        self.assertAlmostEqual(room_height_map["page_2:R01"]["height_m"], 3.2, places=2)
         # Verify full metadata present
         for key in ("page_id", "page_no", "page_label", "room_ref", "room_label",
                      "height_m", "height_type", "height_status", "height_source",
                      "height_evidence_id"):
-            self.assertIn(key, room_height_map["page_1:BED 1"])
+            self.assertIn(key, room_height_map["page_1:R01"])
+
+
+class TestSamePageDuplicateLabels(unittest.TestCase):
+    """BLOCKER 1 extra: same-page duplicate room labels use room_ref identity."""
+
+    def test_same_page_two_bed1_different_room_ref(self):
+        """R04 / BED 1 / CH 2700 and R19 / BED 1 / CH 3000 on same page both survive."""
+        words = [
+            WordBox("CH", 110, 130, 130, 150, page_id=1, line_id=(0, 0)),
+            WordBox("2700", 135, 130, 175, 150, page_id=1, line_id=(0, 0)),
+            WordBox("CH", 410, 130, 430, 150, page_id=1, line_id=(0, 0)),
+            WordBox("3000", 435, 130, 475, 150, page_id=1, line_id=(0, 0)),
+        ]
+        room_r04 = {
+            "label": "BED 1", "room_ref": "R04",
+            "polygon": [(50, 50), (200, 50), (200, 200), (50, 200)],
+        }
+        room_r19 = {
+            "label": "BED 1", "room_ref": "R19",
+            "polygon": [(300, 50), (500, 50), (500, 200), (300, 200)],
+        }
+        ev = extract_all_height_evidence(words, page_id=1, page_label="A301")
+        result = resolve_room_heights([room_r04, room_r19], ev, default_height=2.7)
+        # Both must survive — keyed by room_ref, not label
+        self.assertEqual(len(result), 2)
+        self.assertIn("R04", result)
+        self.assertIn("R19", result)
+        self.assertAlmostEqual(result["R04"]["height_m"], 2.7, places=2)
+        self.assertEqual(result["R04"]["label"], "BED 1")
+        self.assertAlmostEqual(result["R19"]["height_m"], 3.0, places=2)
+        self.assertEqual(result["R19"]["label"], "BED 1")
+        # Same label, different heights — no overwrite
+        self.assertNotEqual(result["R04"]["height_m"], result["R19"]["height_m"])
+
+    def test_production_key_uses_room_ref(self):
+        """Production stores page_X:R04 and page_X:R19, not page_X:BED 1."""
+        words = [
+            WordBox("CH", 110, 130, 130, 150, page_id=1, line_id=(0, 0)),
+            WordBox("2700", 135, 130, 175, 150, page_id=1, line_id=(0, 0)),
+        ]
+        room = {"label": "BED 1", "room_ref": "R04", "polygon": [(50, 50), (200, 50), (200, 200), (50, 200)]}
+        ev = extract_all_height_evidence(words, page_id=1)
+        r = resolve_room_heights([room], ev)
+        # The key in resolve_room_heights output is R04, not BED 1
+        self.assertIn("R04", r)
+        self.assertNotIn("BED 1", r)
 
 
 # ---------------------------------------------------------------------------
@@ -1207,10 +1253,24 @@ class TestRoomHeightMapPageScopedKeys(unittest.TestCase):
 
 
 class TestEndToEndWallPathProduction(unittest.TestCase):
-    """BLOCKER 2: prove v150 height flows through real v139 wall assembly."""
+    """BLOCKER 2: prove v150 height flows through real v139 wall assembly.
 
-    def _make_fake_app(self, default_height: float = 2.7):
-        """Fake app implementing the minimum v139 interface."""
+    The fake app provides page data with extracted_text so the real patched
+    v136 build_profiles → v150 resolver chain processes CH 3000 text.
+    No manual profile injection.
+    """
+
+    def _make_fake_app(
+        self,
+        default_height: float = 2.7,
+        extracted_text: str = "",
+        page_id: int = 1,
+    ):
+        """Fake app implementing the full v136/v139/v150 interface.
+
+        lquery returns page data so the patched build_profiles can process
+        extracted_text through the v150 resolver.
+        """
         settings = {
             "default_wall_height_m": str(default_height),
             "elevation_profiles_v136": "{}",
@@ -1222,23 +1282,37 @@ class TestEndToEndWallPathProduction(unittest.TestCase):
             "wall_ref": "W01",
             "side": "North",
             "length_m": 10.0,
-            "height_m": default_height,  # fallback before v150 patch
+            "height_m": default_height,
             "substrate": "Brick veneer",
             "substrate_confidence": "High",
             "substrate_status": "Derived",
             "height_status": "Default/fallback",
         }]
         # Elevation registration — one North facade with one segment
+        # v136 build_profiles iterates reg["elevations"], not reg["facades"]
         elevations = {
+            "elevations": [{
+                "page_id": page_id,
+                "orientation": "North",
+                "page_label": "A301",
+            }],
             "facades": {
                 "North": {
                     "orientation": "North",
+                    "page_id": page_id,
                     "segments": [{"wall_ref": "W01", "a": (0, 0), "b": (10, 0)}],
                 }
-            }
+            },
         }
-        # Elevation height profiles (before v150 patch — would return 2.7)
-        profiles = {"North": {"height_m": 2.7, "status": "Default/fallback"}}
+        # Page data returned by lquery — contains extracted_text for v150
+        pages_data = [{
+            "id": page_id,
+            "document_id": 0,
+            "page_no": 1,
+            "extracted_text": extracted_text,
+            "page_label": "A301",
+            "page_type": "Elevation",
+        }]
 
         class FakeApp:
             def set_workspace_setting(self, wid, key, val):
@@ -1248,6 +1322,9 @@ class TestEndToEndWallPathProduction(unittest.TestCase):
                 return settings.get(key, default)
 
             def lquery(self, sql, params=()):
+                # Return page data for the pages query
+                if "FROM pages" in str(sql):
+                    return pages_data
                 return []
 
             def register_elevations_v135(self, wid):
@@ -1259,41 +1336,38 @@ class TestEndToEndWallPathProduction(unittest.TestCase):
             def registered_wall_records_v135(self, wid):
                 return wall_records
 
+        # profiles is populated by build_profiles (called by height_by_side)
+        profiles: Dict[str, Any] = {}
+
         app = FakeApp()
-        # Install v150 patch (patches v136 functions on the app)
+        # Install v136 module first, then v150 patch
+        try:
+            import pb_elevation_profile_v136 as v136
+            v136.apply(app)
+        except (ImportError, ModuleNotFoundError):
+            self.skipTest("v136 module not available")
         try:
             from pb_height_evidence_v150 import apply as apply_v150
             apply_v150(app)
         except ImportError:
             self.skipTest("pb_height_evidence_v150 not importable")
-        return app, settings
+        return app, settings, profiles
 
     def test_ch3000_flows_through_to_gross_area(self):
-        """10 m wall + CH 3000 → 30.0 m² with Measured status."""
+        """10 m wall + CH 3000 -> 30.0 m2 with Measured status.
+
+        The real chain: lquery returns page with 'CH 3000' ->
+        patched v136 build_profiles processes through v150 resolver ->
+        v150 recognises CH 3000 as semantic ceiling height ->
+        profile height_m=3.0, status=Measured ->
+        v139 build_registered_walls reads profile ->
+        wall height_m=3.0, gross_m2=30.0.
+        """
         from pb_unified_building_v139 import build_registered_walls, takeoff_rows
 
-        app, settings = self._make_fake_app(default_height=2.7)
-        # Overwrite profiles to simulate v150 resolver finding CH 3000
-        # The patched solve_height_from_text is called by build_profiles
-        # For this test, we directly set the profiles to what v150 would produce
-        profiles = app.elevation_height_by_side_v136(1)
-        profiles["North"] = {
-            "height_m": 3.0,
-            "status": "Measured",
-            "confidence": "Verified",
-            "height_evidence_id": "ev_001",
-        }
-        # Also set the workspace setting so the patched build_profiles uses it
-        import json
-        settings["elevation_profiles_v136"] = json.dumps({
-            "version": "v150",
-            "profiles": [{
-                "side": "North",
-                "height_m": 3.0,
-                "status": "Measured",
-                "confidence": "Verified",
-            }],
-        })
+        app, settings, profiles = self._make_fake_app(
+            default_height=2.7, extracted_text="CH 3000",
+        )
 
         walls = build_registered_walls(app, 1)
         self.assertEqual(len(walls), 1)
@@ -1309,27 +1383,20 @@ class TestEndToEndWallPathProduction(unittest.TestCase):
         self.assertEqual(row["unit"], "m²")
 
     def test_workspace_default_32_flows_through(self):
-        """10 m wall + workspace default 3.2 → 32.0 m², non-Measured status."""
+        """10 m wall + no evidence + workspace default 3.2 -> 32.0 m2.
+
+        The real chain: lquery returns page with empty extracted_text ->
+        patched v136 build_profiles processes through v150 resolver ->
+        v150 finds no evidence -> returns default 3.2 ->
+        profile height_m=3.2, status=Default/fallback ->
+        v139 build_registered_walls reads profile ->
+        wall height_m=3.2, gross_m2=32.0, not Measured.
+        """
         from pb_unified_building_v139 import build_registered_walls, takeoff_rows
 
-        app, settings = self._make_fake_app(default_height=3.2)
-        # Set profiles to use the workspace default
-        import json
-        settings["elevation_profiles_v136"] = json.dumps({
-            "version": "v150",
-            "profiles": [{
-                "side": "North",
-                "height_m": 3.2,
-                "status": "Default/fallback",
-                "confidence": "Review",
-            }],
-        })
-        # Update the in-memory profiles dict too
-        app.elevation_height_by_side_v136(1)["North"] = {
-            "height_m": 3.2,
-            "status": "Default/fallback",
-            "confidence": "Review",
-        }
+        app, settings, profiles = self._make_fake_app(
+            default_height=3.2, extracted_text="",
+        )
 
         walls = build_registered_walls(app, 1)
         self.assertEqual(len(walls), 1)
@@ -1346,22 +1413,9 @@ class TestEndToEndWallPathProduction(unittest.TestCase):
         """Height status is carried through to takeoff row notes."""
         from pb_unified_building_v139 import build_registered_walls, takeoff_rows
 
-        app, settings = self._make_fake_app(default_height=2.7)
-        import json
-        settings["elevation_profiles_v136"] = json.dumps({
-            "version": "v150",
-            "profiles": [{
-                "side": "North",
-                "height_m": 3.0,
-                "status": "Measured",
-                "confidence": "Verified",
-            }],
-        })
-        app.elevation_height_by_side_v136(1)["North"] = {
-            "height_m": 3.0,
-            "status": "Measured",
-            "confidence": "Verified",
-        }
+        app, settings, profiles = self._make_fake_app(
+            default_height=2.7, extracted_text="CH 3000",
+        )
 
         walls = build_registered_walls(app, 1)
         rows = takeoff_rows(walls)
