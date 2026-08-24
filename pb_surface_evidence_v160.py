@@ -44,6 +44,13 @@ _PAINT_CODE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Canonical surface-evidence type identifiers.
+# source_geometry_type = WHAT the surface is (filled polygon, hatch region, etc.)
+# geometry_method     = HOW the geometry was reconstructed (native rect, convex hull, etc.)
+SURFACE_TYPE_FILLED_POLYGON = "filled_polygon"
+SURFACE_TYPE_HATCH = "hatch_region"
+GEOMETRY_METHOD_VECTOR_HATCH = "vector_hatch_region"
+
 
 # ---------------------------------------------------------------------------
 # Geometry primitives
@@ -1447,8 +1454,9 @@ def process_page_surface_evidence(
                 + diag.positioned_words_extraction_error
             )
             for ev in hatch_evidence_list:
-                ev.status = "needs_check"
-                ev.evidence.append(note)
+                if getattr(ev, "source_geometry_type", "") == SURFACE_TYPE_HATCH:
+                    ev.status = "needs_check"
+                    ev.evidence.append(note)
 
         # ------------------------------------------------------------------
         # Text-only fallback: extract codes WITHOUT spatial info.
@@ -1544,13 +1552,13 @@ def process_page_surface_evidence(
         # objects AFTER the combined production association.  Do NOT use the
         # pre-association counts from HatchProcessingResult — those reflect
         # the detector's internal association, not the production pipeline's.
-        # Only detector-owned counts (strokes_extracted, clusters_found, etc.)
-        # are preserved from HatchProcessingResult.
+        # Filter by source_geometry_type (WHAT it is), not geometry_method
+        # (HOW it was reconstructed).
         if hatch_result is not None:
             hatch_associated = 0
             hatch_unassociated = 0
             for ev in evidence_list:
-                if getattr(ev, "geometry_method", "") == "hatch_region":
+                if getattr(ev, "source_geometry_type", "") == SURFACE_TYPE_HATCH:
                     if ev.association_method and ev.association_method != "none":
                         hatch_associated += 1
                     else:

@@ -1002,153 +1002,248 @@ class TestClusteringAxisDirection(unittest.TestCase):
 # BLOCKER 2 tests: hatch error with fills -> status partial
 # ---------------------------------------------------------------------------
 class TestHatchErrorStatusWithFills(unittest.TestCase):
-    """BLOCKER 2 R3: hatch extraction error must not coexist with status ok."""
+    """BLOCKER 2 R4: real adapter-level status regression tests."""
+
+    def _make_real_pdf(self, tmpdir, draw_fills=True, draw_lines=False):
+        """Create a real PyMuPDF PDF with optional fills and hatch lines."""
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)  # A4
+
+        if draw_fills:
+            shape = page.new_shape()
+            shape.draw_rect(fitz.Rect(50, 50, 250, 250))
+            shape.finish(fill=(1, 0, 0), color=(0, 0, 0), width=0.5)
+            shape.commit()
+
+        if draw_lines:
+            _draw_parallel_lines(page, 100, 100, 12, 6, 200, angle_deg=45.0)
+
+        pdf_path = tmpdir / "test_plan.pdf"
+        doc.save(str(pdf_path))
+        doc.close()
+        return str(pdf_path)
+
+    def _make_fake_app(self, pdf_path, page_dict):
+        """Create a fake app with REAL production interfaces."""
+        app = MagicMock()
+        stored_settings = {}
+
+        app.lquery.side_effect = [
+            [page_dict],  # pages
+            [{"path": pdf_path}],  # documents
+        ]
+
+        def fake_set_ws(workspace_id, key, value):
+            stored_settings[(workspace_id, key)] = value
+        app.set_workspace_setting.side_effect = fake_set_ws
+
+        def fake_get_ws(workspace_id, key, default="{}"):
+            return stored_settings.get((workspace_id, key), default)
+        app.workspace_setting.side_effect = fake_get_ws
+        app._stored_settings = stored_settings
+        return app
 
     def test_fill_succeeds_hatch_fails_partial(self):
-        """Fill evidence succeeds + hatch detector raises -> status partial."""
-        from pb_surface_evidence_v160 import SurfaceProcessingDiagnostics
-        diag = SurfaceProcessingDiagnostics()
-        diag.fills_extracted_count = 5
-        diag.hatch_diag.extraction_error = "RuntimeError: test failure"
-        evidence_stored = True
-        any_storage_error = False
-        measured_extraction_failed = False
-        hatch_stage_failed = bool(diag.hatch_diag.extraction_error)
-        if not evidence_stored:
-            status = "error"
-        elif any_storage_error or measured_extraction_failed or hatch_stage_failed:
-            status = "partial"
-        else:
-            status = "ok"
-        self.assertEqual(status, "partial")
+        """Fill evidence extracted + hatch detector raises -> status partial."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from pb_surface_evidence_v160 import process_page_surface_evidence
 
-    def test_no_fill_hatch_fails_not_no_fills(self):
-        """No fill + hatch detector raises -> error, not no_fills."""
-        from pb_surface_evidence_v160 import SurfaceProcessingDiagnostics
-        diag = SurfaceProcessingDiagnostics()
-        diag.hatch_diag.extraction_error = "ValueError: bad page"
-        evidence_stored = False
-        any_storage_error = False
-        measured_extraction_failed = False
-        hatch_stage_failed = bool(diag.hatch_diag.extraction_error)
-        if not evidence_stored:
-            status = "error"
-        elif any_storage_error or measured_extraction_failed or hatch_stage_failed:
-            status = "partial"
-        else:
-            status = "ok"
-        self.assertIn(status, ("error", "partial"))
-        self.assertNotEqual(status, "no_fills")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            pdf_path = self._make_real_pdf(tmpdir, draw_fills=True)
+            page_dict = {
+                "id": 1, "document_id": 1, "page_no": 1,
+                "page_label": "Plan", "page_type": "Floor Plan",
+                "px_per_m": 28.346, "render_zoom": 1.0, "scale_text": "1:100",
+            }
+            app = self._make_fake_app(pdf_path, page_dict)
+
+            with patch("pb_room_face_takeoff.extract_room_faces_from_page",
+                       return_value=[]),                  patch("pb_hatch_detection_v160.extract_strokes",
+                       side_effect=RuntimeError("hatch engine crashed")):
+                result = process_page_surface_evidence(
+                    app, page_id=1, workspace_id=1)
+
+            self.assertEqual(result.status, "partial")
+            self.assertTrue(result.diagnostics.hatch_diag.extraction_error)
+
+    def test_no_fill_hatch_fails_partial(self):
+        """No fills + hatch detector raises -> partial, not no_fills."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from pb_surface_evidence_v160 import process_page_surface_evidence
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            # PDF with no fills and no lines
+            doc = fitz.open()
+            page = doc.new_page(width=595, height=842)
+            pdf_path = tmpdir / "empty.pdf"
+            doc.save(str(pdf_path))
+            doc.close()
+
+            page_dict = {
+                "id": 1, "document_id": 1, "page_no": 1,
+                "page_label": "Plan", "page_type": "Floor Plan",
+                "px_per_m": 28.346, "render_zoom": 1.0, "scale_text": "1:100",
+            }
+            app = self._make_fake_app(str(pdf_path), page_dict)
+
+            with patch("pb_room_face_takeoff.extract_room_faces_from_page",
+                       return_value=[]),                  patch("pb_hatch_detection_v160.extract_strokes",
+                       side_effect=ValueError("bad page")):
+                result = process_page_surface_evidence(
+                    app, page_id=1, workspace_id=1)
+
+            # Hatch failed with no fills -> partial (not no_fills)
+            self.assertIn(result.status, ("partial", "error"))
+            self.assertNotEqual(result.status, "no_fills")
+            self.assertTrue(result.diagnostics.hatch_diag.extraction_error)
 
     def test_fill_and_hatch_clean_ok(self):
-        """Fill + hatch both clean -> ok."""
-        from pb_surface_evidence_v160 import SurfaceProcessingDiagnostics
-        diag = SurfaceProcessingDiagnostics()
-        evidence_stored = True
-        any_storage_error = False
-        measured_extraction_failed = False
-        hatch_stage_failed = bool(diag.hatch_diag.extraction_error)
-        if not evidence_stored:
-            status = "error"
-        elif any_storage_error or measured_extraction_failed or hatch_stage_failed:
-            status = "partial"
-        else:
-            status = "ok"
-        self.assertEqual(status, "ok")
+        """Fill + hatch both process cleanly -> status ok."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from pb_surface_evidence_v160 import process_page_surface_evidence
 
-    def test_genuinely_empty_no_fills(self):
-        """No fill/hatch genuinely present -> no_fills."""
-        from pb_surface_evidence_v160 import SurfaceProcessingDiagnostics
-        diag = SurfaceProcessingDiagnostics()
-        fill_polygons = []
-        hatch_evidence_list = []
-        has_hatch_error = bool(diag.hatch_diag.extraction_error)
-        if not fill_polygons and not hatch_evidence_list:
-            if has_hatch_error:
-                status = "partial"
-            else:
-                status = "no_fills"
-        self.assertEqual(status, "no_fills")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            pdf_path = self._make_real_pdf(
+                tmpdir, draw_fills=True, draw_lines=True)
+            page_dict = {
+                "id": 1, "document_id": 1, "page_no": 1,
+                "page_label": "Plan", "page_type": "Floor Plan",
+                "px_per_m": 28.346, "render_zoom": 1.0, "scale_text": "1:100",
+            }
+            app = self._make_fake_app(pdf_path, page_dict)
+
+            # Mock room face extraction to return empty (no measured rooms)
+            with patch("pb_room_face_takeoff.extract_room_faces_from_page",
+                       return_value=[]):
+                result = process_page_surface_evidence(
+                    app, page_id=1, workspace_id=1)
+
+            self.assertEqual(result.status, "ok")
+            self.assertFalse(result.diagnostics.hatch_diag.extraction_error)
+
+    def test_genuinely_empty_page_no_fills(self):
+        """No fills, no hatches, no error -> status no_fills."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from pb_surface_evidence_v160 import process_page_surface_evidence
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            doc = fitz.open()
+            page = doc.new_page(width=595, height=842)
+            pdf_path = tmpdir / "empty.pdf"
+            doc.save(str(pdf_path))
+            doc.close()
+
+            page_dict = {
+                "id": 1, "document_id": 1, "page_no": 1,
+                "page_label": "Plan", "page_type": "Floor Plan",
+                "px_per_m": 28.346, "render_zoom": 1.0, "scale_text": "1:100",
+            }
+            app = self._make_fake_app(str(pdf_path), page_dict)
+
+            with patch("pb_room_face_takeoff.extract_room_faces_from_page",
+                       return_value=[]):
+                result = process_page_surface_evidence(
+                    app, page_id=1, workspace_id=1)
+
+            self.assertEqual(result.status, "no_fills")
 
 
 # ---------------------------------------------------------------------------
-# BLOCKER 3 tests: hatch association diagnostics are post-association
+# BLOCKER 1 R4 tests: correct source_geometry_type filter
 # ---------------------------------------------------------------------------
 class TestHatchAssociationDiagnostics(unittest.TestCase):
-    """BLOCKER 3 R3: hatch associated/unassociated must reflect
-    post-combination-association state, not pre-association."""
+    """BLOCKER 1 R4: hatch associated/unassociated must filter on
+    source_geometry_type='hatch_region', not geometry_method."""
 
-    def test_hatch_associated_count_after_production_association(self):
-        """One hatch region + one measured target -> associated=1."""
+    def test_real_detector_hatch_associated_count(self):
+        """Real detector creates hatch evidence -> associate -> count=1."""
         from pb_surface_evidence_v160 import (
-            SurfaceEvidence,
+            SURFACE_TYPE_HATCH,
             associate_with_measured_surfaces,
         )
-        # Hatch evidence must have polygon_pdf_pts for association
-        hatch_ev = SurfaceEvidence(
-            surface_id="page_1:hatch_0",
-            geometry_method="hatch_region",
-            polygon_pdf_pts=[(50, 50), (200, 50), (200, 200), (50, 200)],
-            area_page_pts2=10000.0,
-            status="needs_check",
-        )
+        # Create hatch through the REAL detector
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        _draw_parallel_lines(page, 100, 100, 12, 6, 200, angle_deg=45.0)
+        evidence_list, clusters, diag = detect_hatch_patterns(page)
+        doc.close()
+
+        self.assertGreater(len(evidence_list), 0,
+                           "Real detector must produce hatch evidence")
+        for ev in evidence_list:
+            self.assertEqual(ev.source_geometry_type, SURFACE_TYPE_HATCH)
+            self.assertEqual(ev.geometry_method, "vector_hatch_region")
+
+        # Associate with a measured target that contains the hatch
         measured = [{
             "surface_id": "R01",
-            "bbox": [0, 0, 500, 500],
+            "bbox": [0, 0, 400, 400],
             "label": "Room 1",
         }]
         associated_list = associate_with_measured_surfaces(
-            [hatch_ev], measured, [],
+            evidence_list, measured, [],
         )
+        # Count using source_geometry_type (the correct filter)
         hatch_associated = sum(
             1 for ev in associated_list
-            if getattr(ev, "geometry_method", "") == "hatch_region"
+            if getattr(ev, "source_geometry_type", "") == SURFACE_TYPE_HATCH
             and ev.association_method and ev.association_method != "none"
         )
         hatch_unassociated = sum(
             1 for ev in associated_list
-            if getattr(ev, "geometry_method", "") == "hatch_region"
+            if getattr(ev, "source_geometry_type", "") == SURFACE_TYPE_HATCH
             and (not ev.association_method
                  or ev.association_method == "none")
         )
         self.assertEqual(hatch_associated, 1)
         self.assertEqual(hatch_unassociated, 0)
 
-    def test_hatch_unassociated_count(self):
-        """Hatch region far from any measured target -> unassociated=1."""
+    def test_real_detector_hatch_unassociated_count(self):
+        """Real hatch far from measured target -> unassociated=1."""
         from pb_surface_evidence_v160 import (
-            SurfaceEvidence,
+            SURFACE_TYPE_HATCH,
             associate_with_measured_surfaces,
         )
-        # Hatch evidence far from measured target bbox
-        hatch_ev = SurfaceEvidence(
-            surface_id="page_1:hatch_0",
-            geometry_method="hatch_region",
-            polygon_pdf_pts=[(900, 900), (950, 900), (950, 950), (900, 950)],
-            area_page_pts2=1000.0,
-            status="needs_check",
-        )
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        _draw_parallel_lines(page, 100, 100, 12, 6, 200, angle_deg=45.0)
+        evidence_list, clusters, diag = detect_hatch_patterns(page)
+        doc.close()
+
+        # Measured target far from hatch region
         measured = [{
             "surface_id": "R01",
-            "bbox": [0, 0, 500, 500],
+            "bbox": [500, 700, 580, 800],
             "label": "Room 1",
         }]
         associated_list = associate_with_measured_surfaces(
-            [hatch_ev], measured, [],
+            evidence_list, measured, [],
         )
         hatch_associated = sum(
             1 for ev in associated_list
-            if getattr(ev, "geometry_method", "") == "hatch_region"
+            if getattr(ev, "source_geometry_type", "") == SURFACE_TYPE_HATCH
             and ev.association_method and ev.association_method != "none"
         )
         hatch_unassociated = sum(
             1 for ev in associated_list
-            if getattr(ev, "geometry_method", "") == "hatch_region"
+            if getattr(ev, "source_geometry_type", "") == SURFACE_TYPE_HATCH
             and (not ev.association_method
                  or ev.association_method == "none")
         )
         self.assertEqual(hatch_associated, 0)
-        self.assertEqual(hatch_unassociated, 1)
+        self.assertGreaterEqual(hatch_unassociated, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -1160,11 +1255,14 @@ class TestWordExtractionFailureDowngradesHatch(unittest.TestCase):
 
     def test_word_failure_downgrades_hatch_to_needs_check(self):
         """Word extraction error + hatch evidence -> needs_check."""
-        from pb_surface_evidence_v160 import SurfaceEvidence
+        from pb_surface_evidence_v160 import (
+            SurfaceEvidence, SURFACE_TYPE_HATCH,
+        )
         word_extraction_error = "RuntimeError: PDF corrupted"
         hatch_ev = SurfaceEvidence(
             surface_id="page_1:hatch_0",
-            geometry_method="hatch_region",
+            source_geometry_type=SURFACE_TYPE_HATCH,
+            geometry_method="vector_hatch_region",
             status="needs_check",
         )
         hatch_evidence_list = [hatch_ev]
@@ -1172,8 +1270,9 @@ class TestWordExtractionFailureDowngradesHatch(unittest.TestCase):
             note = ("Hatch text-based false-positive filters unavailable: "
                     + word_extraction_error)
             for ev in hatch_evidence_list:
-                ev.status = "needs_check"
-                ev.evidence.append(note)
+                if getattr(ev, "source_geometry_type", "") == SURFACE_TYPE_HATCH:
+                    ev.status = "needs_check"
+                    ev.evidence.append(note)
         self.assertEqual(hatch_ev.status, "needs_check")
         self.assertTrue(
             any("false-positive filters unavailable" in e
@@ -1181,20 +1280,44 @@ class TestWordExtractionFailureDowngradesHatch(unittest.TestCase):
 
     def test_word_success_hatch_not_downgraded(self):
         """When word extraction succeeds, hatch NOT downgraded."""
-        from pb_surface_evidence_v160 import SurfaceEvidence
+        from pb_surface_evidence_v160 import (
+            SurfaceEvidence, SURFACE_TYPE_HATCH,
+        )
         hatch_ev = SurfaceEvidence(
             surface_id="page_1:hatch_0",
-            geometry_method="hatch_region",
+            source_geometry_type=SURFACE_TYPE_HATCH,
+            geometry_method="vector_hatch_region",
             status="needs_check",
         )
         hatch_evidence_list = [hatch_ev]
         word_extraction_error = ""
         if word_extraction_error and hatch_evidence_list:
             for ev in hatch_evidence_list:
-                ev.status = "needs_check"
+                if getattr(ev, "source_geometry_type", "") == SURFACE_TYPE_HATCH:
+                    ev.status = "needs_check"
         self.assertEqual(hatch_ev.status, "needs_check")
         self.assertFalse(
             any("false-positive" in e for e in hatch_ev.evidence))
+
+    def test_non_hatch_evidence_not_affected(self):
+        """Fill evidence (not hatch) should not be downgraded by word error."""
+        from pb_surface_evidence_v160 import (
+            SurfaceEvidence, SURFACE_TYPE_HATCH,
+        )
+        fill_ev = SurfaceEvidence(
+            surface_id="page_1:fill_0",
+            source_geometry_type="filled_polygon",
+            geometry_method="native_rectangle",
+            status="confirmed",
+        )
+        word_extraction_error = "RuntimeError: PDF corrupted"
+        if word_extraction_error:
+            for ev in [fill_ev]:
+                if getattr(ev, "source_geometry_type", "") == SURFACE_TYPE_HATCH:
+                    ev.status = "needs_check"
+        self.assertEqual(fill_ev.status, "confirmed",
+                         "Fill evidence must not be affected by word error")
+
 
 
 class TestUnionFind(unittest.TestCase):

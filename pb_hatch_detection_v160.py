@@ -1065,9 +1065,18 @@ def detect_hatch_patterns(
 
         hatch_type = "cross_hatch" if cluster.is_cross_hatch else "parallel_hatch"
 
+        # Import constants for canonical surface-evidence type identifiers
+        try:
+            from pb_surface_evidence_v160 import (
+                SURFACE_TYPE_HATCH, GEOMETRY_METHOD_VECTOR_HATCH,
+            )
+        except ImportError:
+            SURFACE_TYPE_HATCH = "hatch_region"
+            GEOMETRY_METHOD_VECTOR_HATCH = "vector_hatch_region"
+
         ev = SurfaceEvidence(
-            source_geometry_type="hatch_region",
-            geometry_method="vector_hatch_region",
+            source_geometry_type=SURFACE_TYPE_HATCH,
+            geometry_method=GEOMETRY_METHOD_VECTOR_HATCH,
             polygon_pdf_pts=poly_tuples,
             bbox=cluster.bbox,
             area_page_pts2=area_pts2,
