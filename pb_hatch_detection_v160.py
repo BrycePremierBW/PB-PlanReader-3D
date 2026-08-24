@@ -392,22 +392,16 @@ def _cluster_strokes(
                     continue
 
                 # BLOCKER 1 fix: along-axis proximity check.
-                # Project both strokes onto their shared direction axis.
-                # Reject if their projected intervals don't overlap and the
-                # gap exceeds a threshold relative to stroke length.
-                if dist > 0.1:
-                    dir_x = sj.cx - si.cx
-                    dir_y = sj.cy - si.cy
-                    ln = math.hypot(dir_x, dir_y)
-                    if ln > 1e-6:
-                        dir_x /= ln
-                        dir_y /= ln
-                    else:
-                        dir_x = math.cos(math.radians(si.angle_deg))
-                        dir_y = math.sin(math.radians(si.angle_deg))
-                else:
-                    dir_x = math.cos(math.radians(si.angle_deg))
-                    dir_y = math.sin(math.radians(si.angle_deg))
+                # Project both strokes onto their SHARED DIRECTION axis
+                # derived from the stroke angles themselves (circular mean),
+                # NOT the midpoint-to-midpoint vector which may be largely
+                # perpendicular to the lines for parallel strokes offset
+                # in the perpendicular direction.
+                mean_angle_rad = math.radians(
+                    _circular_mean([si.angle_deg, sj.angle_deg])
+                )
+                dir_x = math.cos(mean_angle_rad)
+                dir_y = math.sin(mean_angle_rad)
 
                 # Project stroke endpoints onto direction axis
                 a_start = si.x1 * dir_x + si.y1 * dir_y

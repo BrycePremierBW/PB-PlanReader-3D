@@ -1437,6 +1437,20 @@ def process_page_surface_evidence(
         evidence_list.extend(hatch_evidence_list)
 
         # ------------------------------------------------------------------
+        # Additional safety: if positioned-word extraction failed, hatch
+        # evidence lacks false-positive text filtering (GRID, BATTEN,
+        # LOUVRE, dimensions).  Downgrade to needs_check and note why.
+        # ------------------------------------------------------------------
+        if diag.positioned_words_extraction_error and hatch_evidence_list:
+            note = (
+                "Hatch text-based false-positive filters unavailable: "
+                + diag.positioned_words_extraction_error
+            )
+            for ev in hatch_evidence_list:
+                ev.status = "needs_check"
+                ev.evidence.append(note)
+
+        # ------------------------------------------------------------------
         # Text-only fallback: extract codes WITHOUT spatial info.
         # These are retained for metadata but NOT used for polygon association.
         # ------------------------------------------------------------------
@@ -1526,10 +1540,23 @@ def process_page_surface_evidence(
                         + ", ".join(codes_found)
                     )
 
-        # Update hatch association diagnostics from actual detector result
+        # Update hatch association diagnostics from ACTUAL hatch evidence
+        # objects AFTER the combined production association.  Do NOT use the
+        # pre-association counts from HatchProcessingResult — those reflect
+        # the detector's internal association, not the production pipeline's.
+        # Only detector-owned counts (strokes_extracted, clusters_found, etc.)
+        # are preserved from HatchProcessingResult.
         if hatch_result is not None:
-            diag.hatch_diag.associated = hatch_result.associated
-            diag.hatch_diag.unassociated = hatch_result.unassociated
+            hatch_associated = 0
+            hatch_unassociated = 0
+            for ev in evidence_list:
+                if getattr(ev, "geometry_method", "") == "hatch_region":
+                    if ev.association_method and ev.association_method != "none":
+                        hatch_associated += 1
+                    else:
+                        hatch_unassociated += 1
+            diag.hatch_diag.associated = hatch_associated
+            diag.hatch_diag.unassociated = hatch_unassociated
 
         # ------------------------------------------------------------------
         # Step 8: Store results via app.set_workspace_setting()
@@ -1587,10 +1614,14 @@ def process_page_surface_evidence(
         diag.storage_ok = evidence_stored and diagnostics_stored
 
         # Determine overall status
+        #
+        # BLOCKER 2 fix: non-empty hatch extraction error must never coexist
+        # with status="ok".  Hatch failure is always at least "partial".
         any_storage_error = bool(diag.storage_error)
+        hatch_stage_failed = bool(diag.hatch_diag.extraction_error)
         if not evidence_stored:
             overall_status = "error"
-        elif any_storage_error or measured_extraction_failed:
+        elif any_storage_error or measured_extraction_failed or hatch_stage_failed:
             overall_status = "partial"
         else:
             overall_status = "ok"

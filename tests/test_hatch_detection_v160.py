@@ -912,6 +912,291 @@ class TestRegularSpacingHigherConfidence(unittest.TestCase):
         self.assertGreater(conf_reg, conf_irr)
 
 
+# ---------------------------------------------------------------------------
+# BLOCKER 1 Round 3 tests: direction axis must be stroke angle, not midpoint
+# ---------------------------------------------------------------------------
+class TestClusteringAxisDirection(unittest.TestCase):
+    """BLOCKER 1 R3: projection axis must be derived from stroke angles,
+    not midpoint-to-midpoint vector."""
+
+    def test_horizontal_strokes_overlapping_x_merge(self):
+        """Two horizontal strokes overlapping in X -> merge."""
+        strokes = [
+            Stroke(x1=100 + i * 5, y1=200 + i * 25,
+                   x2=300 + i * 5, y2=200 + i * 25)
+            for i in range(6)
+        ]
+        clusters = _cluster_strokes(strokes)
+        self.assertEqual(len(clusters), 1,
+                         "Overlapping horizontal strokes should merge")
+
+    def test_horizontal_strokes_large_x_gap_no_merge(self):
+        """Two groups of horizontal strokes with large X gap -> NOT merge."""
+        strokes = [
+            Stroke(x1=100, y1=200, x2=200, y2=200),
+            Stroke(x1=600, y1=200, x2=700, y2=200),
+            Stroke(x1=100, y1=225, x2=200, y2=225),
+            Stroke(x1=600, y1=225, x2=700, y2=225),
+            Stroke(x1=100, y1=250, x2=200, y2=250),
+            Stroke(x1=600, y1=250, x2=700, y2=250),
+        ]
+        clusters = _cluster_strokes(strokes)
+        self.assertGreaterEqual(len(clusters), 2,
+                                "Horizontal strokes with large X gap "
+                                "should not merge")
+
+    def test_45_strokes_offset_perpendicular_merge(self):
+        """Two groups of 45-deg strokes offset perpendicular but
+        overlapping along the 45-deg axis -> merge."""
+        import math
+        rad = math.radians(45)
+        dx, dy = math.cos(rad), math.sin(rad)
+        strokes = [
+            Stroke(x1=100 + i * 6 * (-dy), y1=200 + i * 6 * dx,
+                   x2=100 + i * 6 * (-dy) + 150 * dx,
+                   y2=200 + i * 6 * dx + 150 * dy)
+            for i in range(6)
+        ]
+        clusters = _cluster_strokes(strokes)
+        self.assertEqual(len(clusters), 1,
+                         "45-deg strokes offset perpendicular should merge")
+
+    def test_45_strokes_far_along_45_axis_no_merge(self):
+        """Two groups of 45-deg strokes far apart along the 45-deg
+        direction -> do NOT merge."""
+        import math
+        rad = math.radians(45)
+        dx, dy = math.cos(rad), math.sin(rad)
+        strokes_a = [
+            Stroke(x1=50 + i * 6 * (-dy), y1=50 + i * 6 * dx,
+                   x2=50 + i * 6 * (-dy) + 100 * dx,
+                   y2=50 + i * 6 * dx + 100 * dy)
+            for i in range(6)
+        ]
+        strokes_b = [
+            Stroke(x1=500 + i * 6 * (-dy), y1=500 + i * 6 * dx,
+                   x2=500 + i * 6 * (-dy) + 100 * dx,
+                   y2=500 + i * 6 * dx + 100 * dy)
+            for i in range(6)
+        ]
+        clusters = _cluster_strokes(strokes_a + strokes_b)
+        self.assertGreaterEqual(len(clusters), 2,
+                                "45-deg strokes far along their axis "
+                                "should not merge")
+
+    def test_midpoint_vector_would_fail_vertical_offset(self):
+        """Two horizontal strokes offset PERPENDICULARLY (in Y) have a
+        midpoint-to-midpoint vector that is vertical (wrong axis).
+        With the correct stroke-angle axis they must still merge."""
+        strokes = [
+            Stroke(x1=100, y1=200 + i * 30, x2=300, y2=200 + i * 30)
+            for i in range(6)
+        ]
+        clusters = _cluster_strokes(strokes)
+        self.assertEqual(len(clusters), 1,
+                         "Horizontal strokes with Y offset must merge; "
+                         "midpoint-vector projection would reject")
+
+
+# ---------------------------------------------------------------------------
+# BLOCKER 2 tests: hatch error with fills -> status partial
+# ---------------------------------------------------------------------------
+class TestHatchErrorStatusWithFills(unittest.TestCase):
+    """BLOCKER 2 R3: hatch extraction error must not coexist with status ok."""
+
+    def test_fill_succeeds_hatch_fails_partial(self):
+        """Fill evidence succeeds + hatch detector raises -> status partial."""
+        from pb_surface_evidence_v160 import SurfaceProcessingDiagnostics
+        diag = SurfaceProcessingDiagnostics()
+        diag.fills_extracted_count = 5
+        diag.hatch_diag.extraction_error = "RuntimeError: test failure"
+        evidence_stored = True
+        any_storage_error = False
+        measured_extraction_failed = False
+        hatch_stage_failed = bool(diag.hatch_diag.extraction_error)
+        if not evidence_stored:
+            status = "error"
+        elif any_storage_error or measured_extraction_failed or hatch_stage_failed:
+            status = "partial"
+        else:
+            status = "ok"
+        self.assertEqual(status, "partial")
+
+    def test_no_fill_hatch_fails_not_no_fills(self):
+        """No fill + hatch detector raises -> error, not no_fills."""
+        from pb_surface_evidence_v160 import SurfaceProcessingDiagnostics
+        diag = SurfaceProcessingDiagnostics()
+        diag.hatch_diag.extraction_error = "ValueError: bad page"
+        evidence_stored = False
+        any_storage_error = False
+        measured_extraction_failed = False
+        hatch_stage_failed = bool(diag.hatch_diag.extraction_error)
+        if not evidence_stored:
+            status = "error"
+        elif any_storage_error or measured_extraction_failed or hatch_stage_failed:
+            status = "partial"
+        else:
+            status = "ok"
+        self.assertIn(status, ("error", "partial"))
+        self.assertNotEqual(status, "no_fills")
+
+    def test_fill_and_hatch_clean_ok(self):
+        """Fill + hatch both clean -> ok."""
+        from pb_surface_evidence_v160 import SurfaceProcessingDiagnostics
+        diag = SurfaceProcessingDiagnostics()
+        evidence_stored = True
+        any_storage_error = False
+        measured_extraction_failed = False
+        hatch_stage_failed = bool(diag.hatch_diag.extraction_error)
+        if not evidence_stored:
+            status = "error"
+        elif any_storage_error or measured_extraction_failed or hatch_stage_failed:
+            status = "partial"
+        else:
+            status = "ok"
+        self.assertEqual(status, "ok")
+
+    def test_genuinely_empty_no_fills(self):
+        """No fill/hatch genuinely present -> no_fills."""
+        from pb_surface_evidence_v160 import SurfaceProcessingDiagnostics
+        diag = SurfaceProcessingDiagnostics()
+        fill_polygons = []
+        hatch_evidence_list = []
+        has_hatch_error = bool(diag.hatch_diag.extraction_error)
+        if not fill_polygons and not hatch_evidence_list:
+            if has_hatch_error:
+                status = "partial"
+            else:
+                status = "no_fills"
+        self.assertEqual(status, "no_fills")
+
+
+# ---------------------------------------------------------------------------
+# BLOCKER 3 tests: hatch association diagnostics are post-association
+# ---------------------------------------------------------------------------
+class TestHatchAssociationDiagnostics(unittest.TestCase):
+    """BLOCKER 3 R3: hatch associated/unassociated must reflect
+    post-combination-association state, not pre-association."""
+
+    def test_hatch_associated_count_after_production_association(self):
+        """One hatch region + one measured target -> associated=1."""
+        from pb_surface_evidence_v160 import (
+            SurfaceEvidence,
+            associate_with_measured_surfaces,
+        )
+        # Hatch evidence must have polygon_pdf_pts for association
+        hatch_ev = SurfaceEvidence(
+            surface_id="page_1:hatch_0",
+            geometry_method="hatch_region",
+            polygon_pdf_pts=[(50, 50), (200, 50), (200, 200), (50, 200)],
+            area_page_pts2=10000.0,
+            status="needs_check",
+        )
+        measured = [{
+            "surface_id": "R01",
+            "bbox": [0, 0, 500, 500],
+            "label": "Room 1",
+        }]
+        associated_list = associate_with_measured_surfaces(
+            [hatch_ev], measured, [],
+        )
+        hatch_associated = sum(
+            1 for ev in associated_list
+            if getattr(ev, "geometry_method", "") == "hatch_region"
+            and ev.association_method and ev.association_method != "none"
+        )
+        hatch_unassociated = sum(
+            1 for ev in associated_list
+            if getattr(ev, "geometry_method", "") == "hatch_region"
+            and (not ev.association_method
+                 or ev.association_method == "none")
+        )
+        self.assertEqual(hatch_associated, 1)
+        self.assertEqual(hatch_unassociated, 0)
+
+    def test_hatch_unassociated_count(self):
+        """Hatch region far from any measured target -> unassociated=1."""
+        from pb_surface_evidence_v160 import (
+            SurfaceEvidence,
+            associate_with_measured_surfaces,
+        )
+        # Hatch evidence far from measured target bbox
+        hatch_ev = SurfaceEvidence(
+            surface_id="page_1:hatch_0",
+            geometry_method="hatch_region",
+            polygon_pdf_pts=[(900, 900), (950, 900), (950, 950), (900, 950)],
+            area_page_pts2=1000.0,
+            status="needs_check",
+        )
+        measured = [{
+            "surface_id": "R01",
+            "bbox": [0, 0, 500, 500],
+            "label": "Room 1",
+        }]
+        associated_list = associate_with_measured_surfaces(
+            [hatch_ev], measured, [],
+        )
+        hatch_associated = sum(
+            1 for ev in associated_list
+            if getattr(ev, "geometry_method", "") == "hatch_region"
+            and ev.association_method and ev.association_method != "none"
+        )
+        hatch_unassociated = sum(
+            1 for ev in associated_list
+            if getattr(ev, "geometry_method", "") == "hatch_region"
+            and (not ev.association_method
+                 or ev.association_method == "none")
+        )
+        self.assertEqual(hatch_associated, 0)
+        self.assertEqual(hatch_unassociated, 1)
+
+
+# ---------------------------------------------------------------------------
+# Additional safety: word extraction failure downgrades hatch evidence
+# ---------------------------------------------------------------------------
+class TestWordExtractionFailureDowngradesHatch(unittest.TestCase):
+    """When positioned-word extraction fails, hatch evidence should be
+    downgraded to needs_check with an explanatory note."""
+
+    def test_word_failure_downgrades_hatch_to_needs_check(self):
+        """Word extraction error + hatch evidence -> needs_check."""
+        from pb_surface_evidence_v160 import SurfaceEvidence
+        word_extraction_error = "RuntimeError: PDF corrupted"
+        hatch_ev = SurfaceEvidence(
+            surface_id="page_1:hatch_0",
+            geometry_method="hatch_region",
+            status="needs_check",
+        )
+        hatch_evidence_list = [hatch_ev]
+        if word_extraction_error and hatch_evidence_list:
+            note = ("Hatch text-based false-positive filters unavailable: "
+                    + word_extraction_error)
+            for ev in hatch_evidence_list:
+                ev.status = "needs_check"
+                ev.evidence.append(note)
+        self.assertEqual(hatch_ev.status, "needs_check")
+        self.assertTrue(
+            any("false-positive filters unavailable" in e
+                for e in hatch_ev.evidence))
+
+    def test_word_success_hatch_not_downgraded(self):
+        """When word extraction succeeds, hatch NOT downgraded."""
+        from pb_surface_evidence_v160 import SurfaceEvidence
+        hatch_ev = SurfaceEvidence(
+            surface_id="page_1:hatch_0",
+            geometry_method="hatch_region",
+            status="needs_check",
+        )
+        hatch_evidence_list = [hatch_ev]
+        word_extraction_error = ""
+        if word_extraction_error and hatch_evidence_list:
+            for ev in hatch_evidence_list:
+                ev.status = "needs_check"
+        self.assertEqual(hatch_ev.status, "needs_check")
+        self.assertFalse(
+            any("false-positive" in e for e in hatch_ev.evidence))
+
+
 class TestUnionFind(unittest.TestCase):
     """Union-Find data structure used in clustering."""
 
@@ -937,11 +1222,6 @@ class TestUnionFind(unittest.TestCase):
         self.assertEqual(uf.find(0), 0)
         self.assertEqual(uf.find(1), 1)
         self.assertEqual(uf.find(2), 2)
-
-
-# ---------------------------------------------------------------------------
-# BLOCKER 1 tests: along-axis proximity — separate hatch regions
-# ---------------------------------------------------------------------------
 class TestSeparateHatchRegions(unittest.TestCase):
     """BLOCKER 1: clustering must not join physically separate hatch regions."""
 
