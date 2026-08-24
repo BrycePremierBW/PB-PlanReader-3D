@@ -7,10 +7,14 @@ gating rules.
 Safety contract:
   - Geometric evidence always creates one record per physical opening,
     quantity = 1.
-  - deduct defaults to False for all auto-detected evidence.
-  - Only confirmed, wall-associated, dimension-known instances may
-    set deduct = True.
-  - Uncertain openings never alter net wall m2.
+  - Evidence confidence establishes deduction ELIGIBILITY, not the
+    commercial deduct decision. B1-B4 produce eligible/not_eligible.
+    B5 converts eligible evidence into actual deductions subject to
+    estimator control.
+  - dimension_basis is enforced: only rough_opening dimensions are
+    eligible for wall-void deduction.
+  - Physical-instance dedup requires a geometric position anchor;
+    schedule/type records enrich but never collapse instances.
 """
 from __future__ import annotations
 
@@ -39,13 +43,23 @@ DIMENSION_BASIS_VALUES = (
     DIMENSION_BASIS_UNKNOWN,
 )
 
+# Basis priority: higher = more authoritative for wall deduction.
+# Only rough_opening is eligible for automatic wall-void deduction.
+BASIS_PRIORITY: Dict[str, int] = {
+    DIMENSION_BASIS_ROUGH_OPENING: 5,
+    DIMENSION_BASIS_CLEAR_OPENING: 4,
+    DIMENSION_BASIS_FRAME: 3,
+    DIMENSION_BASIS_LEAF: 2,
+    DIMENSION_BASIS_UNKNOWN: 1,
+}
+
 # ---------------------------------------------------------------------------
 # Confidence thresholds
 # ---------------------------------------------------------------------------
-CONFIDENCE_AUTO_DEDUCT = 0.9     # >= this: eligible for auto-deduct
-CONFIDENCE_DERIVED_DEDUCT = 0.7  # >= this: deduct with "Derived" status
-CONFIDENCE_REVIEW = 0.5          # >= this: flag for Review, no deduction
-# < 0.5: record existence only, no deduction
+CONFIDENCE_AUTO_DEDUCT = 0.9     # >= this: auto_eligible
+CONFIDENCE_DERIVED_DEDUCT = 0.7  # >= this: derived_eligible
+CONFIDENCE_REVIEW = 0.5          # >= this: flag for Review
+# < 0.5: record existence only
 
 # ---------------------------------------------------------------------------
 # Tolerances for cross-source deduplication
@@ -76,9 +90,19 @@ OPENING_TYPES = (
 # ---------------------------------------------------------------------------
 # Deduction statuses
 # ---------------------------------------------------------------------------
+DEDUCTION_AUTO_ELIGIBLE = "auto_eligible"
+DEDUCTION_DERIVED_ELIGIBLE = "derived_eligible"
+DEDUCTION_REVIEW = "review"
+DEDUCTION_NONE = "none"
+
+# Commercial deduction states (set by B5 / estimator)
 DEDUCTION_DEDUCTED = "deducted"
 DEDUCTION_NOT_DEDUCTED = "not_deducted"
-DEDUCTION_REVIEW = "review"
+
+# ---------------------------------------------------------------------------
+# Sources that are NOT physical instances (cannot anchor dedup)
+# ---------------------------------------------------------------------------
+NON_INSTANCE_SOURCES = {"schedule_parse", "manual"}
 
 
 def _num(v: Any, default: float = 0.0) -> float:
@@ -87,6 +111,11 @@ def _num(v: Any, default: float = 0.0) -> float:
         return x if x == x else default  # NaN check
     except (TypeError, ValueError):
         return default
+
+
+def _ordered_dedup(items: list) -> list:
+    """Remove duplicates preserving order. Uses dict.fromkeys not set."""
+    return list(dict.fromkeys(items))
 
 
 # ---------------------------------------------------------------------------
@@ -100,11 +129,14 @@ class OpeningEvidence:
       - opening_instance_id is unique per physical opening (UUID-based).
       - type_mark (W01, D01) is the TYPE mark, NOT physical identity.
         A type mark can repeat many times on the same wall/level.
-      - quantity is ALWAYS 1 for geometric evidence. Grouped commercial
-        allowances are a v134 estimator concept.
+      - quantity is ALWAYS 1 for geometric (non-manual) evidence.
+        Manual/v134 records may retain grouped quantities.
       - dimension_basis records what the width/height refer to.
-        Unknown basis -> lower dimension_confidence.
-      - deduct defaults to False. Only confirmed instances may set True.
+        Only rough_opening is eligible for wall-void deduction.
+      - deduction_status records ELIGIBILITY (auto_eligible, derived_eligible,
+        review, none). It does NOT mean deduct=True.
+      - deduct is the commercial decision, set only by B5 or estimator.
+        B1-B4 must never set deduct=True.
     """
 
     # --- Identity ---
@@ -124,8 +156,9 @@ class OpeningEvidence:
     # --- Type ---
     opening_type: str = OPENING_TYPE_OTHER
 
-    # --- Quantity (always 1 for geometric evidence) ---
+    # --- Quantity ---
     quantity: int = 1
+    _quantity_from_source: str = ""     # "geometric" or "manual/v134"
 
     # --- Dimensions ---
     width_m: Optional[float] = None
@@ -149,16 +182,36 @@ class OpeningEvidence:
     dimension_confidence: float = 0.0
     association_confidence: float = 0.0
 
-    # --- Deduction status (safety gate) ---
-    deduct: bool = False                # DEFAULT False for auto-detected
+    # --- Deduction status (safety gate: ELIGIBILITY, not decision) ---
     deduction_status: str = DEDUCTION_REVIEW
+
+    # --- Commercial decision (set ONLY by B5 / estimator) ---
+    deduct: bool = False
 
     # --- Provenance ---
     evidence: List[str] = field(default_factory=list)
     notes: str = ""
 
+    def __post_init__(self) -> None:
+        """Enforce quantity=1 for geometric sources."""
+        if self._quantity_from_source != "manual":
+            if self.quantity != 1 and self.extraction_method not in ("", "manual"):
+                self.quantity = 1
+
+    def set_quantity(self, qty: int, source: str = "manual") -> None:
+        """Set quantity with source tracking.
+
+        source="geometric" forces quantity=1.
+        source="manual" allows grouped quantities (v134 records).
+        """
+        self._quantity_from_source = source
+        if source == "geometric":
+            self.quantity = 1
+        else:
+            self.quantity = max(1, int(qty))
+
     def compute_area(self) -> None:
-        """Compute area_m2 from dimensions. Called after setting width/height."""
+        """Compute area_m2 from dimensions."""
         if self.width_m is not None and self.height_m is not None:
             self.area_m2 = round(
                 self.width_m * self.height_m * max(1, self.quantity), 4
@@ -166,16 +219,21 @@ class OpeningEvidence:
         else:
             self.area_m2 = None
 
-    def compute_deduction_status(self) -> None:
-        """Set deduction_status based on confidence thresholds.
+    def _is_geometric_source(self) -> bool:
+        """True if this record came from geometric detection (not manual/schedule)."""
+        return self.extraction_method not in ("", "manual", "schedule_parse")
 
-        This is the safety gate. An opening must meet ALL criteria
-        to be eligible for deduction:
-          - geometry_confidence >= CONFIDENCE_DERIVED_DEDUCT
-          - dimension_confidence >= CONFIDENCE_DERIVED_DEDUCT
-          - association_confidence >= CONFIDENCE_DERIVED_DEDUCT
-          - width_m and height_m are known
-          - wall_ref is resolved
+    def compute_deduction_status(self) -> None:
+        """Set deduction_status based on confidence thresholds and dimension_basis.
+
+        This is the ELIGIBILITY gate, not the commercial deduction decision.
+        It sets deduction_status to one of:
+          - auto_eligible: high confidence, rough_opening dims, all criteria met
+          - derived_eligible: medium confidence, rough_opening dims, criteria met
+          - review: insufficient evidence or non-rough_opening dims
+          - none: very low confidence
+
+        It does NOT set deduct=True. That is B5's job.
         """
         has_dims = (
             self.width_m is not None
@@ -185,9 +243,11 @@ class OpeningEvidence:
         )
         has_wall = bool(self.wall_ref)
 
-        if not has_dims or not has_wall:
+        # dimension_basis check: only rough_opening qualifies for wall deduction
+        has_valid_basis = self.dimension_basis == DIMENSION_BASIS_ROUGH_OPENING
+
+        if not has_dims or not has_wall or not has_valid_basis:
             self.deduction_status = DEDUCTION_REVIEW
-            self.deduct = False
             return
 
         min_conf = min(
@@ -197,17 +257,24 @@ class OpeningEvidence:
         )
 
         if min_conf >= CONFIDENCE_AUTO_DEDUCT:
-            self.deduction_status = DEDUCTION_DEDUCTED
-            self.deduct = True
+            self.deduction_status = DEDUCTION_AUTO_ELIGIBLE
         elif min_conf >= CONFIDENCE_DERIVED_DEDUCT:
-            self.deduction_status = DEDUCTION_DEDUCTED
-            self.deduct = True
+            self.deduction_status = DEDUCTION_DERIVED_ELIGIBLE
         elif min_conf >= CONFIDENCE_REVIEW:
             self.deduction_status = DEDUCTION_REVIEW
-            self.deduct = False
         else:
-            self.deduction_status = DEDUCTION_REVIEW
-            self.deduct = False
+            self.deduction_status = DEDUCTION_NONE
+
+    def is_eligible_for_deduction(self) -> bool:
+        """True if this opening is eligible for wall-void deduction.
+
+        This does NOT mean deduct=True. It means the evidence meets
+        the minimum criteria for B5 to consider it.
+        """
+        return self.deduction_status in (
+            DEDUCTION_AUTO_ELIGIBLE,
+            DEDUCTION_DERIVED_ELIGIBLE,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -220,37 +287,115 @@ def same_physical_opening(
     height_tol: float = TOLERANCE_HEIGHT_M,
     position_tol: float = TOLERANCE_POSITION_M,
 ) -> bool:
-    """True if a and b are the same physical opening seen from different sources.
+    """True if a and b are provably the same physical opening.
 
-    Uses geometric position and dimension tolerances, NOT type marks.
-    Type marks are not compared because the same mark can appear on
-    different physical openings.
+    Requires a genuine geometric position anchor.  Two records match
+    only when ALL of:
+      - non-empty compatible wall_ref
+      - compatible level (or one is blank)
+      - BOTH have position_along_wall_m and positions agree within tolerance
+      - dimensions agree within tolerance (when both present)
+
+    Schedule/type records without position never anchor a dedup;
+    they enrich existing instances by type mark or dimension.
     """
-    # Must be same wall and same level
+    # Must have non-empty compatible wall_ref
+    if not a.wall_ref or not b.wall_ref:
+        return False
     if a.wall_ref != b.wall_ref:
         return False
+
+    # Compatible level
     if a.level and b.level and a.level != b.level:
         return False
 
-    # Width within tolerance (with float epsilon)
+    # MUST have position anchor from BOTH records
+    if a.position_along_wall_m is None or b.position_along_wall_m is None:
+        return False
+
+    # Position within tolerance
+    if abs(a.position_along_wall_m - b.position_along_wall_m) > position_tol + 1e-9:
+        return False
+
+    # Width within tolerance (when both present)
     if a.width_m is not None and b.width_m is not None:
         if abs(a.width_m - b.width_m) > width_tol + 1e-9:
             return False
 
-    # Height within tolerance (with float epsilon)
+    # Height within tolerance (when both present)
     if a.height_m is not None and b.height_m is not None:
         if abs(a.height_m - b.height_m) > height_tol + 1e-9:
             return False
 
-    # Position along wall within tolerance (with float epsilon)
-    if (
-        a.position_along_wall_m is not None
-        and b.position_along_wall_m is not None
-    ):
-        if abs(a.position_along_wall_m - b.position_along_wall_m) > position_tol + 1e-9:
-            return False
-
     return True
+
+
+def enriches_by_type(
+    existing: OpeningEvidence,
+    candidate: OpeningEvidence,
+) -> bool:
+    """True if candidate can enrich existing by type mark or dimension,
+    even though they are not the same physical instance (no position match).
+
+    A schedule/manual record enriches a detected instance when:
+      - same wall_ref and compatible level
+      - candidate has a type_mark (existing may or may not)
+      - candidate is a schedule/manual source (not another geometric source)
+    """
+    if not existing.wall_ref or not candidate.wall_ref:
+        return False
+    if existing.wall_ref != candidate.wall_ref:
+        return False
+    if existing.level and candidate.level and existing.level != candidate.level:
+        return False
+    if not candidate.type_mark:
+        return False
+    # Enrichment only if marks are compatible (existing has no mark, or marks match)
+    if existing.type_mark and existing.type_mark != candidate.type_mark:
+        return False
+    if candidate.extraction_method not in NON_INSTANCE_SOURCES:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Dimension source selection: basis + confidence + authority
+# ---------------------------------------------------------------------------
+def _should_replace_dimensions(
+    current_basis: str,
+    current_confidence: float,
+    current_source: str,
+    new_basis: str,
+    new_confidence: float,
+    new_source: str,
+) -> bool:
+    """Decide whether new dimensions should replace current.
+
+    Selection is by:
+      1. Basis priority (rough_opening > clear > frame > leaf > unknown)
+      2. If same basis priority, higher confidence wins
+      3. Schedule source is NOT automatically preferred
+    """
+    cur_pri = BASIS_PRIORITY.get(current_basis, 0)
+    new_pri = BASIS_PRIORITY.get(new_basis, 0)
+
+    if new_pri > cur_pri:
+        return True
+    if new_pri < cur_pri:
+        return False
+
+    # Same basis priority: higher confidence wins
+    if new_confidence > current_confidence + 1e-9:
+        return True
+    if new_confidence < current_confidence - 1e-9:
+        return False
+
+    # Same confidence: schedule_parse is slightly preferred (schedule is
+    # a dimension authority for the same basis)
+    if new_source == "schedule_parse" and current_source != "schedule_parse":
+        return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -263,12 +408,14 @@ def merge_opening_evidence(
     """Merge evidence from two records of the same physical opening.
 
     Keeps highest-confidence values and merges evidence provenance.
-    Prefers schedule dimensions over geometric estimation when available.
+    Dimensions are chosen by basis priority + confidence, not merely
+    by source type.
     """
     merged = OpeningEvidence(**asdict(existing))
+    merged._quantity_from_source = existing._quantity_from_source
 
-    # Merge evidence sources (deduplicated)
-    merged.evidence = list(set(existing.evidence + new.evidence))
+    # Merge evidence sources (ordered dedup, not set)
+    merged.evidence = _ordered_dedup(existing.evidence + new.evidence)
 
     # Upgrade confidence if new source confirms
     merged.geometry_confidence = max(
@@ -281,27 +428,23 @@ def merge_opening_evidence(
         existing.association_confidence, new.association_confidence
     )
 
-    # Prefer schedule dimensions over geometric estimation
-    if new.extraction_method == "schedule_parse":
-        if new.width_m is not None:
-            merged.width_m = new.width_m
+    # Dimensions: choose by basis + confidence, not by source type
+    if new.width_m is not None or new.height_m is not None:
+        should_replace = _should_replace_dimensions(
+            current_basis=existing.dimension_basis,
+            current_confidence=existing.dimension_confidence,
+            current_source=existing.extraction_method,
+            new_basis=new.dimension_basis,
+            new_confidence=new.dimension_confidence,
+            new_source=new.extraction_method,
+        )
+        if should_replace:
+            if new.width_m is not None:
+                merged.width_m = new.width_m
+            if new.height_m is not None:
+                merged.height_m = new.height_m
             merged.dimension_basis = new.dimension_basis
-        if new.height_m is not None:
-            merged.height_m = new.height_m
-            merged.dimension_basis = new.dimension_basis
-
-    # Prefer more specific dimension basis
-    basis_priority = {
-        DIMENSION_BASIS_ROUGH_OPENING: 5,
-        DIMENSION_BASIS_CLEAR_OPENING: 4,
-        DIMENSION_BASIS_FRAME: 3,
-        DIMENSION_BASIS_LEAF: 2,
-        DIMENSION_BASIS_UNKNOWN: 1,
-    }
-    if basis_priority.get(new.dimension_basis, 0) > basis_priority.get(
-        merged.dimension_basis, 0
-    ):
-        merged.dimension_basis = new.dimension_basis
+        # else: keep existing dims and basis
 
     # Take mark if new has one and existing doesn't
     if new.type_mark and not merged.type_mark:
@@ -329,8 +472,12 @@ def deduplicate_openings(
 ) -> List[OpeningEvidence]:
     """Deduplicate a list of opening evidence records.
 
-    Returns a new list with duplicates merged. The first occurrence
-    of each physical opening is kept as the base record.
+    Two records are merged ONLY when same_physical_opening() confirms
+    they are the same physical instance (requires position anchor).
+
+    Schedule/type records that don't match by position may enrich an
+    existing instance by type mark via enriches_by_type(), but they
+    never collapse physical instances.
     """
     result: List[OpeningEvidence] = []
     for new in openings:
@@ -338,6 +485,19 @@ def deduplicate_openings(
         for i, existing in enumerate(result):
             if same_physical_opening(existing, new):
                 result[i] = merge_opening_evidence(existing, new)
+                matched = True
+                break
+            elif enriches_by_type(existing, new):
+                # Enrich by type mark / dimension basis, don't merge
+                if new.type_mark and not existing.type_mark:
+                    result[i].type_mark = new.type_mark
+                if new.dimension_basis != DIMENSION_BASIS_UNKNOWN:
+                    existing_basis_pri = BASIS_PRIORITY.get(existing.dimension_basis, 0)
+                    new_basis_pri = BASIS_PRIORITY.get(new.dimension_basis, 0)
+                    if new_basis_pri > existing_basis_pri:
+                        result[i].dimension_basis = new.dimension_basis
+                if new.evidence:
+                    result[i].evidence = _ordered_dedup(existing.evidence + new.evidence)
                 matched = True
                 break
         if not matched:
@@ -390,6 +550,22 @@ def to_v134_record(opening: OpeningEvidence) -> Dict[str, Any]:
     }
 
 
+def _classify_opening_type(kind: str) -> str:
+    """Classify opening type from kind string. Check specific types first."""
+    kind_lower = kind.lower()
+    if "garage" in kind_lower:
+        return OPENING_TYPE_GARAGE
+    if "roller" in kind_lower:
+        return OPENING_TYPE_ROLLER
+    if "glaz" in kind_lower:
+        return OPENING_TYPE_GLAZED
+    if "window" in kind_lower:
+        return OPENING_TYPE_WINDOW
+    if "door" in kind_lower:
+        return OPENING_TYPE_DOOR
+    return OPENING_TYPE_OTHER
+
+
 def from_v134_record(
     record: Dict[str, Any],
     workspace_id: int = 0,
@@ -397,20 +573,10 @@ def from_v134_record(
     """Convert a v134 register record to OpeningEvidence.
 
     v134 records may have quantity > 1 (grouped commercial allowances).
-    For geometric evidence, quantity should always be 1.
+    These are preserved as manual-grouped records.
     """
-    kind = str(record.get("kind", "")).lower()
-    opening_type = OPENING_TYPE_OTHER
-    if "door" in kind:
-        opening_type = OPENING_TYPE_DOOR
-    elif "window" in kind:
-        opening_type = OPENING_TYPE_WINDOW
-    elif "glaz" in kind:
-        opening_type = OPENING_TYPE_GLAZED
-    elif "garage" in kind:
-        opening_type = OPENING_TYPE_GARAGE
-    elif "roller" in kind:
-        opening_type = OPENING_TYPE_ROLLER
+    kind = str(record.get("kind", ""))
+    opening_type = _classify_opening_type(kind)
 
     width = _num(record.get("width_m"))
     height = _num(record.get("height_m"))
@@ -422,15 +588,14 @@ def from_v134_record(
         workspace_id=workspace_id,
         wall_ref=str(record.get("wall_ref", "")),
         opening_type=opening_type,
-        quantity=quantity,
         width_m=width if width > 0 else None,
         height_m=height if height > 0 else None,
         dimension_basis=DIMENSION_BASIS_UNKNOWN,
-        sill_m=0.0 if opening_type == OPENING_TYPE_DOOR else 0.9,
-        deduction_status=DEDUCTION_REVIEW,
+        sill_m=0.0 if opening_type in (OPENING_TYPE_DOOR, OPENING_TYPE_GARAGE, OPENING_TYPE_ROLLER) else 0.9,
         extraction_method="manual",
         evidence=[str(record.get("source_reference", ""))],
     )
+    ev.set_quantity(quantity, source="manual")
     ev.compute_area()
 
     # For v134 records, respect the existing deduct toggle
