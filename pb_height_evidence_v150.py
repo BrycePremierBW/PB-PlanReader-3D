@@ -78,18 +78,38 @@ class HeightEvidence:
             self.priority = _PRIORITY_MAP[self.extraction_method]
 
 
+@dataclass
+class WordBox:
+    """Positioned text word from PDF extraction (bbox in PDF coordinates)."""
+    text: str
+    x0: float = 0.0
+    y0: float = 0.0
+    x1: float = 0.0
+    y1: float = 0.0
+    page_id: int = 0
+    line_id: int = 0
+
+    @property
+    def centre(self) -> Tuple[float, float]:
+        return ((self.x0 + self.x1) / 2.0, (self.y0 + self.y1) / 2.0)
+
+    @property
+    def bbox(self) -> Tuple[float, float, float, float]:
+        return (self.x0, self.y0, self.x1, self.y1)
+
+
 # ---------------------------------------------------------------------------
 # Regex patterns
 # ---------------------------------------------------------------------------
 
-# Semantic ceiling height labels
+# Semantic ceiling height labels (lookbehind allows start-of-string / after space)
 _CEIL_RE = re.compile(
-    r"\b(?:CH|CLG|CEILING\s*HEIGHT|FCL|CEIL)\s*[:=]?\s*"
+    r"(?<!\w)(?:CH|CLG|CEILING\s*HEIGHT|FCL|CEIL)\s*[:=]?\s*"
     r"(\d{1,5}(?:\.\d+)?)\s*(mm|m)?",
     re.IGNORECASE,
 )
 
-# Floor-to-floor / floor finish level
+# Floor-to-floor / floor finish level (standalone datum — NOT a wall height)
 _FFL_RE = re.compile(
     r"\b(?:FFL|FINISHED\s*FLOOR\s*LEVEL)\s*[:=]?\s*"
     r"(-?\d{1,3}(?:\.\d{1,4})?)\s*(mm|m)?",
@@ -114,6 +134,18 @@ _DIM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Context patterns for dimension orientation classification
+_VERTICAL_CONTEXT_RE = re.compile(
+    r"\b(?:elevation|section|height|ht|vertical|storey|story|floor.to."
+    r"(?:ceiling|floor|roof)|ceiling|soffit|parapet|facade|clg|fcl|ch)\b",
+    re.IGNORECASE,
+)
+_HORIZONTAL_CONTEXT_RE = re.compile(
+    r"\b(?:plan|width|breadth|room|horizontal|long|span|length|internal|"
+    r"external|area|garage|kitchen|bed|bath|living|dining|entry)\b",
+    re.IGNORECASE,
+)
+
 # ---------------------------------------------------------------------------
 # Semantic RL pairing
 # ---------------------------------------------------------------------------
@@ -132,6 +164,69 @@ _RL_KW_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Semantic keywords that indicate height type when paired with RL values
+_F2C_KEYWORDS = {"fcl", "ceiling", "soffit"}
+_F2F_KEYWORDS = {"ffl", "floor", "level", "storey", "story", "finished"}
+_PARAPET_KEYWORDS = {"parapet"}
+_RL_KEYWORDS = {"rl", "ahd", "natural", "ground"}
+
+
+def _infer_rl_height_type(kw_a: str, kw_b: str) -> str:
+    """Determine height type from the semantic identities of both RL endpoints.
+
+    FFL → FCL = floor_to_ceiling
+    Level 1 FFL → Level 2 FFL = floor_to_floor
+    FFL → SOFFIT = soffit
+    FFL → PARAPET = parapet
+    """
+    a, b = kw_a.lower(), kw_b.lower()
+    pair = (min(a, b), max(a, b))
+    # Known semantic pairs take precedence
+    _PAIR_TYPES = {
+        ("fcl", "ffl"): "floor_to_ceiling",
+        ("ceiling", "ffl"): "floor_to_ceiling",
+        ("fcl", "floor"): "floor_to_ceiling",
+        ("ceiling", "floor"): "floor_to_ceiling",
+        ("ffl", "soffit"): "generic",
+        ("fcl", "soffit"): "floor_to_ceiling",
+        ("ffl", "parapet"): "parapet",
+    }
+    if pair in _PAIR_TYPES:
+        return _PAIR_TYPES[pair]
+    # Same keyword family → that type
+    if a == b:
+        if a in _F2C_KEYWORDS:
+            return "floor_to_ceiling"
+        if a in _F2F_KEYWORDS:
+            return "floor_to_floor"
+    # FFL with non-FFL → type of the non-FFL endpoint
+    if a == "ffl" or b == "ffl":
+        other = b if a == "ffl" else a
+        if other in _F2C_KEYWORDS:
+            return "floor_to_ceiling"
+        if other in _PARAPET_KEYWORDS:
+            return "parapet"
+        return "floor_to_floor"  # FFL + level/storey/other = f2f
+    # Mixed types
+    types_a = set()
+    types_b = set()
+    for kw_set, htype in [(_F2C_KEYWORDS, "floor_to_ceiling"),
+                           (_F2F_KEYWORDS, "floor_to_floor"),
+                           (_PARAPET_KEYWORDS, "parapet"),
+                           (_RL_KEYWORDS, "generic")]:
+        if a in kw_set:
+            types_a.add(htype)
+        if b in kw_set:
+            types_b.add(htype)
+    all_types = types_a | types_b
+    if "floor_to_ceiling" in all_types and "floor_to_floor" not in all_types:
+        return "floor_to_ceiling"
+    if "floor_to_floor" in all_types and "floor_to_ceiling" not in all_types:
+        return "floor_to_floor"
+    if "parapet" in all_types:
+        return "parapet"
+    return "generic"
+
 
 def _find_paired_rls(
     text: str,
@@ -144,16 +239,25 @@ def _find_paired_rls(
     Only RLs near semantic height keywords (FFL, FCL, LEVEL, etc.) are
     considered.  Two unrelated RLs on the same sheet must NOT become a
     wall/ceiling height merely because abs(RL2 − RL1) ≈ 2.7–3.2 m.
+    Height type is inferred from the semantic identity of BOTH endpoints.
     """
     paired_rls: List[Tuple[float, str, int]] = []
     for m in _RL_RE.finditer(text):
         rl_val = float(m.group(1))
-        start = max(0, m.start() - 30)
-        end = min(len(text), m.end() + 30)
+        rl_pos = m.start()
+        # Search wider context for the CLOSEST semantic keyword
+        start = max(0, rl_pos - 50)
+        end = min(len(text), m.end() + 50)
         context = text[start:end]
-        kw_match = _RL_KW_RE.search(context)
-        if kw_match:
-            paired_rls.append((rl_val, kw_match.group(0).lower(), m.start()))
+        best_kw = None
+        best_dist = 999
+        for kw_m in _RL_KW_RE.finditer(context):
+            dist = abs(kw_m.start() - (rl_pos - start))
+            if dist < best_dist:
+                best_dist = dist
+                best_kw = kw_m.group(0).lower()
+        if best_kw:
+            paired_rls.append((rl_val, best_kw, rl_pos))
 
     if len(paired_rls) < 2:
         return []
@@ -168,22 +272,23 @@ def _find_paired_rls(
             seen.add(key)
             diff = round(abs(b - a), 4)
             if min_height <= diff <= max_height:
+                ht = _infer_rl_height_type(kw_a, kw_b)
                 best_dist = abs(diff - tolerance)
-                rls_on_page = sorted(set(round(v, 4) for v, _, _ in paired_rls))
                 ev = HeightEvidence(
                     id="",  # assigned by caller
                     source_page_id=0,
                     source_page_label="",
-                    height_type="floor_to_floor",
+                    height_type=ht,
                     raw_text=f"RL {a} → RL {b} (context: {kw_a}/{kw_b})",
                     height_m=diff,
                     extraction_method="rl_difference",
                     confidence=0.95,
-                    confidence_reason=f"Contextual RL pairing ({kw_a}/{kw_b})",
+                    confidence_reason=f"Contextual RL pairing ({kw_a}/{kw_b}) → {ht}",
                     status="Measured",
                     evidence=[
                         f"RL {a} → RL {b} = {diff:.3f} m",
                         f"Semantic context: {kw_a}/{kw_b}",
+                        f"Inferred type: {ht}",
                         f"Distance from 3.0 m anchor: {best_dist:.3f} m",
                     ],
                     position=[pos_a, pos_b],
@@ -198,9 +303,15 @@ def _find_paired_rls(
 # ---------------------------------------------------------------------------
 
 def _extract_semantic_heights(text: str) -> List[HeightEvidence]:
-    """Extract explicitly labelled heights: CH 2700, CLG 3000, FFL 0.000, etc."""
+    """Extract explicitly labelled heights: CH 2700, CLG 3000, etc.
+
+    FFL/level values are stored as level_references, NOT as usable heights.
+    A standalone FFL 10.000 is an absolute datum, not a 10 m wall height.
+    Heights are derived from PAIRED level references by _derive_level_heights.
+    """
     results: List[HeightEvidence] = []
 
+    # --- Ceiling height labels → usable height evidence ---
     for m in _CEIL_RE.finditer(text):
         raw = float(m.group(1))
         unit = (m.group(2) or "").lower()
@@ -227,58 +338,81 @@ def _extract_semantic_heights(text: str) -> List[HeightEvidence]:
                 position=[m.start(), m.end()],
             ))
 
-    for m in _FFL_RE.finditer(text):
-        raw = float(m.group(1))
-        unit = (m.group(2) or "").lower()
-        if unit == "m":
-            val = raw
-        elif unit == "mm" or not unit:
-            val = raw / 1000.0 if abs(raw) >= 10 else raw
+    # FFL/LEVEL references are handled by _extract_ffl_level_refs
+    return results
+
+
+def _extract_ffl_level_refs(text: str) -> List[HeightEvidence]:
+    """Extract FFL/LEVEL line pairs with associated RL values.
+
+    Handles patterns like:
+      FFL 10.000         → level ref 10.0 m
+      LEVEL 1 FFL 10.000 → level ref 10.0 m
+      LEVEL 2 RL 13.200  → level ref 13.2 m
+    """
+    results: List[HeightEvidence] = []
+    for m in re.finditer(
+        r"(?:LEVEL\s+(\d{1,2})\s+)?(?:FFL|FCL|FINISHED\s*FLOOR\s*LEVEL)"
+        r"\s*[:=]?\s*(-?\d{1,3}(?:\.\d{1,4})?)\b",
+        str(text or ""), re.IGNORECASE,
+    ):
+        level_num = m.group(1)
+        raw = float(m.group(2))
+        val = raw if abs(raw) < 100 else raw / 1000.0
+        matched_kw = m.group(0).split()[0].upper()
+        if level_num:
+            label = f"Level {level_num} {matched_kw}"
+        elif matched_kw in ("FCL",):
+            label = "FCL"
         else:
-            continue
+            label = "FFL"
         results.append(HeightEvidence(
             id="", source_page_id=0, source_page_label="",
-            height_type="floor_to_floor",
-            raw_text=m.group(0).strip(),
+            height_type="level_reference",
+            raw_text=f"{label} {val:.3f} m",
             height_m=round(val, 4),
-            extraction_method="semantic_label",
-            confidence=0.85,
-            confidence_reason="Floor level reference (RL value, not a storey height directly)",
-            status="Measured",
-            evidence=[f"Floor level: {m.group(0).strip()} = {val:.3f} m"],
+            extraction_method="level_reference",
+            confidence=0.90,
+            confidence_reason=f"{label} absolute datum",
+            status="Level reference",
+            evidence=[f"{label}: {val:.3f} m (absolute datum)"],
             position=[m.start(), m.end()],
         ))
+    return results
 
-    for m in _LEVEL_RE.finditer(text):
-        level_num = int(m.group(1))
-        if 1 <= level_num <= 99:
-            start = max(0, m.start() - 10)
-            end = min(len(text), m.end() + 30)
-            context = text[start:end]
-            dim_match = _DIM_RE.search(context)
-            if dim_match:
-                raw = float(dim_match.group(1))
-                u = (dim_match.group(2) or "").lower()
-                if u == "mm" or (not u and raw >= 100):
-                    val = raw / 1000.0
-                elif u == "m":
-                    val = raw
-                else:
-                    continue
-                if 1.8 <= val <= 12.0:
-                    results.append(HeightEvidence(
-                        id="", source_page_id=0, source_page_label="",
-                        height_type="floor_to_floor",
-                        raw_text=f"Level {level_num} = {val:.3f} m",
-                        height_m=round(val, 4),
-                        extraction_method="semantic_label",
-                        confidence=0.90,
-                        confidence_reason=f"Level {level_num} height annotation",
-                        status="Measured",
-                        evidence=[f"Level {level_num}: {val:.3f} m"],
-                        position=[m.start(), m.end()],
-                    ))
 
+def _derive_level_heights(level_refs: List[HeightEvidence]) -> List[HeightEvidence]:
+    """Derive height evidence from paired level references.
+
+    FFL 10.000 → FCL 12.700 = floor_to_ceiling 2.700 m
+    LEVEL 1 FFL 10.000 → LEVEL 2 FFL 13.200 = floor_to_floor 3.200 m
+    """
+    results: List[HeightEvidence] = []
+    for i, a in enumerate(level_refs):
+        for b in level_refs[i + 1:]:
+            diff = round(abs(b.height_m - a.height_m), 4)
+            if 1.8 <= diff <= 12.0:
+                kw_a = a.raw_text.split()[0].lower() if a.raw_text else ""
+                kw_b = b.raw_text.split()[0].lower() if b.raw_text else ""
+                ht = _infer_rl_height_type(kw_a, kw_b)
+                results.append(HeightEvidence(
+                    id="",
+                    source_page_id=a.source_page_id,
+                    source_page_label=a.source_page_label,
+                    height_type=ht,
+                    raw_text=f"{a.raw_text} → {b.raw_text}",
+                    height_m=diff,
+                    extraction_method="rl_difference",
+                    confidence=0.90,
+                    confidence_reason=f"Derived from level references ({a.raw_text} → {b.raw_text})",
+                    status="Measured",
+                    evidence=[
+                        f"Level ref A: {a.raw_text} = {a.height_m:.3f} m",
+                        f"Level ref B: {b.raw_text} = {b.height_m:.3f} m",
+                        f"Derived height: {diff:.3f} m ({ht})",
+                    ],
+                    position=a.position + b.position if a.position and b.position else [],
+                ))
     return results
 
 
@@ -286,11 +420,38 @@ def _extract_semantic_heights(text: str) -> List[HeightEvidence]:
 # Raw dimension extraction
 # ---------------------------------------------------------------------------
 
+def _classify_dimension_orientation(text: str, match_start: int, match_end: int) -> str:
+    """Classify whether a dimension is vertical, horizontal, or unknown.
+
+    Checks surrounding text context for orientation cues. Dimensions in
+    section/elevation context are vertical; dimensions in plan/room context
+    are horizontal. Unknown = Review/unresolved.
+    """
+    start = max(0, match_start - 60)
+    end = min(len(text), match_end + 60)
+    context = text[start:end]
+    has_vert = bool(_VERTICAL_CONTEXT_RE.search(context))
+    has_horiz = bool(_HORIZONTAL_CONTEXT_RE.search(context))
+    if has_vert and not has_horiz:
+        return "vertical"
+    if has_horiz and not has_vert:
+        return "horizontal"
+    if has_vert and has_horiz:
+        return "unknown"  # ambiguous
+    return "unknown"
+
+
 def _extract_dimension_heights(
     text: str,
     height_type: str = "generic",
+    is_section_or_elevation: bool = False,
 ) -> List[HeightEvidence]:
-    """Extract raw dimensions in the plausible height range (1.8–12 m)."""
+    """Extract dimensions in the plausible height range (1.8–12 m).
+
+    A raw dimension may only become height evidence when geometry/context
+    proves it is vertical. Without orientation context → Review/unresolved,
+    and it must NOT outrank the project fallback for production wall height.
+    """
     rng = _TYPE_RANGES.get(height_type, _TYPE_RANGES["generic"])
     min_h = max(1.8, rng[0])
     max_h = min(12.0, rng[1])
@@ -304,19 +465,39 @@ def _extract_dimension_heights(
             val = raw
         else:
             continue
-        if min_h <= val <= max_h:
-            results.append(HeightEvidence(
-                id="", source_page_id=0, source_page_label="",
-                height_type=height_type,
-                raw_text=m.group(0).strip(),
-                height_m=round(val, 4),
-                extraction_method="dimension_parse",
-                confidence=0.70,
-                confidence_reason="Raw dimension in plausible height range",
-                status="Provisional measured",
-                evidence=[f"Dimension: {m.group(0).strip()} = {val:.3f} m"],
-                position=[m.start(), m.end()],
-            ))
+        if not (min_h <= val <= max_h):
+            continue
+
+        if is_section_or_elevation:
+            orient = "vertical"
+            conf = 0.70
+            status = "Provisional measured"
+            reason = "Dimension in section/elevation context (vertical assumed)"
+        else:
+            orient = _classify_dimension_orientation(text, m.start(), m.end())
+            if orient == "vertical":
+                conf = 0.70
+                status = "Provisional measured"
+                reason = "Dimension with vertical context cues"
+            elif orient == "horizontal":
+                continue  # horizontal dimension → NOT height evidence
+            else:
+                conf = 0.40
+                status = "Review"
+                reason = "Dimension with unknown orientation — not usable as height"
+
+        results.append(HeightEvidence(
+            id="", source_page_id=0, source_page_label="",
+            height_type=height_type,
+            raw_text=m.group(0).strip(),
+            height_m=round(val, 4),
+            extraction_method="dimension_parse",
+            confidence=conf,
+            confidence_reason=reason,
+            status=status,
+            evidence=[f"Dimension: {m.group(0).strip()} = {val:.3f} m ({orient})"],
+            position=[m.start(), m.end()],
+        ))
     return results
 
 
@@ -348,7 +529,7 @@ def _extract_section_heights(
         ev.confidence = max(0.80, ev.confidence - 0.05)
         results.append(ev)
 
-    for ev in _extract_dimension_heights(text, "generic"):
+    for ev in _extract_dimension_heights(text, "generic", is_section_or_elevation=True):
         ev.source_page_id = page_id
         ev.source_page_label = page_label
         ev.confidence = max(0.65, ev.confidence - 0.05)
@@ -361,14 +542,146 @@ def _extract_section_heights(
 # All-evidence aggregator
 # ---------------------------------------------------------------------------
 
-def extract_all_height_evidence(
+def _words_to_text_with_map(words: Sequence[WordBox]) -> Tuple[str, List[WordBox]]:
+    """Reconstruct text from positioned words and build char→word mapping."""
+    lines: Dict[int, List[WordBox]] = {}
+    for w in words:
+        lines.setdefault(w.line_id, []).append(w)
+    parts: List[str] = []
+    word_map: List[WordBox] = []
+    for lid in sorted(lines.keys()):
+        line_words = sorted(lines[lid], key=lambda w: w.x0)
+        line_words2 = [w for w in line_words if w.text.strip()]
+        for w in line_words2:
+            parts.append(w.text)
+            word_map.append(w)
+            parts.append(" ")
+        if parts and parts[-1] == " ":
+            parts[-1] = "\n"
+    return "".join(parts), word_map
+
+
+def _pos_char_to_word_bbox(
+    char_pos: int,
     text: str,
+    word_map: List[WordBox],
+) -> Optional[List[float]]:
+    """Map a character position in reconstructed text to word bbox."""
+    idx = 0
+    for wi, w in enumerate(word_map):
+        end = idx + len(w.text)
+        if idx <= char_pos < end:
+            return list(w.bbox)
+        idx = end + 1  # +1 for space/newline
+    if word_map:
+        return list(word_map[-1].bbox)
+    return None
+
+
+def _extract_with_positions(
+    words: Sequence[WordBox],
     page_id: int = 0,
     page_label: str = "",
     page_type: str = "",
 ) -> List[HeightEvidence]:
-    """Extract all height evidence from a page's text."""
+    """Extract height evidence from positioned PDF words with real bbox."""
+    if not words:
+        return []
+
+    text, word_map = _words_to_text_with_map(words)
+    is_sect = "section" in str(page_type).lower()
     ev_id_counter = 0
+
+    def _next_id() -> str:
+        nonlocal ev_id_counter
+        ev_id_counter += 1
+        return f"H{page_id:04d}_{ev_id_counter:02d}"
+
+    results: List[HeightEvidence] = []
+
+    for ev in _extract_semantic_heights(text):
+        ev.id = _next_id()
+        ev.source_page_id = page_id
+        ev.source_page_label = page_label
+        if ev.position and len(ev.position) == 2:
+            bbox = _pos_char_to_word_bbox(ev.position[0], text, word_map)
+            if bbox:
+                ev.position = [int(bbox[0]), int(bbox[1])]
+        results.append(ev)
+
+    ffl_refs = _extract_ffl_level_refs(text)
+    for ev in ffl_refs:
+        ev.id = _next_id()
+        ev.source_page_id = page_id
+        ev.source_page_label = page_label
+        if ev.position and len(ev.position) == 2:
+            bbox = _pos_char_to_word_bbox(ev.position[0], text, word_map)
+            if bbox:
+                ev.position = [int(bbox[0]), int(bbox[1])]
+        results.append(ev)
+
+    for ev in _derive_level_heights(ffl_refs):
+        ev.id = _next_id()
+        ev.source_page_id = page_id
+        ev.source_page_label = page_label
+        if ev.position and len(ev.position) >= 2:
+            bbox = _pos_char_to_word_bbox(ev.position[0], text, word_map)
+            if bbox:
+                ev.position = [int(bbox[0]), int(bbox[1])]
+        results.append(ev)
+
+    for ev in _find_paired_rls(text):
+        ev.id = _next_id()
+        ev.source_page_id = page_id
+        ev.source_page_label = page_label
+        if ev.position and len(ev.position) == 2:
+            bbox = _pos_char_to_word_bbox(ev.position[0], text, word_map)
+            if bbox:
+                ev.position = [int(bbox[0]), int(bbox[1])]
+        results.append(ev)
+
+    for ev in _extract_dimension_heights(text, is_section_or_elevation=is_sect):
+        ev.id = _next_id()
+        ev.source_page_id = page_id
+        ev.source_page_label = page_label
+        if ev.position and len(ev.position) == 2:
+            bbox = _pos_char_to_word_bbox(ev.position[0], text, word_map)
+            if bbox:
+                ev.position = [int(bbox[0]), int(bbox[1])]
+        results.append(ev)
+
+    if is_sect:
+        for ev in _extract_section_heights(text, page_id, page_label):
+            if not any(e.raw_text == ev.raw_text and e.height_m == ev.height_m
+                       for e in results):
+                ev.id = _next_id()
+                results.append(ev)
+
+    results.sort(key=lambda e: (-e.confidence, e.priority))
+    return results
+
+
+def extract_all_height_evidence(
+    text_or_words: Any,
+    page_id: int = 0,
+    page_label: str = "",
+    page_type: str = "",
+) -> List[HeightEvidence]:
+    """Extract all height evidence from a page.
+
+    Accepts either plain text (str) or positioned words (list of WordBox).
+    When positioned words are provided, evidence gets real PDF bbox coordinates.
+    """
+    if isinstance(text_or_words, (list, tuple)) and text_or_words and isinstance(text_or_words[0], WordBox):
+        return _extract_with_positions(
+            list(text_or_words), page_id=page_id,
+            page_label=page_label, page_type=page_type,
+        )
+
+    text = str(text_or_words or "")
+    is_sect = "section" in str(page_type).lower()
+    ev_id_counter = 0
+
     def _next_id() -> str:
         nonlocal ev_id_counter
         ev_id_counter += 1
@@ -382,19 +695,33 @@ def extract_all_height_evidence(
         ev.source_page_label = page_label
         results.append(ev)
 
+    # Extract FFL/level references and derive heights from paired levels
+    ffl_refs = _extract_ffl_level_refs(text)
+    for ev in ffl_refs:
+        ev.id = _next_id()
+        ev.source_page_id = page_id
+        ev.source_page_label = page_label
+        results.append(ev)
+
+    for ev in _derive_level_heights(ffl_refs):
+        ev.id = _next_id()
+        ev.source_page_id = page_id
+        ev.source_page_label = page_label
+        results.append(ev)
+
     for ev in _find_paired_rls(text):
         ev.id = _next_id()
         ev.source_page_id = page_id
         ev.source_page_label = page_label
         results.append(ev)
 
-    for ev in _extract_dimension_heights(text):
+    for ev in _extract_dimension_heights(text, is_section_or_elevation=is_sect):
         ev.id = _next_id()
         ev.source_page_id = page_id
         ev.source_page_label = page_label
         results.append(ev)
 
-    if "section" in str(page_type).lower():
+    if is_sect:
         for ev in _extract_section_heights(text, page_id, page_label):
             if not any(e.raw_text == ev.raw_text and e.height_m == ev.height_m
                        for e in results):
@@ -440,6 +767,9 @@ def resolve_height(
 
     compatible: List[HeightEvidence] = []
     for ev in evidence_list:
+        # Level references are absolute datums — never usable as wall heights
+        if ev.height_type == "level_reference":
+            continue
         if ev.height_type == "floor_to_floor" and not allow_floor_to_floor:
             continue
         if target_type in ("floor_to_ceiling", "ceiling_bulkhead"):
@@ -492,9 +822,12 @@ def resolve_room_heights(
         spatial = []
         generic = []
         for ev in all_evidence:
+            # Only use spatial matching when evidence has real bbox coordinates
+            # (from positioned PDF words), not character offsets from plain text
             if ev.position and len(ev.position) == 2:
-                x, y = ev.position
-                if polygon and _point_in_polygon((x, y), polygon):
+                # Evidence from positioned words stores bbox centre as position
+                # Evidence from plain text stores char offsets — not usable as coords
+                if polygon and _point_in_polygon((ev.position[0], ev.position[1]), polygon):
                     spatial.append(ev)
                 else:
                     generic.append(ev)
@@ -503,6 +836,8 @@ def resolve_room_heights(
 
         candidates = []
         for ev in spatial:
+            if ev.height_type == "level_reference":
+                continue
             if ev.height_type == "floor_to_floor" and not allow_f2f:
                 continue
             if room_type in ("floor_to_ceiling", "ceiling_bulkhead"):
@@ -513,13 +848,10 @@ def resolve_room_heights(
         if not candidates:
             for ev in generic:
                 if ev.extraction_method == "default":
-                    continue
-                if ev.height_type == "floor_to_floor" and not allow_f2f:
-                    continue
-                if room_type in ("floor_to_ceiling", "ceiling_bulkhead"):
-                    if ev.height_type == "floor_to_floor":
-                        continue
-                candidates.append(ev)
+                    candidates.append(ev)
+                    break
+                # Non-positioned evidence without real bbox must NOT leak
+                # across rooms — only spatial or default evidence is safe
 
         if candidates:
             candidates.sort(key=lambda e: (e.priority, -e.confidence))
@@ -648,7 +980,21 @@ def apply(app: Any) -> None:
         h, best = resolve_height(ev_list, target_type="generic")
         result = _original_solve(text, default_height)
         if best.extraction_method != "default":
+            # v150 found evidence — use v150 metadata consistently
             result["height_m"] = round(h, 4)
+            result["height_evidence"] = asdict(best)
+            result["status"] = best.status
+            result["confidence"] = (
+                "Verified" if best.confidence >= 0.90 else
+                "High" if best.confidence >= 0.80 else
+                "Derived" if best.confidence >= 0.65 else "Review"
+            )
+            result["source"] = best.extraction_method
+            # Remove old v136 metadata that may conflict with v150
+            result.pop("rls", None)
+            result.pop("dimensions", None)
+        else:
+            # v150 found nothing — keep v136 metadata but tag as fallback
             result["height_evidence"] = asdict(best)
         return result
 
