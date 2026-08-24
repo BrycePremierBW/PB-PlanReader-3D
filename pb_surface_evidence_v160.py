@@ -1094,67 +1094,49 @@ def associate_with_measured_surfaces(
 # ---------------------------------------------------------------------------
 
 def _get_measured_surfaces_for_page(
-    app: Any, page_id: int, workspace_id: int
+    app: Any, page_id: int, workspace_id: int, page: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     """Retrieve existing measured surfaces (rooms/walls) for a page.
+
+    Uses REAL production interfaces:
+      - extract_room_faces_from_page() from pb_room_face_takeoff (Priority 2)
+      - registered_wall_records_v135() from pb_elevation_registration_v135
 
     Returns list of dicts with polygon, ref, type, area_m2 — compatible
     with associate_with_measured_surfaces() input contract.
     """
     surfaces: List[Dict[str, Any]] = []
 
-    # Get room face takeoff data (rooms with calibrated polygons)
+    # 1. Room face polygons from Priority 2
     try:
-        room_data = app.get_room_face_takeoff and app.get_room_face_takeoff()
-        if room_data:
-            for room in room_data:
-                if room.get("page_id") == page_id:
-                    poly = room.get("polygon") or room.get("calibrated_polygon")
-                    if poly:
-                        surfaces.append({
-                            "polygon": poly,
-                            "ref": room.get("room_ref") or room.get("label", ""),
-                            "type": "room",
-                            "area_m2": room.get("area_m2"),
-                        })
-    except Exception:
-        pass
-
-    # Get registered wall data
-    try:
-        wall_data = app.get_registered_walls and app.get_registered_walls()
-        if wall_data:
-            for wall in wall_data:
-                if wall.get("page_id") == page_id:
-                    # Walls may have bbox but not polygon
-                    bbox = wall.get("bbox")
-                    if bbox:
-                        x0, y0, x1, y1 = bbox
-                        surfaces.append({
-                            "bbox": [x0, y0, x1, y1],
-                            "ref": wall.get("wall_ref") or wall.get("label", ""),
-                            "type": "wall",
-                            "area_m2": wall.get("gross_m2") or wall.get("area_m2"),
-                        })
-    except Exception:
-        pass
-
-    # Get takeoff rows as fallback measured surfaces
-    try:
-        rows = app.lexecute(
-            "SELECT id, location, substrate, quantity, unit, notes "
-            "FROM takeoff_rows WHERE workspace_id=? AND source_page=?",
-            (workspace_id, page_id),
-        )
-        if rows:
-            for row in rows:
-                # Only include rows that have an associated polygon in notes
-                # (e.g., from room face takeoff or floor mapper)
+        from pb_room_face_takeoff import extract_room_faces_from_page
+        room_faces = extract_room_faces_from_page(app, page)
+        for rf in room_faces:
+            poly = rf.polygon_pdf_pts
+            if poly and len(poly) >= 3:
                 surfaces.append({
-                    "ref": row[1] or "",
-                    "type": "takeoff_row",
-                    "area_m2": row[3] if row[4] == "m²" else None,
+                    "polygon": [(float(p[0]), float(p[1])) for p in poly],
+                    "ref": str(rf.room_ref or rf.label or ""),
+                    "type": "room",
+                    "area_m2": rf.floor_area_m2,
                 })
+    except Exception:
+        pass
+
+    # 2. Registered wall data from v135 (only if source_polygon is real coords)
+    try:
+        if hasattr(app, "registered_wall_records_v135"):
+            walls = app.registered_wall_records_v135(int(workspace_id))
+            for wall in walls:
+                source_poly = wall.get("source_polygon")
+                # source_polygon may be a string ID or actual coords
+                if isinstance(source_poly, (list, tuple)) and len(source_poly) >= 3:
+                    surfaces.append({
+                        "polygon": [(float(p[0]), float(p[1])) for p in source_poly],
+                        "ref": str(wall.get("wall_ref") or ""),
+                        "type": "wall",
+                        "area_m2": wall.get("net_m2"),
+                    })
     except Exception:
         pass
 
@@ -1168,123 +1150,213 @@ def process_page_surface_evidence(
 ) -> List[SurfaceEvidence]:
     """Production adapter: process one page through the full SurfaceEvidence chain.
 
-    Steps:
-      1. Retrieve the PDF page object from the database
-      2. Extract filled polygons via get_drawings()
-      3. Build SurfaceEvidence with page calibration
-      4. Extract positioned finish codes from page text
-      5. Retrieve existing measured surfaces for this page
-      6. Associate SurfaceEvidence with measured surfaces
-      7. Store results in workspace settings
-      8. Return evidence list
+    Uses ONLY real PlanReader production interfaces:
+      - pages table: id, document_id, page_no, page_label, page_type, px_per_m
+      - documents table: path (PDF file location)
+      - fitz.open(documents.path) → pdf[page_no - 1]
+      - pdf_page.get_text("words") for positioned text
+      - extract_room_faces_from_page() for Priority 2 measured surfaces
+      - app.set_workspace_setting() for storage
+      - app.registered_wall_records_v135() for wall data
 
-    This is the narrow production integration. It does NOT rewrite the
-    takeoff pipeline — it only adds classification metadata.
+    Steps:
+      1. Query pages + documents tables (real schema)
+      2. Open PDF via documents.path → fitz.open → load_page
+      3. Extract filled polygons via get_drawings()
+      4. Build SurfaceEvidence with page calibration
+      5. Extract positioned finish codes via get_text("words")
+      6. Retrieve measured surfaces via real Priority 2 / v135 interfaces
+      7. Associate SurfaceEvidence with measured surfaces
+      8. Store results via app.set_workspace_setting()
+      9. Return evidence list
+
+    This does NOT rewrite the takeoff pipeline — it only adds
+    classification metadata to existing authoritative quantities.
     """
     import json
+    from pathlib import Path
 
-    # Step 1: Get page data and PDF object
+    # ------------------------------------------------------------------
+    # Step 1: Query real pages + documents schema
+    # ------------------------------------------------------------------
     try:
-        pages = app.lexecute(
-            "SELECT id, page_no, label, px_per_m, render_zoom, scale_text "
-            "FROM pages WHERE id=?", (page_id,)
+        rows = app.lquery(
+            "SELECT p.id, p.document_id, p.page_no, p.page_label, "
+            "p.page_type, p.px_per_m, p.render_zoom, p.scale_text "
+            "FROM pages p WHERE p.id=?",
+            (page_id,),
         )
-        if not pages:
+        if not rows:
             return []
-        page_row = pages[0]
+        r = rows[0]
     except Exception:
         return []
 
-    page_dict = {
-        "id": page_row[0],
-        "page_no": page_row[1],
-        "label": page_row[2] or "",
-        "px_per_m": page_row[3],
-        "render_zoom": page_row[4],
-        "scale_text": page_row[5] or "",
-    }
-    page_no = page_dict["page_no"]
-    page_label = page_dict["label"]
+    doc_id = int(r.get("document_id") or 0)
+    page_no = int(r.get("page_no") or 1)
+    page_label = str(r.get("page_label") or "")
+    page_type = str(r.get("page_type") or "")
 
-    # Step 2: Get PDF page object (PyMuPDF)
+    page_dict = {
+        "id": page_id,
+        "document_id": doc_id,
+        "page_no": page_no,
+        "page_label": page_label,
+        "page_type": page_type,
+        "px_per_m": r.get("px_per_m"),
+        "render_zoom": r.get("render_zoom"),
+        "scale_text": str(r.get("scale_text") or ""),
+    }
+
+    # ------------------------------------------------------------------
+    # Step 2: Open PDF via documents.path (real production path)
+    # ------------------------------------------------------------------
     pdf_page = None
+    _pdf_doc = None  # keep reference for cleanup
     try:
-        if hasattr(app, "get_pdf_page"):
-            pdf_page = app.get_pdf_page(page_id)
-        elif hasattr(app, "lexecute"):
-            blobs = app.lexecute(
-                "SELECT pdf_blob FROM pages WHERE id=?", (page_id,)
-            )
-            if blobs and blobs[0][0]:
-                import fitz
-                doc = fitz.open(stream=blobs[0][0], filetype="pdf")
-                pdf_page = doc[0]
+        import fitz as _fitz
+        doc_rows = app.lquery(
+            "SELECT path FROM documents WHERE id=?", (doc_id,)
+        )
+        if not doc_rows:
+            return []
+        pdf_path = Path(str(doc_rows[0].get("path") or ""))
+        if pdf_path.suffix.lower() != ".pdf" or not pdf_path.is_file():
+            return []
+        _pdf_doc = _fitz.open(pdf_path)
+        page_idx = page_no - 1
+        if page_idx < 0 or page_idx >= len(_pdf_doc):
+            return []
+        pdf_page = _pdf_doc[page_idx]
     except Exception:
-        pass
+        return []
 
     if pdf_page is None:
         return []
 
-    # Step 3: Extract filled polygons
-    fill_polygons = extract_filled_polygons(pdf_page)
-
-    # Step 4: Build SurfaceEvidence with calibration
-    scale = page_scale_info(page_dict)
-    evidence_list = build_surface_evidence(
-        fill_polygons,
-        page_id=page_id,
-        page_no=page_no,
-        page_label=page_label,
-        workspace_id=workspace_id,
-        scale_info=scale,
-    )
-
-    # Step 5: Extract positioned finish codes from page text
-    code_occurrences: List[Dict[str, Any]] = []
     try:
-        if hasattr(pdf_page, "get_text"):
-            text = pdf_page.get_text("text") or ""
-            code_occurrences = extract_finish_codes_from_text(
-                text, page_id=page_id, page_no=page_no, page_label=page_label
-            )
-    except Exception:
-        pass
+        # ------------------------------------------------------------------
+        # Step 3: Extract filled polygons
+        # ------------------------------------------------------------------
+        fill_polygons = extract_filled_polygons(pdf_page)
 
-    # Also try positioned word extraction
-    try:
-        if hasattr(app, "extract_words_with_positions"):
-            words = app.extract_words_with_positions(page_id)
-            if words:
-                positioned_codes = extract_finish_codes_from_positions(
-                    words, page_id=page_id, page_no=page_no, page_label=page_label
-                )
-                # Merge positioned codes (prefer positioned over text-based)
-                code_occurrences = positioned_codes or code_occurrences
-    except Exception:
-        pass
-
-    # Step 6: Get existing measured surfaces for this page
-    measured = _get_measured_surfaces_for_page(app, page_id, workspace_id)
-
-    # Step 7: Associate
-    evidence_list = associate_with_measured_surfaces(
-        evidence_list, measured, code_occurrences=code_occurrences
-    )
-
-    # Step 8: Store results in workspace settings
-    try:
-        setting_key = f"surface_evidence_v160_page_{page_id}"
-        records = [ev.to_dict() for ev in evidence_list]
-        app.lexecute(
-            "INSERT OR REPLACE INTO workspace_settings "
-            "(workspace_id, setting_key, setting_value, updated_at) "
-            "VALUES (?, ?, ?, datetime('now'))",
-            (workspace_id, setting_key, json.dumps(records)),
+        # ------------------------------------------------------------------
+        # Step 4: Build SurfaceEvidence with calibration
+        # ------------------------------------------------------------------
+        scale = page_scale_info(page_dict)
+        evidence_list = build_surface_evidence(
+            fill_polygons,
+            page_id=page_id,
+            page_no=page_no,
+            page_label=page_label,
+            workspace_id=workspace_id,
+            scale_info=scale,
         )
-    except Exception:
-        pass
 
-    return evidence_list
+        # ------------------------------------------------------------------
+        # Step 5: Extract positioned finish codes via get_text("words")
+        #
+        # This is the REAL production approach: PyMuPDF get_text("words")
+        # returns (x0, y0, x1, y1, text, block_no, line_no, word_no).
+        # We convert to dicts with "text" and "bbox" for our code extractor.
+        #
+        # IMPORTANT: plain-text fallback (get_text("text")) produces codes
+        # with NO bbox → they cannot spatially associate to polygons.
+        # We retain them as text evidence only; they are NOT passed to
+        # associate_with_measured_surfaces() as spatial code occurrences.
+        # ------------------------------------------------------------------
+        positioned_code_occurrences: List[Dict[str, Any]] = []
+        text_only_codes: List[Dict[str, Any]] = []
+
+        try:
+            words_raw = pdf_page.get_text("words") or []
+            positioned_words = []
+            for w in words_raw:
+                if len(w) < 5:
+                    continue
+                try:
+                    x0, y0, x1, y1 = float(w[0]), float(w[1]), float(w[2]), float(w[3])
+                except (TypeError, ValueError):
+                    continue
+                text = str(w[4]).strip()
+                if text:
+                    positioned_words.append({"text": text, "bbox": [x0, y0, x1, y1]})
+
+            if positioned_words:
+                positioned_code_occurrences = extract_finish_codes_from_positions(
+                    positioned_words, page_id=page_id, page_no=page_no,
+                    page_label=page_label,
+                )
+        except Exception:
+            pass
+
+        # Text-only fallback: extract codes WITHOUT spatial info.
+        # These are retained for metadata but NOT used for polygon association.
+        try:
+            text_str = pdf_page.get_text("text") or ""
+            if text_str:
+                text_only_codes = extract_finish_codes_from_text(
+                    text_str, page_id=page_id, page_no=page_no,
+                    page_label=page_label,
+                )
+        except Exception:
+            pass
+
+        # Use positioned codes for spatial association (have bbox).
+        # Text-only codes are metadata only — never pretend they have coordinates.
+        code_occurrences = positioned_code_occurrences
+
+        # ------------------------------------------------------------------
+        # Step 6: Get measured surfaces via real Priority 2 / v135 interfaces
+        # ------------------------------------------------------------------
+        measured = _get_measured_surfaces_for_page(app, page_id, workspace_id, page_dict)
+
+        # ------------------------------------------------------------------
+        # Step 7: Associate
+        # ------------------------------------------------------------------
+        evidence_list = associate_with_measured_surfaces(
+            evidence_list, measured, code_occurrences=code_occurrences,
+        )
+
+        # Attach text-only code evidence as metadata (no spatial association)
+        if text_only_codes and not positioned_code_occurrences:
+            for sev in evidence_list:
+                codes_found = sorted({c["code"] for c in text_only_codes})
+                if codes_found:
+                    sev.evidence.append(
+                        f"Text-only codes on page (no spatial position): "
+                        + ", ".join(codes_found)
+                    )
+
+        # ------------------------------------------------------------------
+        # Step 8: Store results via app.set_workspace_setting()
+        # ------------------------------------------------------------------
+        try:
+            setting_key = f"surface_evidence_v160_page_{page_id}"
+            records = [ev.to_dict() for ev in evidence_list]
+            payload = json.dumps(records, separators=(",", ":"))
+            if hasattr(app, "set_workspace_setting"):
+                app.set_workspace_setting(int(workspace_id), setting_key, payload)
+            else:
+                # Fallback for test environments without full app
+                app.lexecute(
+                    "INSERT OR REPLACE INTO workspace_settings "
+                    "(workspace_id, setting_key, setting_value, updated_at) "
+                    "VALUES (?, ?, ?, datetime('now'))",
+                    (workspace_id, setting_key, payload),
+                )
+        except Exception:
+            pass
+
+        return evidence_list
+
+    finally:
+        # Clean up PDF document
+        try:
+            if _pdf_doc is not None:
+                _pdf_doc.close()
+        except Exception:
+            pass
 
 
 def apply(app: Any) -> None:
