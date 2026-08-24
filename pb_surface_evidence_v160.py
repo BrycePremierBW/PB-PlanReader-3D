@@ -44,6 +44,13 @@ _PAINT_CODE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Canonical surface-evidence type identifiers.
+# source_geometry_type = WHAT the surface is (filled polygon, hatch region, etc.)
+# geometry_method     = HOW the geometry was reconstructed (native rect, convex hull, etc.)
+SURFACE_TYPE_FILLED_POLYGON = "filled_polygon"
+SURFACE_TYPE_HATCH = "hatch_region"
+GEOMETRY_METHOD_VECTOR_HATCH = "vector_hatch_region"
+
 
 # ---------------------------------------------------------------------------
 # Geometry primitives
@@ -175,6 +182,28 @@ class SurfaceEvidence:
 
 
 @dataclass
+class HatchDiagnostics:
+    """Hatch-stage diagnostics nested inside SurfaceProcessingDiagnostics.
+
+    Separated so that adding hatch fields does not change B1 field positions
+    in persisted JSON.  Constructed with ``**parsed`` which is backward-
+    compatible because every field has a default.
+    """
+
+    strokes_extracted: int = 0
+    clusters_found: int = 0
+    clusters_rejected: int = 0
+    regions_reconstructed: int = 0
+    low_confidence_regions: int = 0
+    associated: int = 0
+    unassociated: int = 0
+    extraction_error: str = ""   # empty = no error
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {k: v for k, v in asdict(self).items()}
+
+
+@dataclass
 class SurfaceProcessingDiagnostics:
     """Structured diagnostics for one page's surface processing pipeline.
 
@@ -199,8 +228,22 @@ class SurfaceProcessingDiagnostics:
     storage_ok: bool = False
     storage_error: str = ""           # empty = no error
 
+    # B2 hatch diagnostics (nested — backward-compatible via default)
+    hatch_diag: HatchDiagnostics = field(default_factory=HatchDiagnostics)
+
+    def __post_init__(self):
+        """Ensure nested hatch_diag is always a HatchDiagnostics instance."""
+        if isinstance(self.hatch_diag, dict):
+            self.hatch_diag = HatchDiagnostics(**self.hatch_diag)
+
     def to_dict(self) -> Dict[str, Any]:
-        return {k: v for k, v in asdict(self).items()}
+        d = {k: v for k, v in asdict(self).items()}
+        # Ensure nested hatch_diag serialises cleanly
+        if isinstance(d.get("hatch_diag"), dict):
+            pass  # asdict already flattened it
+        elif hasattr(self.hatch_diag, "to_dict"):
+            d["hatch_diag"] = self.hatch_diag.to_dict()
+        return d
 
 
 @dataclass
@@ -1296,47 +1339,18 @@ def process_page_surface_evidence(
 
     try:
         # ------------------------------------------------------------------
-        # Step 3: Extract filled polygons
-        # ------------------------------------------------------------------
-        fill_polygons = extract_filled_polygons(pdf_page)
-        diag.fills_extracted_count = len(fill_polygons)
-
-        if not fill_polygons:
-            return SurfaceProcessingResult(
-                diagnostics=diag, status="no_fills",
-            )
-
-        # ------------------------------------------------------------------
-        # Step 4: Build SurfaceEvidence with calibration
-        # ------------------------------------------------------------------
-        scale = page_scale_info(page_dict)
-        evidence_list = build_surface_evidence(
-            fill_polygons,
-            page_id=page_id,
-            page_no=page_no,
-            page_label=page_label,
-            workspace_id=workspace_id,
-            scale_info=scale,
-        )
-
-        # ------------------------------------------------------------------
-        # Step 5: Extract positioned finish codes via get_text("words")
+        # Step 3: Extract positioned words FIRST (shared by hatch + fills)
         #
-        # This is the REAL production approach: PyMuPDF get_text("words")
-        # returns (x0, y0, x1, y1, text, block_no, line_no, word_no).
-        # We convert to dicts with "text" and "bbox" for our code extractor.
-        #
-        # IMPORTANT: plain-text fallback (get_text("text")) produces codes
-        # with NO bbox -> they cannot spatially associate to polygons.
-        # We retain them as text evidence only; they are NOT passed to
-        # associate_with_measured_surfaces() as spatial code occurrences.
+        # BLOCKER 2 fix: words must be available BEFORE hatch detection
+        # so false-positive text filters (GRID, BATTEN, dimensions, etc.)
+        # work in production, not only in isolated tests.
         # ------------------------------------------------------------------
+        positioned_words: List[Dict[str, Any]] = []
         positioned_code_occurrences: List[Dict[str, Any]] = []
         text_only_codes: List[Dict[str, Any]] = []
 
         try:
             words_raw = pdf_page.get_text("words") or []
-            positioned_words = []
             for w in words_raw:
                 if len(w) < 5:
                     continue
@@ -1362,8 +1376,92 @@ def process_page_surface_evidence(
 
         diag.finish_codes_found_count = len(positioned_code_occurrences)
 
+        # ------------------------------------------------------------------
+        # Step 4: Extract filled polygons
+        # ------------------------------------------------------------------
+        fill_polygons = extract_filled_polygons(pdf_page)
+        diag.fills_extracted_count = len(fill_polygons)
+
+        # ------------------------------------------------------------------
+        # Step 5: Hatch extraction (B2) — WITH positioned words for
+        #         false-positive text filters
+        # ------------------------------------------------------------------
+        hatch_result = None
+        try:
+            from pb_hatch_detection_v160 import extract_hatch_evidence
+            scale_for_hatch = page_scale_info(page_dict)
+            hatch_result = extract_hatch_evidence(
+                pdf_page, page_id=page_id, page_no=page_no,
+                page_label=page_label, workspace_id=workspace_id,
+                scale_info=scale_for_hatch,
+                words=positioned_words,  # BLOCKER 2 fix: words for FP filters
+            )
+        except Exception as exc:
+            diag.hatch_diag.extraction_error = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        # BLOCKER 4 fix: propagate actual detector diagnostics
+        hatch_evidence_list: List[SurfaceEvidence] = []
+        if hatch_result is not None:
+            hatch_evidence_list = hatch_result.evidence
+            diag.hatch_diag.strokes_extracted = hatch_result.strokes_extracted
+            diag.hatch_diag.clusters_found = hatch_result.clusters_found
+            diag.hatch_diag.clusters_rejected = hatch_result.clusters_rejected
+            diag.hatch_diag.regions_reconstructed = hatch_result.regions_reconstructed
+            diag.hatch_diag.low_confidence_regions = hatch_result.low_confidence_regions
+            diag.hatch_diag.extraction_error = hatch_result.extraction_error
+
+        # ------------------------------------------------------------------
+        # Failure-state requirement: distinguish genuinely empty from failed
+        # ------------------------------------------------------------------
+        has_hatch_error = bool(diag.hatch_diag.extraction_error)
+        if not fill_polygons and not hatch_evidence_list:
+            if has_hatch_error:
+                # Hatch stage failed — do NOT return normal "no_fills"
+                return SurfaceProcessingResult(
+                    diagnostics=diag, status="partial",
+                )
+            return SurfaceProcessingResult(
+                diagnostics=diag, status="no_fills",
+            )
+
+        # ------------------------------------------------------------------
+        # Step 6: Build SurfaceEvidence with calibration
+        # ------------------------------------------------------------------
+        scale = page_scale_info(page_dict)
+        evidence_list = build_surface_evidence(
+            fill_polygons,
+            page_id=page_id,
+            page_no=page_no,
+            page_label=page_label,
+            workspace_id=workspace_id,
+            scale_info=scale,
+        )
+
+        # Append hatch evidence (B2) — these carry their own surface_ids
+        # and were already calibrated inside extract_hatch_evidence.
+        evidence_list.extend(hatch_evidence_list)
+
+        # ------------------------------------------------------------------
+        # Additional safety: if positioned-word extraction failed, hatch
+        # evidence lacks false-positive text filtering (GRID, BATTEN,
+        # LOUVRE, dimensions).  Downgrade to needs_check and note why.
+        # ------------------------------------------------------------------
+        if diag.positioned_words_extraction_error and hatch_evidence_list:
+            note = (
+                "Hatch text-based false-positive filters unavailable: "
+                + diag.positioned_words_extraction_error
+            )
+            for ev in hatch_evidence_list:
+                if getattr(ev, "source_geometry_type", "") == SURFACE_TYPE_HATCH:
+                    ev.status = "needs_check"
+                    ev.evidence.append(note)
+
+        # ------------------------------------------------------------------
         # Text-only fallback: extract codes WITHOUT spatial info.
         # These are retained for metadata but NOT used for polygon association.
+        # ------------------------------------------------------------------
         try:
             text_str = pdf_page.get_text("text") or ""
             if text_str:
@@ -1403,13 +1501,17 @@ def process_page_surface_evidence(
 
         # ------------------------------------------------------------------
         # Accuracy-status requirement:
-        # If fills were extracted but measured-surface extraction failed,
-        # evidence must NOT look like a normal successful unassociated result.
+        # If fills or hatches were extracted but measured-surface extraction
+        # failed, evidence must NOT look like a normal successful result.
         # ------------------------------------------------------------------
         measured_extraction_failed = bool(
             diag.room_extraction_error or diag.wall_extraction_error
         )
-        if measured_extraction_failed and diag.fills_extracted_count > 0:
+        has_any_geometry = (
+            diag.fills_extracted_count > 0
+            or diag.hatch_diag.regions_reconstructed > 0
+        )
+        if measured_extraction_failed and has_any_geometry:
             for sev in evidence_list:
                 if not sev.association_method or sev.association_method == "none":
                     sev.status = "needs_check"
@@ -1445,6 +1547,24 @@ def process_page_surface_evidence(
                         f"Text-only codes on page (no spatial position): "
                         + ", ".join(codes_found)
                     )
+
+        # Update hatch association diagnostics from ACTUAL hatch evidence
+        # objects AFTER the combined production association.  Do NOT use the
+        # pre-association counts from HatchProcessingResult — those reflect
+        # the detector's internal association, not the production pipeline's.
+        # Filter by source_geometry_type (WHAT it is), not geometry_method
+        # (HOW it was reconstructed).
+        if hatch_result is not None:
+            hatch_associated = 0
+            hatch_unassociated = 0
+            for ev in evidence_list:
+                if getattr(ev, "source_geometry_type", "") == SURFACE_TYPE_HATCH:
+                    if ev.association_method and ev.association_method != "none":
+                        hatch_associated += 1
+                    else:
+                        hatch_unassociated += 1
+            diag.hatch_diag.associated = hatch_associated
+            diag.hatch_diag.unassociated = hatch_unassociated
 
         # ------------------------------------------------------------------
         # Step 8: Store results via app.set_workspace_setting()
@@ -1502,10 +1622,14 @@ def process_page_surface_evidence(
         diag.storage_ok = evidence_stored and diagnostics_stored
 
         # Determine overall status
+        #
+        # BLOCKER 2 fix: non-empty hatch extraction error must never coexist
+        # with status="ok".  Hatch failure is always at least "partial".
         any_storage_error = bool(diag.storage_error)
+        hatch_stage_failed = bool(diag.hatch_diag.extraction_error)
         if not evidence_stored:
             overall_status = "error"
-        elif any_storage_error or measured_extraction_failed:
+        elif any_storage_error or measured_extraction_failed or hatch_stage_failed:
             overall_status = "partial"
         else:
             overall_status = "ok"

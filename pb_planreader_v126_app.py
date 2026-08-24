@@ -92,6 +92,11 @@ apply_accuracy_benchmark_v130(launcher.app)
 apply_accuracy_ui_v130(launcher.app)
 apply_substrate_qa_v131(launcher.app)
 apply_surface_evidence_v160(launcher.app)
+try:
+    from pb_hatch_detection_v160 import apply as apply_hatch_detection_v160
+    apply_hatch_detection_v160(launcher.app)
+except Exception:
+    pass
 apply_precision_3d_v132(launcher.app)
 apply_opening_deductions_v134(launcher.app)
 # v1.3.5 registers elevation drawings back to the calibrated plan footprint.
