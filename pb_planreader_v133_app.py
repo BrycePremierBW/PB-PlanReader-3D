@@ -32,7 +32,7 @@ apply_sidebar_viewport_guard_v146(app)
 apply_runtime_performance_v149(app)
 apply_processing_fastpath_v150(app)
 apply_material_preview_guard_v152(app)
-app.APP_VERSION = "1.5.2"
+app.APP_VERSION = "1.5.1"
 
 if __name__ == "__main__":
     app.main()
