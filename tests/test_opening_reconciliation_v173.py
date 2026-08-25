@@ -538,5 +538,186 @@ class TestEdgeCases(unittest.TestCase):
         self.assertGreater(reconciled[0].reconciliation_confidence, 0.0)
 
 
+class TestPipelineIntegration(unittest.TestCase):
+    """Integration tests exercising the real B0→B1→B2→B3→B4 pipeline.
+
+    These use record_plan_observation() and real enrichment functions
+    rather than manually injecting source_observations.
+    """
+
+    def test_b1_plan_only(self):
+        """B1 instance with record_plan_observation → B4 sees plan_vector."""
+        from pb_opening_evidence_v170 import record_plan_observation
+        inst = _inst(
+            method="plan_vector",
+            width=0.82,
+            height=None,
+            geom_conf=0.6,
+            dim_conf=0.0,
+            assoc_conf=0.3,
+        )
+        record_plan_observation(inst)
+        self.assertEqual(len(inst.source_observations), 1)
+        self.assertEqual(inst.source_observations[0]["source"], "plan_vector")
+        self.assertEqual(inst.source_observations[0]["width_m"], 0.82)
+        reconciled, conflicts = reconcile_opening_evidence([inst])
+        self.assertTrue(_has_plan_evidence(reconciled[0]))
+        self.assertFalse(_has_schedule_evidence(reconciled[0]))
+
+    def test_b1_to_b2_schedule_wins(self):
+        """B1 0.82 → B2 schedule 0.90 wins → plan obs stays 0.82."""
+        from pb_opening_schedule_v171 import enrich_opening_evidence, ScheduleEntry
+        from pb_opening_evidence_v170 import record_plan_observation
+        inst = _inst(
+            mark="D01",
+            method="plan_vector",
+            width=0.82,
+            height=None,
+        )
+        record_plan_observation(inst)
+        sched = ScheduleEntry(
+            type_mark="D01",
+            width_mm=900,
+            height_mm=2100,
+            page_no=5,
+            parse_source="header_separate",
+        )
+        enriched = enrich_opening_evidence([inst], [sched])
+        # Plan observation must remain 0.82 (not contaminated)
+        plan_obs = [o for o in enriched[0].source_observations
+                    if o["source"] == "plan_vector"]
+        self.assertEqual(len(plan_obs), 1)
+        self.assertAlmostEqual(plan_obs[0]["width_m"], 0.82, places=2)
+        # Schedule observation must be 0.90
+        sched_obs = [o for o in enriched[0].source_observations
+                     if o["source"] == "schedule_parse"]
+        self.assertEqual(len(sched_obs), 1)
+        self.assertAlmostEqual(sched_obs[0]["width_m"], 0.90, places=2)
+
+    def test_b1_to_b2_to_b3_provenance(self):
+        """B1 0.82 → B2 schedule 0.90 → B3 elevation 0.90.
+        Plan obs stays 0.82, schedule 0.90, elevation 0.90.
+        B4 detects plan↔schedule width conflict."""
+        from pb_opening_schedule_v171 import enrich_opening_evidence, ScheduleEntry
+        from pb_elevation_evidence_v172 import (
+            ElevationOpening, correlate_elevation_to_plan,
+        )
+        from pb_opening_evidence_v170 import record_plan_observation
+        # B1
+        inst = _inst(
+            mark="D01",
+            method="plan_vector",
+            width=0.82,
+            height=None,
+            geom_conf=0.6,
+            dim_conf=0.0,
+            assoc_conf=0.3,
+        )
+        record_plan_observation(inst)
+        # B2
+        sched = ScheduleEntry(
+            type_mark="D01",
+            width_mm=900,
+            height_mm=2100,
+            page_no=5,
+            parse_source="header_separate",
+        )
+        after_b2 = enrich_opening_evidence([inst], [sched])
+        # B3
+        elev = ElevationOpening(
+            elevation_page_no=8,
+            elevation_side="North",
+            bbox_px=(100, 100, 300, 500),
+            width_m=0.90,
+            height_m=2.10,
+            label="D01",
+            confidence=0.65,
+        )
+        after_b3, _ = correlate_elevation_to_plan([elev], after_b2)
+        # Verify provenance chain
+        obs = after_b3[0].source_observations
+        plan_obs = [o for o in obs if o["source"] == "plan_vector"]
+        sched_obs_list = [o for o in obs if o["source"] == "schedule_parse"]
+        elev_obs = [o for o in obs if o["source"] == "elevation_rect"]
+        self.assertEqual(len(plan_obs), 1)
+        self.assertEqual(len(sched_obs_list), 1)
+        self.assertEqual(len(elev_obs), 1)
+        # Plan observation must remain 0.82
+        self.assertAlmostEqual(plan_obs[0]["width_m"], 0.82, places=2)
+        # Schedule observation must be 0.90
+        self.assertAlmostEqual(sched_obs_list[0]["width_m"], 0.90, places=2)
+        # Elevation observation must be 0.90
+        self.assertAlmostEqual(elev_obs[0]["width_m"], 0.90, places=2)
+        # B4 detects plan↔schedule width conflict
+        reconciled, conflicts = reconcile_opening_evidence(after_b3)
+        dim = [c for c in conflicts if c.conflict_type == "dimension_mismatch"]
+        self.assertGreaterEqual(len(dim), 1)
+        self.assertEqual(reconciled[0].deduction_status, DEDUCTION_REVIEW)
+
+    def test_blank_plan_mark_elevation_d01(self):
+        """Blank plan mark + elevation D01 → instance mark stays blank,
+        elevation observation retains D01."""
+        from pb_elevation_evidence_v172 import (
+            ElevationOpening, correlate_elevation_to_plan,
+        )
+        from pb_opening_evidence_v170 import record_plan_observation
+        inst = _inst(
+            mark="",
+            method="plan_vector",
+            width=0.82,
+            geom_conf=0.6,
+            dim_conf=0.0,
+            assoc_conf=0.3,
+        )
+        record_plan_observation(inst)
+        elev = ElevationOpening(
+            elevation_page_no=8,
+            elevation_side="North",
+            bbox_px=(100, 100, 300, 500),
+            width_m=0.82,
+            height_m=2.1,
+            label="D01",
+            confidence=0.65,
+        )
+        after_b3, _ = correlate_elevation_to_plan([elev], [inst])
+        # Instance mark must stay blank
+        self.assertEqual(after_b3[0].type_mark, "")
+        # Elevation observation must retain D01
+        elev_obs = [o for o in after_b3[0].source_observations
+                    if o["source"] == "elevation_rect"]
+        self.assertEqual(len(elev_obs), 1)
+        self.assertEqual(elev_obs[0]["type_mark"], "D01")
+
+    def test_conflicting_duplicate_schedule(self):
+        """Conflicting D01 schedule rows → no enrichment, ambiguity recorded."""
+        from pb_opening_schedule_v171 import enrich_opening_evidence, ScheduleEntry
+        from pb_opening_evidence_v170 import record_plan_observation
+        inst = _inst(
+            mark="D01",
+            method="plan_vector",
+            width=0.82,
+            height=None,
+        )
+        record_plan_observation(inst)
+        # Two conflicting schedule rows for D01
+        sched1 = ScheduleEntry(
+            type_mark="D01", width_mm=820, height_mm=2100,
+            page_no=5, parse_source="header_separate",
+        )
+        sched2 = ScheduleEntry(
+            type_mark="D01", width_mm=920, height_mm=2100,
+            page_no=5, parse_source="header_separate",
+        )
+        enriched = enrich_opening_evidence([inst], [sched1, sched2])
+        # No dimension enrichment — width stays 0.82
+        self.assertAlmostEqual(enriched[0].width_m, 0.82, places=2)
+        # Conflicting schedule observation recorded
+        sched_obs = [o for o in enriched[0].source_observations
+                     if o["source"] == "schedule_parse"]
+        self.assertEqual(len(sched_obs), 1)
+        self.assertFalse(sched_obs[0]["accepted"])
+        self.assertEqual(sched_obs[0].get("status"), "ambiguous")
+
+
 if __name__ == "__main__":
     unittest.main()

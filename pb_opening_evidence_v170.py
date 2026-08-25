@@ -583,6 +583,29 @@ def deduplicate_openings(
 
 
 # ---------------------------------------------------------------------------
+# Source observation initialization
+# ---------------------------------------------------------------------------
+def record_plan_observation(inst: OpeningEvidence) -> None:
+    """Record the plan source observation on a newly-created instance.
+
+    Called by B1 when creating OpeningEvidence from plan detection.
+    This is the ONLY place the plan observation should be created.
+    B2/B3 never reconstruct another source's observation.
+    """
+    obs = {
+        "source": inst.extraction_method or "plan_vector",
+        "width_m": inst.width_m,
+        "height_m": inst.height_m,
+        "dimension_basis": inst.dimension_basis,
+        "dimension_confidence": inst.dimension_confidence,
+        "type_mark": inst.type_mark,
+        "page_no": inst.page_no,
+        "accepted": True,
+    }
+    inst.source_observations = [obs]
+
+
+# ---------------------------------------------------------------------------
 # Bulk deduction calculation
 # ---------------------------------------------------------------------------
 def deducted_area_m2(openings: Sequence[OpeningEvidence]) -> float:

@@ -45,6 +45,7 @@ from pb_opening_evidence_v170 import (
     OPENING_TYPE_OTHER,
     OPENING_TYPE_WINDOW,
     OpeningEvidence,
+    record_plan_observation,
 )
 
 VERSION = "1.7.3"
@@ -992,6 +993,7 @@ def door_to_opening_evidence(cand: DoorCandidate) -> OpeningEvidence:
     ev.set_quantity(1, source="geometric")
     ev.compute_area()
     ev.compute_deduction_status()
+    record_plan_observation(ev)
     return ev
 
 
@@ -1018,6 +1020,7 @@ def window_to_opening_evidence(cand: WindowCandidate) -> OpeningEvidence:
     ev.set_quantity(1, source="geometric")
     ev.compute_area()
     ev.compute_deduction_status()
+    record_plan_observation(ev)
     return ev
 
 
@@ -1045,6 +1048,7 @@ def gap_to_opening_evidence(cand: GapCandidate) -> OpeningEvidence:
     ev.set_quantity(1, source="geometric")
     ev.compute_area()
     ev.compute_deduction_status()
+    record_plan_observation(ev)
     return ev
 
 

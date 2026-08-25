@@ -608,7 +608,21 @@ def enrich_opening_evidence(
         if mark and mark in mark_authority:
             sched = mark_authority[mark]
             if sched is None:
-                # Conflicting duplicate — skip enrichment
+                # Conflicting duplicate schedule rows — record as rejected
+                # observation so B4 can see the schedule ambiguity.
+                conflicting_obs = {
+                    "source": "schedule_parse",
+                    "width_m": None,
+                    "height_m": None,
+                    "dimension_basis": DIMENSION_BASIS_UNKNOWN,
+                    "dimension_confidence": 0.0,
+                    "type_mark": mark,
+                    "page_no": None,
+                    "accepted": False,
+                    "status": "ambiguous",
+                    "description": f"Conflicting duplicate rows for mark {mark}",
+                }
+                inst.source_observations = list(inst.source_observations) + [conflicting_obs]
                 enriched.append(inst)
                 continue
             # Confidence based on parse provenance
@@ -631,17 +645,8 @@ def enrich_opening_evidence(
                 extraction_method="schedule_parse",
                 page_no=sched.page_no,
             )
-            # Record source observations BEFORE merge (plan dimensions)
-            plan_obs = {
-                "source": "plan_vector",
-                "width_m": inst.width_m,
-                "height_m": inst.height_m,
-                "dimension_basis": inst.dimension_basis,
-                "dimension_confidence": inst.dimension_confidence,
-                "type_mark": inst.type_mark,
-                "page_no": inst.page_no,
-                "accepted": True,  # plan was the existing record
-            }
+            # Only append schedule observation — B1 already recorded the plan obs.
+            # B2 NEVER reconstructs another source's observation.
             sched_obs = {
                 "source": "schedule_parse",
                 "width_m": sched_ev.width_m,
@@ -654,12 +659,11 @@ def enrich_opening_evidence(
             }
             # Use B0's merge logic (basis priority + confidence)
             merged = merge_opening_evidence(inst, sched_ev)
-            # Determine which observation won the atomic bundle
+            # Determine if schedule won the atomic bundle
             if merged.dimension_source == "schedule_parse":
                 sched_obs["accepted"] = True
-                plan_obs["accepted"] = False
-            # Carry forward any existing observations
-            merged.source_observations = list(inst.source_observations) + [plan_obs, sched_obs]
+            # Append ONLY the schedule observation (plan obs already exists)
+            merged.source_observations = list(inst.source_observations) + [sched_obs]
             enriched.append(merged)
         else:
             enriched.append(inst)
