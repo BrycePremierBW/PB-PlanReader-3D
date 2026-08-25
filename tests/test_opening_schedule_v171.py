@@ -812,6 +812,51 @@ class TestFRLPlusRealDimensions(unittest.TestCase):
         self.assertEqual(entries[0].width_mm, 820)
         self.assertEqual(entries[0].height_mm, 2040)
 
+    def test_frl_240_240_no_entry(self):
+        """D01 FRL 240/240 → 240≥200 but is rating, not dimension. No entry."""
+        rows = [_row("D01\tFRL 240/240")]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 0)
+
+    def test_frl_240_240_with_compound(self):
+        """D01 FRL 240/240 820x2040 → must extract 820x2040, not 240x240."""
+        rows = [_row("D01\tFRL 240/240\t820x2040")]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].width_mm, 820)
+        self.assertEqual(entries[0].height_mm, 2040)
+
+    def test_frl_triple_with_compound(self):
+        """D01 Fire rated FRL 240/240/240 920x2040 → must extract 920x2040."""
+        rows = [_row("D01\tFire rated FRL 240/240/240\t920x2040")]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].width_mm, 920)
+        self.assertEqual(entries[0].height_mm, 2040)
+
+    def test_header_dims_slash_notation(self):
+        """Dedicated Size column: 820/2040 → slash is valid in column context."""
+        rows = [
+            _row("Mark\tSize"),
+            _row("D01\t820/2040"),
+        ]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].width_mm, 820)
+        self.assertEqual(entries[0].height_mm, 2040)
+
+    def test_parse_dimension_slash_disallowed(self):
+        """parse_dimension with allow_slash=False rejects slash pairs."""
+        w, h = parse_dimension("240/240", allow_slash=False)
+        self.assertIsNone(w)
+        self.assertIsNone(h)
+
+    def test_parse_dimension_slash_allowed(self):
+        """parse_dimension with allow_slash=True accepts slash pairs."""
+        w, h = parse_dimension("820/2040", allow_slash=True)
+        self.assertEqual(w, 820)
+        self.assertEqual(h, 2040)
+
 
 if __name__ == "__main__":
     unittest.main()

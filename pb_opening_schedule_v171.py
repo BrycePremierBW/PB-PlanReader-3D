@@ -87,10 +87,14 @@ _MARK_PATTERNS = [
 ]
 
 # Patterns for compound dimension extraction (from full row text)
-_DIMENSION_PATTERNS = [
-    re.compile(r"(\d{1,5})\s*[×xX/]\s*(\d{1,5})"),     # 820x2040, 820 × 2040
-    re.compile(r"(\d{1,5})\s*[-–—]\s*(\d{1,5})"),        # 820-2040, 820–2040
-    re.compile(r"(\d{1,5})\s*[bhBH]\s*(\d{1,5})"),       # 820b2040, 820H2040
+# Split: x/× is strong (explicit dimension separator), / is weak (could be rating)
+_DIMENSION_PATTERNS_X = [
+    re.compile(r"(\d{1,5})\s*[×xX]\s*(\d{1,5})"),          # 820x2040, 820 × 2040
+    re.compile(r"(\d{1,5})\s*[-–—]\s*(\d{1,5})"),           # 820-2040, 820–2040
+    re.compile(r"(\d{1,5})\s*[bhBH]\s*(\d{1,5})"),          # 820b2040, 820H2040
+]
+_DIMENSION_PATTERNS_SLASH = [
+    re.compile(r"(\d{1,5})\s*/\s*(\d{1,5})"),               # 820/2040 (weak — may be rating)
 ]
 
 # Single-number pattern for fallback dimension extraction
@@ -165,11 +169,15 @@ def parse_single_dimension(text: str) -> Optional[int]:
     return val
 
 
-def parse_dimension(text: str) -> Tuple[Optional[int], Optional[int]]:
+def parse_dimension(text: str, allow_slash: bool = True) -> Tuple[Optional[int], Optional[int]]:
     """Parse width × height from a dimension cell or row fragment.
 
     Handles: "820x2040", "820 × 2040", "820/2040", "820-2040",
              "820mm x 2040mm", "0.82m x 2.04m", standalone "2040"
+
+    When allow_slash=False, slash-separated values (820/2040) are not
+    treated as dimensions — useful when rating context (FRL, STC) may
+    produce slash-separated non-dimension numbers.
 
     Returns (width_mm, height_mm).  Either may be None if not parseable.
     """
@@ -178,12 +186,21 @@ def parse_dimension(text: str) -> Tuple[Optional[int], Optional[int]]:
 
     t = text.strip()
 
-    # Try compound patterns FIRST: "820x2040", "820 × 2040 mm"
-    for pat in _DIMENSION_PATTERNS:
+    # Try strong compound patterns FIRST: x, ×, -, –, b, H
+    for pat in _DIMENSION_PATTERNS_X:
         for m in pat.finditer(t):
             a, b = int(m.group(1)), int(m.group(2))
             if _is_plausible_dimension(a, b):
                 return a, b
+
+    # Try slash patterns only when allowed (no rating context or in a
+    # dedicated dimensions column)
+    if allow_slash:
+        for pat in _DIMENSION_PATTERNS_SLASH:
+            for m in pat.finditer(t):
+                a, b = int(m.group(1)), int(m.group(2))
+                if _is_plausible_dimension(a, b):
+                    return a, b
 
     # Try mm suffix: "820mm x 2040mm"
     mm_match = _MM_RE.findall(t)
@@ -210,9 +227,12 @@ def parse_dimension(text: str) -> Tuple[Optional[int], Optional[int]]:
     # Fallback: extract standalone numbers
     nums = _SINGLE_NUM_RE.findall(t)
     if len(nums) >= 2:
-        a, b = int(nums[0]), int(nums[1])
-        if _is_plausible_dimension(a, b):
-            return a, b
+        # When slash notation is disallowed, two standalone numbers likely
+        # come from a slash pair (e.g. "FRL 240/240") — skip the pair.
+        if allow_slash or "/" not in t:
+            a, b = int(nums[0]), int(nums[1])
+            if _is_plausible_dimension(a, b):
+                return a, b
     if len(nums) == 1:
         val = int(nums[0])
         # Single number: treat as width if plausible width, else height if plausible height
@@ -367,10 +387,11 @@ def parse_schedule_rows(
                 height_mm = parse_single_dimension(cells[h_idx])
             parse_source = "header_separate"
         else:
-            # Fallback: try full-row extraction regardless of rating keywords.
-            # Rating keywords stop standalone rating values (60/60) from being
-            # dimensions, but a strong explicit compound (820x2040) is still valid.
-            width_mm, height_mm = parse_dimension(text)
+            # Fallback: try full-row extraction.
+            # When rating keywords are present, disallow slash-separated values
+            # (FRL 240/240 is NOT a dimension), but strong x/× compounds are OK.
+            has_rating = _has_rating_keywords(text)
+            width_mm, height_mm = parse_dimension(text, allow_slash=not has_rating)
             if _is_plausible_dimension(width_mm, height_mm):
                 parse_source = "heuristic"
             else:
@@ -430,7 +451,9 @@ def _parse_rows_without_header(
             continue
         if not (mark.startswith("D") or mark.startswith("W")):
             continue
-        width_mm, height_mm = parse_dimension(text)
+        # When rating keywords present, disallow slash-separated values
+        has_rating = _has_rating_keywords(text)
+        width_mm, height_mm = parse_dimension(text, allow_slash=not has_rating)
         if not _is_plausible_dimension(width_mm, height_mm):
             continue
         entries.append(ScheduleEntry(
