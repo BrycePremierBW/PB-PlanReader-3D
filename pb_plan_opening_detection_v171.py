@@ -604,13 +604,17 @@ def detect_window_candidates(
                 pair_midpoints.append(((mcx - wall_ox) * wall_dx + (mcy - wall_oy) * wall_dy) / wall_len)
                 pair_jamb_spacings.append(_segment_distance(a, b))
 
-            # All candidate matches within radius, sorted by distance
+            # All candidate matches within radius, sorted by 2D distance
             TAG_RADIUS_PT = 120.0
             tag_pair_matches: List[Tuple[float, int, int]] = []  # (dist, tag_idx, pair_idx)
-            for pi, mp in enumerate(pair_midpoints):
+            pair_cx_cy = []  # actual 2D midpoint coordinates
+            for _, _, a, b in pairs:
+                mcx = (a.cx + b.cx) / 2.0
+                mcy = (a.cy + b.cy) / 2.0
+                pair_cx_cy.append((mcx, mcy))
+            for pi, (pcx, pcy) in enumerate(pair_cx_cy):
                 for ti in w_tag_indices:
-                    tp = ((words[ti].cx - wall_ox) * wall_dx + (words[ti].cy - wall_oy) * wall_dy) / wall_len
-                    d = abs(mp - tp)
+                    d = math.hypot(pcx - words[ti].cx, pcy - words[ti].cy)
                     if d <= TAG_RADIUS_PT:
                         tag_pair_matches.append((d, ti, pi))
             tag_pair_matches.sort(key=lambda x: x[0])  # globally nearest first

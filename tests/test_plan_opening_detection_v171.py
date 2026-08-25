@@ -810,6 +810,57 @@ class TestWindowDetection(unittest.TestCase):
         for w in windows:
             self.assertIn(w.tag, ["W01", "W02"])
 
+    def test_w_tag_far_perpendicular_not_assigned(self):
+        """W tag at same along-wall coordinate but >120pt perpendicular from
+        the pair → must NOT be assigned (2D distance rejects it)."""
+        wall = WallLine(segment=_horiz_seg(0, 100, 800, 100))
+        # Window pair at x=400, y=100
+        jamb1 = _vert_seg(380, 85, 115)
+        jamb2 = _vert_seg(420, 85, 115)
+
+        all_segs = [wall.segment, jamb1, jamb2]
+        # W tag at same x=400 but y=600 (500pt perpendicular, way beyond 120pt)
+        words = [_word("W01", 400, 600)]
+
+        windows = detect_window_candidates(
+            all_segs, [wall], words,
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(windows), 1)
+        # Tag must NOT be assigned — 2D distance is 500pt > 120pt radius
+        self.assertEqual(windows[0].tag, "")
+
+    def test_parallel_walls_separate_w_tags(self):
+        """Two parallel walls at different Y positions, each with a window
+        pair and its own W tag → each pair gets only its own wall's tag."""
+        # Wall A at y=100
+        wall_a = WallLine(segment=_horiz_seg(0, 100, 800, 100), wall_ref="N01")
+        jamb_a1 = _vert_seg(380, 85, 115)
+        jamb_a2 = _vert_seg(420, 85, 115)
+        # Wall B at y=500
+        wall_b = WallLine(segment=_horiz_seg(0, 500, 800, 500), wall_ref="S01")
+        jamb_b1 = _vert_seg(380, 485, 515)
+        jamb_b2 = _vert_seg(420, 485, 515)
+
+        all_segs = [wall_a.segment, jamb_a1, jamb_a2,
+                     wall_b.segment, jamb_b1, jamb_b2]
+        # Both W tags at x=400 but different Y (near their own wall)
+        words = [_word("W01", 400, 70), _word("W02", 400, 470)]
+
+        windows_a = detect_window_candidates(
+            all_segs, [wall_a], words,
+            scale_info=SCALE_INFO_1X,
+        )
+        windows_b = detect_window_candidates(
+            all_segs, [wall_b], words,
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(windows_a), 1)
+        self.assertEqual(len(windows_b), 1)
+        # Each wall's window gets its own tag (2D distance ensures no cross-assignment)
+        self.assertEqual(windows_a[0].tag, "W01")
+        self.assertEqual(windows_b[0].tag, "W02")
+
 
 # ---------------------------------------------------------------------------
 # 6b. Segment.bbox regression
