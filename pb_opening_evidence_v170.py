@@ -199,6 +199,16 @@ class OpeningEvidence:
     # --- Commercial decision (set ONLY by B5 / estimator) ---
     deduct: bool = False
 
+    # --- Source observations (structured provenance for B4 reconciliation) ---
+    # Each dict: {"source": str, "width_m": float|None, "height_m": float|None,
+    #            "dimension_basis": str, "dimension_confidence": float,
+    #            "type_mark": str, "page_no": int|None, "accepted": bool}
+    # B2/B3 append observations (both winning and rejected) for B4 comparison.
+    source_observations: List[Dict[str, Any]] = field(default_factory=list)
+
+    # --- Reconciliation (computed by B4, separate from per-source confidence) ---
+    reconciliation_confidence: float = 0.0
+
     # --- Provenance ---
     evidence: List[str] = field(default_factory=list)
     notes: str = ""

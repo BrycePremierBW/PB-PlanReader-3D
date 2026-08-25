@@ -493,11 +493,41 @@ def _enrich_from_elevation(
                   f"{elev.width_m:.3f}x{elev.height_m:.3f}m"],
     )
 
+    # Record source observations BEFORE merge
+    plan_obs = {
+        "source": inst.extraction_method or "plan_vector",
+        "width_m": inst.width_m,
+        "height_m": inst.height_m,
+        "dimension_basis": inst.dimension_basis,
+        "dimension_confidence": inst.dimension_confidence,
+        "type_mark": inst.type_mark,
+        "page_no": inst.page_no,
+        "accepted": True,  # plan was the existing record
+    }
+    elev_obs = {
+        "source": "elevation_rect",
+        "width_m": elev.width_m,
+        "height_m": elev.height_m,
+        "dimension_basis": DIMENSION_BASIS_UNKNOWN,
+        "dimension_confidence": ELEVATION_HEIGHT_CONFIDENCE,
+        "type_mark": inst.type_mark,
+        "page_no": elev.elevation_page_no,
+        "accepted": False,  # updated after merge
+    }
+
     # Use B0's merge logic
     merged = merge_opening_evidence(inst, elev_ev)
+
+    # Determine which observation won the atomic bundle
+    if merged.dimension_source == "elevation_rect":
+        elev_obs["accepted"] = True
+        plan_obs["accepted"] = False
 
     # Ensure elevation_side is set on the result (merge may not overwrite)
     if not merged.elevation_side and elev.elevation_side:
         merged.elevation_side = elev.elevation_side
+
+    # Carry forward any existing observations
+    merged.source_observations = list(inst.source_observations) + [plan_obs, elev_obs]
 
     return merged

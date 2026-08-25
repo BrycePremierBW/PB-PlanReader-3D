@@ -631,8 +631,35 @@ def enrich_opening_evidence(
                 extraction_method="schedule_parse",
                 page_no=sched.page_no,
             )
+            # Record source observations BEFORE merge (plan dimensions)
+            plan_obs = {
+                "source": "plan_vector",
+                "width_m": inst.width_m,
+                "height_m": inst.height_m,
+                "dimension_basis": inst.dimension_basis,
+                "dimension_confidence": inst.dimension_confidence,
+                "type_mark": inst.type_mark,
+                "page_no": inst.page_no,
+                "accepted": True,  # plan was the existing record
+            }
+            sched_obs = {
+                "source": "schedule_parse",
+                "width_m": sched_ev.width_m,
+                "height_m": sched_ev.height_m,
+                "dimension_basis": sched_ev.dimension_basis,
+                "dimension_confidence": sched_ev.dimension_confidence,
+                "type_mark": mark,
+                "page_no": sched_ev.page_no,
+                "accepted": False,  # updated after merge
+            }
             # Use B0's merge logic (basis priority + confidence)
             merged = merge_opening_evidence(inst, sched_ev)
+            # Determine which observation won the atomic bundle
+            if merged.dimension_source == "schedule_parse":
+                sched_obs["accepted"] = True
+                plan_obs["accepted"] = False
+            # Carry forward any existing observations
+            merged.source_observations = list(inst.source_observations) + [plan_obs, sched_obs]
             enriched.append(merged)
         else:
             enriched.append(inst)
