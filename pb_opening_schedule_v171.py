@@ -1,0 +1,504 @@
+"""PlanReader v1.7.1 — Door/window schedule table parsing.
+
+Parses tab-separated rows (from _word_rows() or equivalent) to extract
+schedule entries: type mark, width, height, description, count.
+
+Safety rules:
+  - Schedule rows describe opening TYPES, not physical wall instances.
+  - A schedule entry MUST NOT create a new OpeningEvidence record by
+    itself — it can only enrich an existing geometric instance.
+  - Enrichment requires a matching non-empty type_mark on both the
+    schedule entry and the existing evidence.
+  - Width + height + basis + dimension_confidence + dimension_source
+    are one atomic bundle (inherited from B0 safety contract).
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from pb_opening_evidence_v170 import (
+    DIMENSION_BASIS_UNKNOWN,
+    DEDUCTION_REVIEW,
+    NON_INSTANCE_SOURCES,
+    OpeningEvidence,
+    enriches_by_type,
+    merge_opening_evidence,
+)
+
+VERSION = "1.7.1"
+
+# ---------------------------------------------------------------------------
+# Schedule entry — one row from a door/window schedule table
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ScheduleEntry:
+    """One row from a door/window schedule table.
+
+    Represents an opening TYPE (D01, W01), not a physical instance.
+    The same type mark can appear many times on the plan.
+    """
+    type_mark: str              # "D01", "W01"
+    width_mm: Optional[int] = None
+    height_mm: Optional[int] = None
+    description: str = ""
+    count: int = 1
+    page_no: int = 0
+    bbox: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Internal constants
+# ---------------------------------------------------------------------------
+_HEADER_MARK_KEYWORDS = frozenset({
+    "mark", "marks", "type", "code", "no", "num", "number",
+    "door", "window", "tag", "ref", "label", "item",
+})
+
+_HEADER_WIDTH_KEYWORDS = frozenset({
+    "width", "wide", "wdth",
+})
+
+_HEADER_HEIGHT_KEYWORDS = frozenset({
+    "height", "ht", "hgt", "high",
+})
+
+_HEADER_DIMS_KEYWORDS = frozenset({
+    "size", "dims", "dim", "dimensions", "w×h", "w*x", "w x h",
+    "width×height", "width*height", "width x height",
+    "w/h", "w×h", "wxh",
+})
+
+_HEADER_COUNT_KEYWORDS = frozenset({
+    "qty", "quantity", "count", "nos", "no.", "number",
+})
+
+_HEADER_DESC_KEYWORDS = frozenset({
+    "description", "desc", "notes", "note", "detail", "remarks",
+    "type_desc", "material", "finish", "spec",
+})
+
+# Patterns for mark extraction
+_MARK_PATTERNS = [
+    re.compile(r"\b([DW](?:D|W)?\d{1,4})\b"),         # D01, W01, WD01, DW01
+    re.compile(r"\b(I{1,3}|IV|V|VI{0,3}|IX|X{1,3}|XL|L|XC|C{1,3})\b"),  # Roman
+]
+
+# Patterns for compound dimension extraction (from full row text)
+_DIMENSION_PATTERNS = [
+    re.compile(r"(\d{1,5})\s*[×xX/]\s*(\d{1,5})"),     # 820x2040, 820 × 2040
+    re.compile(r"(\d{1,5})\s*[-–—]\s*(\d{1,5})"),        # 820-2040, 820–2040
+    re.compile(r"(\d{1,5})\s*[bhBH]\s*(\d{1,5})"),       # 820b2040, 820H2040
+]
+
+# Single-number pattern for fallback dimension extraction
+_SINGLE_NUM_RE = re.compile(r"\b(\d{2,5})\b")
+
+# Scale patterns for mm→m conversion
+_MM_RE = re.compile(r"(\d{2,5})\s*mm", re.IGNORECASE)
+_M_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3})?)\s*m\b", re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Dimension parsing
+# ---------------------------------------------------------------------------
+def parse_dimension(text: str) -> Tuple[Optional[int], Optional[int]]:
+    """Parse width × height from a dimension cell or row fragment.
+
+    Handles: "820x2040", "820 × 2040", "820/2040", "820-2040",
+             "820mm x 2040mm", "0.82m x 2.04m", standalone "2040"
+
+    Returns (width_mm, height_mm).  Either may be None if not parseable.
+    """
+    if not text or not text.strip():
+        return None, None
+
+    t = text.strip()
+
+    # Try mm suffix first: "820mm x 2040mm"
+    mm_match = _MM_RE.findall(t)
+    if len(mm_match) >= 2:
+        return int(mm_match[0]), int(mm_match[1])
+    if len(mm_match) == 1:
+        val = int(mm_match[0])
+        if val > 2000:
+            return None, val  # likely height (>2m)
+        return val, None
+
+    # Try m suffix: "0.82m x 2.04m"
+    m_match = _M_RE.findall(t)
+    if len(m_match) >= 2:
+        return round(float(m_match[0]) * 1000), round(float(m_match[1]) * 1000)
+    if len(m_match) == 1:
+        val_mm = round(float(m_match[0]) * 1000)
+        if val_mm > 2000:
+            return None, val_mm
+        return val_mm, None
+
+    # Try compound patterns: "820x2040"
+    for pat in _DIMENSION_PATTERNS:
+        m = pat.search(t)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            # Convention: first number is width, second is height
+            # Heuristic: width ≤ 3000mm, height can be larger
+            if a <= 5000 and b <= 5000:
+                return a, b
+
+    # Fallback: extract standalone numbers
+    nums = _SINGLE_NUM_RE.findall(t)
+    if len(nums) >= 2:
+        a, b = int(nums[0]), int(nums[1])
+        return a, b
+    if len(nums) == 1:
+        val = int(nums[0])
+        if val > 2000:
+            return None, val  # likely height
+        return val, None
+
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# Mark extraction
+# ---------------------------------------------------------------------------
+def extract_mark(text: str) -> str:
+    """Extract a door/window type mark from text.
+
+    Returns the first mark found (D01, W01, WD01, etc.) or empty string.
+    """
+    if not text:
+        return ""
+    t_upper = text.upper()
+    for pat in _MARK_PATTERNS:
+        m = pat.search(t_upper)
+        if m:
+            mark = m.group(1).upper()
+            # Accept D, W, WD, DW prefixes
+            if mark and (mark[0] in ("D", "W")):
+                return mark
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Header detection and column mapping
+# ---------------------------------------------------------------------------
+def detect_header(words: Sequence[str]) -> Dict[str, int]:
+    """Detect which columns hold mark, width, height, dims, count, description.
+
+    Args:
+        words: list of column header texts (one per column, lowercased)
+
+    Returns:
+        dict mapping role → column index.  Missing roles are absent.
+    """
+    mapping: Dict[str, int] = {}
+    for i, w in enumerate(words):
+        w_clean = w.strip().lower()
+        if not w_clean:
+            continue
+        if w_clean in _HEADER_MARK_KEYWORDS and "mark" not in mapping:
+            mapping["mark"] = i
+        elif w_clean in _HEADER_WIDTH_KEYWORDS and "width" not in mapping:
+            mapping["width"] = i
+        elif w_clean in _HEADER_HEIGHT_KEYWORDS and "height" not in mapping:
+            mapping["height"] = i
+        elif w_clean in _HEADER_DIMS_KEYWORDS and "dims" not in mapping:
+            mapping["dims"] = i
+        elif w_clean in _HEADER_COUNT_KEYWORDS and "count" not in mapping:
+            mapping["count"] = i
+        elif w_clean in _HEADER_DESC_KEYWORDS and "desc" not in mapping:
+            mapping["desc"] = i
+    return mapping
+
+
+def _is_header_row(words: Sequence[str]) -> bool:
+    """Heuristic: does this row look like a table header?"""
+    mapping = detect_header(words)
+    # Need at least mark OR dims column to be a header
+    return "mark" in mapping or "dims" in mapping
+
+
+# ---------------------------------------------------------------------------
+# Main parser: row list → ScheduleEntry list
+# ---------------------------------------------------------------------------
+def parse_schedule_rows(
+    rows: Sequence[Dict[str, Any]],
+    page_no: int = 0,
+) -> List[ScheduleEntry]:
+    """Parse schedule rows (from _word_rows() or similar) into ScheduleEntry.
+
+    Each row dict must have:
+      - "text": tab-separated row text
+      - "bbox": [x0, y0, x1, y1]
+
+    Strategy:
+      1. Find header row (first row with mark/dims keywords).
+      2. Map columns to roles.
+      3. Parse each data row: extract mark, dimensions, description, count.
+    """
+    if not rows:
+        return []
+
+    entries: List[ScheduleEntry] = []
+    col_map: Dict[str, int] = {}
+    header_idx = -1
+
+    # Find header row
+    for idx, row in enumerate(rows):
+        text = row.get("text", "")
+        cells = [c.strip() for c in text.split("\t")]
+        if _is_header_row(cells):
+            col_map = detect_header(cells)
+            header_idx = idx
+            break
+
+    if header_idx < 0:
+        # No header found — try heuristic extraction from all rows
+        return _parse_rows_without_header(rows, page_no)
+
+    # Parse data rows (after header)
+    for row in rows[header_idx + 1:]:
+        text = row.get("text", "")
+        bbox = row.get("bbox", (0, 0, 0, 0))
+        cells = [c.strip() for c in text.split("\t")]
+
+        # Skip empty rows
+        if not any(cells):
+            continue
+
+        # Extract type mark
+        mark = ""
+        if "mark" in col_map and col_map["mark"] < len(cells):
+            mark = extract_mark(cells[col_map["mark"]])
+        if not mark:
+            # Fallback: search full row text
+            mark = extract_mark(text)
+
+        if not mark:
+            continue
+
+        # Skip header-like rows that leaked through
+        if mark in ("", "MARK", "TYPE", "CODE"):
+            continue
+
+        # Skip non-door/window marks
+        if not (mark.startswith("D") or mark.startswith("W")):
+            continue
+
+        # Extract dimensions
+        width_mm: Optional[int] = None
+        height_mm: Optional[int] = None
+
+        if "dims" in col_map and col_map["dims"] < len(cells):
+            width_mm, height_mm = parse_dimension(cells[col_map["dims"]])
+        elif "width" in col_map and "height" in col_map:
+            w_idx = col_map["width"]
+            h_idx = col_map["height"]
+            if w_idx < len(cells):
+                w_text = cells[w_idx].replace("mm", "").replace("m", "").strip()
+                try:
+                    width_mm = int(float(w_text) * (1000 if "." in w_text else 1))
+                except (ValueError, TypeError):
+                    pass
+            if h_idx < len(cells):
+                h_text = cells[h_idx].replace("mm", "").replace("m", "").strip()
+                try:
+                    height_mm = int(float(h_text) * (1000 if "." in h_text else 1))
+                except (ValueError, TypeError):
+                    pass
+        else:
+            # Fallback: search full row text for compound dimension
+            width_mm, height_mm = parse_dimension(text)
+
+        # Extract count
+        count = 1
+        if "count" in col_map and col_map["count"] < len(cells):
+            try:
+                count = max(1, int(cells[col_map["count"]].replace("x", "").strip()))
+            except (ValueError, TypeError):
+                count = 1
+
+        # Extract description
+        desc = ""
+        if "desc" in col_map and col_map["desc"] < len(cells):
+            desc = cells[col_map["desc"]].strip()
+
+        entries.append(ScheduleEntry(
+            type_mark=mark,
+            width_mm=width_mm,
+            height_mm=height_mm,
+            description=desc,
+            count=count,
+            page_no=page_no,
+            bbox=tuple(bbox) if len(bbox) >= 4 else (0, 0, 0, 0),
+        ))
+
+    return entries
+
+
+def _parse_rows_without_header(
+    rows: Sequence[Dict[str, Any]],
+    page_no: int,
+) -> List[ScheduleEntry]:
+    """Fallback parser when no header row is detected.
+
+    Scans all rows for mark + dimension patterns.
+    """
+    entries: List[ScheduleEntry] = []
+    for row in rows:
+        text = row.get("text", "")
+        bbox = row.get("bbox", (0, 0, 0, 0))
+        mark = extract_mark(text)
+        if not mark:
+            continue
+        if not (mark.startswith("D") or mark.startswith("W")):
+            continue
+        width_mm, height_mm = parse_dimension(text)
+        entries.append(ScheduleEntry(
+            type_mark=mark,
+            width_mm=width_mm,
+            height_mm=height_mm,
+            page_no=page_no,
+            bbox=tuple(bbox) if len(bbox) >= 4 else (0, 0, 0, 0),
+        ))
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# Convenience: parse from a PDF page (uses _word_rows if available)
+# ---------------------------------------------------------------------------
+def parse_schedule_page(
+    pdf_page: Any,
+    page_no: int = 0,
+) -> List[ScheduleEntry]:
+    """Parse a door/window schedule page from a PyMuPDF page object.
+
+    Uses _word_rows() from pb_plan_read_engine_v1228 for row extraction.
+    """
+    try:
+        from pb_plan_read_engine_v1228 import _word_rows
+        rows = _word_rows(pdf_page)
+    except ImportError:
+        # Fallback: basic word extraction
+        try:
+            words = list(pdf_page.get_text("words") or [])
+        except Exception:
+            return []
+        rows = _basic_word_rows(words)
+    return parse_schedule_rows(rows, page_no=page_no)
+
+
+def _basic_word_rows(words: list) -> List[Dict[str, Any]]:
+    """Minimal row grouping fallback when _word_rows is unavailable."""
+    if not words:
+        return []
+    usable = []
+    for word in words:
+        if len(word) < 5:
+            continue
+        try:
+            x0, y0, x1, y1 = map(float, word[:4])
+        except Exception:
+            continue
+        text = str(word[4]).strip()
+        if text:
+            usable.append((x0, y0, x1, y1, text))
+    if not usable:
+        return []
+
+    usable.sort(key=lambda item: ((item[1] + item[3]) / 2.0, item[0]))
+    rows: List[List[tuple]] = []
+    row_cy: List[float] = []
+    tolerance = 5.0
+    for item in usable:
+        cy = (item[1] + item[3]) / 2.0
+        best = -1
+        best_d = 1e9
+        for idx in range(len(rows)):
+            d = abs(cy - row_cy[idx])
+            if d <= tolerance and d < best_d:
+                best, best_d = idx, d
+        if best < 0:
+            rows.append([item])
+            row_cy.append(cy)
+        else:
+            rows[best].append(item)
+            row_cy[best] = sum((p[1] + p[3]) / 2.0 for p in rows[best]) / len(rows[best])
+
+    output = []
+    for row in rows:
+        row.sort(key=lambda item: item[0])
+        pieces = []
+        prev_x1 = None
+        for x0, y0, x1, y1, text in row:
+            if prev_x1 is not None:
+                gap = x0 - prev_x1
+                pieces.append("\t" if gap > 18.0 else " ")
+            pieces.append(text)
+            prev_x1 = x1
+        output.append({
+            "text": "".join(pieces).strip(),
+            "bbox": [min(r[0] for r in row), min(r[1] for r in row),
+                     max(r[2] for r in row), max(r[3] for r in row)],
+            "words": row,
+        })
+    output.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
+    return output
+
+
+# ---------------------------------------------------------------------------
+# Enrichment: apply schedule data to existing OpeningEvidence
+# ---------------------------------------------------------------------------
+def enrich_opening_evidence(
+    instances: List[OpeningEvidence],
+    schedule_entries: List[ScheduleEntry],
+) -> List[OpeningEvidence]:
+    """Enrich geometric instances with schedule dimensions.
+
+    Schedule data provides width/height for openings that already have
+    a matching type_mark.  The schedule does NOT create new instances.
+
+    Rules:
+      - Both must share the same non-empty type_mark (B0 safety).
+      - Schedule dimensions override only if they upgrade the atomic
+        dimension bundle (basis priority + confidence).
+      - dimension_source is set to "schedule_parse".
+      - No deduction changes — schedule enrichment is evidence-only.
+
+    Returns:
+        New list with enriched records (originals not mutated).
+    """
+    if not instances or not schedule_entries:
+        return list(instances)
+
+    # Build lookup: type_mark → ScheduleEntry (first match wins)
+    schedule_by_mark: Dict[str, ScheduleEntry] = {}
+    for entry in schedule_entries:
+        if entry.type_mark and entry.type_mark not in schedule_by_mark:
+            schedule_by_mark[entry.type_mark] = entry
+
+    enriched = []
+    for inst in instances:
+        mark = inst.type_mark
+        if mark and mark in schedule_by_mark:
+            sched = schedule_by_mark[mark]
+            # Create a schedule-sourced evidence record for merging
+            sched_ev = OpeningEvidence(
+                type_mark=mark,
+                width_m=(sched.width_mm / 1000.0) if sched.width_mm else None,
+                height_m=(sched.height_mm / 1000.0) if sched.height_mm else None,
+                dimension_basis=DIMENSION_BASIS_UNKNOWN,
+                dimension_source="schedule_parse",
+                dimension_confidence=0.8,
+                extraction_method="schedule_parse",
+                page_no=sched.page_no,
+            )
+            # Use B0's merge logic (basis priority + confidence)
+            merged = merge_opening_evidence(inst, sched_ev)
+            enriched.append(merged)
+        else:
+            enriched.append(inst)
+
+    return enriched
