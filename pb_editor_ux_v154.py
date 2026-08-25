@@ -30,40 +30,13 @@ def merge_substrate_presets(existing: Iterable[Dict[str, Any]]) -> List[Dict[str
 
 
 def install() -> None:
-    """Install the internal substrate vocabulary into loaded editor modules."""
+    """Install the internal substrate vocabulary into the shared editor presets."""
     try:
         import pb_takeoff_studio_v1211 as studio
     except Exception:
         return
 
     studio.SUBSTRATE_PRESETS[:] = merge_substrate_presets(studio.SUBSTRATE_PRESETS)
-
-    # The 3D surface editor resolves its presets dynamically from the Takeoff
-    # Studio module, so extending the shared list also extends its selector.
-    try:
-        import pb_3d_surface_editor_v1212 as surface
-    except Exception:
-        return
-
-    if getattr(surface, "_pb_internal_substrate_inference_v154", False):
-        return
-
-    base_infer = surface.infer_substrate
-
-    def infer_with_internal(finish: Any) -> str:
-        text = str(finish or "").lower()
-        rules = [
-            (("plasterboard", "gyprock", "drywall"), "PB"),
-            (("fibre cement", "fiber cement", "fibrecement", "cement sheet"), "FC"),
-            (("mdf", "skirting", "architrave", "timber trim"), "MDF"),
-            (("plywood", "ply board", "ply sheet"), "PLY"),
-            (("concrete", "internal masonry", "internal blockwork"), "CON"),
-            (("metal", "steel", "metalwork"), "MET"),
-        ]
-        for needles, code in rules:
-            if any(needle in text for needle in needles):
-                return code
-        return base_infer(finish)
-
-    surface.infer_substrate = infer_with_internal
-    surface._pb_internal_substrate_inference_v154 = True
+    # pb_3d_surface_editor_v1212 reads this shared list dynamically via
+    # substrate_presets(), so the same options appear there without eagerly
+    # importing the 3D editor during app startup.
