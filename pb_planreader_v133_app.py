@@ -27,6 +27,9 @@ from pb_processing_fastpath_v150 import apply as apply_processing_fastpath_v150
 from pb_material_preview_guard_v152 import apply as apply_material_preview_guard_v152
 from pb_quick_takeoff_v153 import apply as apply_quick_takeoff_v153
 from pb_takeoff_colours_v153 import apply as apply_takeoff_colours_v153
+from pb_editor_ux_v154 import install as install_editor_ux_v154
+
+install_editor_ux_v154()
 
 app = base.base.launcher.app
 apply_upload_register_v147(app)
