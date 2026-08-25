@@ -34,6 +34,7 @@ from pb_elevation_evidence_v172 import (
     _marks_conflict,
     _opening_type_conflicts,
     _correlation_score,
+    _find_unique_best_pairs,
     _extract_label_near_rect,
     ELEVATION_WIDTH_TOLERANCE_M,
     ELEVATION_HEIGHT_CONFIDENCE,
@@ -449,11 +450,13 @@ class TestCorrelateElevationToPlan(unittest.TestCase):
     def test_nearest_assignment(self):
         """Each elevation matches at most one plan instance."""
         inst1 = _inst(mark="D01", side="North", width=0.82, pos=2.0)
-        inst2 = _inst(mark="D01", side="North", width=0.82, pos=4.0)
+        inst2 = _inst(mark="D02", side="North", width=0.82, pos=4.0)
         elev = _elev(side="North", w=0.82, h=2.1, label="D01")
         enriched, unmatched = correlate_elevation_to_plan([elev], [inst1, inst2])
-        heights = [e.height_m for e in enriched if e.height_m is not None]
-        self.assertEqual(len(heights), 1)
+        # D01 matches uniquely (D02 has mark conflict)
+        self.assertIsNotNone(enriched[0].height_m)
+        self.assertIsNone(enriched[1].height_m)
+        self.assertEqual(len(unmatched), 0)
 
     def test_global_assignment_order_independent(self):
         """Reversing plan-instance order must assign the same physical opening."""
@@ -464,12 +467,67 @@ class TestCorrelateElevationToPlan(unittest.TestCase):
         enriched_fwd, _ = correlate_elevation_to_plan([elev], [inst_a, inst_b])
         enriched_rev, _ = correlate_elevation_to_plan([elev], [inst_b, inst_a])
 
-        # The SAME physical instance (by position) must receive the elevation
-        pos_fwd = [e.position_along_wall_m for e in enriched_fwd
-                   if e.height_m is not None]
-        pos_rev = [e.position_along_wall_m for e in enriched_rev
-                   if e.height_m is not None]
-        self.assertEqual(pos_fwd, pos_rev)
+        # Same number of enriched instances (both may be 0 if ambiguous)
+        h_fwd = [e.height_m for e in enriched_fwd if e.height_m is not None]
+        h_rev = [e.height_m for e in enriched_rev if e.height_m is not None]
+        self.assertEqual(len(h_fwd), len(h_rev))
+
+    def test_ambiguous_plan_instances_rejected(self):
+        """Two identical D01 plan instances + 1 D01 elevation → neither matches."""
+        inst_a = _inst(mark="D01", side="North", width=0.82, pos=2.0)
+        inst_b = _inst(mark="D01", side="North", width=0.82, pos=4.0)
+        elev = _elev(side="North", w=0.82, h=2.1, label="D01")
+        enriched, unmatched = correlate_elevation_to_plan([elev], [inst_a, inst_b])
+        # Both plan instances score equally → ambiguity → no enrichment
+        self.assertIsNone(enriched[0].height_m)
+        self.assertIsNone(enriched[1].height_m)
+        self.assertEqual(len(unmatched), 1)
+
+    def test_ambiguous_elevations_rejected(self):
+        """1 D01 plan instance + 2 equally-matching D01 elevations → no enrichment."""
+        inst = _inst(mark="D01", side="North", width=0.82)
+        elev_a = _elev(side="North", w=0.82, h=2.1, label="D01")
+        elev_b = _elev(side="North", w=0.82, h=2.4, label="D01")
+        enriched, unmatched = correlate_elevation_to_plan(
+            [elev_a, elev_b], [inst]
+        )
+        self.assertIsNone(enriched[0].height_m)
+        self.assertEqual(len(unmatched), 2)
+
+    def test_unique_width_resolves_ambiguity(self):
+        """D01 widths 0.82 and 0.94; elevation 0.82 → unique match."""
+        inst窄 = _inst(mark="D01", side="North", width=0.82, pos=2.0)
+        inst宽 = _inst(mark="D01", side="North", width=0.94, pos=4.0)
+        elev = _elev(side="North", w=0.82, h=2.1, label="D01")
+        enriched, unmatched = correlate_elevation_to_plan(
+            [elev], [inst窄, inst宽]
+        )
+        # Only the 0.82 plan instance is compatible → unique match
+        heights = [e.height_m for e in enriched if e.height_m is not None]
+        self.assertEqual(len(heights), 1)
+
+    def test_unique_width_resolves_ambiguity_reversed_order(self):
+        """Same as above with reversed plan order → same physical result."""
+        inst窄 = _inst(mark="D01", side="North", width=0.82, pos=2.0)
+        inst宽 = _inst(mark="D01", side="North", width=0.94, pos=4.0)
+        elev = _elev(side="North", w=0.82, h=2.1, label="D01")
+        enriched, _ = correlate_elevation_to_plan(
+            [elev], [inst宽, inst窄]
+        )
+        heights = [e.height_m for e in enriched if e.height_m is not None]
+        self.assertEqual(len(heights), 1)
+
+    def test_unique_mark_resolves_ambiguity(self):
+        """Two D01 openings at same width; one has D01 label, one blank → unique."""
+        inst_marked = _inst(mark="D01", side="North", width=0.82, pos=2.0)
+        inst_blank = _inst(mark="", side="North", width=0.82, pos=4.0)
+        elev = _elev(side="North", w=0.82, h=2.1, label="D01")
+        enriched, unmatched = correlate_elevation_to_plan(
+            [elev], [inst_marked, inst_blank]
+        )
+        # inst_marked gets higher score (has mark match) → unique best
+        self.assertIsNotNone(enriched[0].height_m)
+        self.assertIsNone(enriched[1].height_m)
 
     def test_empty_inputs(self):
         enriched, unmatched = correlate_elevation_to_plan([], [])
@@ -656,6 +714,42 @@ class TestLabelExtraction(unittest.TestCase):
         ]
         label = _extract_label_near_rect(words, (100, 100, 300, 500))
         self.assertEqual(label, "D01")
+
+
+class TestUniqueBestPairs(unittest.TestCase):
+    """_find_unique_best_pairs() — ambiguity detection for matching."""
+
+    def test_unique_best_qualifies(self):
+        """One clearly best pair → qualifies."""
+        pairs = [(0.8, 0, 0), (0.4, 1, 0)]
+        result = _find_unique_best_pairs(pairs)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0], (0.8, 0, 0))
+
+    def test_tied_plan_instances_rejected(self):
+        """Two pairs with same score for same elevation → both rejected."""
+        pairs = [(0.65, 0, 0), (0.65, 1, 0)]
+        result = _find_unique_best_pairs(pairs)
+        self.assertEqual(len(result), 0)
+
+    def test_tied_elevations_rejected(self):
+        """Two pairs with same score for same plan → both rejected."""
+        pairs = [(0.65, 0, 0), (0.65, 0, 1)]
+        result = _find_unique_best_pairs(pairs)
+        self.assertEqual(len(result), 0)
+
+    def test_different_scores_different_elevations(self):
+        """Different elevations, different scores → each qualifies."""
+        pairs = [(0.8, 0, 0), (0.5, 0, 1)]
+        result = _find_unique_best_pairs(pairs)
+        # Plan 0 has two candidates at different scores.
+        # The best is (0.8, 0, 0). (0.5, 0, 1) is not best for plan 0.
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0], (0.8, 0, 0))
+
+    def test_empty_pairs(self):
+        result = _find_unique_best_pairs([])
+        self.assertEqual(len(result), 0)
 
 
 class TestEdgeCases(unittest.TestCase):

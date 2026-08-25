@@ -336,6 +336,47 @@ def _correlation_score(
     return min(score, 1.0)
 
 
+def _find_unique_best_pairs(
+    pairs: List[Tuple[float, int, int]],
+) -> List[Tuple[float, int, int]]:
+    """Filter pairs to only those that are uniquely best for both sides.
+
+    A pair qualifies when:
+      - Its score is strictly greater than any other pair involving the same
+        plan instance OR the same elevation candidate.
+    Equal scores for the same elevation/plan → ambiguity → no match.
+    """
+    # Per plan instance: best score, and count of pairs at that score
+    plan_best: Dict[int, Tuple[float, int]] = {}  # p_idx → (best_score, count_at_best)
+    # Per elevation candidate: best score, and count of pairs at that score
+    elev_best: Dict[int, Tuple[float, int]] = {}  # e_idx → (best_score, count_at_best)
+
+    # Sort by score descending first to ensure we see the best first
+    sorted_pairs = sorted(pairs, key=lambda x: x[0], reverse=True)
+
+    for sc, p_idx, e_idx in sorted_pairs:
+        # Track plan instance best
+        if p_idx not in plan_best or sc > plan_best[p_idx][0]:
+            plan_best[p_idx] = (sc, 1)
+        elif sc == plan_best[p_idx][0]:
+            plan_best[p_idx] = (sc, plan_best[p_idx][1] + 1)
+
+        # Track elevation candidate best
+        if e_idx not in elev_best or sc > elev_best[e_idx][0]:
+            elev_best[e_idx] = (sc, 1)
+        elif sc == elev_best[e_idx][0]:
+            elev_best[e_idx] = (sc, elev_best[e_idx][1] + 1)
+
+    # A pair qualifies only if it's uniquely best for BOTH sides
+    qualified: List[Tuple[float, int, int]] = []
+    for sc, p_idx, e_idx in sorted_pairs:
+        if (plan_best[p_idx][0] == sc and plan_best[p_idx][1] == 1
+                and elev_best[e_idx][0] == sc and elev_best[e_idx][1] == 1):
+            qualified.append((sc, p_idx, e_idx))
+
+    return qualified
+
+
 def correlate_elevation_to_plan(
     elevation_openings: Sequence[ElevationOpening],
     plan_instances: Sequence[OpeningEvidence],
@@ -343,13 +384,18 @@ def correlate_elevation_to_plan(
 ) -> Tuple[List[OpeningEvidence], List[ElevationOpening]]:
     """Match elevation candidates to B1/B2 plan instances and enrich.
 
-    Uses globally strongest-first greedy assignment (order-independent):
+    Uses unique-best greedy assignment (order-independent, ambiguity-safe):
       1. Build ALL eligible (score, plan_idx, elev_idx) triples.
-      2. Sort by score descending.
+      2. Filter to pairs that are uniquely best for both the plan instance
+         and the elevation candidate (no tied scores → no ambiguity).
       3. Greedily assign: each plan instance and each elevation candidate
          can be matched at most once.
       4. Matched instances are enriched with elevation height/geometry.
       5. Unmatched elevation candidates are returned separately.
+
+    Ambiguity is rejected, not broken arbitrarily:
+      - If two plan instances score equally for one elevation → unmatched.
+      - If two elevations score equally for one plan → unmatched.
 
     Args:
         elevation_openings: Detected rectangles from elevation drawings.
@@ -373,25 +419,19 @@ def correlate_elevation_to_plan(
             if sc >= _MIN_STRONG_SIGNAL:
                 pairs.append((sc, p_idx, e_idx))
 
-    # Step 2: Sort globally strongest-first with physical tie-breaker
-    # When scores are equal, prefer the instance closer to wall start
-    # (lower position_along_wall_m) for deterministic, order-independent results.
-    def _sort_key(pair: Tuple[float, int, int]) -> Tuple[float, float]:
-        sc, p_idx, _e_idx = pair
-        pos = plan_instances[p_idx].position_along_wall_m
-        return (sc, -(pos if pos is not None else 1e9))
+    # Step 2: Filter to uniquely-best pairs (reject ambiguity)
+    qualified = _find_unique_best_pairs(pairs)
 
-    pairs.sort(key=_sort_key, reverse=True)
-
-    # Step 3: Greedy one-to-one assignment
+    # Step 3: Greedy one-to-one assignment on qualified pairs
+    qualified.sort(key=lambda x: x[0], reverse=True)
     assigned_plan: set = set()
     assigned_elev: set = set()
-    assignments: Dict[int, Tuple[float, int]] = {}  # plan_idx → (score, elev_idx)
+    assignments: Dict[int, int] = {}  # plan_idx → elev_idx
 
-    for sc, p_idx, e_idx in pairs:
+    for sc, p_idx, e_idx in qualified:
         if p_idx in assigned_plan or e_idx in assigned_elev:
             continue
-        assignments[p_idx] = (sc, e_idx)
+        assignments[p_idx] = e_idx
         assigned_plan.add(p_idx)
         assigned_elev.add(e_idx)
 
@@ -399,7 +439,7 @@ def correlate_elevation_to_plan(
     enriched: List[OpeningEvidence] = []
     for p_idx, inst in enumerate(plan_instances):
         if p_idx in assignments:
-            _, e_idx = assignments[p_idx]
+            e_idx = assignments[p_idx]
             elev = elevation_openings[e_idx]
             merged = _enrich_from_elevation(inst, elev)
             enriched.append(merged)
