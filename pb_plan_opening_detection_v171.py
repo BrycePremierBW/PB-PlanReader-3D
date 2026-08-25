@@ -367,13 +367,14 @@ def detect_door_candidates(
 
     pt_per_m, m_per_pt = _resolve_scale(scale_info, scale_px_per_m)
 
-    # Scale-aware geometry gates (physical metres → points via calibration)
-    MIN_LEAF_PT = max(25.0, 0.3 * pt_per_m) if pt_per_m > 0 else 25.0
-    MAX_LEAF_PT = max(150.0, 1.5 * pt_per_m) if pt_per_m > 0 else 150.0
-    WALL_PROXIMITY_PT = max(30.0, 0.6 * pt_per_m) if pt_per_m > 0 else 30.0
+    # Scale-aware geometry gates — physical metres × pt_per_m when calibrated,
+    # old fixed-point values only as uncalibrated fallback
+    MIN_LEAF_PT = _physical_pt(0.3, pt_per_m, 25.0)
+    MAX_LEAF_PT = _physical_pt(1.5, pt_per_m, 150.0)
+    WALL_PROXIMITY_PT = _physical_pt(0.6, pt_per_m, 30.0)
+    DOOR_TAG_RADIUS_PT = _physical_pt(0.6, pt_per_m, 120.0)
 
     # Pre-identify segments that are part of wall-local parallel pairs (windows)
-    # Only exclude if the pair is near the SAME wall
     wall_local_parallel: set = set()
     for wl in wall_lines:
         wall = wl.segment
@@ -388,7 +389,7 @@ def detect_door_candidates(
             for j, b in enumerate(near_this_wall):
                 if j <= i:
                     continue
-                if _segments_parallel(a, b) and _segment_distance(a, b) <= 100.0:
+                if _segments_parallel(a, b) and _segment_distance(a, b) <= _physical_pt(2.0, pt_per_m, 100.0):
                     wall_local_parallel.add(id(a))
                     wall_local_parallel.add(id(b))
 
@@ -413,7 +414,7 @@ def detect_door_candidates(
                 continue
 
             # Found a perpendicular jamb/leaf segment
-            tag, tag_cls = _find_tag_near(seg.cx, seg.cy, words)
+            tag, tag_cls = _find_tag_near(seg.cx, seg.cy, words, max_dist_pt=DOOR_TAG_RADIUS_PT)
 
             # Tag/type compatibility: door geometry may only assign Dxx marks
             assigned_tag = ""
@@ -496,56 +497,30 @@ class WindowCandidate:
     page_no: int = 0
 
 
-def _compute_hatch_and_tags(
-    pairs: List[Tuple[int, int, Segment, Segment]],
+def _physical_pt(physical_m: float, pt_per_m: float, fallback: float) -> float:
+    """Convert physical metres to points using calibration, or return fallback."""
+    return physical_m * pt_per_m if pt_per_m > 0 else fallback
+
+
+def _global_tag_assignment(
+    surviving: List[Tuple],
     words: Sequence["TextWord"],
-    wall_dx: float, wall_dy: float,
-    wall_ox: float, wall_oy: float,
-    wall_len: float,
-    pt_per_m: float,
     tag_radius_pt: float,
-    used_tags: set,
-) -> Tuple[bool, set, Dict[int, str], List[Tuple[float, float]]]:
-    """Compute hatch status and globally-nearest one-to-one W-tag assignment.
+) -> Dict[int, str]:
+    """Globally-nearest one-to-one W-tag assignment across all surviving pairs.
 
-    Args:
-        pairs: list of (i, j, seg_a, seg_b) jamb pairs
-        words: page text words
-        wall direction/origin/length for position projection
-        pt_per_m: calibrated scale (0 = uncalibrated)
-        tag_radius_pt: scale-aware maximum 2D distance for tag assignment
-        used_tags: mutable set of already-consumed tag indices (page-level)
-
-    Returns:
-        (is_hatch, hatch_tagged_indices, pair_assigned_tag, pair_cx_cy)
+    Each W tag is assigned to the physically closest pair across ALL walls.
+    One tag = one pair (consumed after assignment).
     """
-    is_hatch = False
-    hatch_tagged_indices: set = set()
-    pair_assigned_tag: Dict[int, str] = {}
-    pair_cx_cy: List[Tuple[float, float]] = []
-
-    if len(pairs) < 2:
-        return is_hatch, hatch_tagged_indices, pair_assigned_tag, pair_cx_cy
-
-    # Collect W-tag word indices (page-level; used_tags stores tag TEXT to
-    # prevent reuse across walls in both the helper and fallback paths)
     w_tag_indices = [i for i, w in enumerate(words)
-                     if _classify_tag(w.text) == "window"
-                     and w.text not in used_tags]
+                     if _classify_tag(w.text) == "window"]
 
-    # Pair midpoints (projected + actual 2D)
-    pair_midpoints = []
-    pair_jamb_spacings = []
-    pair_cx_cy_local = []
-    for _, _, a, b in pairs:
+    pair_cx_cy = []
+    for (i, j, a, b), _, _ in surviving:
         mcx = (a.cx + b.cx) / 2.0
         mcy = (a.cy + b.cy) / 2.0
-        pair_midpoints.append(((mcx - wall_ox) * wall_dx + (mcy - wall_oy) * wall_dy) / wall_len)
-        pair_jamb_spacings.append(_segment_distance(a, b))
-        pair_cx_cy_local.append((mcx, mcy))
-    pair_cx_cy = pair_cx_cy_local
+        pair_cx_cy.append((mcx, mcy))
 
-    # All candidate matches within 2D radius, sorted by distance
     tag_pair_matches: List[Tuple[float, int, int]] = []
     for pi, (pcx, pcy) in enumerate(pair_cx_cy):
         for ti in w_tag_indices:
@@ -554,24 +529,48 @@ def _compute_hatch_and_tags(
                 tag_pair_matches.append((d, ti, pi))
     tag_pair_matches.sort(key=lambda x: x[0])
 
-    # Greedy one-to-one assignment (closest first, each tag/pair used once)
+    used_tags_idx: set = set()
     used_pairs: set = set()
-    pair_has_w_tag = [False] * len(pairs)
+    pair_assigned_tag: Dict[int, str] = {}
     for dist, ti, pi in tag_pair_matches:
-        if words[ti].text in used_tags or pi in used_pairs:
+        if ti in used_tags_idx or pi in used_pairs:
             continue
-        pair_has_w_tag[pi] = True
         pair_assigned_tag[pi] = words[ti].text
-        used_tags.add(words[ti].text)
+        used_tags_idx.add(ti)
         used_pairs.add(pi)
 
-    # Sort midpoints for gap analysis
+    return pair_assigned_tag
+
+
+def _compute_hatch_and_tags(
+    pairs: List[Tuple[int, int, Segment, Segment]],
+    wall_dx: float, wall_dy: float,
+    wall_ox: float, wall_oy: float,
+    wall_len: float,
+    pt_per_m: float,
+) -> Tuple[bool, List[Tuple[float, float]]]:
+    """Compute hatch status for a wall's jamb pairs (geometric only).
+
+    Returns (is_hatch, pair_cx_cy).
+    """
+    is_hatch = False
+    pair_cx_cy: List[Tuple[float, float]] = []
+
+    if len(pairs) < 2:
+        return is_hatch, pair_cx_cy
+
+    pair_midpoints = []
+    pair_jamb_spacings = []
+    for _, _, a, b in pairs:
+        mcx = (a.cx + b.cx) / 2.0
+        mcy = (a.cy + b.cy) / 2.0
+        pair_midpoints.append(((mcx - wall_ox) * wall_dx + (mcy - wall_oy) * wall_dy) / wall_len)
+        pair_jamb_spacings.append(_segment_distance(a, b))
+        pair_cx_cy.append((mcx, mcy))
+
     indexed_pairs = sorted(enumerate(pair_midpoints), key=lambda x: x[1])
     pair_midpoints_sorted = [pair_midpoints[orig_i] for orig_i, _ in indexed_pairs]
-    pair_has_w_tag_sorted = [pair_has_w_tag[orig_i] for orig_i, _ in indexed_pairs]
-    original_indices = [orig_i for orig_i, _ in indexed_pairs]
 
-    # Gaps between consecutive pair midpoints
     gaps_between = [
         pair_midpoints_sorted[k + 1] - pair_midpoints_sorted[k]
         for k in range(len(pair_midpoints_sorted) - 1)
@@ -581,12 +580,9 @@ def _compute_hatch_and_tags(
     if gaps_between and mean_jamb > 0:
         max_gap = max(gaps_between)
         gap_ratio = max_gap / mean_jamb
-
-        # Scale-aware minimum gap: 1.5 m between pair centres
         MIN_GAP_M = 1.5
         scale_min_gap_pt = MIN_GAP_M * pt_per_m if pt_per_m > 0 else 0
 
-        # Evaluate hatch geometrically (always, regardless of tags)
         if len(gaps_between) >= 2:
             if gap_ratio <= 2.5:
                 if scale_min_gap_pt > 0 and max_gap >= scale_min_gap_pt:
@@ -599,13 +595,7 @@ def _compute_hatch_and_tags(
             elif scale_min_gap_pt <= 0 and gap_ratio <= 2.5:
                 is_hatch = True
 
-    # If hatch, collect pair-local W-tag corroboration
-    if is_hatch:
-        for sorted_idx, has_tag in enumerate(pair_has_w_tag_sorted):
-            if has_tag:
-                hatch_tagged_indices.add(original_indices[sorted_idx])
-
-    return is_hatch, hatch_tagged_indices, pair_assigned_tag, pair_cx_cy
+    return is_hatch, pair_cx_cy
 
 
 def detect_window_candidates(
@@ -636,17 +626,16 @@ def detect_window_candidates(
 
     pt_per_m, m_per_pt = _resolve_scale(scale_info, scale_px_per_m)
 
-    # Scale-aware geometry gates (physical metres → points via calibration)
-    # Uncalibrated fallback preserves old fixed-point behaviour
-    MIN_WINDOW_PT = max(25.0, 0.3 * pt_per_m) if pt_per_m > 0 else 25.0
-    MAX_WINDOW_PT = max(200.0, 3.0 * pt_per_m) if pt_per_m > 0 else 200.0
-    # Scale-aware jamb-pair distance: at 50pt/m → 60pt (1.2m), at 200pt/m → 240pt
-    MAX_PAIR_DISTANCE_PT = max(50.0, 1.2 * pt_per_m) if pt_per_m > 0 else 100.0
-    WALL_PROXIMITY_PT = max(30.0, 0.6 * pt_per_m) if pt_per_m > 0 else 30.0
-    # Scale-aware tag matching radius (2.4 m physical, floor 120 pt)
-    TAG_RADIUS_PT = max(120.0, 2.4 * pt_per_m) if pt_per_m > 0 else 120.0
+    # Scale-aware geometry gates — physical metres × pt_per_m when calibrated,
+    # old fixed-point values only as uncalibrated fallback
+    MIN_WINDOW_PT = _physical_pt(0.3, pt_per_m, 25.0)
+    MAX_WINDOW_PT = _physical_pt(3.0, pt_per_m, 200.0)
+    MAX_PAIR_DISTANCE_PT = _physical_pt(1.2, pt_per_m, 100.0)
+    WALL_PROXIMITY_PT = _physical_pt(0.6, pt_per_m, 30.0)
+    TAG_RADIUS_PT = _physical_pt(2.4, pt_per_m, 120.0)
 
-    used_tags: set = set()  # page-level: one W tag → one opening across all walls
+    # PASS 1: Collect surviving pairs per wall (hatch-filtered)
+    all_surviving: List[Tuple] = []  # (pair_tuple, wl, is_hatch_multi)
 
     for wl in wall_lines:
         wall = wl.segment
@@ -694,93 +683,83 @@ def detect_window_candidates(
                 pairs.append((i, j, a, b))
                 break  # each segment belongs to at most one pair
 
-        # Step 3: Hatch filter + one-to-one W-tag assignment (page-level)
-        is_hatch, hatch_tagged_indices, pair_assigned_tag, _pair_cx_cy = \
-            _compute_hatch_and_tags(
-                pairs, words, wall_dx, wall_dy, wall_ox, wall_oy, wall_len,
-                pt_per_m, TAG_RADIUS_PT, used_tags,
-            )
+        # Step 3: Hatch filter (geometric only — tags assigned globally later)
+        is_hatch, pair_cx_cy = _compute_hatch_and_tags(
+            pairs, wall_dx, wall_dy, wall_ox, wall_oy, wall_len,
+            pt_per_m,
+        )
 
-        if is_hatch and not hatch_tagged_indices:
-            continue
+        # Collect ALL pairs for global tag assignment (hatch pairs included
+        # so they can receive tag corroboration post-global)
+        for pi, (i, j, a, b) in enumerate(pairs):
+            all_surviving.append(((i, j, a, b), wl, is_hatch))
 
-        # Step 4: Process each pair as a window candidate
-        for pair_idx, (i, j, a, b) in enumerate(pairs):
-            # When hatch detected, only W-tag-corroborated pairs survive
-            if is_hatch and pair_idx not in hatch_tagged_indices:
-                continue
-            pair_dist = _segment_distance(a, b)
-            width_m = _pt_to_m(pair_dist, m_per_pt)
+    # PASS 2: Global one-to-one W-tag assignment across all surviving pairs
+    global_assigned = _global_tag_assignment(all_surviving, words, TAG_RADIUS_PT)
 
-            # Position: midpoint projected onto wall (canonical)
-            mid_cx = (a.cx + b.cx) / 2.0
-            mid_cy = (a.cy + b.cy) / 2.0
-            pos_pt = ((mid_cx - wall_ox) * wall_dx + (mid_cy - wall_oy) * wall_dy) / wall_len
-            pos_m = _pt_to_m(pos_pt, m_per_pt)
+    # Post-global: reject hatch pairs that received no tag corroboration
+    surviving_final = [
+        (orig_idx, pair, wl, is_hatch_multi)
+        for orig_idx, (pair, wl, is_hatch_multi) in enumerate(all_surviving)
+        if not is_hatch_multi or global_assigned.get(orig_idx, "") != ""
+    ]
 
-            # Use the exclusive one-to-one tag assignment from the hatch filter.
-            # This ensures one W tag = one pair (no stealing, no double-use).
-            # Fallback to _find_tag_near only for pairs with no pre-assigned tag
-            # (single-pair walls that skip the hatch filter).
-            assigned_tag = pair_assigned_tag.get(pair_idx, "")
-            raw_tag = ""
-            raw_tag_cls = ""
-            if not assigned_tag:
-                tag, tag_cls = _find_tag_near(mid_cx, mid_cy, words,
-                                              max_dist_pt=TAG_RADIUS_PT)
-                raw_tag = tag or ""
-                raw_tag_cls = tag_cls
-                # Tag/type compatibility: window geometry may only assign Wxx marks.
-                # Skip if this tag was already consumed (page-level or this wall).
-                consumed_tags = set(pair_assigned_tag.values()) | used_tags
-                if tag and tag_cls == "window" and tag not in consumed_tags:
-                    assigned_tag = tag
-                    used_tags.add(tag)
-            tag_cls = _classify_tag(assigned_tag) if assigned_tag else ""
+    # PASS 3: Create WindowCandidate for each surviving pair
+    for _si, (orig_idx, pair, wl, _is_hatch_multi) in enumerate(surviving_final):
+        i, j, a, b = pair
+        pair_dist = _segment_distance(a, b)
+        width_m = _pt_to_m(pair_dist, m_per_pt)
 
-            # --- Three independent confidence channels ---
+        mid_cx = (a.cx + b.cx) / 2.0
+        mid_cy = (a.cy + b.cy) / 2.0
+        wall = wl.segment
+        wall_dx, wall_dy, wall_ox, wall_oy = _canonical_wall_direction(wall)
+        wall_len = math.hypot(wall_dx, wall_dy)
+        pos_pt = ((mid_cx - wall_ox) * wall_dx + (mid_cy - wall_oy) * wall_dy) / wall_len if wall_len > 1e-9 else 0
+        pos_m = _pt_to_m(pos_pt, m_per_pt)
 
-            # GEOMETRY: parallel pair near wall is moderate evidence
-            geom_conf = 0.60
-            if width_m is not None and 0.3 <= width_m <= 3.0:
-                geom_conf = 0.70  # reasonable window width
+        assigned_tag = global_assigned.get(orig_idx, "")
+        tag_cls = _classify_tag(assigned_tag) if assigned_tag else ""
 
-            # ASSOCIATION
-            assoc_conf = 0.70 if wl.wall_ref else 0.30
+        raw_tag = ""
+        raw_tag_cls = ""
+        if not assigned_tag:
+            raw_tag, raw_tag_cls = _find_tag_near(mid_cx, mid_cy, words,
+                                                  max_dist_pt=TAG_RADIUS_PT)
 
-            # SEMANTIC: only W tags contribute to window semantic confidence
-            # D tags near window geometry are conflicting (not assigned)
-            sem_conf = 0.0
-            if assigned_tag and tag_cls == "window":
-                sem_conf = 0.95
-            elif assigned_tag and tag_cls == "door":
-                sem_conf = 0.30  # conflicting tag
-            elif assigned_tag:
-                sem_conf = 0.60
-            elif raw_tag and raw_tag_cls == "door":
-                sem_conf = 0.30  # D tag near window — conflicting, not assigned
+        geom_conf = 0.60
+        if width_m is not None and 0.3 <= width_m <= 3.0:
+            geom_conf = 0.70
 
-            ev = []
-            ev.append(f"jamb_pair: {a.length:.1f}pt + {b.length:.1f}pt, spacing={pair_dist:.1f}pt")
-            if assigned_tag:
-                ev.append(f"tag: {assigned_tag} (window-compatible)")
-            elif raw_tag and raw_tag_cls == "door":
-                ev.append(f"tag: {raw_tag} (conflicting — not assigned as type_mark)")
-            elif raw_tag:
-                ev.append(f"tag: {raw_tag} (not window-compatible)")
+        assoc_conf = 0.70 if wl.wall_ref else 0.30
 
-            candidates.append(WindowCandidate(
-                wall_ref=wl.wall_ref or "",
-                position_along_wall_m=pos_m,
-                width_m=width_m,
-                parallel_segments=[a, b],
-                tag=assigned_tag,
-                geometry_confidence=geom_conf,
-                association_confidence=assoc_conf,
-                semantic_confidence=sem_conf,
-                evidence=ev,
-                page_no=page_no,
-            ))
+        sem_conf = 0.0
+        if assigned_tag and tag_cls == "window":
+            sem_conf = 0.95
+        elif assigned_tag and tag_cls == "door":
+            sem_conf = 0.30
+        elif assigned_tag:
+            sem_conf = 0.60
+        elif raw_tag and raw_tag_cls == "door":
+            sem_conf = 0.30
+
+        ev = []
+        ev.append(f"jamb_pair: {a.length:.1f}pt + {b.length:.1f}pt, spacing={pair_dist:.1f}pt")
+        if assigned_tag:
+            ev.append(f"tag: {assigned_tag} (window-compatible)")
+
+        candidates.append(WindowCandidate(
+            wall_ref=wl.wall_ref or "",
+            position_along_wall_m=pos_m,
+            width_m=width_m,
+            parallel_segments=[a, b],
+            tag=assigned_tag,
+            geometry_confidence=geom_conf,
+            association_confidence=assoc_conf,
+            semantic_confidence=sem_conf,
+            evidence=ev,
+            page_no=page_no,
+        ))
 
     return candidates
 
@@ -828,9 +807,11 @@ def detect_gap_candidates(
 
     pt_per_m, m_per_pt = _resolve_scale(scale_info, scale_px_per_m)
 
-    # Scale-aware geometry gates (physical metres → points via calibration)
-    MIN_GAP_PT = max(30.0, 0.5 * pt_per_m) if pt_per_m > 0 else 30.0
-    MAX_GAP_PT = max(200.0, 2.0 * pt_per_m) if pt_per_m > 0 else 200.0
+    # Scale-aware geometry gates — physical metres × pt_per_m when calibrated,
+    # old fixed-point values only as uncalibrated fallback
+    MIN_GAP_PT = _physical_pt(0.5, pt_per_m, 30.0)
+    MAX_GAP_PT = _physical_pt(2.0, pt_per_m, 200.0)
+    GAP_TAG_RADIUS_PT = _physical_pt(0.6, pt_per_m, 120.0)
     COLLINEAR_TOL_DEG = 10.0
     COLLINEAR_OFFSET_PT = 15.0  # max perpendicular offset for "same line"
     ENDPOINT_PROXIMITY_PT = 5.0  # gap = space between non-adjacent endpoints
@@ -918,16 +899,34 @@ def detect_gap_candidates(
                 continue
 
             # Found a genuine wall discontinuity
-            mid_pt = (gap_start_pt + gap_end_pt) / 2.0
-            # mid_pt is in points along wall direction (unit vector cos_a, sin_a)
-            # Actual position = origin + mid_pt * direction
-            mid_cx = wall_ox + mid_pt * wall_dx
-            mid_cy = wall_oy + mid_pt * wall_dy
+            # Use segment endpoint midpoints for stable 2D position (avoids
+            # projection origin losing wall's perpendicular offset)
+            if a_max < b_min:
+                a_end = max(a_proj)
+                b_end = min(b_proj)
+            else:
+                a_end = min(a_proj)
+                b_end = max(b_proj)
+            def _interp(seg: Segment, t_proj: float) -> Tuple[float, float]:
+                t1 = ((seg.x1 - shared_origin_x) * cos_a + (seg.y1 - shared_origin_y) * sin_a)
+                t2 = ((seg.x2 - shared_origin_x) * cos_a + (seg.y2 - shared_origin_y) * sin_a)
+                if abs(t2 - t1) < 1e-9:
+                    return (seg.cx, seg.cy)
+                frac = (t_proj - t1) / (t2 - t1)
+                frac = max(0.0, min(1.0, frac))
+                return (seg.x1 + frac * (seg.x2 - seg.x1),
+                        seg.y1 + frac * (seg.y2 - seg.y1))
+            end_a_2d = _interp(a, a_end)
+            end_b_2d = _interp(b, b_end)
+            mid_cx = (end_a_2d[0] + end_b_2d[0]) / 2.0
+            mid_cy = (end_a_2d[1] + end_b_2d[1]) / 2.0
 
             width_m = _pt_to_m(gap_len_pt, m_per_pt)
+            mid_pt = (gap_start_pt + gap_end_pt) / 2.0  # projection midpoint for pos_m
             pos_m = _pt_to_m(mid_pt, m_per_pt)
 
-            tag, tag_cls = _find_tag_near(mid_cx, mid_cy, words)
+            tag, tag_cls = _find_tag_near(mid_cx, mid_cy, words,
+                                          max_dist_pt=GAP_TAG_RADIUS_PT)
 
             # --- Three independent confidence channels ---
 
