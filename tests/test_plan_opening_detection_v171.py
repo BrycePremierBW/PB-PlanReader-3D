@@ -576,6 +576,30 @@ class TestWindowDetection(unittest.TestCase):
         tags = {w.tag for w in windows}
         self.assertEqual(tags, {"W01", "W02", "W03"})
 
+    def test_three_windows_without_tags_strong_geometry(self):
+        """3 real windows at 8.0 m spacing → detected by geometry alone (no tags).
+        Gap ratio 400/20=20 > 2.5 → not hatch. Proves geometry independently
+        supports detection without requiring W-tag corroboration."""
+        wall = WallLine(segment=_horiz_seg(0, 100, 1200, 100))
+        jamb1a = _vert_seg(190, 85, 115)
+        jamb1b = _vert_seg(210, 85, 115)
+        jamb2a = _vert_seg(590, 85, 115)
+        jamb2b = _vert_seg(610, 85, 115)
+        jamb3a = _vert_seg(990, 85, 115)
+        jamb3b = _vert_seg(1010, 85, 115)
+
+        all_segs = [wall.segment, jamb1a, jamb1b, jamb2a, jamb2b, jamb3a, jamb3b]
+
+        # No tags — geometry alone must detect the 3 windows
+        windows = detect_window_candidates(
+            all_segs, [wall], [],
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(windows), 3)
+        # All have blank tags (no W marks available)
+        for w in windows:
+            self.assertEqual(w.tag, "")
+
     def test_two_windows_on_same_wall(self):
         """Wall with 2 windows → 2 candidates."""
         wall = WallLine(segment=_horiz_seg(0, 100, 800, 100))
@@ -696,15 +720,15 @@ class TestWindowDetection(unittest.TestCase):
         self.assertEqual(tags, {"W01", "W02", "W03"})
 
     def test_w_tag_overrides_hatch_filter_for_multiple_pairs(self):
-        """Five window pairs at 1.4 m spacing (70pt at 50pt/m) → hatch filter
-        rejects untagged pairs but W tags override for tagged pairs.
+        """Five hatch-like pairs + one W03 tag → only the W03-corroborated
+        pair survives, not all 5.  Proves pair-local W-tag corroboration.
 
-        Without tags: max_gap=70pt < scale_min=75pt → is_hatch=True
-        With W03 tag on middle pair: any_w_tag=True → skip hatch filter"""
+        Without tags: all 5 rejected as hatch (max_gap=70 < scale_min=75)
+        With W03 tag: only the pair near W03 survives, other 4 stay rejected"""
         wall = WallLine(segment=_horiz_seg(0, 100, 600, 100))
         # 5 pairs at centres 150, 220, 290, 360, 430 → spacing = 70pt = 1.4m
         # Jamb spacing = 44pt = 0.88m opening width
-        # All gaps = 70pt < scale_min=75pt → hatch filter triggers without tags
+        # All gaps = 70pt < scale_min=75pt → hatch filter triggers
         pairs_segs = []
         for cx in [150, 220, 290, 360, 430]:
             pairs_segs.append(_vert_seg(cx - 22, 85, 115))
@@ -714,19 +738,20 @@ class TestWindowDetection(unittest.TestCase):
         words_no_tag = []
         words_with_tag = [_word("W03", 290, 70)]
 
-        # Without tags: hatch filter rejects (max_gap=70 < scale_min=75)
+        # Without tags: hatch filter rejects all 5
         windows_no_tag = detect_window_candidates(
             all_segs, [wall], words_no_tag,
             scale_info={"px_per_m": 50.0, "render_zoom": 1.0},
         )
         self.assertEqual(len(windows_no_tag), 0)
 
-        # With W03 tag: W-tag override bypasses hatch filter → 5 windows
+        # With W03 tag: only the W03-corroborated pair survives (not all 5)
         windows_with_tag = detect_window_candidates(
             all_segs, [wall], words_with_tag,
             scale_info={"px_per_m": 50.0, "render_zoom": 1.0},
         )
-        self.assertEqual(len(windows_with_tag), 5)
+        self.assertEqual(len(windows_with_tag), 1)
+        self.assertEqual(windows_with_tag[0].tag, "W03")
 
 
 # ---------------------------------------------------------------------------
@@ -876,8 +901,8 @@ class TestGapSuppression(unittest.TestCase):
 
     def test_same_wall_matching_ref_suppressed(self):
         """Gap at same position on same wall as a door → suppressed.
-        Gap is ≥30pt (production MIN_GAP_PT), wall_lines passed explicitly
-        to preserve N01 ref. Proves the gap exists before suppression."""
+        Proves gap exists via detect_gap_candidates(), then proves
+        plan_opening_candidates() removes it when door matches."""
         # Two wall segments on same line with a 50pt gap at x≈500
         gap_a = WallLine(segment=_horiz_seg(0, 100, 475, 100), wall_ref="N01")
         gap_b = WallLine(segment=_horiz_seg(525, 100, 1000, 100), wall_ref="N01")
@@ -885,20 +910,30 @@ class TestGapSuppression(unittest.TestCase):
         door_leaf = _vert_seg(500, 85, 115)
 
         words = [_word("D01", 500, 70)]
+        wall_lines = [gap_a, gap_b]
+        segs = [gap_a.segment, door_leaf, gap_b.segment]
 
-        # Pass wall_lines explicitly so N01 ref is preserved
-        result = plan_opening_candidates(
-            [gap_a.segment, door_leaf, gap_b.segment],
-            words,
-            wall_lines=[gap_a, gap_b],
+        # PROVE: detect_gap_candidates finds the N01 gap
+        raw_gaps = detect_gap_candidates(
+            segs, wall_lines, words,
             scale_info=SCALE_INFO_1X,
         )
-        # Verify: gap exists as a candidate (position ≈10.0m on N01)
-        all_positions = [c.position_along_wall_m for c in result.candidates
-                         if c.position_along_wall_m is not None]
-        close_to_10m = [p for p in all_positions if abs(p - 10.0) < 0.2]
-        # Door at 10.0m is one candidate; gap at 10.0m should be suppressed
-        self.assertLessEqual(len(close_to_10m), 1)
+        n01_gaps = [g for g in raw_gaps if g.wall_ref == "N01"]
+        self.assertEqual(len(n01_gaps), 1)
+        self.assertAlmostEqual(n01_gaps[0].position_along_wall_m, 10.0, delta=0.2)
+
+        # PROVE: plan_opening_candidates suppresses the matching N01 gap
+        result = plan_opening_candidates(
+            segs, words,
+            wall_lines=wall_lines,
+            scale_info=SCALE_INFO_1X,
+        )
+        n01_at_10m = [c for c in result.candidates
+                      if c.wall_ref == "N01"
+                      and c.position_along_wall_m is not None
+                      and abs(c.position_along_wall_m - 10.0) < 0.2]
+        # Only the door remains at 10.0m on N01 — gap is suppressed
+        self.assertLessEqual(len(n01_at_10m), 1)
 
     def test_different_walls_nonempty_ref_not_suppressed(self):
         """Gap on wall S01 NOT suppressed by door on wall N01 (different refs).

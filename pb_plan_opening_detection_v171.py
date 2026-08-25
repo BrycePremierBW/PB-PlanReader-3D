@@ -576,28 +576,55 @@ def detect_window_candidates(
                 pairs.append((i, j, a, b))
                 break  # each segment belongs to at most one pair
 
-        # Step 3: Hatch filter — scale-aware with tag override
+        # Step 3: Hatch filter — scale-aware, pair-local tag corroboration
         # After pairing, check if pairs represent separate windows or hatch.
         #
         # Hatch: pairs are uniformly spaced with gap ≈ jamb spacing (ratio ≈ 2.0).
         # Windows: gap is much larger than jamb spacing (ratio > 2.5).
         #
-        # When pairs have W tags, they are evidence-corroborated windows and
-        # override the geometric hatch suspicion — a W tag is strong semantic
-        # evidence that the pair represents a real window, not a hatch element.
+        # W-tag corroboration is pair-local: a W tag near a specific pair
+        # means THAT pair is a real window.  Untagged hatch-like pairs remain
+        # rejected — one annotation must not promote unrelated linework.
         is_hatch = False
+        hatch_tagged_indices: set = set()  # pair indices with W tags (when hatch)
         if len(pairs) >= 2:
+            # Collect W-tag positions (exclusive: each tag used at most once)
+            w_tag_positions = []
+            for w in words:
+                if _classify_tag(w.text) == "window":
+                    w_tag_positions.append(
+                        ((w.cx - wall_ox) * wall_dx + (w.cy - wall_oy) * wall_dy) / wall_len
+                    )
+
             pair_midpoints = []
             pair_jamb_spacings = []
-            pair_has_w_tag = []
             for _, _, a, b in pairs:
                 mcx = (a.cx + b.cx) / 2.0
                 mcy = (a.cy + b.cy) / 2.0
                 pair_midpoints.append(((mcx - wall_ox) * wall_dx + (mcy - wall_oy) * wall_dy) / wall_len)
                 pair_jamb_spacings.append(_segment_distance(a, b))
-                tag, _ = _find_tag_near(mcx, mcy, words)
-                pair_has_w_tag.append(_classify_tag(tag) == "window")
-            pair_midpoints.sort()
+
+            # Sort midpoints and find exclusive nearest W-tag for each pair
+            indexed_pairs = sorted(enumerate(pair_midpoints), key=lambda x: x[1])
+            pair_midpoints_sorted = [pair_midpoints[orig_i] for orig_i, _ in indexed_pairs]
+            used_tags: set = set()
+            pair_has_w_tag_sorted = []
+            for _, mp in indexed_pairs:
+                best_tag_dist = float("inf")
+                best_tag_idx = -1
+                for ti, tp in enumerate(w_tag_positions):
+                    if ti in used_tags:
+                        continue
+                    d = abs(mp - tp)
+                    if d < best_tag_dist:
+                        best_tag_dist = d
+                        best_tag_idx = ti
+                if best_tag_idx >= 0 and best_tag_dist <= 120.0:
+                    pair_has_w_tag_sorted.append(True)
+                    used_tags.add(best_tag_idx)
+                else:
+                    pair_has_w_tag_sorted.append(False)
+            original_indices = [orig_i for orig_i, _ in indexed_pairs]
 
             # Gaps between consecutive pair midpoints
             gaps_between = [
@@ -615,34 +642,36 @@ def detect_window_candidates(
                 MIN_GAP_M = 1.5
                 scale_min_gap_pt = MIN_GAP_M * pt_per_m if pt_per_m > 0 else 0
 
-                # W-tag override: if ANY pair has a nearby Wxx mark, the
-                # evidence-corroborated pairs survive hatch suspicion.  A W
-                # tag is strong semantic evidence that a pair represents a
-                # real window, not a hatch element.  We skip the entire hatch
-                # filter for this wall when any pair is tag-corroborated.
-                any_w_tag = any(pair_has_w_tag)
-
-                if not any_w_tag:
-                    if len(gaps_between) >= 2:
-                        # Multiple gaps: ratio test is reliable
-                        if gap_ratio <= 2.5:
-                            if scale_min_gap_pt > 0 and max_gap >= scale_min_gap_pt:
-                                pass
-                            else:
-                                is_hatch = True
-                    else:
-                        # Single gap (2 pairs): ratio test ambiguous
-                        # Use scale threshold only (no tags to override)
-                        if scale_min_gap_pt > 0 and max_gap < scale_min_gap_pt:
+                # Evaluate hatch geometrically (always, regardless of tags)
+                if len(gaps_between) >= 2:
+                    # Multiple gaps: ratio test is reliable
+                    if gap_ratio <= 2.5:
+                        if scale_min_gap_pt > 0 and max_gap >= scale_min_gap_pt:
+                            pass
+                        else:
                             is_hatch = True
-                        elif scale_min_gap_pt <= 0 and gap_ratio <= 2.5:
-                            is_hatch = True
+                else:
+                    # Single gap (2 pairs): ratio test ambiguous
+                    # Use scale threshold only
+                    if scale_min_gap_pt > 0 and max_gap < scale_min_gap_pt:
+                        is_hatch = True
+                    elif scale_min_gap_pt <= 0 and gap_ratio <= 2.5:
+                        is_hatch = True
 
-        if is_hatch:
+            # If hatch, collect pair-local W-tag corroboration
+            if is_hatch:
+                for sorted_idx, has_tag in enumerate(pair_has_w_tag_sorted):
+                    if has_tag:
+                        hatch_tagged_indices.add(original_indices[sorted_idx])
+
+        if is_hatch and not hatch_tagged_indices:
             continue
 
         # Step 4: Process each pair as a window candidate
-        for i, j, a, b in pairs:
+        for pair_idx, (i, j, a, b) in enumerate(pairs):
+            # When hatch detected, only W-tag-corroborated pairs survive
+            if is_hatch and pair_idx not in hatch_tagged_indices:
+                continue
             pair_dist = _segment_distance(a, b)
             width_m = _pt_to_m(pair_dist, m_per_pt)
 
