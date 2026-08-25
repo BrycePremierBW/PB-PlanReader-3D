@@ -29,6 +29,7 @@ from pb_opening_evidence_v170 import (
     OPENING_TYPE_DOOR,
     OPENING_TYPE_GARAGE,
     OPENING_TYPE_GLAZED,
+    OPENING_TYPE_OTHER,
     OPENING_TYPE_ROLLER,
     OPENING_TYPE_WINDOW,
     TOLERANCE_HEIGHT_M,
@@ -367,6 +368,40 @@ class TestPhysicalDeduplication(unittest.TestCase):
         a = _make_window(level="Ground", position=3.0)
         b = _make_window(level="First", position=3.0)
         self.assertFalse(same_physical_opening(a, b))
+
+    def test_conflicting_types_not_same(self):
+        """Confirmed door and confirmed window at same position -> not same."""
+        door = _make_door(wall_ref="N01", position=3.0, confidence=0.95)
+        window = _make_window(wall_ref="N01", position=3.0, confidence=0.95)
+        self.assertFalse(same_physical_opening(door, window))
+
+    def test_generic_type_matches_specific(self):
+        """Generic 'opening' type is compatible with any specific type."""
+        generic = OpeningEvidence(
+            opening_type=OPENING_TYPE_OTHER,
+            wall_ref="N01", level="Ground",
+            width_m=0.82, height_m=2.04,
+            position_along_wall_m=3.0,
+            dimension_basis=DIMENSION_BASIS_ROUGH_OPENING,
+        )
+        door = _make_door(wall_ref="N01", position=3.0)
+        self.assertTrue(same_physical_opening(generic, door))
+
+    def test_garage_vs_door_not_same(self):
+        """Garage door and ordinary door at same position -> not same."""
+        garage = OpeningEvidence(
+            opening_type=OPENING_TYPE_GARAGE,
+            wall_ref="N01", level="Ground",
+            width_m=3.0, height_m=2.4,
+            position_along_wall_m=5.0,
+            dimension_basis=DIMENSION_BASIS_ROUGH_OPENING,
+            extraction_method="plan_vector",
+            geometry_confidence=0.95,
+            dimension_confidence=0.95,
+            association_confidence=0.95,
+        )
+        door = _make_door(wall_ref="N01", position=5.0, width=0.82, height=2.04)
+        self.assertFalse(same_physical_opening(garage, door))
 
     def test_width_beyond_tolerance(self):
         a = _make_window(width=1.20, position=3.0)

@@ -309,6 +309,13 @@ def same_physical_opening(
     if a.level and b.level and a.level != b.level:
         return False
 
+    # Conflicting specific types: door vs window at same location → not same
+    # "opening" (generic) is compatible with anything
+    if (a.opening_type != OPENING_TYPE_OTHER
+            and b.opening_type != OPENING_TYPE_OTHER
+            and a.opening_type != b.opening_type):
+        return False
+
     # MUST have position anchor from BOTH records
     if a.position_along_wall_m is None or b.position_along_wall_m is None:
         return False
