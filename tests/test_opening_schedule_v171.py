@@ -40,10 +40,11 @@ def _row(text: str, bbox=None):
     return {"text": text, "bbox": bbox or (0, 0, 100, 20)}
 
 
-def _entry(mark, w=None, h=None, desc="", count=1, page=0):
+def _entry(mark, w=None, h=None, desc="", count=1, page=0, src=""):
     """Shorthand for ScheduleEntry."""
     return ScheduleEntry(type_mark=mark, width_mm=w, height_mm=h,
-                         description=desc, count=count, page_no=page)
+                         description=desc, count=count, page_no=page,
+                         parse_source=src)
 
 
 def _inst(mark="", wall_ref="N01", width=None, height=None, method="plan_vector"):
@@ -90,9 +91,10 @@ class TestDimensionParsing(unittest.TestCase):
         self.assertEqual(parse_dimension("0.82m x 2.04m"), (820, 2040))
 
     def test_single_mm_tall(self):
+        """Single mm value → treated as width (no height guess for single cells)."""
         w, h = parse_dimension("2040mm")
-        self.assertIsNone(w)
-        self.assertEqual(h, 2040)
+        self.assertEqual(w, 2040)
+        self.assertIsNone(h)
 
     def test_single_number_small(self):
         w, h = parse_dimension("820")
@@ -111,10 +113,11 @@ class TestDimensionParsing(unittest.TestCase):
     def test_no_numbers(self):
         self.assertEqual(parse_dimension("solid core"), (None, None))
 
-    def test_large_height(self):
+    def test_large_standalone_number(self):
+        """Standalone number within plausible range → treated as width."""
         w, h = parse_dimension("2700")
-        self.assertIsNone(w)
-        self.assertEqual(h, 2700)
+        self.assertEqual(w, 2700)
+        self.assertIsNone(h)
 
 
 class TestMarkExtraction(unittest.TestCase):
@@ -645,6 +648,169 @@ class TestDimensionEdgeCases(unittest.TestCase):
         w, h = parse_dimension("Size 820 x 2040 mm")
         self.assertEqual(w, 820)
         self.assertEqual(h, 2040)
+
+
+class TestPlausibilityAllPaths(unittest.TestCase):
+    """Plausibility validation is applied on ALL parse paths, not just heuristic."""
+
+    def test_mm_path_rejects_implausible(self):
+        """60mm x 60mm → rejected by plausibility."""
+        w, h = parse_dimension("60mm x 60mm")
+        self.assertIsNone(w)
+        self.assertIsNone(h)
+
+    def test_m_path_rejects_implausible(self):
+        """0.06m x 0.06m → rejected by plausibility."""
+        w, h = parse_dimension("0.06m x 0.06m")
+        self.assertIsNone(w)
+        self.assertIsNone(h)
+
+    def test_mm_path_accepts_plausible(self):
+        """820mm x 2040mm → accepted."""
+        w, h = parse_dimension("820mm x 2040mm")
+        self.assertEqual(w, 820)
+        self.assertEqual(h, 2040)
+
+    def test_single_mm_rejects_too_small(self):
+        """60mm → rejected by plausibility."""
+        w, h = parse_dimension("60mm")
+        self.assertIsNone(w)
+        self.assertIsNone(h)
+
+    def test_single_mm_rejects_too_large(self):
+        """8000mm → rejected by plausibility."""
+        w, h = parse_dimension("8000mm")
+        self.assertIsNone(w)
+        self.assertIsNone(h)
+
+    def test_single_m_rejects_too_small(self):
+        """0.06m → rejected by plausibility."""
+        w, h = parse_dimension("0.06m")
+        self.assertIsNone(w)
+        self.assertIsNone(h)
+
+    def test_header_separate_validates_bundle(self):
+        """Header separate columns: implausible dims rejected."""
+        rows = [
+            _row("Mark\tWidth\tHeight"),
+            _row("D01\t60\t60"),
+        ]
+        entries = parse_schedule_rows(rows)
+        # 60mm is below minimum plausible → rejected
+        self.assertEqual(len(entries), 1)
+        self.assertIsNone(entries[0].width_mm)
+        self.assertIsNone(entries[0].height_mm)
+
+    def test_header_dims_validates_bundle(self):
+        """Header dims column: implausible dims rejected."""
+        rows = [
+            _row("Mark\tSize"),
+            _row("D01\t60x60"),
+        ]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        self.assertIsNone(entries[0].width_mm)
+        self.assertIsNone(entries[0].height_mm)
+
+    def test_parse_single_dimension_rejects_implausible(self):
+        """parse_single_dimension rejects values outside plausible range."""
+        self.assertIsNone(parse_single_dimension("60mm"))
+        self.assertIsNone(parse_single_dimension("0.06m"))
+        self.assertIsNone(parse_single_dimension("8000mm"))
+
+    def test_parse_single_dimension_accepts_plausible(self):
+        """parse_single_dimension accepts values within plausible range."""
+        self.assertEqual(parse_single_dimension("820mm"), 820)
+        self.assertEqual(parse_single_dimension("1m"), 1000)
+        self.assertEqual(parse_single_dimension("2040"), 2040)
+
+
+class TestDuplicateProvenanceOrderIndependent(unittest.TestCase):
+    """Identical-duplicate enrichment uses strongest provenance, not first row."""
+
+    def test_identical_dims_header_over_heuristic(self):
+        """header_separate row first, heuristic second → confidence 0.8."""
+        inst = _inst(mark="D01")
+        sched = [
+            _entry("D01", w=820, h=2040, src="header_separate"),
+            _entry("D01", w=820, h=2040, src="heuristic"),
+        ]
+        result = enrich_opening_evidence([inst], sched)
+        self.assertAlmostEqual(result[0].height_m, 2.04, places=2)
+
+    def test_identical_dims_reverse_order_same_result(self):
+        """Reversing identical-duplicate row order must not change result."""
+        inst = _inst(mark="D01")
+        sched_a = [
+            _entry("D01", w=820, h=2040, src="heuristic"),
+            _entry("D01", w=820, h=2040, src="header_separate"),
+        ]
+        sched_b = [
+            _entry("D01", w=820, h=2040, src="header_separate"),
+            _entry("D01", w=820, h=2040, src="heuristic"),
+        ]
+        result_a = enrich_opening_evidence([inst], sched_a)
+        result_b = enrich_opening_evidence([inst], sched_b)
+        # Both should produce the same enrichment
+        self.assertAlmostEqual(result_a[0].height_m, 2.04, places=2)
+        self.assertAlmostEqual(result_b[0].height_m, 2.04, places=2)
+
+    def test_three_duplicates_picks_strongest(self):
+        """Three identical rows with different provenance → strongest wins."""
+        inst = _inst(mark="D01")
+        sched = [
+            _entry("D01", w=820, h=2040, src="heuristic"),
+            _entry("D01", w=820, h=2040, src="header_dims"),
+            _entry("D01", w=820, h=2040, src="header_separate"),
+        ]
+        result = enrich_opening_evidence([inst], sched)
+        # Should use header_separate (strongest) → confidence 0.8
+        self.assertAlmostEqual(result[0].height_m, 2.04, places=2)
+
+
+class TestFRLPlusRealDimensions(unittest.TestCase):
+    """Rows with FRL/STC + explicit compound dims → extract the dims."""
+
+    def test_no_header_frl_plus_compound(self):
+        """No header: D02 FRL 120/120 820x2040 → must extract 820x2040."""
+        rows = [_row("D02\tFRL 120/120\t820x2040")]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].width_mm, 820)
+        self.assertEqual(entries[0].height_mm, 2040)
+
+    def test_no_header_frl_only_no_dims(self):
+        """No header: D01 FRL 60/60 → no plausible dims, no entry."""
+        rows = [_row("D01\tFire Door\tFRL 60/60")]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 0)
+
+    def test_no_header_stc_plus_compound(self):
+        """No header: W01 STC 50 1200x2100 → must extract 1200x2100."""
+        rows = [_row("W01\tSTC 50\t1200x2100")]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].width_mm, 1200)
+        self.assertEqual(entries[0].height_mm, 2100)
+
+    def test_no_header_fire_text_plus_compound(self):
+        """No header: D01 Fire rated 820x2040 → must extract 820x2040."""
+        rows = [_row("D01\tFire rated door\t820x2040")]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].width_mm, 820)
+        self.assertEqual(entries[0].height_mm, 2040)
+
+    def test_header_dims_frl_still_extracts(self):
+        """Header dims column with FRL in description → dims extracted from Size col."""
+        rows = [
+            _row("Mark\tDescription\tSize"),
+            _row("D01\tFire FRL 60/60\t820x2040"),
+        ]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].width_mm, 820)
+        self.assertEqual(entries[0].height_mm, 2040)
 
 
 if __name__ == "__main__":

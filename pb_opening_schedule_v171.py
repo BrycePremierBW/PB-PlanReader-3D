@@ -135,29 +135,34 @@ def parse_single_dimension(text: str) -> Optional[int]:
     """Parse a single dimension value from a cell, handling units.
 
     Handles: "820", "820mm", "2040 mm", "0.82m", "1m", "2m"
-    Returns value in mm, or None if not parseable.
+    Returns value in mm, or None if not parseable or implausible.
     """
     if not text or not text.strip():
         return None
     t = text.strip()
+    val: Optional[int] = None
 
     # Try mm suffix: "820mm", "2040 mm"
     m = _MM_RE.search(t)
     if m:
-        return int(m.group(1))
+        val = int(m.group(1))
+    else:
+        # Try m suffix: "0.82m", "1m", "2m"
+        m = _M_RE.search(t)
+        if m:
+            val = round(float(m.group(1)) * 1000)
+        else:
+            # Bare number: assume mm
+            t_clean = t.replace(",", "").strip()
+            try:
+                val = int(float(t_clean))
+            except (ValueError, TypeError):
+                return None
 
-    # Try m suffix: "0.82m", "1m", "2m"
-    m = _M_RE.search(t)
-    if m:
-        return round(float(m.group(1)) * 1000)
-
-    # Bare number: assume mm
-    t_clean = t.replace(",", "").strip()
-    try:
-        val = int(float(t_clean))
-        return val
-    except (ValueError, TypeError):
+    # Plausibility check: reject implausible opening sizes
+    if val is not None and not _is_plausible_dimension(val, None):
         return None
+    return val
 
 
 def parse_dimension(text: str) -> Tuple[Optional[int], Optional[int]]:
@@ -175,8 +180,7 @@ def parse_dimension(text: str) -> Tuple[Optional[int], Optional[int]]:
 
     # Try compound patterns FIRST: "820x2040", "820 × 2040 mm"
     for pat in _DIMENSION_PATTERNS:
-        m = pat.search(t)
-        if m:
+        for m in pat.finditer(t):
             a, b = int(m.group(1)), int(m.group(2))
             if _is_plausible_dimension(a, b):
                 return a, b
@@ -184,22 +188,24 @@ def parse_dimension(text: str) -> Tuple[Optional[int], Optional[int]]:
     # Try mm suffix: "820mm x 2040mm"
     mm_match = _MM_RE.findall(t)
     if len(mm_match) >= 2:
-        return int(mm_match[0]), int(mm_match[1])
+        w, h = int(mm_match[0]), int(mm_match[1])
+        if _is_plausible_dimension(w, h):
+            return w, h
     if len(mm_match) == 1:
         val = int(mm_match[0])
-        if val > 2000:
-            return None, val  # likely height (>2m)
-        return val, None
+        if _MIN_PLAUSIBLE_MM <= val <= _MAX_PLAUSIBLE_MM:
+            return val, None  # single value → width
 
     # Try m suffix: "0.82m x 2.04m"
     m_match = _M_RE.findall(t)
     if len(m_match) >= 2:
-        return round(float(m_match[0]) * 1000), round(float(m_match[1]) * 1000)
+        w, h = round(float(m_match[0]) * 1000), round(float(m_match[1]) * 1000)
+        if _is_plausible_dimension(w, h):
+            return w, h
     if len(m_match) == 1:
         val_mm = round(float(m_match[0]) * 1000)
-        if val_mm > 2000:
-            return None, val_mm
-        return val_mm, None
+        if _MIN_PLAUSIBLE_MM <= val_mm <= _MAX_PLAUSIBLE_MM:
+            return val_mm, None  # single value → width
 
     # Fallback: extract standalone numbers
     nums = _SINGLE_NUM_RE.findall(t)
@@ -209,9 +215,10 @@ def parse_dimension(text: str) -> Tuple[Optional[int], Optional[int]]:
             return a, b
     if len(nums) == 1:
         val = int(nums[0])
-        if val > 2000:
-            return None, val  # likely height
-        return val, None
+        # Single number: treat as width if plausible width, else height if plausible height
+        if _MIN_PLAUSIBLE_MM <= val <= _MAX_PLAUSIBLE_MM:
+            return val, None  # assume width
+        return None, None
 
     return None, None
 
@@ -360,15 +367,21 @@ def parse_schedule_rows(
                 height_mm = parse_single_dimension(cells[h_idx])
             parse_source = "header_separate"
         else:
-            # Fallback: only use full-row if row has strong dimension signals
-            # and does NOT contain rating/fire/acoustic keywords
-            if not _has_rating_keywords(text):
-                width_mm, height_mm = parse_dimension(text)
-                if _is_plausible_dimension(width_mm, height_mm):
-                    parse_source = "heuristic"
-                else:
-                    width_mm, height_mm = None, None
-                    parse_source = ""
+            # Fallback: try full-row extraction regardless of rating keywords.
+            # Rating keywords stop standalone rating values (60/60) from being
+            # dimensions, but a strong explicit compound (820x2040) is still valid.
+            width_mm, height_mm = parse_dimension(text)
+            if _is_plausible_dimension(width_mm, height_mm):
+                parse_source = "heuristic"
+            else:
+                width_mm, height_mm = None, None
+                parse_source = ""
+
+        # Final plausibility gate: reject implausible bundles regardless of source
+        if width_mm is not None or height_mm is not None:
+            if not _is_plausible_dimension(width_mm, height_mm):
+                width_mm, height_mm = None, None
+                parse_source = ""
 
         # Extract count
         count = 1
@@ -404,8 +417,9 @@ def _parse_rows_without_header(
     """Fallback parser when no header row is detected.
 
     Scans all rows for mark + dimension patterns.
-    Only extracts dimensions when the expression is strong and the row
-    does NOT contain rating/fire/acoustic keywords.
+    Rating/fire keywords prevent standalone rating values (60/60) from
+    being treated as dimensions, but a strong explicit compound like
+    820x2040 is still extracted.
     """
     entries: List[ScheduleEntry] = []
     for row in rows:
@@ -415,9 +429,6 @@ def _parse_rows_without_header(
         if not mark:
             continue
         if not (mark.startswith("D") or mark.startswith("W")):
-            continue
-        # Reject rows with rating/fire/acoustic keywords
-        if _has_rating_keywords(text):
             continue
         width_mm, height_mm = parse_dimension(text)
         if not _is_plausible_dimension(width_mm, height_mm):
@@ -549,6 +560,7 @@ def enrich_opening_evidence(
     # For each mark, determine the authoritative schedule data:
     # - Identical dimensions across duplicates → safe to use
     # - Conflicting dimensions → skip enrichment (ambiguous)
+    _PROVENANCE_RANK = {"header_separate": 3, "header_dims": 2, "heuristic": 1, "": 0}
     mark_authority: Dict[str, Optional[ScheduleEntry]] = {}
     for mark, entries_list in schedule_by_mark.items():
         if len(entries_list) == 1:
@@ -559,8 +571,10 @@ def enrich_opening_evidence(
             for e in entries_list:
                 dims_set.add((e.width_mm, e.height_mm))
             if len(dims_set) == 1:
-                # All identical → safe
-                mark_authority[mark] = entries_list[0]
+                # All identical → safe; pick strongest provenance
+                best = max(entries_list,
+                           key=lambda e: _PROVENANCE_RANK.get(e.parse_source, 0))
+                mark_authority[mark] = best
             else:
                 # Conflicting → do NOT enrich
                 mark_authority[mark] = None
