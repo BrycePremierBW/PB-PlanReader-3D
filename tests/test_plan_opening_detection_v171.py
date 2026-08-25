@@ -646,6 +646,73 @@ class TestWindowDetection(unittest.TestCase):
         )
         self.assertEqual(len(windows), 0)
 
+    # --- Scale-aware hatch filter (BLOCKER 1 — different scales) ---
+
+    def test_three_windows_close_1_5m_at_50pt_m(self):
+        """Three tagged windows ~1.5 m apart at 50 pt/m → 3 candidates.
+        W tags override geometric hatch suspicion for close windows."""
+        wall = WallLine(segment=_horiz_seg(0, 100, 1200, 100))
+        # Window centres at 300, 375, 450 → spacing = 75pt = 1.5m at 50pt/m
+        jamb1a = _vert_seg(290, 85, 115)
+        jamb1b = _vert_seg(310, 85, 115)
+        jamb2a = _vert_seg(365, 85, 115)
+        jamb2b = _vert_seg(385, 85, 115)
+        jamb3a = _vert_seg(440, 85, 115)
+        jamb3b = _vert_seg(460, 85, 115)
+
+        all_segs = [wall.segment, jamb1a, jamb1b, jamb2a, jamb2b, jamb3a, jamb3b]
+        words = [_word("W01", 300, 70), _word("W02", 375, 70), _word("W03", 450, 70)]
+
+        windows = detect_window_candidates(
+            all_segs, [wall], words,
+            scale_info={"px_per_m": 50.0, "render_zoom": 1.0},
+        )
+        self.assertEqual(len(windows), 3)
+        tags = {w.tag for w in windows}
+        self.assertEqual(tags, {"W01", "W02", "W03"})
+
+    def test_three_windows_close_1_5m_at_200pt_m(self):
+        """Same 3-window layout at 200 pt/m (higher resolution) → 3 candidates."""
+        wall = WallLine(segment=_horiz_seg(0, 100, 4800, 100))
+        # Window centres at 1200, 1500, 1800 → spacing = 300pt = 1.5m at 200pt/m
+        jamb1a = _vert_seg(1160, 85, 115)
+        jamb1b = _vert_seg(1240, 85, 115)
+        jamb2a = _vert_seg(1460, 85, 115)
+        jamb2b = _vert_seg(1540, 85, 115)
+        jamb3a = _vert_seg(1760, 85, 115)
+        jamb3b = _vert_seg(1840, 85, 115)
+
+        all_segs = [wall.segment, jamb1a, jamb1b, jamb2a, jamb2b, jamb3a, jamb3b]
+        words = [_word("W01", 1200, 70), _word("W02", 1500, 70), _word("W03", 1800, 70)]
+
+        windows = detect_window_candidates(
+            all_segs, [wall], words,
+            scale_info={"px_per_m": 200.0, "render_zoom": 1.0},
+        )
+        self.assertEqual(len(windows), 3)
+        tags = {w.tag for w in windows}
+        self.assertEqual(tags, {"W01", "W02", "W03"})
+
+
+# ---------------------------------------------------------------------------
+# 6b. Segment.bbox regression
+# ---------------------------------------------------------------------------
+
+class TestSegmentBbox(unittest.TestCase):
+
+    def test_bbox_normal_endpoints(self):
+        s = Segment(x1=10, y1=20, x2=30, y2=40)
+        self.assertEqual(s.bbox, (10, 20, 30, 40))
+
+    def test_bbox_reversed_endpoints(self):
+        """Reversed endpoints produce the same bbox."""
+        s = Segment(x1=30, y1=40, x2=10, y2=20)
+        self.assertEqual(s.bbox, (10, 20, 30, 40))
+
+    def test_bbox_mixed_reversal(self):
+        s = Segment(x1=30, y1=10, x2=10, y2=40)
+        self.assertEqual(s.bbox, (10, 10, 30, 40))
+
 
 # ---------------------------------------------------------------------------
 # 7. Gap detection (BLOCKER 2 — real discontinuities only)
@@ -742,6 +809,81 @@ class TestGapDetection(unittest.TestCase):
         self.assertEqual(gaps[0].tag, "D03")
         self.assertAlmostEqual(gaps[0].semantic_confidence, 0.80)
         self.assertAlmostEqual(gaps[0].geometry_confidence, 0.75)
+
+
+# ---------------------------------------------------------------------------
+# 7b. Gap suppression — blank wall_ref safety
+# ---------------------------------------------------------------------------
+
+class TestGapSuppression(unittest.TestCase):
+
+    def test_different_walls_blank_ref_not_suppressed(self):
+        """Gap on wall B NOT suppressed by door on wall A when both have blank ref.
+        Walls are perpendicular to avoid the filler-check bug (parallel segments
+        on different wall lines filling each other's gaps)."""
+        # Wall A: horizontal, door at x=500 → position 10.0m
+        wall_a = WallLine(segment=_horiz_seg(0, 100, 1000, 100))
+        door_leaf = _vert_seg(500, 85, 115)
+        # Wall B: vertical at x=800 with gap from y=480→520 → position 10.0m
+        wall_b1 = WallLine(segment=_vert_seg(800, 0, 480))
+        wall_b2 = WallLine(segment=_vert_seg(800, 520, 1000))
+
+        words = [_word("D01", 500, 70)]
+
+        result = plan_opening_candidates(
+            [wall_a.segment, door_leaf, wall_b1.segment, wall_b2.segment],
+            words,
+            scale_info=SCALE_INFO_1X,
+        )
+        # Door on wall A should NOT suppress gap on wall B (blank ref safety)
+        gap_count = sum(1 for c in result.candidates if c.opening_type == OPENING_TYPE_OTHER)
+        self.assertGreaterEqual(gap_count, 1)
+
+    def test_same_wall_matching_ref_suppressed(self):
+        """Gap at same position on same wall as a door → suppressed.
+        Only the gap walls and door are provided (no superset wall that fills the gap)."""
+        # Two wall segments on same line with a gap at x=500
+        gap_a = WallLine(segment=_horiz_seg(0, 100, 490, 100), wall_ref="N01")
+        gap_b = WallLine(segment=_horiz_seg(510, 100, 1000, 100), wall_ref="N01")
+        # Door leaf at x=500 (on gap_a's line, position 10.0m)
+        door_leaf = _vert_seg(500, 85, 115)
+
+        words = [_word("D01", 500, 70)]
+
+        result = plan_opening_candidates(
+            [gap_a.segment, door_leaf, gap_b.segment],
+            words,
+            scale_info=SCALE_INFO_1X,
+        )
+        # Gap at position 10.0m should be suppressed by door at same position on same wall
+        positions = [c.position_along_wall_m for c in result.candidates
+                     if c.position_along_wall_m is not None]
+        close_to_10m = [p for p in positions if abs(p - 10.0) < 0.2]
+        self.assertLessEqual(len(close_to_10m), 1)
+
+    def test_different_walls_nonempty_ref_not_suppressed(self):
+        """Gap on wall S01 NOT suppressed by door on wall N01 (different refs).
+        Uses pre-detected wall_lines to preserve wall_ref assignments."""
+        # Wall N: horizontal, door at x=500 → position 10.0m
+        wall_n = WallLine(segment=_horiz_seg(0, 100, 1000, 100), wall_ref="N01")
+        door_leaf = _vert_seg(500, 85, 115)
+        # Wall S: vertical at x=800 with gap → position 10.0m, ref S01
+        wall_s1 = WallLine(segment=_vert_seg(800, 0, 480), wall_ref="S01")
+        wall_s2 = WallLine(segment=_vert_seg(800, 520, 1000), wall_ref="S01")
+
+        words = [_word("D01", 500, 70)]
+
+        # Pass pre-detected wall_lines so wall_ref is preserved
+        result = plan_opening_candidates(
+            [wall_n.segment, door_leaf, wall_s1.segment, wall_s2.segment],
+            words,
+            wall_lines=[wall_n, wall_s1, wall_s2],
+            scale_info=SCALE_INFO_1X,
+        )
+        # Gap on S01 should survive — different wall_ref from door on N01
+        s01_gaps = [c for c in result.candidates
+                    if c.wall_ref == "S01" and c.opening_type == OPENING_TYPE_OTHER]
+        self.assertGreaterEqual(len(s01_gaps), 1)
 
 
 # ---------------------------------------------------------------------------
