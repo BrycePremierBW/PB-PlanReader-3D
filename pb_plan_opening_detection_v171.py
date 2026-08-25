@@ -1,4 +1,4 @@
-"""PlanReader v1.7.2 plan-vector opening candidate detection.
+"""PlanReader v1.7.3 plan-vector opening candidate detection.
 
 Phase B1 of Priority 5: reads raw PDF geometric features (line segments,
 text words) and detects opening candidates — door jambs/leaves,
@@ -24,6 +24,11 @@ Each candidate carries three independent confidence channels:
 
 Tag proximity sets type_mark and semantic confidence but must NOT
 inflate geometry or association confidence.
+
+Tag/type compatibility:
+  - door geometry may only assign Dxx marks
+  - window geometry may only assign Wxx marks
+  - conflicting tags are recorded as evidence but not as type_mark
 """
 from __future__ import annotations
 
@@ -42,7 +47,7 @@ from pb_opening_evidence_v170 import (
     OpeningEvidence,
 )
 
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 
 # ---------------------------------------------------------------------------
 # Geometry primitives for input
@@ -74,6 +79,10 @@ class Segment:
     def cy(self) -> float:
         return (self.y1 + self.y2) * 0.5
 
+    @property
+    def bbox(self) -> Tuple[float, float, float, float]:
+        return (self.x0, self.y0, self.x1, self.y1)
+
 
 @dataclass(frozen=True)
 class TextWord:
@@ -101,6 +110,7 @@ class TextWord:
 # ---------------------------------------------------------------------------
 # Tag patterns
 # ---------------------------------------------------------------------------
+
 _TAG_DOOR_RE = re.compile(r"^D\d{1,3}$", re.IGNORECASE)
 _TAG_WINDOW_RE = re.compile(r"^W\d{1,3}$", re.IGNORECASE)
 
@@ -224,6 +234,49 @@ def _find_tag_near(
 
 
 # ---------------------------------------------------------------------------
+# Canonical wall direction
+# ---------------------------------------------------------------------------
+
+def _canonical_wall_direction(seg: Segment) -> Tuple[float, float, float, float]:
+    """Return (dx, dy, origin_x, origin_y) with a stable, orientation-independent
+    direction for a wall segment.
+
+    The canonical direction is determined by the segment's angle:
+      - angle < 45° or >= 135° → horizontal → left-to-right (lower x first)
+      - otherwise → vertical → bottom-to-top (lower y first)
+
+    Reversing the input segment endpoints produces the SAME direction and origin.
+    """
+    angle = seg.angle_deg
+    if angle < 45.0 or angle >= 135.0:
+        # Horizontal-ish: canonical left-to-right
+        if seg.x1 <= seg.x2:
+            return (seg.x2 - seg.x1, seg.y2 - seg.y1, seg.x1, seg.y1)
+        else:
+            return (seg.x1 - seg.x2, seg.y1 - seg.y2, seg.x2, seg.y2)
+    else:
+        # Vertical-ish: canonical bottom-to-top
+        if seg.y1 <= seg.y2:
+            return (seg.x2 - seg.x1, seg.y2 - seg.y1, seg.x1, seg.y1)
+        else:
+            return (seg.x1 - seg.x2, seg.y1 - seg.y2, seg.x2, seg.y2)
+
+
+def _position_along_wall(px: float, py: float,
+                         wall: Segment) -> Optional[float]:
+    """Project a point onto a wall's canonical axis and return the signed
+    distance from the canonical origin.  Always >= 0 for valid projections.
+    """
+    dx, dy, ox, oy = _canonical_wall_direction(wall)
+    wall_len_sq = dx * dx + dy * dy
+    if wall_len_sq < 1e-12:
+        return None
+    t = ((px - ox) * dx + (py - oy) * dy) / wall_len_sq
+    wall_len = math.sqrt(wall_len_sq)
+    return t * wall_len  # can be negative if outside the canonical segment
+
+
+# ---------------------------------------------------------------------------
 # Wall line detection
 # ---------------------------------------------------------------------------
 
@@ -247,6 +300,24 @@ def detect_wall_lines(
     long_segs = [s for s in segments if s.length >= min_length_pt]
     long_segs.sort(key=lambda s: s.length, reverse=True)
     return [WallLine(segment=s) for s in long_segs]
+
+
+# ---------------------------------------------------------------------------
+# Wall-ref conflict resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_wall_ref(wl_a: WallLine, wl_b: WallLine) -> str:
+    """Resolve wall_ref from two collinear wall segments.
+
+    If both have non-empty wall_ref and they disagree, return "" (conflict).
+    If one has a ref and the other is empty, return the non-empty one.
+    If both empty, return "".
+    """
+    a_ref = wl_a.wall_ref.strip()
+    b_ref = wl_b.wall_ref.strip()
+    if a_ref and b_ref:
+        return a_ref if a_ref == b_ref else ""  # conflict → blank
+    return a_ref or b_ref
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +356,9 @@ def detect_door_candidates(
       4. Higher geometry confidence requires additional corroboration
          (reasonable width, or being part of a discontinuity)
 
+    Tag compatibility: door geometry may only assign Dxx marks.
+    A nearby W tag is recorded as evidence but NOT as type_mark.
+
     Returns candidates with THREE independent confidence channels.
     Tags set semantic_confidence, NOT geometry_confidence.
     """
@@ -318,8 +392,7 @@ def detect_door_candidates(
 
     for wl in wall_lines:
         wall = wl.segment
-        wall_dx = wall.x2 - wall.x1
-        wall_dy = wall.y2 - wall.y1
+        wall_dx, wall_dy, wall_ox, wall_oy = _canonical_wall_direction(wall)
         wall_len = math.hypot(wall_dx, wall_dy)
         if wall_len < 1e-9:
             continue
@@ -340,12 +413,21 @@ def detect_door_candidates(
             # Found a perpendicular jamb/leaf segment
             tag, tag_cls = _find_tag_near(seg.cx, seg.cy, words)
 
+            # Tag/type compatibility: door geometry may only assign Dxx marks
+            assigned_tag = ""
+            if tag and tag_cls == "door":
+                assigned_tag = tag  # compatible: D tag for door geometry
+            elif tag and tag_cls == "window":
+                # Conflicting: W tag near door geometry — record as evidence
+                pass  # assigned_tag stays ""
+            elif tag:
+                pass  # unknown tag type — don't assign
+
             # Width from the perpendicular segment
             width_m = _pt_to_m(seg.length, m_per_pt)
 
-            # Position along wall
-            t = ((seg.cx - wall.x1) * wall_dx + (seg.cy - wall.y1) * wall_dy) / (wall_len * wall_len)
-            pos_pt = t * wall_len
+            # Position along wall (canonical, orientation-independent)
+            pos_pt = ((seg.cx - wall_ox) * wall_dx + (seg.cy - wall_oy) * wall_dy) / wall_len
             pos_m = _pt_to_m(pos_pt, m_per_pt)
 
             # --- Three independent confidence channels ---
@@ -361,23 +443,28 @@ def detect_door_candidates(
             assoc_conf = 0.70 if wl.wall_ref else 0.30
 
             # SEMANTIC confidence: based on tag/label evidence.
+            # Only D tags contribute to door semantic confidence.
             sem_conf = 0.0
             if tag and tag_cls == "door":
                 sem_conf = 0.95
+            elif tag and tag_cls == "window":
+                sem_conf = 0.30  # conflicting tag — weak semantic
             elif tag:
-                sem_conf = 0.60  # tag present but not door-specific
+                sem_conf = 0.60  # unknown tag but present
 
             ev = []
             ev.append(f"jamb_leaf: {seg.length:.1f}pt perpendicular to wall")
-            if tag:
-                ev.append(f"tag: {tag} (semantic evidence)")
+            if assigned_tag:
+                ev.append(f"tag: {tag} (door-compatible)")
+            elif tag:
+                ev.append(f"tag: {tag} (conflicting — not assigned as type_mark)")
 
             candidates.append(DoorCandidate(
                 wall_ref=wl.wall_ref or "",
                 position_along_wall_m=pos_m,
                 width_m=width_m,
                 jamb_segment=seg,
-                tag=tag,
+                tag=assigned_tag,
                 geometry_confidence=geom_conf,
                 association_confidence=assoc_conf,
                 semantic_confidence=sem_conf,
@@ -389,7 +476,7 @@ def detect_door_candidates(
 
 
 # ---------------------------------------------------------------------------
-# Window / jamb pair detection (wall-local, hatch-aware)
+# Window / jamb pair detection (wall-local, cluster-based hatch filter)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -418,8 +505,14 @@ def detect_window_candidates(
     """Detect window openings from wall-local parallel jamb pairs.
 
     Window detection is WALL-LOCAL: only segments near the SAME wall
-    are considered as potential jamb pairs.  This prevents hatch/grid
-    patterns (louvre, battens, balustrade) from creating false windows.
+    are considered as potential jamb pairs.
+
+    Hatch/grid filter uses PAIR-LOCAL analysis:
+      1. First find all parallel pairs within window-distance range
+      2. Then check unpaired segments — if many remain and form regular
+         spacing patterns (hatch/battens), reject the whole wall
+      3. Legitimate multi-window walls have distinct pairs with gaps
+         between them, not a continuous run of equally-spaced lines
 
     A pair of parallel segments that are both perpendicular to a wall
     and close together indicates a window jamb pair.  The distance
@@ -433,9 +526,6 @@ def detect_window_candidates(
     MAX_WINDOW_PT = 200.0
     MAX_PAIR_DISTANCE_PT = 100.0
     WALL_PROXIMITY_PT = 30.0
-    # Hatch filter: reject if more than this many similar parallel segments
-    # are nearby (indicates hatch/grid, not isolated window jambs)
-    MAX_SIMILAR_PARALLEL = 4
 
     for wl in wall_lines:
         wall = wl.segment
@@ -448,17 +538,28 @@ def detect_window_candidates(
             and _point_segment_distance(s.cx, s.cy, wall) <= WALL_PROXIMITY_PT
         ]
 
-        # Hatch/grid filter: if too many similar parallel segments exist
-        # near this wall, they are likely hatch/battens, not window jambs
-        if len(near_wall) > MAX_SIMILAR_PARALLEL:
+        if not near_wall:
             continue
 
-        # Check all pairs for parallelism
+        # Step 1: Sort by position along wall for cluster analysis
+        wall_dx, wall_dy, wall_ox, wall_oy = _canonical_wall_direction(wall)
+        wall_len = math.hypot(wall_dx, wall_dy)
+        if wall_len < 1e-9:
+            continue
+
+        def _pos(s: Segment) -> float:
+            return ((s.cx - wall_ox) * wall_dx + (s.cy - wall_oy) * wall_dy) / wall_len
+
+        sorted_segs = sorted(near_wall, key=_pos)
+
+        # Step 2: Find parallel pairs within window-distance range
         used: set = set()
-        for i, a in enumerate(near_wall):
+        pairs: List[Tuple[int, int, Segment, Segment]] = []
+
+        for i, a in enumerate(sorted_segs):
             if i in used:
                 continue
-            for j, b in enumerate(near_wall):
+            for j, b in enumerate(sorted_segs):
                 if j <= i or j in used:
                     continue
                 if not _segments_parallel(a, b):
@@ -466,61 +567,101 @@ def detect_window_candidates(
                 pair_dist = _segment_distance(a, b)
                 if pair_dist > MAX_PAIR_DISTANCE_PT:
                     continue
-
-                # Found a wall-local parallel pair
+                # Found a pair
                 used.add(i)
                 used.add(j)
+                pairs.append((i, j, a, b))
+                break  # each segment belongs to at most one pair
 
-                width_m = _pt_to_m(pair_dist, m_per_pt)
+        # Step 3: Hatch filter — cluster analysis on pair midpoints
+        # After pairing, check if ALL pairs form a single tight cluster.
+        # Hatch: all pairs clustered together (regular small spacing)
+        # Windows: pairs spread across the wall (large gaps between pairs)
+        is_hatch = False
+        if len(pairs) >= 2:
+            pair_midpoints = []
+            for _, _, a, b in pairs:
+                mcx = (a.cx + b.cx) / 2.0
+                mcy = (a.cy + b.cy) / 2.0
+                pair_midpoints.append(((mcx - wall_ox) * wall_dx + (mcy - wall_oy) * wall_dy) / wall_len)
+            pair_midpoints.sort()
 
-                # Position: midpoint projected onto wall
-                mid_cx = (a.cx + b.cx) / 2.0
-                mid_cy = (a.cy + b.cy) / 2.0
-                wall_dx = wall.x2 - wall.x1
-                wall_dy = wall.y2 - wall.y1
-                wall_len = math.hypot(wall_dx, wall_dy)
-                if wall_len > 1e-9:
-                    t = ((mid_cx - wall.x1) * wall_dx + (mid_cy - wall.y1) * wall_dy) / (wall_len * wall_len)
-                    pos_m = _pt_to_m(t * wall_len, m_per_pt)
+            # Group into clusters: consecutive midpoints within CLUSTER_GAP_PT
+            CLUSTER_GAP_PT = 150.0  # ~3m at 50pt/m — larger than any window spacing
+            clusters: List[List[float]] = [[pair_midpoints[0]]]
+            for mp in pair_midpoints[1:]:
+                if mp - clusters[-1][-1] <= CLUSTER_GAP_PT:
+                    clusters[-1].append(mp)
                 else:
-                    pos_m = None
+                    clusters.append([mp])
 
-                tag, tag_cls = _find_tag_near(mid_cx, mid_cy, words)
+            # Hatch: single cluster containing ALL pairs (all pairs are close together)
+            if len(clusters) == 1 and len(pairs) >= 2:
+                is_hatch = True
 
-                # --- Three independent confidence channels ---
+        if is_hatch:
+            continue
 
-                # GEOMETRY: parallel pair near wall is moderate evidence
-                geom_conf = 0.60
-                if width_m is not None and 0.3 <= width_m <= 3.0:
-                    geom_conf = 0.70  # reasonable window width
+        # Step 4: Process each pair as a window candidate
+        for i, j, a, b in pairs:
+            pair_dist = _segment_distance(a, b)
+            width_m = _pt_to_m(pair_dist, m_per_pt)
 
-                # ASSOCIATION
-                assoc_conf = 0.70 if wl.wall_ref else 0.30
+            # Position: midpoint projected onto wall (canonical)
+            mid_cx = (a.cx + b.cx) / 2.0
+            mid_cy = (a.cy + b.cy) / 2.0
+            pos_pt = ((mid_cx - wall_ox) * wall_dx + (mid_cy - wall_oy) * wall_dy) / wall_len
+            pos_m = _pt_to_m(pos_pt, m_per_pt)
 
-                # SEMANTIC: tag provides type evidence only
-                sem_conf = 0.0
-                if tag and tag_cls == "window":
-                    sem_conf = 0.95
-                elif tag:
-                    sem_conf = 0.60
+            tag, tag_cls = _find_tag_near(mid_cx, mid_cy, words)
 
-                ev = []
-                ev.append(f"jamb_pair: {a.length:.1f}pt + {b.length:.1f}pt, spacing={pair_dist:.1f}pt")
-                if tag:
-                    ev.append(f"tag: {tag} (semantic evidence)")
+            # Tag/type compatibility: window geometry may only assign Wxx marks
+            assigned_tag = ""
+            if tag and tag_cls == "window":
+                assigned_tag = tag  # compatible: W tag for window geometry
+            elif tag and tag_cls == "door":
+                pass  # conflicting: D tag near window — don't assign
+            elif tag:
+                pass  # unknown tag type
 
-                candidates.append(WindowCandidate(
-                    wall_ref=wl.wall_ref or "",
-                    position_along_wall_m=pos_m,
-                    width_m=width_m,
-                    parallel_segments=[a, b],
-                    tag=tag,
-                    geometry_confidence=geom_conf,
-                    association_confidence=assoc_conf,
-                    semantic_confidence=sem_conf,
-                    evidence=ev,
-                    page_no=page_no,
-                ))
+            # --- Three independent confidence channels ---
+
+            # GEOMETRY: parallel pair near wall is moderate evidence
+            geom_conf = 0.60
+            if width_m is not None and 0.3 <= width_m <= 3.0:
+                geom_conf = 0.70  # reasonable window width
+
+            # ASSOCIATION
+            assoc_conf = 0.70 if wl.wall_ref else 0.30
+
+            # SEMANTIC: only W tags contribute to window semantic confidence
+            sem_conf = 0.0
+            if tag and tag_cls == "window":
+                sem_conf = 0.95
+            elif tag and tag_cls == "door":
+                sem_conf = 0.30  # conflicting tag
+            elif tag:
+                sem_conf = 0.60
+
+            ev = []
+            ev.append(f"jamb_pair: {a.length:.1f}pt + {b.length:.1f}pt, spacing={pair_dist:.1f}pt")
+            if assigned_tag:
+                ev.append(f"tag: {tag} (window-compatible)")
+            elif tag:
+                ev.append(f"tag: {tag} (conflicting — not assigned as type_mark)")
+
+            candidates.append(WindowCandidate(
+                wall_ref=wl.wall_ref or "",
+                position_along_wall_m=pos_m,
+                width_m=width_m,
+                parallel_segments=[a, b],
+                tag=assigned_tag,
+                geometry_confidence=geom_conf,
+                association_confidence=assoc_conf,
+                semantic_confidence=sem_conf,
+                evidence=ev,
+                page_no=page_no,
+            ))
 
     return candidates
 
@@ -560,6 +701,9 @@ def detect_gap_candidates(
 
     A continuous wall line running through a region does NOT create a gap.
     Only actual termination of wall linework creates a gap.
+
+    Position is computed using a canonical wall direction (orientation-independent).
+    Conflicting wall_refs from two segments result in a blank wall_ref.
     """
     candidates: List[GapCandidate] = []
 
@@ -588,17 +732,34 @@ def detect_gap_candidates(
             if perp_dist > COLLINEAR_OFFSET_PT:
                 continue
 
-            # Project both segments onto the shared wall direction
-            wall_dx = a.x2 - a.x1
-            wall_dy = a.y2 - a.y1
-            wall_len = math.hypot(wall_dx, wall_dy)
-            if wall_len < 1e-9:
-                continue
+            # Resolve wall_ref (conflicting → blank)
+            gap_wall_ref = _resolve_wall_ref(wl_a, wl_b)
+
+            # Use canonical wall direction for stable projection
+            # Use a shared origin from both segments to ensure the projection
+            # is stable regardless of which segment is 'a' vs 'b'
+            a_angle = a.angle_deg
+            cos_a = math.cos(math.radians(a_angle))
+            sin_a = math.sin(math.radians(a_angle))
+
+            a_starts = [(a.x1 * cos_a + a.y1 * sin_a),
+                        (a.x2 * cos_a + a.y2 * sin_a)]
+            b_starts = [(b.x1 * cos_a + b.y1 * sin_a),
+                        (b.x2 * cos_a + b.y2 * sin_a)]
+            shared_min_t = min(a_starts + b_starts)
+            shared_origin_x = shared_min_t * cos_a
+            shared_origin_y = shared_min_t * sin_a
+
+            wall_dx = cos_a
+            wall_dy = sin_a
+            wall_ox = shared_origin_x
+            wall_oy = shared_origin_y
+            wall_len = a.length + b.length  # approximate; sufficient for projection
 
             def _project(seg: Segment) -> Tuple[float, float]:
-                """Project segment endpoints onto wall direction axis."""
-                t1 = ((seg.x1 - a.x1) * wall_dx + (seg.y1 - a.y1) * wall_dy) / (wall_len * wall_len)
-                t2 = ((seg.x2 - a.x1) * wall_dx + (seg.y2 - a.y1) * wall_dy) / (wall_len * wall_len)
+                """Project segment endpoints onto canonical wall axis (in points)."""
+                t1 = ((seg.x1 - wall_ox) * wall_dx + (seg.y1 - wall_oy) * wall_dy) / wall_len
+                t2 = ((seg.x2 - wall_ox) * wall_dx + (seg.y2 - wall_oy) * wall_dy) / wall_len
                 return (t1 * wall_len, t2 * wall_len)
 
             a_proj = _project(a)
@@ -611,11 +772,9 @@ def detect_gap_candidates(
             if a_max < b_min:
                 gap_start_pt = a_max
                 gap_end_pt = b_min
-                gap_wall_ref = wl_a.wall_ref or wl_b.wall_ref
             elif b_max < a_min:
                 gap_start_pt = b_max
                 gap_end_pt = a_min
-                gap_wall_ref = wl_b.wall_ref or wl_a.wall_ref
             else:
                 continue  # overlapping — no gap
 
@@ -640,8 +799,10 @@ def detect_gap_candidates(
 
             # Found a genuine wall discontinuity
             mid_pt = (gap_start_pt + gap_end_pt) / 2.0
-            mid_cx = a.x1 + (mid_pt / wall_len) * wall_dx
-            mid_cy = a.y1 + (mid_pt / wall_len) * wall_dy
+            # mid_pt is in points along wall direction (unit vector cos_a, sin_a)
+            # Actual position = origin + mid_pt * direction
+            mid_cx = wall_ox + mid_pt * wall_dx
+            mid_cy = wall_oy + mid_pt * wall_dy
 
             width_m = _pt_to_m(gap_len_pt, m_per_pt)
             pos_m = _pt_to_m(mid_pt, m_per_pt)

@@ -1,11 +1,14 @@
 """Tests for Priority 5 Phase B1 — plan-vector opening candidate detection.
 
-Covers all ChatGPT review corrections through round 1:
+Covers all ChatGPT review corrections through round 2:
   1. Authoritative PDF-point calibration (scale_info with render_zoom)
   2. True discontinuity-based wall gaps (continuous wall = 0 gaps)
   3. Three confidence channels (tag ≠ geometry ≠ association)
   4. Downgraded straight-line door evidence (no fake swing)
   5. Wall-local + hatch-aware false-positive filtering
+  6. Multi-window wall detection (cluster-based, not whole-wall count)
+  7. D/W tag/type compatibility (no cross-type type_mark assignment)
+  8. Canonical, orientation-independent wall position
 """
 from __future__ import annotations
 
@@ -28,10 +31,13 @@ from pb_plan_opening_detection_v171 import (
     TextWord,
     WallLine,
     WindowCandidate,
+    _canonical_wall_direction,
     _classify_tag,
     _line_perp_distance,
     _point_segment_distance,
+    _position_along_wall,
     _resolve_scale,
+    _resolve_wall_ref,
     _segments_parallel,
     _segments_perpendicular,
     door_to_opening_evidence,
@@ -162,10 +168,8 @@ class TestSegmentRelationships(unittest.TestCase):
     def test_line_perp_distance_along_extension(self):
         """_line_perp_distance gives perpendicular-only distance, even past endpoint."""
         s = _horiz_seg(0, 0, 100, 0)
-        # Point 250pt along wall direction, 10pt perpendicular
         d_perp = _line_perp_distance(250, 10, s)
         self.assertAlmostEqual(d_perp, 10.0)  # perpendicular only
-        # Verify it differs from _point_segment_distance (which includes along-wall)
         d_euclid = _point_segment_distance(250, 10, s)
         self.assertGreater(d_euclid, 100.0)  # Euclidean is much larger
 
@@ -182,23 +186,19 @@ class TestCalibration(unittest.TestCase):
         self.assertAlmostEqual(m_per_pt, 0.02)
 
     def test_scale_info_2x_render_zoom(self):
-        """render_zoom=2.0 means rendered at 100 px/m but PDF pt/m = 50."""
         pt_per_m, m_per_pt = _resolve_scale({"px_per_m": 100.0, "render_zoom": 2.0})
         self.assertAlmostEqual(pt_per_m, 50.0)
         self.assertAlmostEqual(m_per_pt, 0.02)
 
     def test_scale_info_4x_render_zoom(self):
-        """render_zoom=4.0: px_per_m=200 → 50 PDF pt/m."""
         pt_per_m, m_per_pt = _resolve_scale({"px_per_m": 200.0, "render_zoom": 4.0})
         self.assertAlmostEqual(pt_per_m, 50.0)
 
     def test_scale_info_missing_zoom(self):
-        """Missing render_zoom defaults to 1.0."""
         pt_per_m, m_per_pt = _resolve_scale({"px_per_m": 50.0})
         self.assertAlmostEqual(pt_per_m, 50.0)
 
     def test_legacy_scale_px_per_m(self):
-        """Legacy scale_px_per_m used when no scale_info."""
         pt_per_m, m_per_pt = _resolve_scale(None, scale_px_per_m=50.0)
         self.assertAlmostEqual(pt_per_m, 50.0)
 
@@ -207,7 +207,6 @@ class TestCalibration(unittest.TestCase):
         self.assertAlmostEqual(pt_per_m, 0.0)
 
     def test_render_zoom_2x_produces_correct_widths(self):
-        """With render_zoom=2.0, a 50pt segment = 1.0m, not 2.0m."""
         wall = WallLine(segment=_horiz_seg(0, 100, 500, 100))
         leaf = _vert_seg(200, 85, 115)  # 30pt long
         words = [_word("D01", 200, 70)]
@@ -217,9 +216,7 @@ class TestCalibration(unittest.TestCase):
             scale_info={"px_per_m": 100.0, "render_zoom": 2.0},
         )
         self.assertEqual(len(doors), 1)
-        # 30pt / (100/2.0 pt/m) = 30 / 50 = 0.6m
         self.assertAlmostEqual(doors[0].width_m, 0.6, places=2)
-        # Position: 200pt / 50 pt/m = 4.0m
         self.assertAlmostEqual(doors[0].position_along_wall_m, 4.0, places=2)
 
 
@@ -249,13 +246,176 @@ class TestWallLineDetection(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 4. Door detection (BLOCKER 4 — no fake swing, lower base confidence)
+# 4. Canonical wall direction (BLOCKER 3 — orientation-independent position)
+# ---------------------------------------------------------------------------
+
+class TestCanonicalWallDirection(unittest.TestCase):
+
+    def test_horizontal_left_to_right(self):
+        seg = _horiz_seg(0, 100, 500, 100)
+        dx, dy, ox, oy = _canonical_wall_direction(seg)
+        self.assertGreater(dx, 0)  # left to right
+        self.assertAlmostEqual(ox, 0.0)
+
+    def test_horizontal_reversed(self):
+        """Reversing segment endpoints produces the same canonical direction."""
+        seg_fwd = _horiz_seg(0, 100, 500, 100)
+        seg_rev = _horiz_seg(500, 100, 0, 100)
+        dx1, dy1, ox1, oy1 = _canonical_wall_direction(seg_fwd)
+        dx2, dy2, ox2, oy2 = _canonical_wall_direction(seg_rev)
+        self.assertAlmostEqual(dx1, dx2)
+        self.assertAlmostEqual(dy1, dy2)
+        self.assertAlmostEqual(ox1, ox2)
+        self.assertAlmostEqual(oy1, oy2)
+
+    def test_vertical_bottom_to_top(self):
+        seg = _vert_seg(100, 0, 500)
+        dx, dy, ox, oy = _canonical_wall_direction(seg)
+        self.assertGreater(dy, 0)  # bottom to top
+        self.assertAlmostEqual(oy, 0.0)
+
+    def test_vertical_reversed(self):
+        seg_fwd = _vert_seg(100, 0, 500)
+        seg_rev = _vert_seg(100, 500, 0)
+        dx1, dy1, ox1, oy1 = _canonical_wall_direction(seg_fwd)
+        dx2, dy2, ox2, oy2 = _canonical_wall_direction(seg_rev)
+        self.assertAlmostEqual(dx1, dx2)
+        self.assertAlmostEqual(dy1, dy2)
+        self.assertAlmostEqual(ox1, ox2)
+        self.assertAlmostEqual(oy1, oy2)
+
+    def test_position_along_wall_non_negative(self):
+        wall = _horiz_seg(0, 100, 500, 100)
+        pos = _position_along_wall(250, 100, wall)
+        self.assertAlmostEqual(pos, 250.0)
+        self.assertGreaterEqual(pos, 0)
+
+    def test_position_reversed_segment_same(self):
+        """Reversed segment gives the same position for the same point."""
+        wall_fwd = _horiz_seg(0, 100, 500, 100)
+        wall_rev = _horiz_seg(500, 100, 0, 100)
+        pos_fwd = _position_along_wall(250, 110, wall_fwd)
+        pos_rev = _position_along_wall(250, 110, wall_rev)
+        self.assertAlmostEqual(pos_fwd, pos_rev)
+
+
+class TestDoorPositionOrientationStability(unittest.TestCase):
+
+    def test_reversed_wall_gives_same_position(self):
+        """Door position is stable when wall segment is reversed."""
+        wall_fwd = WallLine(segment=_horiz_seg(0, 100, 500, 100))
+        wall_rev = WallLine(segment=_horiz_seg(500, 100, 0, 100))
+        leaf = _vert_seg(200, 85, 115)
+
+        doors_fwd = detect_door_candidates(
+            [wall_fwd.segment, leaf], [wall_fwd], [],
+            scale_info=SCALE_INFO_1X,
+        )
+        doors_rev = detect_door_candidates(
+            [wall_rev.segment, leaf], [wall_rev], [],
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(doors_fwd), 1)
+        self.assertEqual(len(doors_rev), 1)
+        self.assertAlmostEqual(
+            doors_fwd[0].position_along_wall_m,
+            doors_rev[0].position_along_wall_m,
+            places=2,
+        )
+
+
+class TestWindowPositionOrientationStability(unittest.TestCase):
+
+    def test_reversed_wall_gives_same_position(self):
+        wall_fwd = WallLine(segment=_horiz_seg(0, 100, 600, 100))
+        wall_rev = WallLine(segment=_horiz_seg(600, 100, 0, 100))
+        jamb1 = _vert_seg(290, 85, 115)
+        jamb2 = _vert_seg(310, 85, 115)
+
+        wins_fwd = detect_window_candidates(
+            [wall_fwd.segment, jamb1, jamb2], [wall_fwd], [],
+            scale_info=SCALE_INFO_1X,
+        )
+        wins_rev = detect_window_candidates(
+            [wall_rev.segment, jamb1, jamb2], [wall_rev], [],
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(wins_fwd), 1)
+        self.assertEqual(len(wins_rev), 1)
+        self.assertAlmostEqual(
+            wins_fwd[0].position_along_wall_m,
+            wins_rev[0].position_along_wall_m,
+            places=2,
+        )
+
+
+class TestGapPositionOrientationStability(unittest.TestCase):
+
+    def test_reversed_wall_gives_same_position(self):
+        """Gap position is stable when either wall segment is reversed."""
+        wall_a = WallLine(segment=_horiz_seg(0, 100, 200, 100))
+        wall_b = WallLine(segment=_horiz_seg(300, 100, 600, 100))
+
+        gaps_fwd = detect_gap_candidates(
+            [wall_a.segment, wall_b.segment], [wall_a, wall_b], [],
+            scale_info=SCALE_INFO_1X,
+        )
+
+        # Reverse both segments
+        wall_a_rev = WallLine(segment=_horiz_seg(200, 100, 0, 100))
+        wall_b_rev = WallLine(segment=_horiz_seg(600, 100, 300, 100))
+        gaps_rev = detect_gap_candidates(
+            [wall_a_rev.segment, wall_b_rev.segment], [wall_a_rev, wall_b_rev], [],
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(gaps_fwd), 1)
+        self.assertEqual(len(gaps_rev), 1)
+        self.assertAlmostEqual(
+            gaps_fwd[0].position_along_wall_m,
+            gaps_rev[0].position_along_wall_m,
+            places=2,
+        )
+
+    def test_swapped_segment_order_same_position(self):
+        """Swapping input order of gap segments produces the same position."""
+        wall_a = WallLine(segment=_horiz_seg(0, 100, 200, 100))
+        wall_b = WallLine(segment=_horiz_seg(300, 100, 600, 100))
+
+        gaps_ab = detect_gap_candidates(
+            [wall_a.segment, wall_b.segment], [wall_a, wall_b], [],
+            scale_info=SCALE_INFO_1X,
+        )
+        gaps_ba = detect_gap_candidates(
+            [wall_b.segment, wall_a.segment], [wall_b, wall_a], [],
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(gaps_ab), 1)
+        self.assertEqual(len(gaps_ba), 1)
+        self.assertAlmostEqual(
+            gaps_ab[0].position_along_wall_m,
+            gaps_ba[0].position_along_wall_m,
+            places=2,
+        )
+
+    def test_gap_position_non_negative(self):
+        wall_a = WallLine(segment=_horiz_seg(0, 100, 200, 100))
+        wall_b = WallLine(segment=_horiz_seg(300, 100, 600, 100))
+
+        gaps = detect_gap_candidates(
+            [wall_a.segment, wall_b.segment], [wall_a, wall_b], [],
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertGreaterEqual(gaps[0].position_along_wall_m, 0)
+
+
+# ---------------------------------------------------------------------------
+# 5. Door detection (BLOCKER 4 — no fake swing, lower base confidence)
 # ---------------------------------------------------------------------------
 
 class TestDoorDetection(unittest.TestCase):
 
     def test_door_jamb_with_tag(self):
-        """Perpendicular segment near wall + D01 tag → door candidate."""
         wall = WallLine(segment=_horiz_seg(0, 100, 500, 100))
         leaf = _vert_seg(200, 85, 115)
         words = [_word("D01", 200, 70)]
@@ -268,7 +428,6 @@ class TestDoorDetection(unittest.TestCase):
         self.assertEqual(doors[0].tag, "D01")
 
     def test_door_base_geometry_confidence_is_low(self):
-        """A single perpendicular line is weak geometry — not 0.95."""
         wall = WallLine(segment=_horiz_seg(0, 100, 500, 100))
         leaf = _vert_seg(200, 85, 115)
         words = [_word("D01", 200, 70)]
@@ -277,11 +436,9 @@ class TestDoorDetection(unittest.TestCase):
             [wall.segment, leaf], [wall], words,
             scale_info=SCALE_INFO_1X,
         )
-        # Tag provides SEMANTIC confidence, not geometry confidence
-        self.assertAlmostEqual(doors[0].geometry_confidence, 0.60)  # reasonable width
-        self.assertAlmostEqual(doors[0].semantic_confidence, 0.95)  # D tag
-        # No wall_ref → low association
-        self.assertAlmostEqual(doors[0].association_confidence, 0.30)
+        self.assertAlmostEqual(doors[0].geometry_confidence, 0.60)
+        self.assertAlmostEqual(doors[0].semantic_confidence, 0.95)
+        self.assertAlmostEqual(doors[0].association_confidence, 0.30)  # no wall_ref
 
     def test_door_without_tag_lower_confidence(self):
         wall = WallLine(segment=_horiz_seg(0, 100, 500, 100))
@@ -327,7 +484,6 @@ class TestDoorDetection(unittest.TestCase):
         self.assertAlmostEqual(doors[0].position_along_wall_m, 5.0, places=2)
 
     def test_no_wall_ref_low_association(self):
-        """Without wall_ref, association confidence stays low."""
         wall = WallLine(segment=_horiz_seg(0, 100, 500, 100))
         leaf = _vert_seg(200, 85, 115)
 
@@ -335,12 +491,11 @@ class TestDoorDetection(unittest.TestCase):
             [wall.segment, leaf], [wall], [],
             scale_info=SCALE_INFO_1X,
         )
-        # WallLine has no wall_ref → low association
         self.assertAlmostEqual(doors[0].association_confidence, 0.30)
 
 
 # ---------------------------------------------------------------------------
-# 5. Window detection (BLOCKER 5 — wall-local, hatch-aware)
+# 6. Window detection (BLOCKER 5 — wall-local, hatch-aware)
 # ---------------------------------------------------------------------------
 
 class TestWindowDetection(unittest.TestCase):
@@ -357,9 +512,8 @@ class TestWindowDetection(unittest.TestCase):
         )
         self.assertEqual(len(windows), 1)
         self.assertEqual(windows[0].tag, "W01")
-        # Tag is semantic, not geometry
-        self.assertAlmostEqual(windows[0].geometry_confidence, 0.70)  # reasonable width
-        self.assertAlmostEqual(windows[0].semantic_confidence, 0.95)  # W tag
+        self.assertAlmostEqual(windows[0].geometry_confidence, 0.70)
+        self.assertAlmostEqual(windows[0].semantic_confidence, 0.95)
 
     def test_window_without_tag(self):
         wall = WallLine(segment=_horiz_seg(0, 100, 600, 100))
@@ -396,12 +550,53 @@ class TestWindowDetection(unittest.TestCase):
         )
         self.assertEqual(len(windows), 0)
 
+    # --- Multi-window wall (BLOCKER 1 — cluster-based, not whole-wall count) ---
+
+    def test_three_windows_on_same_wall(self):
+        """Wall with 3 windows (6 jamb segments) → 3 candidates, not 0."""
+        wall = WallLine(segment=_horiz_seg(0, 100, 1200, 100))
+        # Window 1: jambs at 190, 210 (spacing=20pt)
+        jamb1a = _vert_seg(190, 85, 115)
+        jamb1b = _vert_seg(210, 85, 115)
+        # Window 2: jambs at 590, 610 (spacing=20pt)
+        jamb2a = _vert_seg(590, 85, 115)
+        jamb2b = _vert_seg(610, 85, 115)
+        # Window 3: jambs at 990, 1010 (spacing=20pt)
+        jamb3a = _vert_seg(990, 85, 115)
+        jamb3b = _vert_seg(1010, 85, 115)
+
+        all_segs = [wall.segment, jamb1a, jamb1b, jamb2a, jamb2b, jamb3a, jamb3b]
+        words = [_word("W01", 200, 70), _word("W02", 600, 70), _word("W03", 1000, 70)]
+
+        windows = detect_window_candidates(
+            all_segs, [wall], words,
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(windows), 3)
+        tags = {w.tag for w in windows}
+        self.assertEqual(tags, {"W01", "W02", "W03"})
+
+    def test_two_windows_on_same_wall(self):
+        """Wall with 2 windows → 2 candidates."""
+        wall = WallLine(segment=_horiz_seg(0, 100, 800, 100))
+        jamb1a = _vert_seg(190, 85, 115)
+        jamb1b = _vert_seg(210, 85, 115)
+        jamb2a = _vert_seg(590, 85, 115)
+        jamb2b = _vert_seg(610, 85, 115)
+
+        all_segs = [wall.segment, jamb1a, jamb1b, jamb2a, jamb2b]
+
+        windows = detect_window_candidates(
+            all_segs, [wall], [],
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(windows), 2)
+
     # --- Hatch/grid false-positive tests (BLOCKER 5) ---
 
     def test_hatch_panel_not_detected_as_window(self):
-        """Many parallel perpendicular lines near a wall → hatch, not window."""
+        """Many parallel perpendicular lines with regular spacing → hatch."""
         wall = WallLine(segment=_horiz_seg(0, 100, 800, 100))
-        # 6 parallel vertical lines (louvre/batten pattern)
         hatch_segs = [_vert_seg(x, 85, 115) for x in range(100, 400, 30)]
 
         windows = detect_window_candidates(
@@ -411,7 +606,6 @@ class TestWindowDetection(unittest.TestCase):
         self.assertEqual(len(windows), 0)
 
     def test_batten_repetition_not_window(self):
-        """Repeated battens/slabs are not windows."""
         wall = WallLine(segment=_horiz_seg(0, 100, 800, 100))
         battens = [_vert_seg(x, 90, 110) for x in range(50, 350, 20)]
 
@@ -422,9 +616,7 @@ class TestWindowDetection(unittest.TestCase):
         self.assertEqual(len(windows), 0)
 
     def test_dimension_ticks_not_window(self):
-        """Dimension tick marks are not windows."""
         wall = WallLine(segment=_horiz_seg(0, 100, 800, 100))
-        # Short ticks at regular intervals (dimension annotation)
         ticks = [_vert_seg(x, 95, 105) for x in range(100, 400, 50)]
 
         windows = detect_window_candidates(
@@ -434,7 +626,6 @@ class TestWindowDetection(unittest.TestCase):
         self.assertEqual(len(windows), 0)
 
     def test_balustrade_repeated_lines_not_window(self):
-        """Balustrade/stair repeated lines are not windows."""
         wall = WallLine(segment=_horiz_seg(0, 100, 800, 100))
         rails = [_vert_seg(x, 80, 120) for x in range(100, 400, 25)]
 
@@ -445,10 +636,7 @@ class TestWindowDetection(unittest.TestCase):
         self.assertEqual(len(windows), 0)
 
     def test_two_unrelated_parallel_near_wall_not_window(self):
-        """Two parallel lines near a wall but from different features."""
         wall = WallLine(segment=_horiz_seg(0, 100, 800, 100))
-        # One near the wall, one also near but not a pair
-        # They happen to be parallel but are 300pt apart (not a pair)
         seg1 = _vert_seg(100, 85, 115)
         seg2 = _vert_seg(400, 85, 115)  # 300pt apart > MAX_PAIR_DISTANCE_PT
 
@@ -460,17 +648,13 @@ class TestWindowDetection(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 6. Gap detection (BLOCKER 2 — real discontinuities only)
+# 7. Gap detection (BLOCKER 2 — real discontinuities only)
 # ---------------------------------------------------------------------------
 
 class TestGapDetection(unittest.TestCase):
 
     def test_continuous_wall_no_gaps(self):
-        """A continuous wall with perpendicular intersections → 0 gaps.
-
-        Perpendicular lines crossing a continuous wall are partition
-        returns or intersections, NOT openings.
-        """
+        """A continuous wall with perpendicular intersections → 0 gaps."""
         wall = WallLine(segment=_horiz_seg(0, 100, 600, 100))
         left = _vert_seg(100, 85, 115)
         right = _vert_seg(200, 85, 115)
@@ -482,7 +666,6 @@ class TestGapDetection(unittest.TestCase):
         self.assertEqual(len(gaps), 0)
 
     def test_continuous_wall_with_intersections_no_gaps(self):
-        """Multiple perpendicular lines along continuous wall → 0 gaps."""
         wall = WallLine(segment=_horiz_seg(0, 100, 800, 100))
         perps = [_vert_seg(x, 85, 115) for x in [100, 200, 300, 400, 500]]
 
@@ -493,25 +676,20 @@ class TestGapDetection(unittest.TestCase):
         self.assertEqual(len(gaps), 0)
 
     def test_two_collinear_wall_segments_with_gap(self):
-        """Two collinear wall segments with a gap → 1 gap detected."""
         wall_a = WallLine(segment=_horiz_seg(0, 100, 200, 100))
         wall_b = WallLine(segment=_horiz_seg(300, 100, 600, 100))
-        # Gap: 200→300 = 100pt = 2.0m
 
         gaps = detect_gap_candidates(
             [wall_a.segment, wall_b.segment], [wall_a, wall_b], [],
             scale_info=SCALE_INFO_1X,
         )
         self.assertEqual(len(gaps), 1)
-        # Gap width: 100pt / 50 pt/m = 2.0m
         self.assertAlmostEqual(gaps[0].width_m, 2.0, places=2)
         self.assertAlmostEqual(gaps[0].geometry_confidence, 0.75)
 
     def test_gap_width_from_wall_discontinuity(self):
-        """Gap width is measured from wall segment endpoints, not perp lines."""
         wall_a = WallLine(segment=_horiz_seg(0, 100, 150, 100))
         wall_b = WallLine(segment=_horiz_seg(250, 100, 500, 100))
-        # Gap: 150→250 = 100pt
 
         gaps = detect_gap_candidates(
             [wall_a.segment, wall_b.segment], [wall_a, wall_b], [],
@@ -521,7 +699,6 @@ class TestGapDetection(unittest.TestCase):
         self.assertAlmostEqual(gaps[0].width_m, 2.0, places=2)
 
     def test_no_gap_when_segments_overlap(self):
-        """Overlapping collinear segments → no gap."""
         wall_a = WallLine(segment=_horiz_seg(0, 100, 300, 100))
         wall_b = WallLine(segment=_horiz_seg(200, 100, 600, 100))
 
@@ -532,10 +709,9 @@ class TestGapDetection(unittest.TestCase):
         self.assertEqual(len(gaps), 0)
 
     def test_no_gap_when_fillers_block(self):
-        """Gap filled by another wall segment → no gap."""
         wall_a = WallLine(segment=_horiz_seg(0, 100, 200, 100))
         wall_b = WallLine(segment=_horiz_seg(300, 100, 600, 100))
-        filler = _horiz_seg(205, 100, 295, 100)  # bridges the 200→300 gap
+        filler = _horiz_seg(205, 100, 295, 100)
 
         gaps = detect_gap_candidates(
             [wall_a.segment, wall_b.segment, filler], [wall_a, wall_b], [],
@@ -544,7 +720,6 @@ class TestGapDetection(unittest.TestCase):
         self.assertEqual(len(gaps), 0)
 
     def test_non_collinear_segments_no_gap(self):
-        """Non-parallel wall segments → no gap (different walls)."""
         wall_h = WallLine(segment=_horiz_seg(0, 100, 300, 100))
         wall_v = WallLine(segment=_vert_seg(400, 0, 300))
 
@@ -555,7 +730,6 @@ class TestGapDetection(unittest.TestCase):
         self.assertEqual(len(gaps), 0)
 
     def test_gap_with_tag(self):
-        """Wall discontinuity with nearby tag → higher semantic confidence."""
         wall_a = WallLine(segment=_horiz_seg(0, 100, 200, 100))
         wall_b = WallLine(segment=_horiz_seg(300, 100, 600, 100))
         words = [_word("D03", 250, 70)]
@@ -567,18 +741,16 @@ class TestGapDetection(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertEqual(gaps[0].tag, "D03")
         self.assertAlmostEqual(gaps[0].semantic_confidence, 0.80)
-        # Geometry confidence stays at 0.75 (from wall discontinuity)
         self.assertAlmostEqual(gaps[0].geometry_confidence, 0.75)
 
 
 # ---------------------------------------------------------------------------
-# 7. Confidence channel separation (BLOCKER 3)
+# 8. Confidence channel separation (BLOCKER 3)
 # ---------------------------------------------------------------------------
 
 class TestConfidenceChannels(unittest.TestCase):
 
     def test_tag_does_not_inflate_geometry_confidence(self):
-        """D01 tag near a jamb sets semantic, NOT geometry confidence."""
         wall = WallLine(segment=_horiz_seg(0, 100, 500, 100), wall_ref="N01")
         leaf = _vert_seg(200, 85, 115)
         words = [_word("D01", 200, 70)]
@@ -587,18 +759,14 @@ class TestConfidenceChannels(unittest.TestCase):
             [wall.segment, leaf], [wall], words,
             scale_info=SCALE_INFO_1X,
         )
-        # Geometry from a single perpendicular line is moderate
         self.assertLessEqual(doors[0].geometry_confidence, 0.65)
-        # Semantic from D tag is high
         self.assertAlmostEqual(doors[0].semantic_confidence, 0.95)
-        # These are independent channels
         self.assertNotAlmostEqual(
             doors[0].geometry_confidence,
             doors[0].semantic_confidence,
         )
 
     def test_window_tag_does_not_inflate_geometry(self):
-        """W01 tag near jamb pair sets semantic, NOT geometry confidence."""
         wall = WallLine(segment=_horiz_seg(0, 100, 600, 100), wall_ref="S01")
         jamb1 = _vert_seg(290, 85, 115)
         jamb2 = _vert_seg(310, 85, 115)
@@ -612,8 +780,7 @@ class TestConfidenceChannels(unittest.TestCase):
         self.assertAlmostEqual(windows[0].semantic_confidence, 0.95)
 
     def test_no_wall_ref_low_association(self):
-        """Without resolved wall_ref, association confidence stays low."""
-        wall = WallLine(segment=_horiz_seg(0, 100, 500, 100))  # no wall_ref
+        wall = WallLine(segment=_horiz_seg(0, 100, 500, 100))
         leaf = _vert_seg(200, 85, 115)
         words = [_word("D01", 200, 70)]
 
@@ -624,7 +791,6 @@ class TestConfidenceChannels(unittest.TestCase):
         self.assertAlmostEqual(doors[0].association_confidence, 0.30)
 
     def test_wall_ref_gives_higher_association(self):
-        """With resolved wall_ref, association confidence is higher."""
         wall = WallLine(segment=_horiz_seg(0, 100, 500, 100), wall_ref="N01")
         leaf = _vert_seg(200, 85, 115)
         words = [_word("D01", 200, 70)]
@@ -636,7 +802,6 @@ class TestConfidenceChannels(unittest.TestCase):
         self.assertAlmostEqual(doors[0].association_confidence, 0.70)
 
     def test_three_channels_are_independent(self):
-        """geometry, association, and semantic are three separate values."""
         wall = WallLine(segment=_horiz_seg(0, 100, 500, 100), wall_ref="N01")
         leaf = _vert_seg(200, 85, 115)
         words = [_word("D01", 200, 70)]
@@ -646,16 +811,165 @@ class TestConfidenceChannels(unittest.TestCase):
             scale_info=SCALE_INFO_1X,
         )
         d = doors[0]
-        # All three are set and can be different
         self.assertGreater(d.geometry_confidence, 0)
         self.assertGreater(d.association_confidence, 0)
         self.assertGreater(d.semantic_confidence, 0)
-        # Geometry is not inflated by tag
         self.assertLessEqual(d.geometry_confidence, 0.65)
 
 
 # ---------------------------------------------------------------------------
-# 8. Conversion to OpeningEvidence
+# 9. Tag/type compatibility (BLOCKER 2 — no cross-type type_mark)
+# ---------------------------------------------------------------------------
+
+class TestTagTypeCompatibility(unittest.TestCase):
+
+    def test_door_with_nearby_w_tag_blank_mark(self):
+        """Door geometry + nearby W01 → blank type_mark, W01 recorded as evidence."""
+        wall = WallLine(segment=_horiz_seg(0, 100, 500, 100))
+        leaf = _vert_seg(200, 85, 115)
+        words = [_word("W01", 200, 70)]
+
+        doors = detect_door_candidates(
+            [wall.segment, leaf], [wall], words,
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(doors), 1)
+        self.assertEqual(doors[0].tag, "")  # blank — W tag incompatible with door
+        self.assertAlmostEqual(doors[0].semantic_confidence, 0.30)  # conflicting tag
+        # Evidence should note the conflict
+        conflict_ev = [e for e in doors[0].evidence if "conflicting" in e.lower() or "W01" in e]
+        self.assertTrue(len(conflict_ev) > 0)
+
+    def test_window_with_nearby_d_tag_blank_mark(self):
+        """Window geometry + nearby D01 → blank type_mark."""
+        wall = WallLine(segment=_horiz_seg(0, 100, 600, 100))
+        jamb1 = _vert_seg(290, 85, 115)
+        jamb2 = _vert_seg(310, 85, 115)
+        words = [_word("D01", 300, 70)]
+
+        windows = detect_window_candidates(
+            [wall.segment, jamb1, jamb2], [wall], words,
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0].tag, "")  # blank — D tag incompatible with window
+        self.assertAlmostEqual(windows[0].semantic_confidence, 0.30)  # conflicting
+
+    def test_door_with_matching_d_tag(self):
+        """Door geometry + D01 → type_mark = D01."""
+        wall = WallLine(segment=_horiz_seg(0, 100, 500, 100))
+        leaf = _vert_seg(200, 85, 115)
+        words = [_word("D01", 200, 70)]
+
+        doors = detect_door_candidates(
+            [wall.segment, leaf], [wall], words,
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(doors[0].tag, "D01")
+        self.assertAlmostEqual(doors[0].semantic_confidence, 0.95)
+
+    def test_window_with_matching_w_tag(self):
+        """Window geometry + W01 → type_mark = W01."""
+        wall = WallLine(segment=_horiz_seg(0, 100, 600, 100))
+        jamb1 = _vert_seg(290, 85, 115)
+        jamb2 = _vert_seg(310, 85, 115)
+        words = [_word("W01", 300, 70)]
+
+        windows = detect_window_candidates(
+            [wall.segment, jamb1, jamb2], [wall], words,
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(windows[0].tag, "W01")
+        self.assertAlmostEqual(windows[0].semantic_confidence, 0.95)
+
+    def test_gap_with_any_tag_classifies(self):
+        """Gap (generic) may use D or W tag to classify the opening type."""
+        wall_a = WallLine(segment=_horiz_seg(0, 100, 200, 100))
+        wall_b = WallLine(segment=_horiz_seg(300, 100, 600, 100))
+        words = [_word("D03", 250, 70)]
+
+        gaps = detect_gap_candidates(
+            [wall_a.segment, wall_b.segment], [wall_a, wall_b], words,
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0].tag, "D03")
+
+    def test_door_evidence_records_conflicting_w_tag(self):
+        """Conflicting W tag is recorded in evidence, not lost."""
+        wall = WallLine(segment=_horiz_seg(0, 100, 500, 100))
+        leaf = _vert_seg(200, 85, 115)
+        words = [_word("W01", 200, 70)]
+
+        doors = detect_door_candidates(
+            [wall.segment, leaf], [wall], words,
+            scale_info=SCALE_INFO_1X,
+        )
+        all_ev = " ".join(doors[0].evidence)
+        self.assertIn("W01", all_ev)
+        self.assertIn("conflicting", all_ev.lower())
+
+    def test_converted_evidence_has_blank_mark(self):
+        """Converted OpeningEvidence for door + W01 has blank type_mark."""
+        wall = WallLine(segment=_horiz_seg(0, 100, 500, 100))
+        leaf = _vert_seg(200, 85, 115)
+        words = [_word("W01", 200, 70)]
+
+        doors = detect_door_candidates(
+            [wall.segment, leaf], [wall], words,
+            scale_info=SCALE_INFO_1X,
+        )
+        ev = door_to_opening_evidence(doors[0])
+        self.assertEqual(ev.type_mark, "")
+        self.assertEqual(ev.opening_type, OPENING_TYPE_DOOR)
+
+
+# ---------------------------------------------------------------------------
+# 10. Wall-ref conflict resolution
+# ---------------------------------------------------------------------------
+
+class TestWallRefConflict(unittest.TestCase):
+
+    def test_conflicting_wall_ref_gap_blank(self):
+        """Two collinear segments with different non-empty wall_refs → blank."""
+        wall_a = WallLine(segment=_horiz_seg(0, 100, 200, 100), wall_ref="N01")
+        wall_b = WallLine(segment=_horiz_seg(300, 100, 600, 100), wall_ref="S02")
+
+        gaps = detect_gap_candidates(
+            [wall_a.segment, wall_b.segment], [wall_a, wall_b], [],
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0].wall_ref, "")  # conflict → blank
+        self.assertAlmostEqual(gaps[0].association_confidence, 0.30)  # low
+
+    def test_matching_wall_ref_gap_preserved(self):
+        """Same wall_ref on both segments → preserved."""
+        wall_a = WallLine(segment=_horiz_seg(0, 100, 200, 100), wall_ref="N01")
+        wall_b = WallLine(segment=_horiz_seg(300, 100, 600, 100), wall_ref="N01")
+
+        gaps = detect_gap_candidates(
+            [wall_a.segment, wall_b.segment], [wall_a, wall_b], [],
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0].wall_ref, "N01")
+
+    def test_one_empty_one_populated_wall_ref(self):
+        """One segment has wall_ref, other is empty → use the populated one."""
+        wall_a = WallLine(segment=_horiz_seg(0, 100, 200, 100))
+        wall_b = WallLine(segment=_horiz_seg(300, 100, 600, 100), wall_ref="N01")
+
+        gaps = detect_gap_candidates(
+            [wall_a.segment, wall_b.segment], [wall_a, wall_b], [],
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0].wall_ref, "N01")
+
+
+# ---------------------------------------------------------------------------
+# 11. Conversion to OpeningEvidence
 # ---------------------------------------------------------------------------
 
 class TestConversionToEvidence(unittest.TestCase):
@@ -687,7 +1001,6 @@ class TestConversionToEvidence(unittest.TestCase):
         self.assertEqual(ev.quantity, 1)
         self.assertFalse(ev.deduct)
         self.assertEqual(ev.deduction_status, DEDUCTION_REVIEW)
-        # geometry_confidence comes from candidate, not inflated by tag
         self.assertAlmostEqual(ev.geometry_confidence, 0.60)
         self.assertAlmostEqual(ev.association_confidence, 0.70)
 
@@ -753,13 +1066,12 @@ class TestConversionToEvidence(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 9. Main pipeline integration
+# 12. Main pipeline integration
 # ---------------------------------------------------------------------------
 
 class TestPlanOpeningCandidates(unittest.TestCase):
 
     def test_full_pipeline_door_and_window(self):
-        """Complete pipeline with a door and a window on one wall."""
         wall = _horiz_seg(0, 100, 800, 100)
         door_leaf = _vert_seg(150, 85, 115)
         jamb1 = _vert_seg(490, 85, 115)
@@ -820,9 +1132,32 @@ class TestPlanOpeningCandidates(unittest.TestCase):
         self.assertEqual(len(doors), 1)
         self.assertIsNone(doors[0].width_m)
 
+    def test_pipeline_three_windows(self):
+        """Full pipeline: wall with 3 windows produces 3 candidates."""
+        wall = _horiz_seg(0, 100, 1200, 100)
+        pairs = [
+            (_vert_seg(190, 85, 115), _vert_seg(210, 85, 115)),
+            (_vert_seg(590, 85, 115), _vert_seg(610, 85, 115)),
+            (_vert_seg(990, 85, 115), _vert_seg(1010, 85, 115)),
+        ]
+        words = [_word("W01", 200, 70), _word("W02", 600, 70), _word("W03", 1000, 70)]
+
+        all_segs = [wall]
+        for a, b in pairs:
+            all_segs.extend([a, b])
+
+        result = plan_opening_candidates(
+            all_segs, words,
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(result.window_count, 3)
+        self.assertEqual(len(result.candidates), 3)
+        marks = {c.type_mark for c in result.candidates}
+        self.assertEqual(marks, {"W01", "W02", "W03"})
+
 
 # ---------------------------------------------------------------------------
-# 10. Contract compliance
+# 13. Contract compliance
 # ---------------------------------------------------------------------------
 
 class TestContractCompliance(unittest.TestCase):
