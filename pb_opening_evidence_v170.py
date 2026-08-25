@@ -17,8 +17,9 @@ Safety contract:
     schedule/type records enrich but never collapse instances.
   - Schedule enrichment requires matching non-empty type_mark on
     both sides; never assigns marks to unlabeled openings.
-  - Width + height + basis + confidence are one atomic measurement
-    bundle; partial dimension updates never relabel basis.
+  - Width + height + basis + dimension_confidence + dimension_source
+    are one atomic measurement bundle; partial dimension updates
+    never relabel basis.  Rejected dimensions never donate confidence.
 """
 from __future__ import annotations
 
@@ -137,6 +138,10 @@ class OpeningEvidence:
         Manual/v134 records may retain grouped quantities.
       - dimension_basis records what the width/height refer to.
         Only rough_opening is eligible for wall-void deduction.
+      - dimension_source tracks which source provided the current
+        width/height pair (e.g. "plan_vector", "schedule_parse").
+        Separated from extraction_method which describes the overall
+        record provenance, not the dimension provenance.
       - deduction_status records ELIGIBILITY (auto_eligible, derived_eligible,
         review, none). It does NOT mean deduct=True.
       - deduct is the commercial decision, set only by B5 or estimator.
@@ -164,10 +169,11 @@ class OpeningEvidence:
     quantity: int = 1
     _quantity_from_source: str = ""     # "geometric" or "manual/v134"
 
-    # --- Dimensions ---
+    # --- Dimensions (atomic bundle: all five travel together) ---
     width_m: Optional[float] = None
     height_m: Optional[float] = None
     dimension_basis: str = DIMENSION_BASIS_UNKNOWN
+    dimension_source: str = ""          # which source provided these dims
     sill_m: float = 0.0                 # 0.0 for doors, 0.9 for windows
     area_m2: Optional[float] = None     # computed: width x height x quantity
 
@@ -183,7 +189,8 @@ class OpeningEvidence:
 
     # --- Confidence ---
     geometry_confidence: float = 0.0
-    dimension_confidence: float = 0.0
+    dimension_confidence: float = 0.0   # confidence in the DIMENSION SOURCE,
+                                        # not the overall record
     association_confidence: float = 0.0
 
     # --- Deduction status (safety gate: ELIGIBILITY, not decision) ---
@@ -441,8 +448,10 @@ def merge_opening_evidence(
 
     Keeps highest-confidence values and merges evidence provenance.
     Dimensions are chosen by basis priority + confidence, not merely
-    by source type.  Width + height + basis + confidence are treated
-    as one atomic measurement bundle.
+    by source type.  Width + height + basis + dimension_confidence +
+    dimension_source are one atomic measurement bundle.
+
+    Rejected dimensions never donate confidence.
     """
     merged = OpeningEvidence(**asdict(existing))
     merged._quantity_from_source = existing._quantity_from_source
@@ -450,32 +459,33 @@ def merge_opening_evidence(
     # Merge evidence sources (ordered dedup, not set)
     merged.evidence = _ordered_dedup(existing.evidence + new.evidence)
 
-    # Upgrade confidence if new source confirms
+    # Upgrade geometry and association confidence (not dimension yet)
     merged.geometry_confidence = max(
         existing.geometry_confidence, new.geometry_confidence
-    )
-    merged.dimension_confidence = max(
-        existing.dimension_confidence, new.dimension_confidence
     )
     merged.association_confidence = max(
         existing.association_confidence, new.association_confidence
     )
 
-    # Dimensions: atomic bundle — both width and height must be present to replace
-    if _should_replace_dimensions(
+    # Dimensions: decide replacement FIRST, then upgrade confidence only
+    # if accepted.  Rejected dimensions never donate confidence.
+    dims_replaced = _should_replace_dimensions(
         current_basis=existing.dimension_basis,
         current_confidence=existing.dimension_confidence,
-        current_source=existing.extraction_method,
+        current_source=existing.dimension_source or existing.extraction_method,
         new_basis=new.dimension_basis,
         new_confidence=new.dimension_confidence,
-        new_source=new.extraction_method,
+        new_source=new.dimension_source or new.extraction_method,
         new_width=new.width_m,
         new_height=new.height_m,
-    ):
+    )
+    if dims_replaced:
         merged.width_m = new.width_m
         merged.height_m = new.height_m
         merged.dimension_basis = new.dimension_basis
-    # else: keep existing dims and basis (partial dims never relabel basis)
+        merged.dimension_confidence = new.dimension_confidence
+        merged.dimension_source = new.dimension_source or new.extraction_method
+    # else: keep existing dims, basis, dimension_confidence, dimension_source
 
     # Take mark if new has one and existing doesn't
     if new.type_mark and not merged.type_mark:
@@ -504,20 +514,33 @@ def _apply_enrichment(
 ) -> None:
     """Apply schedule enrichment to an existing instance in-place.
 
-    Enrichment adds evidence provenance and may upgrade dimension_basis
-    when the candidate provides BOTH width AND height with a higher-basis
-    measurement.  Partial dimension updates never relabel basis.
+    Enrichment adds evidence provenance and may upgrade the full
+    dimension bundle (width + height + basis + dimension_confidence +
+    dimension_source) when the candidate provides BOTH width AND height
+    with a higher-basis measurement.  Partial dimension updates never
+    relabel basis.  The bundle is atomic: all five fields change
+    together or none change.
     """
     existing.evidence = _ordered_dedup(existing.evidence + candidate.evidence)
 
-    # Only upgrade dimension_basis when candidate provides both dimensions
+    # Only upgrade dimension bundle when candidate provides both dimensions
+    # and the basis is a strict improvement
     if (candidate.width_m is not None
             and candidate.height_m is not None
             and candidate.dimension_basis != DIMENSION_BASIS_UNKNOWN):
         existing_basis_pri = BASIS_PRIORITY.get(existing.dimension_basis, 0)
         new_basis_pri = BASIS_PRIORITY.get(candidate.dimension_basis, 0)
         if new_basis_pri > existing_basis_pri:
+            # Atomic bundle: replace all five together
+            existing.width_m = candidate.width_m
+            existing.height_m = candidate.height_m
             existing.dimension_basis = candidate.dimension_basis
+            existing.dimension_confidence = candidate.dimension_confidence
+            existing.dimension_source = (
+                candidate.dimension_source or candidate.extraction_method
+            )
+            existing.compute_area()
+            existing.compute_deduction_status()
 
 
 def deduplicate_openings(
@@ -635,6 +658,7 @@ def from_v134_record(
         width_m=width if width > 0 else None,
         height_m=height if height > 0 else None,
         dimension_basis=DIMENSION_BASIS_UNKNOWN,
+        dimension_source="manual",
         sill_m=0.0 if opening_type in (OPENING_TYPE_DOOR, OPENING_TYPE_GARAGE, OPENING_TYPE_ROLLER) else 0.9,
         extraction_method="manual",
         evidence=[str(record.get("source_reference", ""))],
