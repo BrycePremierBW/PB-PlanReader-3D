@@ -525,7 +525,9 @@ def detect_window_candidates(
 
     MIN_WINDOW_PT = 25.0
     MAX_WINDOW_PT = 200.0
-    MAX_PAIR_DISTANCE_PT = 100.0
+    # Scale-aware jamb-pair distance: at 50pt/m → 60pt (1.2m), at 200pt/m → 240pt
+    # Floor of 50pt ensures pairing works even at very low resolutions.
+    MAX_PAIR_DISTANCE_PT = max(50.0, 1.2 * pt_per_m) if pt_per_m > 0 else 100.0
     WALL_PROXIMITY_PT = 30.0
 
     for wl in wall_lines:
@@ -613,17 +615,24 @@ def detect_window_candidates(
                 MIN_GAP_M = 1.5
                 scale_min_gap_pt = MIN_GAP_M * pt_per_m if pt_per_m > 0 else 0
 
-                if len(gaps_between) >= 2:
-                    # Multiple gaps: ratio test is reliable
-                    if gap_ratio <= 2.5:
-                        if scale_min_gap_pt > 0 and max_gap >= scale_min_gap_pt:
-                            pass
-                        else:
-                            is_hatch = True
-                else:
-                    # Single gap (2 pairs): ratio test ambiguous
-                    # Use scale threshold, but W tags override
-                    if not any(pair_has_w_tag):
+                # W-tag override: if ANY pair has a nearby Wxx mark, the
+                # evidence-corroborated pairs survive hatch suspicion.  A W
+                # tag is strong semantic evidence that a pair represents a
+                # real window, not a hatch element.  We skip the entire hatch
+                # filter for this wall when any pair is tag-corroborated.
+                any_w_tag = any(pair_has_w_tag)
+
+                if not any_w_tag:
+                    if len(gaps_between) >= 2:
+                        # Multiple gaps: ratio test is reliable
+                        if gap_ratio <= 2.5:
+                            if scale_min_gap_pt > 0 and max_gap >= scale_min_gap_pt:
+                                pass
+                            else:
+                                is_hatch = True
+                    else:
+                        # Single gap (2 pairs): ratio test ambiguous
+                        # Use scale threshold only (no tags to override)
                         if scale_min_gap_pt > 0 and max_gap < scale_min_gap_pt:
                             is_hatch = True
                         elif scale_min_gap_pt <= 0 and gap_ratio <= 2.5:
