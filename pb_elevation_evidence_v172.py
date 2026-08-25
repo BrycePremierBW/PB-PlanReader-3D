@@ -29,6 +29,8 @@ from pb_opening_evidence_v170 import (
     DIMENSION_BASIS_UNKNOWN,
     DEDUCTION_REVIEW,
     NON_INSTANCE_SOURCES,
+    OPENING_TYPE_DOOR,
+    OPENING_TYPE_WINDOW,
     TOLERANCE_WIDTH_M,
     TOLERANCE_POSITION_M,
 )
@@ -237,12 +239,32 @@ def _mark_type(mark: str) -> str:
     return ""
 
 
-def _marks_conflict(mark1: str, mark2: str) -> bool:
-    """True if both marks are non-empty and have different D/W types."""
-    if not mark1 or not mark2:
+def _marks_conflict(inst_mark: str, elev_label: str) -> bool:
+    """True if both marks are non-empty and disagree.
+
+    Any nonblank mismatch is a conflict — D01 vs D02, W01 vs W03,
+    D01 vs W01, etc.  Type marks are type identity, not just
+    door-vs-window category.
+    """
+    if not inst_mark or not elev_label:
         return False
-    t1, t2 = _mark_type(mark1), _mark_type(mark2)
-    return bool(t1 and t2 and t1 != t2)
+    return inst_mark.upper() != elev_label.upper()
+
+
+def _opening_type_conflicts(inst: OpeningEvidence, elev_label: str) -> bool:
+    """True if the instance's opening_type contradicts the elevation mark.
+
+    For example, a window instance (opening_type=window) should not
+    correlate with a D01 (door) elevation label.
+    """
+    if not elev_label:
+        return False
+    elev_type = elev_label[0].upper()
+    if inst.opening_type == OPENING_TYPE_WINDOW and elev_type == "D":
+        return True
+    if inst.opening_type == OPENING_TYPE_DOOR and elev_type == "W":
+        return True
+    return False
 
 
 def _correlation_score(
@@ -252,20 +274,25 @@ def _correlation_score(
     """Score how well a plan instance matches an elevation candidate.
 
     Returns 0.0-1.0 (higher = better match).  Returns 0.0 for
-    incompatible pairs (wrong side, wrong mark type, incompatible width,
-    or insufficient strong signals).
+    incompatible pairs or insufficient identity evidence.
 
-    Matching requires at least one strong instance-specific signal:
-      - compatible width + exact mark match, OR
-      - compatible width + same elevation_side (side alone is NOT enough).
-    A generic side match without width agreement does not qualify.
+    Qualification requires BOTH:
+      - compatible width (baseline check), AND
+      - at least one identity signal: exact mark match, OR
+        registered side match with opening_type compatibility.
+
+    Width alone is NOT sufficient — common 820mm doors repeat many times.
     """
     score = 0.0
     has_width_signal = False
-    has_mark_signal = False
+    has_identity_signal = False
 
-    # --- Hard reject: conflicting D/W marks ---
+    # --- Hard reject: conflicting marks (any nonblank mismatch) ---
     if _marks_conflict(inst.type_mark, elev.label):
+        return 0.0
+
+    # --- Hard reject: opening_type vs mark type conflict ---
+    if _opening_type_conflicts(inst, elev.label):
         return 0.0
 
     # --- Hard reject: different sides ---
@@ -278,32 +305,33 @@ def _correlation_score(
     if inst.elevation_side and elev.elevation_side:
         side_match = inst.elevation_side == elev.elevation_side
         if side_match:
-            score += 0.15  # contextual bonus, not sufficient alone
+            score += 0.15
 
-    # --- Width agreement: strong signal ---
+    # --- Width agreement: baseline compatibility (not identity) ---
     if inst.width_m is not None:
         if not _width_compatible(inst.width_m, elev.width_m):
             return 0.0  # incompatible widths → hard reject
         diff = abs(inst.width_m - elev.width_m)
-        width_score = 0.35 * max(0, 1.0 - diff / ELEVATION_WIDTH_TOLERANCE_M)
+        width_score = 0.30 * max(0, 1.0 - diff / ELEVATION_WIDTH_TOLERANCE_M)
         score += width_score
         has_width_signal = width_score > 0
 
-    # --- Mark match: strong signal ---
+    # --- Mark match: strong identity signal ---
     if inst.type_mark and elev.label:
         if inst.type_mark.upper() == elev.label.upper():
-            score += 0.35
-            has_mark_signal = True
+            score += 0.40
+            has_identity_signal = True
 
-    # --- Require width agreement as baseline ---
-    # Without width, side/mark alone are insufficient for reliable matching.
+    # --- Side + width as weaker identity signal ---
+    if side_match and has_width_signal and not has_identity_signal:
+        has_identity_signal = True
+        score += 0.15  # side+width combined is moderate identity
+
+    # --- Require width baseline + identity signal ---
     if not has_width_signal:
         return 0.0
-
-    # --- Wall ref consistency check (not scoring, just reject conflicts) ---
-    # Don't infer side from wall_ref[0] — only reject if wall_ref clearly
-    # contradicts the elevation side via explicit registration.
-    # (wall_ref → side mapping is deferred to B4 reconciliation.)
+    if not has_identity_signal:
+        return 0.0
 
     return min(score, 1.0)
 
@@ -345,8 +373,15 @@ def correlate_elevation_to_plan(
             if sc >= _MIN_STRONG_SIGNAL:
                 pairs.append((sc, p_idx, e_idx))
 
-    # Step 2: Sort globally strongest-first (order-independent)
-    pairs.sort(key=lambda x: x[0], reverse=True)
+    # Step 2: Sort globally strongest-first with physical tie-breaker
+    # When scores are equal, prefer the instance closer to wall start
+    # (lower position_along_wall_m) for deterministic, order-independent results.
+    def _sort_key(pair: Tuple[float, int, int]) -> Tuple[float, float]:
+        sc, p_idx, _e_idx = pair
+        pos = plan_instances[p_idx].position_along_wall_m
+        return (sc, -(pos if pos is not None else 1e9))
+
+    pairs.sort(key=_sort_key, reverse=True)
 
     # Step 3: Greedy one-to-one assignment
     assigned_plan: set = set()
@@ -392,9 +427,11 @@ def _enrich_from_elevation(
     not necessarily the wall void rough opening.  Only explicit
     wall-void evidence would upgrade the basis.
     """
-    # Build an elevation-sourced evidence record
+    # Build an elevation-sourced evidence record.
+    # Preserve the existing plan type_mark — elevation labels must NOT
+    # populate a blank plan mark (correlation is not semantic identity).
     elev_ev = OpeningEvidence(
-        type_mark=inst.type_mark or elev.label,
+        type_mark=inst.type_mark,
         width_m=elev.width_m,
         height_m=elev.height_m,
         dimension_basis=DIMENSION_BASIS_UNKNOWN,

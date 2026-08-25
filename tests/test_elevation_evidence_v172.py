@@ -32,6 +32,7 @@ from pb_elevation_evidence_v172 import (
     _width_compatible,
     _mark_compatible,
     _marks_conflict,
+    _opening_type_conflicts,
     _correlation_score,
     _extract_label_near_rect,
     ELEVATION_WIDTH_TOLERANCE_M,
@@ -196,12 +197,16 @@ class TestMarkCompatible(unittest.TestCase):
 
 
 class TestMarksConflict(unittest.TestCase):
-    """_marks_conflict() — D vs W type conflict detection."""
+    """_marks_conflict() — exact mark mismatch detection."""
 
-    def test_same_type(self):
-        self.assertFalse(_marks_conflict("D01", "D02"))
+    def test_same_mark(self):
+        self.assertFalse(_marks_conflict("D01", "D01"))
 
-    def test_different_type(self):
+    def test_different_mark_same_family(self):
+        """D01 vs D02 → conflict (marks are type identity)."""
+        self.assertTrue(_marks_conflict("D01", "D02"))
+
+    def test_different_mark_cross_family(self):
         self.assertTrue(_marks_conflict("D01", "W01"))
 
     def test_one_empty(self):
@@ -212,14 +217,15 @@ class TestMarksConflict(unittest.TestCase):
         self.assertFalse(_marks_conflict("", ""))
 
     def test_case_insensitive(self):
-        self.assertTrue(_marks_conflict("d01", "W01"))
+        self.assertFalse(_marks_conflict("d01", "D01"))
+        self.assertTrue(_marks_conflict("d01", "D02"))
 
 
 class TestCorrelationScore(unittest.TestCase):
-    """_correlation_score() — matching quality with strong-signal requirement."""
+    """_correlation_score() — matching quality with identity-signal gate."""
 
     def test_perfect_match(self):
-        """Side + width + mark → strong score."""
+        """Side + width + exact mark → strong score."""
         inst = _inst(mark="D01", side="North", width=0.82)
         elev = _elev(side="North", w=0.82, label="D01")
         sc = _correlation_score(inst, elev)
@@ -237,17 +243,24 @@ class TestCorrelationScore(unittest.TestCase):
         sc = _correlation_score(inst, elev)
         self.assertEqual(sc, 0.0)
 
-    def test_conflicting_marks_rejected(self):
-        """D01 plan + W01 elevation → score 0."""
+    def test_same_family_marks_conflict(self):
+        """D01 vs D02 → score 0 (marks are type identity)."""
+        inst = _inst(mark="D01", side="North", width=0.82)
+        elev = _elev(side="North", w=0.82, label="D02")
+        sc = _correlation_score(inst, elev)
+        self.assertEqual(sc, 0.0)
+
+    def test_cross_family_marks_conflict(self):
+        """D01 vs W01 → score 0."""
         inst = _inst(mark="D01", side="North", width=0.82)
         elev = _elev(side="North", w=0.82, label="W01")
         sc = _correlation_score(inst, elev)
         self.assertEqual(sc, 0.0)
 
-    def test_side_only_rejected(self):
-        """Side match without width or mark → score 0 (insufficient signal)."""
-        inst = _inst(width=None, side="North")
-        elev = _elev(side="North", w=0.82)
+    def test_width_only_rejected(self):
+        """Width alone (no side, no mark) → score 0."""
+        inst = _inst(width=0.82, side="", mark="")
+        elev = _elev(side="", w=0.82, label="")
         sc = _correlation_score(inst, elev)
         self.assertEqual(sc, 0.0)
 
@@ -256,19 +269,28 @@ class TestCorrelationScore(unittest.TestCase):
         inst = _inst(width=0.82, side="North")
         elev = _elev(side="North", w=0.82)
         sc = _correlation_score(inst, elev)
-        self.assertGreaterEqual(sc, _MIN_STRONG_SIGNAL)
+        self.assertGreater(sc, 0.3)
 
-    def test_mark_plus_width_sufficient(self):
-        """Width agreement + mark match → qualifies (no side needed)."""
+    def test_width_plus_mark_sufficient(self):
+        """Width agreement + exact mark match → qualifies."""
         inst = _inst(mark="D01", width=0.82, side="")
         elev = _elev(side="", w=0.82, label="D01")
         sc = _correlation_score(inst, elev)
-        self.assertGreaterEqual(sc, _MIN_STRONG_SIGNAL)
+        self.assertGreater(sc, 0.3)
 
     def test_mark_only_no_width_rejected(self):
-        """Mark match without width or side → insufficient signal."""
+        """Mark match without width → no match."""
         inst = _inst(mark="D01", width=None, side="")
         elev = _elev(side="", w=0.82, label="D01")
+        sc = _correlation_score(inst, elev)
+        self.assertEqual(sc, 0.0)
+
+    def test_opening_type_conflict(self):
+        """Window instance + door label → rejected."""
+        inst = _inst(mark="", side="North", width=0.82,
+                     method="plan_vector")
+        inst.opening_type = "window"
+        elev = _elev(side="North", w=0.82, label="D01")
         sc = _correlation_score(inst, elev)
         self.assertEqual(sc, 0.0)
 
@@ -400,6 +422,22 @@ class TestCorrelateElevationToPlan(unittest.TestCase):
         self.assertIsNone(enriched[0].height_m)
         self.assertEqual(len(unmatched), 1)
 
+    def test_same_family_marks_no_match(self):
+        """D01 plan + D02 elevation → no match."""
+        inst = _inst(mark="D01", side="North", width=0.82)
+        elev = _elev(side="North", w=0.82, label="D02")
+        enriched, unmatched = correlate_elevation_to_plan([elev], [inst])
+        self.assertIsNone(enriched[0].height_m)
+        self.assertEqual(len(unmatched), 1)
+
+    def test_type_mark_not_populated_from_elevation(self):
+        """Blank plan type_mark must NOT be filled by elevation label."""
+        inst = _inst(mark="", side="North", width=0.82)
+        elev = _elev(side="North", w=0.82, h=2.1, label="D01")
+        enriched, _ = correlate_elevation_to_plan([elev], [inst])
+        # type_mark must remain blank — correlation is not semantic identity
+        self.assertEqual(enriched[0].type_mark, "")
+
     def test_side_only_no_match(self):
         """Side match without width or mark → no match."""
         inst = _inst(width=None, side="North")
@@ -418,7 +456,7 @@ class TestCorrelateElevationToPlan(unittest.TestCase):
         self.assertEqual(len(heights), 1)
 
     def test_global_assignment_order_independent(self):
-        """Reversing plan-instance order must not change assignment result."""
+        """Reversing plan-instance order must assign the same physical opening."""
         inst_a = _inst(mark="D01", side="North", width=0.82, pos=2.0)
         inst_b = _inst(mark="D01", side="North", width=0.82, pos=4.0)
         elev = _elev(side="North", w=0.82, h=2.1, label="D01")
@@ -426,10 +464,12 @@ class TestCorrelateElevationToPlan(unittest.TestCase):
         enriched_fwd, _ = correlate_elevation_to_plan([elev], [inst_a, inst_b])
         enriched_rev, _ = correlate_elevation_to_plan([elev], [inst_b, inst_a])
 
-        # Same number of enriched instances
-        h_fwd = [e.height_m for e in enriched_fwd if e.height_m is not None]
-        h_rev = [e.height_m for e in enriched_rev if e.height_m is not None]
-        self.assertEqual(len(h_fwd), len(h_rev))
+        # The SAME physical instance (by position) must receive the elevation
+        pos_fwd = [e.position_along_wall_m for e in enriched_fwd
+                   if e.height_m is not None]
+        pos_rev = [e.position_along_wall_m for e in enriched_rev
+                   if e.height_m is not None]
+        self.assertEqual(pos_fwd, pos_rev)
 
     def test_empty_inputs(self):
         enriched, unmatched = correlate_elevation_to_plan([], [])
@@ -484,7 +524,19 @@ class TestEnrichFromElevation(unittest.TestCase):
         result = _enrich_from_elevation(inst, elev)
         self.assertEqual(result.dimension_basis, DIMENSION_BASIS_UNKNOWN)
 
-    def test_sets_elevation_geometry(self):
+    def test_type_mark_preserved(self):
+        """Enrichment preserves existing plan type_mark."""
+        inst = _inst(mark="D01")
+        elev = _elev(label="D01")
+        result = _enrich_from_elevation(inst, elev)
+        self.assertEqual(result.type_mark, "D01")
+
+    def test_blank_type_mark_not_filled(self):
+        """Blank plan type_mark stays blank after elevation enrichment."""
+        inst = _inst(mark="")
+        elev = _elev(label="D01")
+        result = _enrich_from_elevation(inst, elev)
+        self.assertEqual(result.type_mark, "")
         inst = _inst()
         elev = _elev()
         result = _enrich_from_elevation(inst, elev)
@@ -534,12 +586,12 @@ class TestSafetyContract(unittest.TestCase):
         enriched, _ = correlate_elevation_to_plan(elevs, insts)
         self.assertEqual(len(enriched), 2)
 
-    def test_deduction_status_not_auto_eligible(self):
-        """B3 enrichment must not promote to auto/derived eligible."""
+    def test_deduction_status_remains_review(self):
+        """B3 enrichment with unknown basis must not change deduction_status."""
         inst = _inst()
         elev = _elev()
         result = _enrich_from_elevation(inst, elev)
-        self.assertNotIn(result.deduction_status, ("auto_eligible", "deducted"))
+        self.assertEqual(result.deduction_status, DEDUCTION_REVIEW)
 
     def test_unmatched_elevations_not_in_enriched(self):
         inst = _inst(side="North", width=0.82)
