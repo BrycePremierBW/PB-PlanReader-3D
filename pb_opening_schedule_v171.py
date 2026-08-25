@@ -585,6 +585,7 @@ def enrich_opening_evidence(
     # - Conflicting dimensions → skip enrichment (ambiguous)
     _PROVENANCE_RANK = {"header_separate": 3, "header_dims": 2, "heuristic": 1, "": 0}
     mark_authority: Dict[str, Optional[ScheduleEntry]] = {}
+    mark_conflicts: Dict[str, List[ScheduleEntry]] = {}  # conflicting entries
     for mark, entries_list in schedule_by_mark.items():
         if len(entries_list) == 1:
             mark_authority[mark] = entries_list[0]
@@ -599,8 +600,9 @@ def enrich_opening_evidence(
                            key=lambda e: _PROVENANCE_RANK.get(e.parse_source, 0))
                 mark_authority[mark] = best
             else:
-                # Conflicting → do NOT enrich
+                # Conflicting → do NOT enrich; retain alternatives for B4
                 mark_authority[mark] = None
+                mark_conflicts[mark] = entries_list
 
     enriched = []
     for inst in instances:
@@ -608,8 +610,9 @@ def enrich_opening_evidence(
         if mark and mark in mark_authority:
             sched = mark_authority[mark]
             if sched is None:
-                # Conflicting duplicate schedule rows — record as rejected
-                # observation so B4 can see the schedule ambiguity.
+                # Conflicting duplicate schedule rows — record alternatives
+                # so B4 can see the exact schedule ambiguity.
+                alternatives = mark_conflicts.get(mark, [])
                 conflicting_obs = {
                     "source": "schedule_parse",
                     "width_m": None,
@@ -620,7 +623,15 @@ def enrich_opening_evidence(
                     "page_no": None,
                     "accepted": False,
                     "status": "ambiguous",
-                    "description": f"Conflicting duplicate rows for mark {mark}",
+                    "alternatives": [
+                        {
+                            "width_mm": e.width_mm,
+                            "height_mm": e.height_mm,
+                            "page_no": e.page_no,
+                            "parse_source": e.parse_source,
+                        }
+                        for e in alternatives
+                    ],
                 }
                 inst.source_observations = list(inst.source_observations) + [conflicting_obs]
                 enriched.append(inst)

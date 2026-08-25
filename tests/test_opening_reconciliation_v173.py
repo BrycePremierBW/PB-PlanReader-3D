@@ -284,6 +284,103 @@ class TestConflictDetection(unittest.TestCase):
         self.assertEqual(len(sched_obs), 1)
         self.assertFalse(sched_obs[0]["accepted"])
 
+    def test_source_ambiguous_conflict(self):
+        """Ambiguous schedule observation → source_ambiguous conflict."""
+        inst = _inst(observations=[
+            _obs(SOURCE_PLAN, width=0.82),
+            {
+                "source": SOURCE_SCHEDULE,
+                "width_m": None,
+                "height_m": None,
+                "dimension_basis": DIMENSION_BASIS_UNKNOWN,
+                "dimension_confidence": 0.0,
+                "type_mark": "D01",
+                "page_no": None,
+                "accepted": False,
+                "status": "ambiguous",
+                "alternatives": [
+                    {"width_mm": 820, "height_mm": 2100, "page_no": 5,
+                     "parse_source": "header_separate"},
+                    {"width_mm": 920, "height_mm": 2100, "page_no": 5,
+                     "parse_source": "header_separate"},
+                ],
+            },
+        ])
+        conflicts = _detect_conflicts(inst)
+        ambig = [c for c in conflicts if c.conflict_type == "source_ambiguous"]
+        self.assertEqual(len(ambig), 1)
+        self.assertEqual(ambig[0].severity, "error")
+        self.assertIn("820", ambig[0].description)
+        self.assertIn("920", ambig[0].description)
+
+    def test_ambiguous_does_not_count_as_source(self):
+        """Ambiguous schedule observation does NOT count as schedule evidence."""
+        inst = _inst(observations=[
+            _obs(SOURCE_PLAN, width=0.82),
+            {
+                "source": SOURCE_SCHEDULE,
+                "width_m": None,
+                "height_m": None,
+                "dimension_basis": DIMENSION_BASIS_UNKNOWN,
+                "dimension_confidence": 0.0,
+                "type_mark": "D01",
+                "page_no": None,
+                "accepted": False,
+                "status": "ambiguous",
+                "alternatives": [],
+            },
+        ])
+        self.assertTrue(_has_plan_evidence(inst))
+        self.assertFalse(_has_schedule_evidence(inst))  # ambiguous ≠ evidence
+
+    def test_ambiguous_does_not_boost_confidence(self):
+        """Ambiguous schedule does not increase reconciliation_confidence."""
+        # Plan only → 0.55
+        inst_plan = _inst(observations=[_obs(SOURCE_PLAN, width=0.82)])
+        conf_plan = _compute_reconciliation_confidence(inst_plan)
+        # Plan + ambiguous schedule → should still be ~0.55 (plan only)
+        inst_ambig = _inst(observations=[
+            _obs(SOURCE_PLAN, width=0.82),
+            {
+                "source": SOURCE_SCHEDULE,
+                "width_m": None, "height_m": None,
+                "dimension_basis": DIMENSION_BASIS_UNKNOWN,
+                "dimension_confidence": 0.0,
+                "type_mark": "D01", "page_no": None,
+                "accepted": False, "status": "ambiguous",
+                "alternatives": [],
+            },
+        ])
+        conf_ambig = _compute_reconciliation_confidence(inst_ambig)
+        self.assertAlmostEqual(conf_plan, conf_ambig, places=2)
+
+    def test_source_ambiguous_forces_review(self):
+        """Ambiguous observation + no other conflict → still forces review."""
+        inst = _inst(
+            geom_conf=0.95, dim_conf=0.95, assoc_conf=0.95,
+            observations=[
+                _obs(SOURCE_PLAN, width=0.82),
+                {
+                    "source": SOURCE_SCHEDULE,
+                    "width_m": None, "height_m": None,
+                    "dimension_basis": DIMENSION_BASIS_UNKNOWN,
+                    "dimension_confidence": 0.0,
+                    "type_mark": "D01", "page_no": None,
+                    "accepted": False, "status": "ambiguous",
+                    "alternatives": [
+                        {"width_mm": 820, "height_mm": 2100,
+                         "page_no": 5, "parse_source": "header_separate"},
+                        {"width_mm": 920, "height_mm": 2100,
+                         "page_no": 5, "parse_source": "header_separate"},
+                    ],
+                },
+            ],
+        )
+        reconciled, conflicts = reconcile_opening_evidence([inst])
+        ambig = [c for c in conflicts if c.conflict_type == "source_ambiguous"]
+        self.assertGreaterEqual(len(ambig), 1)
+        self.assertEqual(reconciled[0].deduction_status, DEDUCTION_REVIEW)
+
     def test_conflict_record_frozen(self):
         cr = ConflictRecord(
             opening_instance_id="abc",
@@ -689,7 +786,8 @@ class TestPipelineIntegration(unittest.TestCase):
         self.assertEqual(elev_obs[0]["type_mark"], "D01")
 
     def test_conflicting_duplicate_schedule(self):
-        """Conflicting D01 schedule rows → no enrichment, ambiguity recorded."""
+        """Conflicting D01 schedule rows → no enrichment, alternatives recorded,
+        B4 detects source_ambiguous conflict → status=review."""
         from pb_opening_schedule_v171 import enrich_opening_evidence, ScheduleEntry
         from pb_opening_evidence_v170 import record_plan_observation
         inst = _inst(
@@ -711,12 +809,21 @@ class TestPipelineIntegration(unittest.TestCase):
         enriched = enrich_opening_evidence([inst], [sched1, sched2])
         # No dimension enrichment — width stays 0.82
         self.assertAlmostEqual(enriched[0].width_m, 0.82, places=2)
-        # Conflicting schedule observation recorded
+        # Conflicting schedule observation with alternatives recorded
         sched_obs = [o for o in enriched[0].source_observations
                      if o["source"] == "schedule_parse"]
         self.assertEqual(len(sched_obs), 1)
         self.assertFalse(sched_obs[0]["accepted"])
         self.assertEqual(sched_obs[0].get("status"), "ambiguous")
+        alts = sched_obs[0].get("alternatives", [])
+        self.assertEqual(len(alts), 2)
+        alt_widths = {a["width_mm"] for a in alts}
+        self.assertEqual(alt_widths, {820, 920})
+        # B4 detects the ambiguity → review
+        reconciled, conflicts = reconcile_opening_evidence(enriched)
+        ambig = [c for c in conflicts if c.conflict_type == "source_ambiguous"]
+        self.assertGreaterEqual(len(ambig), 1)
+        self.assertEqual(reconciled[0].deduction_status, DEDUCTION_REVIEW)
 
 
 if __name__ == "__main__":

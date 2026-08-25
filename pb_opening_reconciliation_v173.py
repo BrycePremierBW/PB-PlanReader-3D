@@ -86,10 +86,11 @@ class ConflictRecord:
 # Source detection from structured observations
 # ---------------------------------------------------------------------------
 def _obs_sources(inst: OpeningEvidence) -> Dict[str, bool]:
-    """Determine which source types contributed observations.
+    """Determine which source types contributed VALID observations.
 
     Uses explicit source IDs from source_observations, NOT free-text
-    substring matching on evidence strings.
+    substring matching on evidence strings.  Ambiguous observations
+    (status="ambiguous") do NOT count as corroborating evidence.
     """
     sources: Dict[str, bool] = {
         SOURCE_PLAN: False,
@@ -98,7 +99,7 @@ def _obs_sources(inst: OpeningEvidence) -> Dict[str, bool]:
     }
     for obs in inst.source_observations:
         src = obs.get("source", "")
-        if src in sources:
+        if src in sources and obs.get("status") != "ambiguous":
             sources[src] = True
     return sources
 
@@ -270,6 +271,37 @@ def _detect_conflicts(inst: OpeningEvidence) -> List[ConflictRecord]:
                     f"remains unknown — cannot confirm rough_opening "
                     f"for wall deduction"
                 ),
+            ))
+
+    # --- Source ambiguity: internally contradictory observations ---
+    for obs in inst.source_observations:
+        if obs.get("status") == "ambiguous":
+            alternatives = obs.get("alternatives", [])
+            if alternatives:
+                alt_strs = [
+                    f"{a.get('width_mm', '?')}×{a.get('height_mm', '?')}mm"
+                    for a in alternatives
+                ]
+                desc = (
+                    f"{obs['source']} has conflicting alternatives for "
+                    f"mark '{obs.get('type_mark', '?')}': "
+                    f"{', '.join(alt_strs)}"
+                )
+            else:
+                desc = (
+                    f"{obs['source']} has internally conflicting "
+                    f"observations for mark '{obs.get('type_mark', '?')}'"
+                )
+            conflicts.append(ConflictRecord(
+                opening_instance_id=iid,
+                conflict_type="source_ambiguous",
+                source_a=obs["source"],
+                source_b="",
+                field_name="source_observations",
+                value_a=obs.get("status"),
+                value_b=str(len(alternatives)) if alternatives else "",
+                severity="error",
+                description=desc,
             ))
 
     return conflicts
