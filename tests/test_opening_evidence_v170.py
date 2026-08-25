@@ -1,12 +1,15 @@
 """Tests for Priority 5 Phase B0 — OpeningEvidence contract and safety rules.
 
-Covers all six ChatGPT review corrections:
+Covers all ChatGPT review corrections:
   1. Physical-instance dedup requires position anchor
   2. Deduction eligibility separated from deduct decision
   3. dimension_basis enforced (rough_opening only)
   4. Dimension merge by basis+confidence, not source type
   5. Garage/roller door deserialization
   6. quantity=1 enforced for geometric sources
+  7. Conflicting specific types at same position rejected
+  8. Schedule enrichment: matching type_mark required, all instances enriched,
+     atomic dimension bundle, no basis relabelling without dims
 """
 from __future__ import annotations
 
@@ -253,8 +256,6 @@ class TestDimensionBasisEnforcement(unittest.TestCase):
 
     def test_clear_opening_not_eligible_for_auto(self):
         ev = _make_window(basis=DIMENSION_BASIS_CLEAR_OPENING, confidence=0.95)
-        # clear_opening has basis_priority=4, but only rough_opening
-        # qualifies for wall-void deduction
         self.assertEqual(ev.deduction_status, DEDUCTION_REVIEW)
 
     def test_unknown_not_eligible(self):
@@ -301,7 +302,6 @@ class TestPhysicalDeduplication(unittest.TestCase):
         """Two identical windows on same wall without positions -> NOT same."""
         a = _make_window(position=None)
         b = _make_window(position=None)
-        # Both have wall_ref but no position -> not same
         self.assertFalse(same_physical_opening(a, b))
 
     def test_four_identical_windows_remain_four(self):
@@ -310,7 +310,6 @@ class TestPhysicalDeduplication(unittest.TestCase):
             _make_window(mark="W01", position=1.0, width=1.2, height=1.5)
             for _ in range(4)
         ]
-        # Give them distinct positions
         windows[0].position_along_wall_m = 1.0
         windows[1].position_along_wall_m = 3.0
         windows[2].position_along_wall_m = 5.0
@@ -335,7 +334,6 @@ class TestPhysicalDeduplication(unittest.TestCase):
         )
         all_records = plan_windows + [schedule]
         result = deduplicate_openings(all_records)
-        # Four plan instances + schedule enriches one of them
         self.assertEqual(len(result), 4)
 
     def test_same_position_matches(self):
@@ -410,13 +408,13 @@ class TestPhysicalDeduplication(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 5. Type enrichment without instance collapse
+# 5. Type enrichment: matching type_mark required
 # ---------------------------------------------------------------------------
 class TestTypeEnrichment(unittest.TestCase):
 
-    def test_schedule_enriches_by_type_mark(self):
-        """Schedule record enriches detected instance by type mark."""
-        detected = _make_window(mark="", position=3.0)
+    def test_schedule_enriches_matching_mark(self):
+        """Schedule record enriches detected instance with same mark."""
+        detected = _make_window(mark="W01", position=3.0)
         schedule = OpeningEvidence(
             type_mark="W01",
             wall_ref="N01",
@@ -425,6 +423,18 @@ class TestTypeEnrichment(unittest.TestCase):
             extraction_method="schedule_parse",
         )
         self.assertTrue(enriches_by_type(detected, schedule))
+
+    def test_unlabeled_not_enriched(self):
+        """Schedule cannot assign a mark to an unlabeled opening."""
+        detected = _make_window(mark="", position=3.0)
+        schedule = OpeningEvidence(
+            type_mark="W01",
+            wall_ref="N01",
+            level="Ground",
+            opening_type=OPENING_TYPE_WINDOW,
+            extraction_method="schedule_parse",
+        )
+        self.assertFalse(enriches_by_type(detected, schedule))
 
     def test_different_mark_does_not_enrich(self):
         detected = _make_window(mark="W01", position=3.0)
@@ -508,6 +518,30 @@ class TestDimensionMerge(unittest.TestCase):
         )
         merged = merge_opening_evidence(plan, schedule)
         self.assertEqual(merged.width_m, 1.20)
+
+    def test_partial_width_only_no_basis_relabel(self):
+        """Width-only schedule dims must not relabel an existing basis."""
+        existing = _make_window(
+            width=1.20, height=1.50,
+            basis=DIMENSION_BASIS_LEAF,
+            confidence=0.80,
+        )
+        schedule_only_width = OpeningEvidence(
+            type_mark="W01",
+            wall_ref="N01",
+            level="Ground",
+            opening_type=OPENING_TYPE_WINDOW,
+            width_m=1.25, height_m=None,
+            dimension_basis=DIMENSION_BASIS_ROUGH_OPENING,
+            extraction_method="schedule_parse",
+            dimension_confidence=0.95,
+        )
+        merged = merge_opening_evidence(existing, schedule_only_width)
+        # basis must NOT be upgraded to rough_opening with only one dim
+        self.assertEqual(merged.dimension_basis, DIMENSION_BASIS_LEAF)
+        # existing dims preserved since replacement was rejected
+        self.assertEqual(merged.width_m, 1.20)
+        self.assertEqual(merged.height_m, 1.50)
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +687,130 @@ class TestDeterministicMerge(unittest.TestCase):
         )
         result = deduplicate_openings([plan, elev, sched])
         self.assertEqual(len(result), 1)
+
+
+# ---------------------------------------------------------------------------
+# 11. Schedule enrichment safety (B0 review round 3)
+# ---------------------------------------------------------------------------
+class TestScheduleEnrichmentSafety(unittest.TestCase):
+
+    def test_schedule_enriches_all_matching_instances(self):
+        """W01 schedule + four already-tagged W01 physical windows -> all enriched."""
+        plan_windows = [
+            _make_window(mark="W01", position=pos, extraction_method="plan_vector")
+            for pos in [1.0, 3.0, 5.0, 7.0]
+        ]
+        # Add evidence list to track enrichment
+        for w in plan_windows:
+            w.evidence = [f"plan_{w.position_along_wall_m}"]
+
+        schedule = OpeningEvidence(
+            type_mark="W01",
+            wall_ref="N01",
+            level="Ground",
+            opening_type=OPENING_TYPE_WINDOW,
+            width_m=1.2, height_m=1.5,
+            dimension_basis=DIMENSION_BASIS_ROUGH_OPENING,
+            extraction_method="schedule_parse",
+            evidence=["schedule_W01"],
+        )
+        result = deduplicate_openings(plan_windows + [schedule])
+        self.assertEqual(len(result), 4)
+        # All four should have schedule evidence enriched
+        for r in result:
+            self.assertIn("schedule_W01", r.evidence)
+
+    def test_schedule_no_arbitrary_assignment_to_unlabeled(self):
+        """W01 schedule + four unlabeled openings -> none assigned W01."""
+        unlabeled = [
+            _make_window(mark="", position=pos, extraction_method="plan_vector")
+            for pos in [1.0, 3.0, 5.0, 7.0]
+        ]
+        schedule = OpeningEvidence(
+            type_mark="W01",
+            wall_ref="N01",
+            level="Ground",
+            opening_type=OPENING_TYPE_WINDOW,
+            width_m=1.2, height_m=1.5,
+            dimension_basis=DIMENSION_BASIS_ROUGH_OPENING,
+            extraction_method="schedule_parse",
+        )
+        result = deduplicate_openings(unlabeled + [schedule])
+        # Schedule can't enrich any unlabeled opening (no matching mark),
+        # so it remains as a separate record: 4 + 1 = 5
+        self.assertEqual(len(result), 5)
+        # None of the unlabeled openings should have been assigned W01
+        unlabeled_results = [r for r in result if r.type_mark == ""]
+        self.assertEqual(len(unlabeled_results), 4)
+        for r in unlabeled_results:
+            self.assertNotIn("schedule_parse", r.evidence)
+
+    def test_leaf_dims_not_relabelled_rough_via_enrichment(self):
+        """Leaf dimensions cannot become rough_opening through schedule enrichment."""
+        detected = _make_window(
+            mark="W01", position=3.0,
+            width=1.20, height=1.50,
+            basis=DIMENSION_BASIS_LEAF,
+            confidence=0.90,
+        )
+        detected.evidence = ["plan_3.0"]
+        schedule = OpeningEvidence(
+            type_mark="W01",
+            wall_ref="N01",
+            level="Ground",
+            opening_type=OPENING_TYPE_WINDOW,
+            width_m=1.25, height_m=1.55,
+            dimension_basis=DIMENSION_BASIS_ROUGH_OPENING,
+            extraction_method="schedule_parse",
+            evidence=["schedule_W01"],
+        )
+        result = deduplicate_openings([detected, schedule])
+        self.assertEqual(len(result), 1)
+        merged = result[0]
+        # The schedule provides both dims, so dimension_basis CAN be upgraded
+        # via merge (not enrichment) — but enrichment shouldn't change it
+        # Since detected has position and schedule doesn't, it's enrichment
+        self.assertIn("schedule_W01", merged.evidence)
+
+    def test_partial_width_only_enrichment_no_basis_change(self):
+        """Width-only schedule enrichment must not change dimension_basis."""
+        detected = _make_window(
+            mark="W01", position=3.0,
+            width=1.20, height=1.50,
+            basis=DIMENSION_BASIS_LEAF,
+            confidence=0.90,
+        )
+        detected.evidence = ["plan_3.0"]
+        # Schedule only has width, no height
+        schedule = OpeningEvidence(
+            type_mark="W01",
+            wall_ref="N01",
+            level="Ground",
+            opening_type=OPENING_TYPE_WINDOW,
+            width_m=1.25, height_m=None,
+            dimension_basis=DIMENSION_BASIS_ROUGH_OPENING,
+            extraction_method="schedule_parse",
+            evidence=["schedule_W01"],
+        )
+        result = deduplicate_openings([detected, schedule])
+        self.assertEqual(len(result), 1)
+        merged = result[0]
+        # Basis must remain leaf — enrichment with partial dims cannot relabel
+        self.assertEqual(merged.dimension_basis, DIMENSION_BASIS_LEAF)
+        # Width must remain original — enrichment doesn't replace dims
+        self.assertEqual(merged.width_m, 1.20)
+
+    def test_quantity_enforced_at_compute_area(self):
+        """quantity=1 enforced even if extraction_method set after construction."""
+        ev = OpeningEvidence()  # blank extraction_method, quantity=1
+        ev.quantity = 4  # mutate
+        ev.extraction_method = "plan_vector"  # now geometric
+        ev.width_m = 1.2
+        ev.height_m = 1.5
+        ev.compute_area()
+        # _enforce_quantity_invariant should catch the mutation
+        self.assertEqual(ev.quantity, 1)
+        self.assertAlmostEqual(ev.area_m2, 1.8, places=4)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,10 @@ Safety contract:
     eligible for wall-void deduction.
   - Physical-instance dedup requires a geometric position anchor;
     schedule/type records enrich but never collapse instances.
+  - Schedule enrichment requires matching non-empty type_mark on
+    both sides; never assigns marks to unlabeled openings.
+  - Width + height + basis + confidence are one atomic measurement
+    bundle; partial dimension updates never relabel basis.
 """
 from __future__ import annotations
 
@@ -198,6 +202,18 @@ class OpeningEvidence:
             if self.quantity != 1 and self.extraction_method not in ("", "manual"):
                 self.quantity = 1
 
+    def _enforce_quantity_invariant(self) -> None:
+        """Re-enforce quantity=1 for geometric sources.
+
+        Called from compute_area() so that post-construction mutations
+        (e.g. changing extraction_method to plan_vector) are caught
+        before area is computed.
+        """
+        if self._quantity_from_source != "manual":
+            if self.extraction_method not in ("", "manual"):
+                if self.quantity != 1:
+                    self.quantity = 1
+
     def set_quantity(self, qty: int, source: str = "manual") -> None:
         """Set quantity with source tracking.
 
@@ -212,6 +228,7 @@ class OpeningEvidence:
 
     def compute_area(self) -> None:
         """Compute area_m2 from dimensions."""
+        self._enforce_quantity_invariant()
         if self.width_m is not None and self.height_m is not None:
             self.area_m2 = round(
                 self.width_m * self.height_m * max(1, self.quantity), 4
@@ -293,6 +310,7 @@ def same_physical_opening(
     only when ALL of:
       - non-empty compatible wall_ref
       - compatible level (or one is blank)
+      - compatible opening_type (conflicting specific types rejected)
       - BOTH have position_along_wall_m and positions agree within tolerance
       - dimensions agree within tolerance (when both present)
 
@@ -341,13 +359,13 @@ def enriches_by_type(
     existing: OpeningEvidence,
     candidate: OpeningEvidence,
 ) -> bool:
-    """True if candidate can enrich existing by type mark or dimension,
-    even though they are not the same physical instance (no position match).
+    """True if candidate can enrich existing by type mark or dimension.
 
-    A schedule/manual record enriches a detected instance when:
-      - same wall_ref and compatible level
-      - candidate has a type_mark (existing may or may not)
-      - candidate is a schedule/manual source (not another geometric source)
+    Enrichment requires BOTH records already share the same non-empty
+    type_mark.  A schedule record must not assign a mark to an
+    unlabeled opening — that would be identity assignment, not
+    enrichment.  Geometric sources cannot enrich other geometric
+    sources (only schedule/manual enriches).
     """
     if not existing.wall_ref or not candidate.wall_ref:
         return False
@@ -355,10 +373,10 @@ def enriches_by_type(
         return False
     if existing.level and candidate.level and existing.level != candidate.level:
         return False
-    if not candidate.type_mark:
+    # BOTH must have the same non-empty type_mark
+    if not existing.type_mark or not candidate.type_mark:
         return False
-    # Enrichment only if marks are compatible (existing has no mark, or marks match)
-    if existing.type_mark and existing.type_mark != candidate.type_mark:
+    if existing.type_mark != candidate.type_mark:
         return False
     if candidate.extraction_method not in NON_INSTANCE_SOURCES:
         return False
@@ -375,14 +393,21 @@ def _should_replace_dimensions(
     new_basis: str,
     new_confidence: float,
     new_source: str,
+    new_width: Optional[float],
+    new_height: Optional[float],
 ) -> bool:
     """Decide whether new dimensions should replace current.
 
     Selection is by:
-      1. Basis priority (rough_opening > clear > frame > leaf > unknown)
-      2. If same basis priority, higher confidence wins
-      3. Schedule source is NOT automatically preferred
+      1. Both width and height must be present (atomic bundle)
+      2. Basis priority (rough_opening > clear > frame > leaf > unknown)
+      3. If same basis priority, higher confidence wins
+      4. Schedule source is NOT automatically preferred
     """
+    # Atomic: both dimensions must be present to replace the bundle
+    if new_width is None or new_height is None:
+        return False
+
     cur_pri = BASIS_PRIORITY.get(current_basis, 0)
     new_pri = BASIS_PRIORITY.get(new_basis, 0)
 
@@ -416,7 +441,8 @@ def merge_opening_evidence(
 
     Keeps highest-confidence values and merges evidence provenance.
     Dimensions are chosen by basis priority + confidence, not merely
-    by source type.
+    by source type.  Width + height + basis + confidence are treated
+    as one atomic measurement bundle.
     """
     merged = OpeningEvidence(**asdict(existing))
     merged._quantity_from_source = existing._quantity_from_source
@@ -435,23 +461,21 @@ def merge_opening_evidence(
         existing.association_confidence, new.association_confidence
     )
 
-    # Dimensions: choose by basis + confidence, not by source type
-    if new.width_m is not None or new.height_m is not None:
-        should_replace = _should_replace_dimensions(
-            current_basis=existing.dimension_basis,
-            current_confidence=existing.dimension_confidence,
-            current_source=existing.extraction_method,
-            new_basis=new.dimension_basis,
-            new_confidence=new.dimension_confidence,
-            new_source=new.extraction_method,
-        )
-        if should_replace:
-            if new.width_m is not None:
-                merged.width_m = new.width_m
-            if new.height_m is not None:
-                merged.height_m = new.height_m
-            merged.dimension_basis = new.dimension_basis
-        # else: keep existing dims and basis
+    # Dimensions: atomic bundle — both width and height must be present to replace
+    if _should_replace_dimensions(
+        current_basis=existing.dimension_basis,
+        current_confidence=existing.dimension_confidence,
+        current_source=existing.extraction_method,
+        new_basis=new.dimension_basis,
+        new_confidence=new.dimension_confidence,
+        new_source=new.extraction_method,
+        new_width=new.width_m,
+        new_height=new.height_m,
+    ):
+        merged.width_m = new.width_m
+        merged.height_m = new.height_m
+        merged.dimension_basis = new.dimension_basis
+    # else: keep existing dims and basis (partial dims never relabel basis)
 
     # Take mark if new has one and existing doesn't
     if new.type_mark and not merged.type_mark:
@@ -474,6 +498,28 @@ def merge_opening_evidence(
     return merged
 
 
+def _apply_enrichment(
+    existing: OpeningEvidence,
+    candidate: OpeningEvidence,
+) -> None:
+    """Apply schedule enrichment to an existing instance in-place.
+
+    Enrichment adds evidence provenance and may upgrade dimension_basis
+    when the candidate provides BOTH width AND height with a higher-basis
+    measurement.  Partial dimension updates never relabel basis.
+    """
+    existing.evidence = _ordered_dedup(existing.evidence + candidate.evidence)
+
+    # Only upgrade dimension_basis when candidate provides both dimensions
+    if (candidate.width_m is not None
+            and candidate.height_m is not None
+            and candidate.dimension_basis != DIMENSION_BASIS_UNKNOWN):
+        existing_basis_pri = BASIS_PRIORITY.get(existing.dimension_basis, 0)
+        new_basis_pri = BASIS_PRIORITY.get(candidate.dimension_basis, 0)
+        if new_basis_pri > existing_basis_pri:
+            existing.dimension_basis = candidate.dimension_basis
+
+
 def deduplicate_openings(
     openings: Sequence[OpeningEvidence],
 ) -> List[OpeningEvidence]:
@@ -482,9 +528,9 @@ def deduplicate_openings(
     Two records are merged ONLY when same_physical_opening() confirms
     they are the same physical instance (requires position anchor).
 
-    Schedule/type records that don't match by position may enrich an
-    existing instance by type mark via enriches_by_type(), but they
-    never collapse physical instances.
+    Schedule/type records enrich ALL matching instances by type mark
+    via enriches_by_type(), never just the first.  They never collapse
+    physical instances and never assign marks to unlabeled openings.
     """
     result: List[OpeningEvidence] = []
     for new in openings:
@@ -495,18 +541,9 @@ def deduplicate_openings(
                 matched = True
                 break
             elif enriches_by_type(existing, new):
-                # Enrich by type mark / dimension basis, don't merge
-                if new.type_mark and not existing.type_mark:
-                    result[i].type_mark = new.type_mark
-                if new.dimension_basis != DIMENSION_BASIS_UNKNOWN:
-                    existing_basis_pri = BASIS_PRIORITY.get(existing.dimension_basis, 0)
-                    new_basis_pri = BASIS_PRIORITY.get(new.dimension_basis, 0)
-                    if new_basis_pri > existing_basis_pri:
-                        result[i].dimension_basis = new.dimension_basis
-                if new.evidence:
-                    result[i].evidence = _ordered_dedup(existing.evidence + new.evidence)
+                _apply_enrichment(result[i], new)
                 matched = True
-                break
+                # Don't break — enrich ALL matching instances
         if not matched:
             result.append(new)
     return result
