@@ -702,19 +702,21 @@ class TestWindowDetection(unittest.TestCase):
 
     def test_three_windows_close_1_5m_at_200pt_m(self):
         """Same 3-window layout at 200 pt/m with 0.9 m opening widths → 3 candidates.
-        Proves physical scale invariance: same layout at different PDF scales."""
+        Proves physical scale invariance: same layout at different PDF scales.
+        Jamb segments are 80pt = 0.4m (above scale-aware MIN_WINDOW_PT=60pt)."""
         wall = WallLine(segment=_horiz_seg(0, 100, 4800, 100))
         # Window centres at 1200, 1500, 1800 → spacing = 300pt = 1.5m at 200pt/m
         # Jamb spacing = 180pt = 0.9m opening width (realistic)
-        jamb1a = _vert_seg(1110, 85, 115)
-        jamb1b = _vert_seg(1290, 85, 115)
-        jamb2a = _vert_seg(1410, 85, 115)
-        jamb2b = _vert_seg(1590, 85, 115)
-        jamb3a = _vert_seg(1710, 85, 115)
-        jamb3b = _vert_seg(1890, 85, 115)
+        # Jamb length = 80pt = 0.4m (must exceed MIN_WINDOW_PT at 200pt/m)
+        jamb1a = _vert_seg(1110, 60, 140)
+        jamb1b = _vert_seg(1290, 60, 140)
+        jamb2a = _vert_seg(1410, 60, 140)
+        jamb2b = _vert_seg(1590, 60, 140)
+        jamb3a = _vert_seg(1710, 60, 140)
+        jamb3b = _vert_seg(1890, 60, 140)
 
         all_segs = [wall.segment, jamb1a, jamb1b, jamb2a, jamb2b, jamb3a, jamb3b]
-        words = [_word("W01", 1200, 70), _word("W02", 1500, 70), _word("W03", 1800, 70)]
+        words = [_word("W01", 1200, 40), _word("W02", 1500, 40), _word("W03", 1800, 40)]
 
         windows = detect_window_candidates(
             all_segs, [wall], words,
@@ -860,6 +862,143 @@ class TestWindowDetection(unittest.TestCase):
         # Each wall's window gets its own tag (2D distance ensures no cross-assignment)
         self.assertEqual(windows_a[0].tag, "W01")
         self.assertEqual(windows_b[0].tag, "W02")
+
+    # --- Round 8 regressions: scale-aware thresholds + page-level tags ---
+
+    def test_hatch_pairs_not_rescued_by_far_perpendicular_w_tag(self):
+        """5 hatch-like pairs + one W03 tag 200pt perpendicular from the wall.
+        The tag shares the correct along-wall coordinate but is physically far
+        away.  The 2D distance (200pt) exceeds TAG_RADIUS_PT at 50pt/m (120pt),
+        so the tag must NOT rescue any pair from hatch rejection."""
+        wall = WallLine(segment=_horiz_seg(0, 100, 600, 100))
+        # 5 pairs at centres 150, 220, 290, 360, 430 → spacing = 70pt = 1.4m
+        # Hatch filter triggers (max_gap=70 < scale_min=75 at 50pt/m)
+        pairs_segs = []
+        for cx in [150, 220, 290, 360, 430]:
+            pairs_segs.append(_vert_seg(cx - 22, 85, 115))
+            pairs_segs.append(_vert_seg(cx + 22, 85, 115))
+
+        all_segs = [wall.segment] + pairs_segs
+        # W03 at same x=290 but y=300 (200pt perpendicular, > 120pt radius)
+        words = [_word("W03", 290, 300)]
+
+        windows = detect_window_candidates(
+            all_segs, [wall], words,
+            scale_info={"px_per_m": 50.0, "render_zoom": 1.0},
+        )
+        # Tag is 200pt away (2D), exceeds 120pt radius → no assignment → hatch rejects all
+        self.assertEqual(len(windows), 0)
+
+    def test_tag_radius_scales_with_calibration(self):
+        """Same physical layout at 50pt/m and 200pt/m.  W tag at 150pt perpendicular
+        from wall: rejected at 50pt/m (radius=120pt), accepted at 200pt/m (radius=240pt).
+        Proves tag proximity is calibrated, not fixed."""
+        # --- 50pt/m: TAG_RADIUS_PT = 120pt ---
+        wall_50 = WallLine(segment=_horiz_seg(0, 100, 800, 100))
+        jamb_a = _vert_seg(380, 85, 115)
+        jamb_b = _vert_seg(420, 85, 115)
+        all_segs_50 = [wall_50.segment, jamb_a, jamb_b]
+        # Tag at same x=400, y=250 → 2D distance = 150pt > 120pt radius
+        words_50 = [_word("W01", 400, 250)]
+        windows_50 = detect_window_candidates(
+            all_segs_50, [wall_50], words_50,
+            scale_info={"px_per_m": 50.0, "render_zoom": 1.0},
+        )
+        self.assertEqual(len(windows_50), 1)
+        self.assertEqual(windows_50[0].tag, "")  # too far → not assigned
+
+        # --- 200pt/m: TAG_RADIUS_PT = 240pt ---
+        wall_200 = WallLine(segment=_horiz_seg(0, 100, 3200, 100))
+        jamb_a2 = _vert_seg(1520, 60, 140)  # 80pt = 0.4m (above MIN_WINDOW_PT=60pt)
+        jamb_b2 = _vert_seg(1680, 60, 140)
+        all_segs_200 = [wall_200.segment, jamb_a2, jamb_b2]
+        # Same physical tag position: y=250 → 2D distance = 150pt < 240pt radius
+        words_200 = [_word("W01", 1600, 250)]
+        windows_200 = detect_window_candidates(
+            all_segs_200, [wall_200], words_200,
+            scale_info={"px_per_m": 200.0, "render_zoom": 1.0},
+        )
+        self.assertEqual(len(windows_200), 1)
+        self.assertEqual(windows_200[0].tag, "W01")  # within 240pt radius → assigned
+
+    def test_door_0_9m_detected_at_both_scales(self):
+        """Same physical 0.9m door at 50pt/m and 200pt/m → both detected.
+        Old fixed MAX_LEAF_PT=150 rejected 0.9m at 200pt/m (180pt)."""
+        from pb_plan_opening_detection_v171 import detect_door_candidates
+
+        # --- 50pt/m: door leaf = 45pt ---
+        wall_50 = WallLine(segment=_horiz_seg(0, 100, 1000, 100))
+        door_50 = _vert_seg(500, 85, 115)  # 30pt leaf at 50pt/m
+        words_50 = [_word("D01", 500, 70)]
+
+        doors_50 = detect_door_candidates(
+            [wall_50.segment, door_50], [wall_50], words_50,
+            scale_info={"px_per_m": 50.0, "render_zoom": 1.0},
+        )
+        self.assertGreaterEqual(len(doors_50), 1)
+
+        # --- 200pt/m: door leaf = 180pt (old MAX_LEAF_PT=150 would reject) ---
+        wall_200 = WallLine(segment=_horiz_seg(0, 100, 4000, 100))
+        door_200 = _vert_seg(2000, 10, 190)  # 180pt leaf = 0.9m at 200pt/m
+        words_200 = [_word("D01", 2000, 0)]
+
+        doors_200 = detect_door_candidates(
+            [wall_200.segment, door_200], [wall_200], words_200,
+            scale_info={"px_per_m": 200.0, "render_zoom": 1.0},
+        )
+        self.assertGreaterEqual(len(doors_200), 1)
+
+    def test_gap_1_2m_detected_at_both_scales(self):
+        """Same physical 1.2m gap at 50pt/m and 200pt/m → both detected.
+        Old fixed MAX_GAP_PT=200 rejected 1.2m at 200pt/m (240pt)."""
+        # --- 50pt/m: gap = 60pt ---
+        gap_a_50 = WallLine(segment=_horiz_seg(0, 100, 470, 100))
+        gap_b_50 = WallLine(segment=_horiz_seg(530, 100, 1000, 100))
+
+        gaps_50 = detect_gap_candidates(
+            [gap_a_50.segment, gap_b_50.segment],
+            [gap_a_50, gap_b_50], [],
+            scale_info={"px_per_m": 50.0, "render_zoom": 1.0},
+        )
+        self.assertGreaterEqual(len(gaps_50), 1)
+
+        # --- 200pt/m: gap = 240pt (old MAX_GAP_PT=200 would reject) ---
+        gap_a_200 = WallLine(segment=_horiz_seg(0, 100, 1880, 100))
+        gap_b_200 = WallLine(segment=_horiz_seg(2120, 100, 4000, 100))
+
+        gaps_200 = detect_gap_candidates(
+            [gap_a_200.segment, gap_b_200.segment],
+            [gap_a_200, gap_b_200], [],
+            scale_info={"px_per_m": 200.0, "render_zoom": 1.0},
+        )
+        self.assertGreaterEqual(len(gaps_200), 1)
+
+    def test_one_w_tag_not_reusable_across_walls(self):
+        """Two nearby walls with window pairs at the same X, one W tag
+        between them → only ONE window gets the tag (page-level used_tags).
+        Proves W annotations are consumed, not shared."""
+        wall_a = WallLine(segment=_horiz_seg(0, 100, 800, 100), wall_ref="N01")
+        wall_b = WallLine(segment=_horiz_seg(0, 300, 800, 300), wall_ref="S01")
+        jamb_a1 = _vert_seg(380, 85, 115)
+        jamb_a2 = _vert_seg(420, 85, 115)
+        jamb_b1 = _vert_seg(380, 285, 315)
+        jamb_b2 = _vert_seg(420, 285, 315)
+
+        all_segs = [wall_a.segment, jamb_a1, jamb_a2,
+                     wall_b.segment, jamb_b1, jamb_b2]
+        # One W tag at (400, 200) — between the two walls, within 120pt of both
+        words = [_word("W01", 400, 200)]
+
+        # Single call with both walls — page-level used_tags must prevent reuse
+        windows = detect_window_candidates(
+            all_segs, [wall_a, wall_b], words,
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(windows), 2)
+        tagged = [w for w in windows if w.tag == "W01"]
+        untagged = [w for w in windows if w.tag == ""]
+        self.assertEqual(len(tagged), 1)
+        self.assertEqual(len(untagged), 1)
 
 
 # ---------------------------------------------------------------------------
