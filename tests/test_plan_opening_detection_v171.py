@@ -694,6 +694,11 @@ class TestWindowDetection(unittest.TestCase):
         self.assertEqual(len(windows), 3)
         tags = {w.tag for w in windows}
         self.assertEqual(tags, {"W01", "W02", "W03"})
+        # Each tag at correct position (one-to-one, no stealing)
+        by_tag = {w.tag: w for w in windows}
+        self.assertAlmostEqual(by_tag["W01"].position_along_wall_m, 6.0, delta=0.2)
+        self.assertAlmostEqual(by_tag["W02"].position_along_wall_m, 7.5, delta=0.2)
+        self.assertAlmostEqual(by_tag["W03"].position_along_wall_m, 9.0, delta=0.2)
 
     def test_three_windows_close_1_5m_at_200pt_m(self):
         """Same 3-window layout at 200 pt/m with 0.9 m opening widths → 3 candidates.
@@ -720,11 +725,12 @@ class TestWindowDetection(unittest.TestCase):
         self.assertEqual(tags, {"W01", "W02", "W03"})
 
     def test_w_tag_overrides_hatch_filter_for_multiple_pairs(self):
-        """Five hatch-like pairs + one W03 tag → only the W03-corroborated
-        pair survives, not all 5.  Proves pair-local W-tag corroboration.
+        """Five hatch-like pairs + one W03 tag → only the pair at position
+        290 (where W03 actually sits) survives, not all 5 and not the
+        wrong pair at 220.  Proves globally-nearest one-to-one assignment.
 
         Without tags: all 5 rejected as hatch (max_gap=70 < scale_min=75)
-        With W03 tag: only the pair near W03 survives, other 4 stay rejected"""
+        With W03 tag at x=290: only the 290 pair survives"""
         wall = WallLine(segment=_horiz_seg(0, 100, 600, 100))
         # 5 pairs at centres 150, 220, 290, 360, 430 → spacing = 70pt = 1.4m
         # Jamb spacing = 44pt = 0.88m opening width
@@ -745,13 +751,64 @@ class TestWindowDetection(unittest.TestCase):
         )
         self.assertEqual(len(windows_no_tag), 0)
 
-        # With W03 tag: only the W03-corroborated pair survives (not all 5)
+        # With W03 tag at x=290: only the 290 pair survives (not 220, not all 5)
         windows_with_tag = detect_window_candidates(
             all_segs, [wall], words_with_tag,
             scale_info={"px_per_m": 50.0, "render_zoom": 1.0},
         )
         self.assertEqual(len(windows_with_tag), 1)
         self.assertEqual(windows_with_tag[0].tag, "W03")
+        # Position must correspond to the 290 pair (≈5.8m at 50pt/m)
+        self.assertAlmostEqual(windows_with_tag[0].position_along_wall_m, 5.8, delta=0.2)
+
+    def test_w_tag_one_to_one_assignment(self):
+        """One W tag within range of two valid window pairs → exactly one
+        pair gets that tag (not both).  Proves one-to-one assignment."""
+        wall = WallLine(segment=_horiz_seg(0, 100, 800, 100))
+        # Two valid window pairs at centres 200 and 400 (200pt apart = 4.0m)
+        # Gap ratio = 200/40 = 5.0 > 2.5 → not hatch, both detected
+        jamb1a = _vert_seg(180, 85, 115)
+        jamb1b = _vert_seg(220, 85, 115)  # centre 200
+        jamb2a = _vert_seg(380, 85, 115)
+        jamb2b = _vert_seg(420, 85, 115)  # centre 400
+
+        all_segs = [wall.segment, jamb1a, jamb1b, jamb2a, jamb2b]
+        # One W tag at x=300 (midpoint of the pair) — 100pt from each pair
+        words = [_word("W01", 300, 70)]
+
+        windows = detect_window_candidates(
+            all_segs, [wall], words,
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(windows), 2)
+        # Only one window gets the W01 tag (closest pair wins)
+        tagged = [w for w in windows if w.tag == "W01"]
+        untagged = [w for w in windows if w.tag == ""]
+        self.assertEqual(len(tagged), 1)
+        self.assertEqual(len(untagged), 1)
+
+    def test_multiple_w_tags_each_assigned_once(self):
+        """Two W tags + two window pairs → each tag assigned to exactly
+        one pair, no sharing."""
+        wall = WallLine(segment=_horiz_seg(0, 100, 800, 100))
+        jamb1a = _vert_seg(180, 85, 115)
+        jamb1b = _vert_seg(220, 85, 115)  # centre 200
+        jamb2a = _vert_seg(580, 85, 115)
+        jamb2b = _vert_seg(620, 85, 115)  # centre 600
+
+        all_segs = [wall.segment, jamb1a, jamb1b, jamb2a, jamb2b]
+        words = [_word("W01", 200, 70), _word("W02", 600, 70)]
+
+        windows = detect_window_candidates(
+            all_segs, [wall], words,
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(windows), 2)
+        tags = {w.tag for w in windows}
+        self.assertEqual(tags, {"W01", "W02"})
+        # Each tag used exactly once
+        for w in windows:
+            self.assertIn(w.tag, ["W01", "W02"])
 
 
 # ---------------------------------------------------------------------------

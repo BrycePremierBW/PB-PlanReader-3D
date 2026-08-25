@@ -587,14 +587,14 @@ def detect_window_candidates(
         # rejected — one annotation must not promote unrelated linework.
         is_hatch = False
         hatch_tagged_indices: set = set()  # pair indices with W tags (when hatch)
+        pair_assigned_tag: Dict[int, str] = {}  # pair_idx → assigned tag text
         if len(pairs) >= 2:
-            # Collect W-tag positions (exclusive: each tag used at most once)
-            w_tag_positions = []
-            for w in words:
-                if _classify_tag(w.text) == "window":
-                    w_tag_positions.append(
-                        ((w.cx - wall_ox) * wall_dx + (w.cy - wall_oy) * wall_dy) / wall_len
-                    )
+            # --- One-to-one W-tag assignment (globally nearest) ---
+            # Build all (distance, tag_idx, pair_idx) candidates within 120pt,
+            # sort by distance, then greedily assign closest first.  Each tag
+            # and each pair is used at most once.
+            w_tag_indices = [i for i, w in enumerate(words)
+                             if _classify_tag(w.text) == "window"]
 
             pair_midpoints = []
             pair_jamb_spacings = []
@@ -604,32 +604,38 @@ def detect_window_candidates(
                 pair_midpoints.append(((mcx - wall_ox) * wall_dx + (mcy - wall_oy) * wall_dy) / wall_len)
                 pair_jamb_spacings.append(_segment_distance(a, b))
 
-            # Sort midpoints and find exclusive nearest W-tag for each pair
+            # All candidate matches within radius, sorted by distance
+            TAG_RADIUS_PT = 120.0
+            tag_pair_matches: List[Tuple[float, int, int]] = []  # (dist, tag_idx, pair_idx)
+            for pi, mp in enumerate(pair_midpoints):
+                for ti in w_tag_indices:
+                    tp = ((words[ti].cx - wall_ox) * wall_dx + (words[ti].cy - wall_oy) * wall_dy) / wall_len
+                    d = abs(mp - tp)
+                    if d <= TAG_RADIUS_PT:
+                        tag_pair_matches.append((d, ti, pi))
+            tag_pair_matches.sort(key=lambda x: x[0])  # globally nearest first
+
+            used_tags: set = set()
+            used_pairs: set = set()
+            pair_has_w_tag = [False] * len(pairs)
+            for dist, ti, pi in tag_pair_matches:
+                if ti in used_tags or pi in used_pairs:
+                    continue
+                pair_has_w_tag[pi] = True
+                pair_assigned_tag[pi] = words[ti].text
+                used_tags.add(ti)
+                used_pairs.add(pi)
+
+            # Sort midpoints for gap analysis
             indexed_pairs = sorted(enumerate(pair_midpoints), key=lambda x: x[1])
             pair_midpoints_sorted = [pair_midpoints[orig_i] for orig_i, _ in indexed_pairs]
-            used_tags: set = set()
-            pair_has_w_tag_sorted = []
-            for _, mp in indexed_pairs:
-                best_tag_dist = float("inf")
-                best_tag_idx = -1
-                for ti, tp in enumerate(w_tag_positions):
-                    if ti in used_tags:
-                        continue
-                    d = abs(mp - tp)
-                    if d < best_tag_dist:
-                        best_tag_dist = d
-                        best_tag_idx = ti
-                if best_tag_idx >= 0 and best_tag_dist <= 120.0:
-                    pair_has_w_tag_sorted.append(True)
-                    used_tags.add(best_tag_idx)
-                else:
-                    pair_has_w_tag_sorted.append(False)
+            pair_has_w_tag_sorted = [pair_has_w_tag[orig_i] for orig_i, _ in indexed_pairs]
             original_indices = [orig_i for orig_i, _ in indexed_pairs]
 
             # Gaps between consecutive pair midpoints
             gaps_between = [
-                pair_midpoints[k + 1] - pair_midpoints[k]
-                for k in range(len(pair_midpoints) - 1)
+                pair_midpoints_sorted[k + 1] - pair_midpoints_sorted[k]
+                for k in range(len(pair_midpoints_sorted) - 1)
             ]
             mean_jamb = sum(pair_jamb_spacings) / len(pair_jamb_spacings)
 
@@ -681,16 +687,23 @@ def detect_window_candidates(
             pos_pt = ((mid_cx - wall_ox) * wall_dx + (mid_cy - wall_oy) * wall_dy) / wall_len
             pos_m = _pt_to_m(pos_pt, m_per_pt)
 
-            tag, tag_cls = _find_tag_near(mid_cx, mid_cy, words)
-
-            # Tag/type compatibility: window geometry may only assign Wxx marks
-            assigned_tag = ""
-            if tag and tag_cls == "window":
-                assigned_tag = tag  # compatible: W tag for window geometry
-            elif tag and tag_cls == "door":
-                pass  # conflicting: D tag near window — don't assign
-            elif tag:
-                pass  # unknown tag type
+            # Use the exclusive one-to-one tag assignment from the hatch filter.
+            # This ensures one W tag = one pair (no stealing, no double-use).
+            # Fallback to _find_tag_near only for pairs with no pre-assigned tag
+            # (single-pair walls that skip the hatch filter).
+            assigned_tag = pair_assigned_tag.get(pair_idx, "")
+            raw_tag = ""
+            raw_tag_cls = ""
+            if not assigned_tag:
+                tag, tag_cls = _find_tag_near(mid_cx, mid_cy, words)
+                raw_tag = tag or ""
+                raw_tag_cls = tag_cls
+                # Tag/type compatibility: window geometry may only assign Wxx marks.
+                # Skip if this tag was already consumed by the one-to-one assignment.
+                consumed_tags = set(pair_assigned_tag.values())
+                if tag and tag_cls == "window" and tag not in consumed_tags:
+                    assigned_tag = tag
+            tag_cls = _classify_tag(assigned_tag) if assigned_tag else ""
 
             # --- Three independent confidence channels ---
 
@@ -703,20 +716,25 @@ def detect_window_candidates(
             assoc_conf = 0.70 if wl.wall_ref else 0.30
 
             # SEMANTIC: only W tags contribute to window semantic confidence
+            # D tags near window geometry are conflicting (not assigned)
             sem_conf = 0.0
-            if tag and tag_cls == "window":
+            if assigned_tag and tag_cls == "window":
                 sem_conf = 0.95
-            elif tag and tag_cls == "door":
+            elif assigned_tag and tag_cls == "door":
                 sem_conf = 0.30  # conflicting tag
-            elif tag:
+            elif assigned_tag:
                 sem_conf = 0.60
+            elif raw_tag and raw_tag_cls == "door":
+                sem_conf = 0.30  # D tag near window — conflicting, not assigned
 
             ev = []
             ev.append(f"jamb_pair: {a.length:.1f}pt + {b.length:.1f}pt, spacing={pair_dist:.1f}pt")
             if assigned_tag:
-                ev.append(f"tag: {tag} (window-compatible)")
-            elif tag:
-                ev.append(f"tag: {tag} (conflicting — not assigned as type_mark)")
+                ev.append(f"tag: {assigned_tag} (window-compatible)")
+            elif raw_tag and raw_tag_cls == "door":
+                ev.append(f"tag: {raw_tag} (conflicting — not assigned as type_mark)")
+            elif raw_tag:
+                ev.append(f"tag: {raw_tag} (not window-compatible)")
 
             candidates.append(WindowCandidate(
                 wall_ref=wl.wall_ref or "",
