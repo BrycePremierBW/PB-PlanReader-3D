@@ -25,10 +25,13 @@ from pb_opening_schedule_v171 import (
     VERSION,
     ScheduleEntry,
     parse_dimension,
+    parse_single_dimension,
     extract_mark,
     detect_header,
     parse_schedule_rows,
     enrich_opening_evidence,
+    _is_plausible_dimension,
+    _has_rating_keywords,
 )
 
 
@@ -418,15 +421,36 @@ class TestEnrichment(unittest.TestCase):
         result = enrich_opening_evidence([inst], sched)
         self.assertEqual(result[0].type_mark, "")  # mark not assigned
 
-    def test_first_schedule_mark_wins(self):
-        """If schedule has duplicate marks, first entry wins."""
+    def test_duplicate_same_dims_enriches(self):
+        """Duplicate D01 with identical dimensions → enrichment allowed."""
         inst = _inst(mark="D01")
         sched = [
             _entry("D01", w=820, h=2040),
-            _entry("D01", w=900, h=2100),  # duplicate — ignored
+            _entry("D01", w=820, h=2040),  # identical — safe
         ]
         result = enrich_opening_evidence([inst], sched)
         self.assertAlmostEqual(result[0].height_m, 2.04, places=2)
+
+    def test_duplicate_conflicting_dims_no_enrichment(self):
+        """Duplicate D01 with different dimensions → NO enrichment."""
+        inst = _inst(mark="D01")
+        sched = [
+            _entry("D01", w=820, h=2040),
+            _entry("D01", w=920, h=2100),  # conflicting
+        ]
+        result = enrich_opening_evidence([inst], sched)
+        self.assertIsNone(result[0].width_m)
+        self.assertIsNone(result[0].height_m)
+
+    def test_duplicate_conflicting_order_invariant(self):
+        """Reversing duplicate row order must not change result."""
+        inst = _inst(mark="D01")
+        sched_a = [_entry("D01", w=820, h=2040), _entry("D01", w=920, h=2100)]
+        sched_b = [_entry("D01", w=920, h=2100), _entry("D01", w=820, h=2040)]
+        result_a = enrich_opening_evidence([inst], sched_a)
+        result_b = enrich_opening_evidence([inst], sched_b)
+        self.assertIsNone(result_a[0].width_m)
+        self.assertIsNone(result_b[0].width_m)
 
     def test_enrichment_does_not_mutate_original(self):
         inst = _inst(mark="D01")
@@ -460,6 +484,167 @@ class TestSafetyContract(unittest.TestCase):
         result = enrich_opening_evidence([inst], sched)
         # merge_opening_evidence is called — evidence list should be merged
         self.assertIsInstance(result[0], OpeningEvidence)
+
+
+class TestParseSingleDimension(unittest.TestCase):
+    """parse_single_dimension() — unit-aware single-cell parsing."""
+
+    def test_bare_mm(self):
+        self.assertEqual(parse_single_dimension("820"), 820)
+
+    def test_mm_suffix(self):
+        self.assertEqual(parse_single_dimension("820mm"), 820)
+
+    def test_mm_suffix_with_space(self):
+        self.assertEqual(parse_single_dimension("2040 mm"), 2040)
+
+    def test_m_suffix_integer(self):
+        self.assertEqual(parse_single_dimension("1m"), 1000)
+
+    def test_m_suffix_integer_2(self):
+        self.assertEqual(parse_single_dimension("2m"), 2000)
+
+    def test_m_suffix_decimal(self):
+        self.assertEqual(parse_single_dimension("0.82m"), 820)
+
+    def test_m_suffix_decimal_2(self):
+        self.assertEqual(parse_single_dimension("2.04m"), 2040)
+
+    def test_empty(self):
+        self.assertIsNone(parse_single_dimension(""))
+
+    def test_none(self):
+        self.assertIsNone(parse_single_dimension(None))
+
+    def test_non_numeric(self):
+        self.assertIsNone(parse_single_dimension("solid core"))
+
+    def test_comma_separated(self):
+        self.assertEqual(parse_single_dimension("1,200"), 1200)
+
+
+class TestRatingKeywordRejection(unittest.TestCase):
+    """FRL/fire-rating/acoustic data must NOT become dimensions."""
+
+    def test_frl_60_60_no_header(self):
+        """D01 | Fire Door | FRL 60/60 → must not produce 60x60 dims."""
+        rows = [_row("D01\tFire Door\tFRL 60/60")]
+        entries = parse_schedule_rows(rows)
+        # No header → heuristic parser rejects rating rows
+        self.assertEqual(len(entries), 0)
+
+    def test_frl_with_compound_dims_header(self):
+        """D02 | FRL 120/120 | 820x2040 → must select 820x2040."""
+        rows = [
+            _row("Mark\tDescription\tDims"),
+            _row("D02\tFire Door FRL 120/120\t820x2040"),
+        ]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].width_mm, 820)
+        self.assertEqual(entries[0].height_mm, 2040)
+
+    def test_acoustic_rating_rejected(self):
+        """STC 50 rating must not become dimensions."""
+        rows = [_row("W01\tAcoustic STC 50")]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 0)
+
+    def test_fire_keyword_rejected(self):
+        """Fire door with no real dimensions → no entry."""
+        rows = [_row("D01\tFire rated door")]
+        entries = parse_schedule_rows(rows)
+        # No header, no dimension pattern, no entry
+        self.assertEqual(len(entries), 0)
+
+    def test_hr_rating_rejected(self):
+        """HR 60 rating must not become dimensions."""
+        rows = [_row("D03\tHR 60/60")]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 0)
+
+    def test_has_rating_keywords(self):
+        self.assertTrue(_has_rating_keywords("FRL 60/60"))
+        self.assertTrue(_has_rating_keywords("STC 50"))
+        self.assertTrue(_has_rating_keywords("Fire Door"))
+        self.assertFalse(_has_rating_keywords("Solid core flush"))
+        self.assertFalse(_has_rating_keywords("820x2040"))
+
+
+class TestPlausibilityValidation(unittest.TestCase):
+    """_is_plausible_dimension() — reject implausible sizes."""
+
+    def test_valid(self):
+        self.assertTrue(_is_plausible_dimension(820, 2040))
+
+    def test_both_none(self):
+        self.assertFalse(_is_plausible_dimension(None, None))
+
+    def test_width_too_small(self):
+        self.assertFalse(_is_plausible_dimension(60, 2040))
+
+    def test_height_too_small(self):
+        self.assertFalse(_is_plausible_dimension(820, 60))
+
+    def test_width_too_large(self):
+        self.assertFalse(_is_plausible_dimension(8000, 2040))
+
+    def test_height_only(self):
+        self.assertTrue(_is_plausible_dimension(None, 2040))
+
+    def test_width_only(self):
+        self.assertTrue(_is_plausible_dimension(820, None))
+
+
+class TestParseSource(unittest.TestCase):
+    """ScheduleEntry.parse_source — provenance tracking."""
+
+    def test_header_separate_columns(self):
+        rows = [
+            _row("Mark\tWidth\tHeight"),
+            _row("D01\t820\t2040"),
+        ]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(entries[0].parse_source, "header_separate")
+
+    def test_header_dims_column(self):
+        rows = [
+            _row("Mark\tSize"),
+            _row("D01\t820x2040"),
+        ]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(entries[0].parse_source, "header_dims")
+
+    def test_heuristic_no_header(self):
+        rows = [_row("D01 820x2040 Solid core")]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(entries[0].parse_source, "heuristic")
+
+    def test_frl_no_source(self):
+        """Rating rows that get rejected should not produce entries."""
+        rows = [_row("D01 FRL 60/60")]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 0)
+
+
+class TestDimensionEdgeCases(unittest.TestCase):
+    """Edge cases for parse_dimension."""
+
+    def test_slash_with_small_numbers(self):
+        """60/60 is implausible → rejected."""
+        w, h = parse_dimension("60/60")
+        self.assertIsNone(w)
+        self.assertIsNone(h)
+
+    def test_compound_plausible(self):
+        w, h = parse_dimension("820x2040")
+        self.assertEqual(w, 820)
+        self.assertEqual(h, 2040)
+
+    def test_compound_with_text(self):
+        w, h = parse_dimension("Size 820 x 2040 mm")
+        self.assertEqual(w, 820)
+        self.assertEqual(h, 2040)
 
 
 if __name__ == "__main__":

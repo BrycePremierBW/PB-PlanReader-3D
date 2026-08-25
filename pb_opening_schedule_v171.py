@@ -46,6 +46,7 @@ class ScheduleEntry:
     count: int = 1
     page_no: int = 0
     bbox: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    parse_source: str = ""      # "header_dims", "header_separate", "heuristic"
 
 
 # ---------------------------------------------------------------------------
@@ -99,10 +100,66 @@ _SINGLE_NUM_RE = re.compile(r"\b(\d{2,5})\b")
 _MM_RE = re.compile(r"(\d{2,5})\s*mm", re.IGNORECASE)
 _M_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3})?)\s*m\b", re.IGNORECASE)
 
+# Patterns that indicate rating/fire/acoustic data (NOT dimensions)
+_RATING_KEYWORDS = re.compile(
+    r"\b(frl|fire|rating|acoustic|stc|rw|db|hr|sound|insul)\b",
+    re.IGNORECASE,
+)
+
+# Minimum plausible opening dimension in mm
+_MIN_PLAUSIBLE_MM = 200
+# Maximum plausible opening dimension in mm
+_MAX_PLAUSIBLE_MM = 6000
+
 
 # ---------------------------------------------------------------------------
 # Dimension parsing
 # ---------------------------------------------------------------------------
+def _is_plausible_dimension(w: Optional[int], h: Optional[int]) -> bool:
+    """True if both dimensions are within plausible opening size ranges."""
+    if w is None and h is None:
+        return False
+    if w is not None and (w < _MIN_PLAUSIBLE_MM or w > _MAX_PLAUSIBLE_MM):
+        return False
+    if h is not None and (h < _MIN_PLAUSIBLE_MM or h > _MAX_PLAUSIBLE_MM):
+        return False
+    return True
+
+
+def _has_rating_keywords(text: str) -> bool:
+    """True if text contains fire-rating, acoustic, or similar non-dimension numbers."""
+    return bool(_RATING_KEYWORDS.search(text))
+
+
+def parse_single_dimension(text: str) -> Optional[int]:
+    """Parse a single dimension value from a cell, handling units.
+
+    Handles: "820", "820mm", "2040 mm", "0.82m", "1m", "2m"
+    Returns value in mm, or None if not parseable.
+    """
+    if not text or not text.strip():
+        return None
+    t = text.strip()
+
+    # Try mm suffix: "820mm", "2040 mm"
+    m = _MM_RE.search(t)
+    if m:
+        return int(m.group(1))
+
+    # Try m suffix: "0.82m", "1m", "2m"
+    m = _M_RE.search(t)
+    if m:
+        return round(float(m.group(1)) * 1000)
+
+    # Bare number: assume mm
+    t_clean = t.replace(",", "").strip()
+    try:
+        val = int(float(t_clean))
+        return val
+    except (ValueError, TypeError):
+        return None
+
+
 def parse_dimension(text: str) -> Tuple[Optional[int], Optional[int]]:
     """Parse width × height from a dimension cell or row fragment.
 
@@ -116,7 +173,15 @@ def parse_dimension(text: str) -> Tuple[Optional[int], Optional[int]]:
 
     t = text.strip()
 
-    # Try mm suffix first: "820mm x 2040mm"
+    # Try compound patterns FIRST: "820x2040", "820 × 2040 mm"
+    for pat in _DIMENSION_PATTERNS:
+        m = pat.search(t)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if _is_plausible_dimension(a, b):
+                return a, b
+
+    # Try mm suffix: "820mm x 2040mm"
     mm_match = _MM_RE.findall(t)
     if len(mm_match) >= 2:
         return int(mm_match[0]), int(mm_match[1])
@@ -136,21 +201,12 @@ def parse_dimension(text: str) -> Tuple[Optional[int], Optional[int]]:
             return None, val_mm
         return val_mm, None
 
-    # Try compound patterns: "820x2040"
-    for pat in _DIMENSION_PATTERNS:
-        m = pat.search(t)
-        if m:
-            a, b = int(m.group(1)), int(m.group(2))
-            # Convention: first number is width, second is height
-            # Heuristic: width ≤ 3000mm, height can be larger
-            if a <= 5000 and b <= 5000:
-                return a, b
-
     # Fallback: extract standalone numbers
     nums = _SINGLE_NUM_RE.findall(t)
     if len(nums) >= 2:
         a, b = int(nums[0]), int(nums[1])
-        return a, b
+        if _is_plausible_dimension(a, b):
+            return a, b
     if len(nums) == 1:
         val = int(nums[0])
         if val > 2000:
@@ -290,27 +346,29 @@ def parse_schedule_rows(
         # Extract dimensions
         width_mm: Optional[int] = None
         height_mm: Optional[int] = None
+        parse_source = "heuristic"
 
         if "dims" in col_map and col_map["dims"] < len(cells):
             width_mm, height_mm = parse_dimension(cells[col_map["dims"]])
+            parse_source = "header_dims"
         elif "width" in col_map and "height" in col_map:
             w_idx = col_map["width"]
             h_idx = col_map["height"]
             if w_idx < len(cells):
-                w_text = cells[w_idx].replace("mm", "").replace("m", "").strip()
-                try:
-                    width_mm = int(float(w_text) * (1000 if "." in w_text else 1))
-                except (ValueError, TypeError):
-                    pass
+                width_mm = parse_single_dimension(cells[w_idx])
             if h_idx < len(cells):
-                h_text = cells[h_idx].replace("mm", "").replace("m", "").strip()
-                try:
-                    height_mm = int(float(h_text) * (1000 if "." in h_text else 1))
-                except (ValueError, TypeError):
-                    pass
+                height_mm = parse_single_dimension(cells[h_idx])
+            parse_source = "header_separate"
         else:
-            # Fallback: search full row text for compound dimension
-            width_mm, height_mm = parse_dimension(text)
+            # Fallback: only use full-row if row has strong dimension signals
+            # and does NOT contain rating/fire/acoustic keywords
+            if not _has_rating_keywords(text):
+                width_mm, height_mm = parse_dimension(text)
+                if _is_plausible_dimension(width_mm, height_mm):
+                    parse_source = "heuristic"
+                else:
+                    width_mm, height_mm = None, None
+                    parse_source = ""
 
         # Extract count
         count = 1
@@ -333,6 +391,7 @@ def parse_schedule_rows(
             count=count,
             page_no=page_no,
             bbox=tuple(bbox) if len(bbox) >= 4 else (0, 0, 0, 0),
+            parse_source=parse_source,
         ))
 
     return entries
@@ -345,6 +404,8 @@ def _parse_rows_without_header(
     """Fallback parser when no header row is detected.
 
     Scans all rows for mark + dimension patterns.
+    Only extracts dimensions when the expression is strong and the row
+    does NOT contain rating/fire/acoustic keywords.
     """
     entries: List[ScheduleEntry] = []
     for row in rows:
@@ -355,13 +416,19 @@ def _parse_rows_without_header(
             continue
         if not (mark.startswith("D") or mark.startswith("W")):
             continue
+        # Reject rows with rating/fire/acoustic keywords
+        if _has_rating_keywords(text):
+            continue
         width_mm, height_mm = parse_dimension(text)
+        if not _is_plausible_dimension(width_mm, height_mm):
+            continue
         entries.append(ScheduleEntry(
             type_mark=mark,
             width_mm=width_mm,
             height_mm=height_mm,
             page_no=page_no,
             bbox=tuple(bbox) if len(bbox) >= 4 else (0, 0, 0, 0),
+            parse_source="heuristic",
         ))
     return entries
 
@@ -473,17 +540,49 @@ def enrich_opening_evidence(
     if not instances or not schedule_entries:
         return list(instances)
 
-    # Build lookup: type_mark → ScheduleEntry (first match wins)
-    schedule_by_mark: Dict[str, ScheduleEntry] = {}
+    # Build lookup: type_mark → list of ScheduleEntry (all rows for that mark)
+    schedule_by_mark: Dict[str, List[ScheduleEntry]] = {}
     for entry in schedule_entries:
-        if entry.type_mark and entry.type_mark not in schedule_by_mark:
-            schedule_by_mark[entry.type_mark] = entry
+        if entry.type_mark:
+            schedule_by_mark.setdefault(entry.type_mark, []).append(entry)
+
+    # For each mark, determine the authoritative schedule data:
+    # - Identical dimensions across duplicates → safe to use
+    # - Conflicting dimensions → skip enrichment (ambiguous)
+    mark_authority: Dict[str, Optional[ScheduleEntry]] = {}
+    for mark, entries_list in schedule_by_mark.items():
+        if len(entries_list) == 1:
+            mark_authority[mark] = entries_list[0]
+        else:
+            # Multiple rows for same mark — check dimension consistency
+            dims_set = set()
+            for e in entries_list:
+                dims_set.add((e.width_mm, e.height_mm))
+            if len(dims_set) == 1:
+                # All identical → safe
+                mark_authority[mark] = entries_list[0]
+            else:
+                # Conflicting → do NOT enrich
+                mark_authority[mark] = None
 
     enriched = []
     for inst in instances:
         mark = inst.type_mark
-        if mark and mark in schedule_by_mark:
-            sched = schedule_by_mark[mark]
+        if mark and mark in mark_authority:
+            sched = mark_authority[mark]
+            if sched is None:
+                # Conflicting duplicate — skip enrichment
+                enriched.append(inst)
+                continue
+            # Confidence based on parse provenance
+            if sched.parse_source == "header_separate":
+                dim_conf = 0.8
+            elif sched.parse_source == "header_dims":
+                dim_conf = 0.75
+            elif sched.parse_source == "heuristic":
+                dim_conf = 0.5
+            else:
+                dim_conf = 0.5
             # Create a schedule-sourced evidence record for merging
             sched_ev = OpeningEvidence(
                 type_mark=mark,
@@ -491,7 +590,7 @@ def enrich_opening_evidence(
                 height_m=(sched.height_mm / 1000.0) if sched.height_mm else None,
                 dimension_basis=DIMENSION_BASIS_UNKNOWN,
                 dimension_source="schedule_parse",
-                dimension_confidence=0.8,
+                dimension_confidence=dim_conf,
                 extraction_method="schedule_parse",
                 page_no=sched.page_no,
             )
