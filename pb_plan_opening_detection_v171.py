@@ -81,7 +81,8 @@ class Segment:
 
     @property
     def bbox(self) -> Tuple[float, float, float, float]:
-        return (self.x0, self.y0, self.x1, self.y1)
+        return (min(self.x1, self.x2), min(self.y1, self.y2),
+                max(self.x1, self.x2), max(self.y1, self.y2))
 
 
 @dataclass(frozen=True)
@@ -573,31 +574,60 @@ def detect_window_candidates(
                 pairs.append((i, j, a, b))
                 break  # each segment belongs to at most one pair
 
-        # Step 3: Hatch filter — cluster analysis on pair midpoints
-        # After pairing, check if ALL pairs form a single tight cluster.
-        # Hatch: all pairs clustered together (regular small spacing)
-        # Windows: pairs spread across the wall (large gaps between pairs)
+        # Step 3: Hatch filter — scale-aware with tag override
+        # After pairing, check if pairs represent separate windows or hatch.
+        #
+        # Hatch: pairs are uniformly spaced with gap ≈ jamb spacing (ratio ≈ 2.0).
+        # Windows: gap is much larger than jamb spacing (ratio > 2.5).
+        #
+        # When pairs have W tags, they are evidence-corroborated windows and
+        # override the geometric hatch suspicion — a W tag is strong semantic
+        # evidence that the pair represents a real window, not a hatch element.
         is_hatch = False
         if len(pairs) >= 2:
             pair_midpoints = []
+            pair_jamb_spacings = []
+            pair_has_w_tag = []
             for _, _, a, b in pairs:
                 mcx = (a.cx + b.cx) / 2.0
                 mcy = (a.cy + b.cy) / 2.0
                 pair_midpoints.append(((mcx - wall_ox) * wall_dx + (mcy - wall_oy) * wall_dy) / wall_len)
+                pair_jamb_spacings.append(_segment_distance(a, b))
+                tag, _ = _find_tag_near(mcx, mcy, words)
+                pair_has_w_tag.append(_classify_tag(tag) == "window")
             pair_midpoints.sort()
 
-            # Group into clusters: consecutive midpoints within CLUSTER_GAP_PT
-            CLUSTER_GAP_PT = 150.0  # ~3m at 50pt/m — larger than any window spacing
-            clusters: List[List[float]] = [[pair_midpoints[0]]]
-            for mp in pair_midpoints[1:]:
-                if mp - clusters[-1][-1] <= CLUSTER_GAP_PT:
-                    clusters[-1].append(mp)
-                else:
-                    clusters.append([mp])
+            # Gaps between consecutive pair midpoints
+            gaps_between = [
+                pair_midpoints[k + 1] - pair_midpoints[k]
+                for k in range(len(pair_midpoints) - 1)
+            ]
+            mean_jamb = sum(pair_jamb_spacings) / len(pair_jamb_spacings)
 
-            # Hatch: single cluster containing ALL pairs (all pairs are close together)
-            if len(clusters) == 1 and len(pairs) >= 2:
-                is_hatch = True
+            if gaps_between and mean_jamb > 0:
+                max_gap = max(gaps_between)
+                gap_ratio = max_gap / mean_jamb
+
+                # Scale-aware minimum gap: 1.5 m between pair centres
+                # (minimum wall section between separate windows)
+                MIN_GAP_M = 1.5
+                scale_min_gap_pt = MIN_GAP_M * pt_per_m if pt_per_m > 0 else 0
+
+                if len(gaps_between) >= 2:
+                    # Multiple gaps: ratio test is reliable
+                    if gap_ratio <= 2.5:
+                        if scale_min_gap_pt > 0 and max_gap >= scale_min_gap_pt:
+                            pass
+                        else:
+                            is_hatch = True
+                else:
+                    # Single gap (2 pairs): ratio test ambiguous
+                    # Use scale threshold, but W tags override
+                    if not any(pair_has_w_tag):
+                        if scale_min_gap_pt > 0 and max_gap < scale_min_gap_pt:
+                            is_hatch = True
+                        elif scale_min_gap_pt <= 0 and gap_ratio <= 2.5:
+                            is_hatch = True
 
         if is_hatch:
             continue
@@ -1031,7 +1061,9 @@ def plan_opening_candidates(
     for g in gaps:
         if g.position_along_wall_m is not None:
             overlaps = any(
-                abs(g.position_along_wall_m - pos) < 0.20 and g.wall_ref == ref
+                abs(g.position_along_wall_m - pos) < 0.20
+                and g.wall_ref != "" and ref != ""
+                and g.wall_ref == ref
                 for pos, ref in used_positions
             )
             if overlaps:
