@@ -2,19 +2,20 @@
 
 Detects door/window rectangular regions from elevation drawings and
 correlates them with B1 plan-vector instances.  The primary contribution
-is providing HEIGHT (which plan view cannot measure) and confirming the
-dimension basis (rough_opening vs frame vs leaf).
+is providing HEIGHT (which plan view cannot measure).
 
 Safety contract:
   - Elevation evidence NEVER creates new instances.  It enriches only
     existing B1/B2 OpeningEvidence records via merge_opening_evidence().
   - Elevation evidence NEVER sets deduct=True.
-  - Elevation rectangles match plan instances by:
-      (a) same wall_ref / elevation_side AND compatible width, OR
-      (b) matching type_mark label AND compatible width.
+  - Elevation rectangles remain dimension_basis=unknown unless explicit
+    wall-void evidence is registered (generic elevation_rect does NOT
+    manufacture rough_opening authority).
+  - Matching requires at least one strong instance-specific signal
+    (compatible width + matching mark, or compatible width + validated
+    position).  A generic side match alone is NOT sufficient.
+  - Conflicting D/W marks (D01 vs W01) hard-reject the match.
   - Unmatched elevation evidence is discarded (not carried forward).
-  - dimension_basis can be upgraded to rough_opening only when the
-    elevation rectangle clearly represents the wall void opening.
 """
 from __future__ import annotations
 
@@ -26,7 +27,6 @@ from pb_opening_evidence_v170 import (
     OpeningEvidence,
     merge_opening_evidence,
     DIMENSION_BASIS_UNKNOWN,
-    DIMENSION_BASIS_ROUGH_OPENING,
     DEDUCTION_REVIEW,
     NON_INSTANCE_SOURCES,
     TOLERANCE_WIDTH_M,
@@ -52,6 +52,12 @@ _MAX_OPENING_WIDTH_M = 6.0
 _MIN_OPENING_HEIGHT_M = 0.3
 _MAX_OPENING_HEIGHT_M = 5.0
 
+# Physical label search radius (metres) — labels sit ~0.5m from opening
+_LABEL_SEARCH_RADIUS_M = 0.5
+
+# Minimum strong signal score for a match to qualify
+_MIN_STRONG_SIGNAL = 0.3
+
 # Mark label pattern
 _MARK_RE = re.compile(r"\b([DW]0?\d{1,2})\b", re.IGNORECASE)
 
@@ -72,8 +78,8 @@ class ElevationOpening:
     bbox_px: Tuple[float, float, float, float]  # (x0, y0, x1, y1) in page coords
     width_m: float
     height_m: float
-    sill_m: float = 0.0
-    head_m: float = 0.0       # sill + height
+    sill_m: Optional[float] = None   # None until elevation datum registered
+    head_m: Optional[float] = None   # None until elevation datum registered
     label: str = ""           # nearby mark text (D01, W01) if detected
     confidence: float = 0.5
     extraction_method: str = "elevation_rect"
@@ -142,7 +148,6 @@ def detect_elevation_openings(
     rects: Sequence[Dict[str, Any]],
     words: Sequence[Dict[str, Any]],
     scale_px_per_m: float,
-    ground_level_m: float = 0.0,
 ) -> List[ElevationOpening]:
     """Detect opening-sized rectangular regions on an elevation drawing.
 
@@ -153,14 +158,18 @@ def detect_elevation_openings(
                page pixel coordinates.  May also have "confidence".
         words: Word dicts from PDF extraction (positioned text).
         scale_px_per_m: Calibration factor (pixels per metre).
-        ground_level_m: Ground floor level in metres (for sill calc).
 
     Returns:
         List of ElevationOpening candidates.  These are NOT confirmed
         instances — they must be correlated with B1 plan data.
+
+    Sill/head are None until an elevation datum/baseline is registered.
     """
     if scale_px_per_m <= 0:
         return []
+
+    # Convert physical label search radius to pixels
+    label_radius_px = _LABEL_SEARCH_RADIUS_M * scale_px_per_m
 
     candidates: List[ElevationOpening] = []
     for rect in rects:
@@ -178,19 +187,10 @@ def detect_elevation_openings(
         if not _is_opening_sized(width_m, height_m):
             continue
 
-        # Compute sill/head from vertical position
-        # In elevation drawings, y=0 is typically the top of the page,
-        # so bottom of rect is the sill and top of rect is the head.
-        top_y = min(y0, y1)
-        bottom_y = max(y0, y1)
-        # Sill = distance from ground to bottom of opening
-        # (simplified: assumes ground at bottom of page or uses ground_level_m)
-        page_height = max(bottom_y, 1.0)  # avoid div-by-zero
-        sill_m = ground_level_m + (1.0 - bottom_y / page_height) * 3.0  # rough estimate
-        head_m = sill_m + height_m
-
-        # Look for a mark label near this rectangle
-        label = _extract_label_near_rect(words, (x0, y0, x1, y1))
+        # Look for a mark label near this rectangle (scale-aware radius)
+        label = _extract_label_near_rect(
+            words, (x0, y0, x1, y1), max_distance_px=label_radius_px
+        )
 
         # Confidence: higher for clearly opening-sized, lower for borderline
         conf = 0.5
@@ -206,8 +206,6 @@ def detect_elevation_openings(
             bbox_px=(x0, y0, x1, y1),
             width_m=round(width_m, 4),
             height_m=round(height_m, 4),
-            sill_m=round(sill_m, 3),
-            head_m=round(head_m, 3),
             label=label,
             confidence=round(conf, 2),
         ))
@@ -232,6 +230,21 @@ def _mark_compatible(mark1: str, mark2: str) -> bool:
     return mark1.upper() == mark2.upper()
 
 
+def _mark_type(mark: str) -> str:
+    """Return the type prefix of a mark: 'D', 'W', or ''."""
+    if mark and mark[0].upper() in ("D", "W"):
+        return mark[0].upper()
+    return ""
+
+
+def _marks_conflict(mark1: str, mark2: str) -> bool:
+    """True if both marks are non-empty and have different D/W types."""
+    if not mark1 or not mark2:
+        return False
+    t1, t2 = _mark_type(mark1), _mark_type(mark2)
+    return bool(t1 and t2 and t1 != t2)
+
+
 def _correlation_score(
     inst: OpeningEvidence,
     elev: ElevationOpening,
@@ -239,39 +252,58 @@ def _correlation_score(
     """Score how well a plan instance matches an elevation candidate.
 
     Returns 0.0-1.0 (higher = better match).  Returns 0.0 for
-    incompatible pairs (wrong side, wrong mark, incompatible width).
+    incompatible pairs (wrong side, wrong mark type, incompatible width,
+    or insufficient strong signals).
+
+    Matching requires at least one strong instance-specific signal:
+      - compatible width + exact mark match, OR
+      - compatible width + same elevation_side (side alone is NOT enough).
+    A generic side match without width agreement does not qualify.
     """
     score = 0.0
+    has_width_signal = False
+    has_mark_signal = False
 
-    # Side match (strong signal)
+    # --- Hard reject: conflicting D/W marks ---
+    if _marks_conflict(inst.type_mark, elev.label):
+        return 0.0
+
+    # --- Hard reject: different sides ---
     if inst.elevation_side and elev.elevation_side:
-        if inst.elevation_side == elev.elevation_side:
-            score += 0.4
-        else:
-            return 0.0  # different sides → incompatible
+        if inst.elevation_side != elev.elevation_side:
+            return 0.0
 
-    # Wall ref match (strongest signal when available)
-    if inst.wall_ref and elev.elevation_side:
-        # wall_ref first letter is the cardinal side
-        if inst.wall_ref[0].upper() == elev.elevation_side[0].upper():
-            score += 0.2
-        elif inst.wall_ref:
-            return 0.0  # wall ref implies different side
+    # --- Side match: contextual evidence (not sufficient alone) ---
+    side_match = False
+    if inst.elevation_side and elev.elevation_side:
+        side_match = inst.elevation_side == elev.elevation_side
+        if side_match:
+            score += 0.15  # contextual bonus, not sufficient alone
 
-    # Width agreement
+    # --- Width agreement: strong signal ---
     if inst.width_m is not None:
         if not _width_compatible(inst.width_m, elev.width_m):
-            return 0.0  # incompatible widths
-        # Closer width → higher score
+            return 0.0  # incompatible widths → hard reject
         diff = abs(inst.width_m - elev.width_m)
-        score += 0.2 * max(0, 1.0 - diff / ELEVATION_WIDTH_TOLERANCE_M)
+        width_score = 0.35 * max(0, 1.0 - diff / ELEVATION_WIDTH_TOLERANCE_M)
+        score += width_score
+        has_width_signal = width_score > 0
 
-    # Label match
+    # --- Mark match: strong signal ---
     if inst.type_mark and elev.label:
         if inst.type_mark.upper() == elev.label.upper():
-            score += 0.2
-        # Mismatched labels still get partial credit if other signals agree
-        # (labels can be ambiguous on crowded elevations)
+            score += 0.35
+            has_mark_signal = True
+
+    # --- Require width agreement as baseline ---
+    # Without width, side/mark alone are insufficient for reliable matching.
+    if not has_width_signal:
+        return 0.0
+
+    # --- Wall ref consistency check (not scoring, just reject conflicts) ---
+    # Don't infer side from wall_ref[0] — only reject if wall_ref clearly
+    # contradicts the elevation side via explicit registration.
+    # (wall_ref → side mapping is deferred to B4 reconciliation.)
 
     return min(score, 1.0)
 
@@ -283,11 +315,11 @@ def correlate_elevation_to_plan(
 ) -> Tuple[List[OpeningEvidence], List[ElevationOpening]]:
     """Match elevation candidates to B1/B2 plan instances and enrich.
 
-    Matching strategy:
-      1. For each plan instance, find the best-scoring elevation candidate.
-      2. Score must exceed minimum threshold (0.3) to qualify.
-      3. Each elevation candidate can match at most one plan instance
-         (global nearest assignment).
+    Uses globally strongest-first greedy assignment (order-independent):
+      1. Build ALL eligible (score, plan_idx, elev_idx) triples.
+      2. Sort by score descending.
+      3. Greedily assign: each plan instance and each elevation candidate
+         can be matched at most once.
       4. Matched instances are enriched with elevation height/geometry.
       5. Unmatched elevation candidates are returned separately.
 
@@ -305,27 +337,30 @@ def correlate_elevation_to_plan(
     if not elevation_openings or not plan_instances:
         return list(plan_instances), list(elevation_openings)
 
-    MIN_SCORE = 0.3
-
-    # Compute score matrix: plan_idx → list of (score, elev_idx)
-    assignments: Dict[int, Tuple[float, int]] = {}  # plan_idx → (best_score, elev_idx)
-    used_elev: set = set()
-
+    # Step 1: Build ALL eligible pairs with scores
+    pairs: List[Tuple[float, int, int]] = []  # (score, plan_idx, elev_idx)
     for p_idx, inst in enumerate(plan_instances):
-        best_score = 0.0
-        best_e_idx = -1
         for e_idx, elev in enumerate(elevation_openings):
-            if e_idx in used_elev:
-                continue
             sc = _correlation_score(inst, elev)
-            if sc > best_score:
-                best_score = sc
-                best_e_idx = e_idx
-        if best_score >= MIN_SCORE and best_e_idx >= 0:
-            assignments[p_idx] = (best_score, best_e_idx)
-            used_elev.add(best_e_idx)
+            if sc >= _MIN_STRONG_SIGNAL:
+                pairs.append((sc, p_idx, e_idx))
 
-    # Build enriched list
+    # Step 2: Sort globally strongest-first (order-independent)
+    pairs.sort(key=lambda x: x[0], reverse=True)
+
+    # Step 3: Greedy one-to-one assignment
+    assigned_plan: set = set()
+    assigned_elev: set = set()
+    assignments: Dict[int, Tuple[float, int]] = {}  # plan_idx → (score, elev_idx)
+
+    for sc, p_idx, e_idx in pairs:
+        if p_idx in assigned_plan or e_idx in assigned_elev:
+            continue
+        assignments[p_idx] = (sc, e_idx)
+        assigned_plan.add(p_idx)
+        assigned_elev.add(e_idx)
+
+    # Step 4: Build enriched list
     enriched: List[OpeningEvidence] = []
     for p_idx, inst in enumerate(plan_instances):
         if p_idx in assignments:
@@ -336,7 +371,7 @@ def correlate_elevation_to_plan(
         else:
             enriched.append(inst)
 
-    unmatched = [e for i, e in enumerate(elevation_openings) if i not in used_elev]
+    unmatched = [e for i, e in enumerate(elevation_openings) if i not in assigned_elev]
     return enriched, unmatched
 
 
@@ -351,13 +386,18 @@ def _enrich_from_elevation(
 
     Uses merge_opening_evidence() for atomic dimension bundle updates.
     Sets elevation_geometry and elevation_side as additional context.
+
+    dimension_basis remains unknown for generic elevation_rect —
+    elevation rectangles measure the visible opening (frame/leaf),
+    not necessarily the wall void rough opening.  Only explicit
+    wall-void evidence would upgrade the basis.
     """
     # Build an elevation-sourced evidence record
     elev_ev = OpeningEvidence(
         type_mark=inst.type_mark or elev.label,
         width_m=elev.width_m,
         height_m=elev.height_m,
-        dimension_basis=DIMENSION_BASIS_ROUGH_OPENING,
+        dimension_basis=DIMENSION_BASIS_UNKNOWN,
         dimension_source="elevation_rect",
         dimension_confidence=ELEVATION_HEIGHT_CONFIDENCE,
         extraction_method="elevation_rect",
