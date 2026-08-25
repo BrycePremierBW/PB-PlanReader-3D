@@ -170,6 +170,7 @@ def apply(app: Any) -> None:
         app.st.info(
             f"⚡ Quick Take-off: **{SCOPES[scope]}**. This is a standalone PlanReader workspace and is not linked to JobHub."
         )
+        rows_now = [dict(r) for r in app.lquery("SELECT * FROM takeoff_rows WHERE workspace_id=? ORDER BY id", (wid,))]
         cols = app.st.columns([1.4, 1.0])
         with cols[0]:
             selected = app.st.selectbox(
@@ -180,10 +181,26 @@ def apply(app: Any) -> None:
                 key=f"pb_quick_scope_existing_{wid}",
             )
             if selected != scope:
-                app.set_workspace_setting(wid, SETTING_SCOPE, selected)
-                prune_workspace_rows(app, wid, selected)
-                app.st.rerun()
-        rows_now = [dict(r) for r in app.lquery("SELECT * FROM takeoff_rows WHERE workspace_id=? ORDER BY id", (wid,))]
+                if rows_now:
+                    remove_count = sum(1 for row in rows_now if not row_matches_scope(row, selected)) if selected != "full" else 0
+                    app.st.warning(
+                        f"Changing scope can remove {remove_count} existing out-of-scope row(s) and their mapped measurements. "
+                        "Nothing is removed until you confirm below."
+                    )
+                    if app.st.button(
+                        "Apply scope and remove other rows",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"pb_quick_scope_confirm_{wid}",
+                    ):
+                        app.set_workspace_setting(wid, SETTING_SCOPE, selected)
+                        prune_workspace_rows(app, wid, selected)
+                        app.st.rerun()
+                else:
+                    # With no commercial rows yet there is nothing destructive
+                    # to confirm, so keep setup quick and apply immediately.
+                    app.set_workspace_setting(wid, SETTING_SCOPE, selected)
+                    app.st.rerun()
         with cols[1]:
             app.st.download_button(
                 "Download quick take-off CSV",
