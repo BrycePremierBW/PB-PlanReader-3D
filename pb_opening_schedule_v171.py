@@ -146,26 +146,28 @@ def _resolve_dimension_basis(
     """Resolve the final dimension basis from individual column bases.
 
     Rules:
-      - If a combined Size/dims column was used, its basis applies.
-      - If both width and height were used and agree on basis → use it.
-      - If they disagree → unknown (mixed measurement bundle).
-      - If only one was used → use that one's basis.
-      - If none have basis → unknown.
+      - A combined Size/dims column with explicit basis → use that basis.
+        (Both values originate from one explicitly based field.)
+      - Both width and height present AND agree on basis → use it.
+      - Any other case (one missing, one generic, disagree) → unknown.
+        Generic "Width" does not become a rough-opening width merely
+        because the height column says "Rough Opening Height".
+
+    The atomic measurement-bundle contract requires ALL dimensions in
+    the bundle to share the same explicit basis.
     """
-    # Combined Size/dims column takes precedence
+    # Combined Size/dims column takes precedence (single field = safe)
     if dims_basis:
         return dims_basis, dims_source
-    # Both width and height present
+    # Both width and height present — must agree
     if width_basis and height_basis:
         if width_basis == height_basis:
             return width_basis, width_source
-        # Disagreeing bases → unsafe, treat as unknown
+        # Disagreeing bases → unsafe
         return "", ""
-    # Only one present
-    if width_basis:
-        return width_basis, width_source
-    if height_basis:
-        return height_basis, height_source
+    # Only one present, or one/both generic → unknown
+    # A single explicitly labelled column cannot establish basis for
+    # the other dimension which remains generic.
     return "", ""
 
 # Patterns for mark extraction
@@ -391,7 +393,20 @@ def detect_header(words: Sequence[str]) -> Dict[str, Any]:
         # Infer basis for this column
         col_basis, col_source = _infer_column_basis(w)
 
-        # Check role: exact match first, then substring for compound headings
+        # Role resolution order: dims (combined column) first, then
+        # width, then height.  This prevents "RO Width x Height" from
+        # being captured as a width column before reaching the dims path.
+        if "dims" not in mapping:
+            is_dims = (
+                w_clean in _HEADER_DIMS_KEYWORDS
+                or any(kw in w_clean for kw in _HEADER_DIMS_KEYWORDS)
+            )
+            if is_dims:
+                mapping["dims"] = i
+                dims_basis = col_basis
+                dims_basis_source = col_source
+                continue
+
         if "width" not in mapping:
             is_width = (
                 w_clean in _HEADER_WIDTH_KEYWORDS
@@ -412,17 +427,6 @@ def detect_header(words: Sequence[str]) -> Dict[str, Any]:
                 mapping["height"] = i
                 height_basis = col_basis
                 height_basis_source = col_source
-                continue
-
-        if "dims" not in mapping:
-            is_dims = (
-                w_clean in _HEADER_DIMS_KEYWORDS
-                or any(kw in w_clean for kw in _HEADER_DIMS_KEYWORDS)
-            )
-            if is_dims:
-                mapping["dims"] = i
-                dims_basis = col_basis
-                dims_basis_source = col_source
                 continue
 
         if "count" not in mapping and w_clean in _HEADER_COUNT_KEYWORDS:

@@ -215,8 +215,8 @@ class TestHeaderDetection(unittest.TestCase):
         self.assertEqual(h["dimension_basis"], "leaf")
         self.assertIn("leaf", h["basis_source"])
 
-    def test_clear_opening_basis(self):
-        h = detect_header(["Mark", "Clear Opening Width", "Height"])
+    def test_clear_opening_basis_both_columns(self):
+        h = detect_header(["Mark", "Clear Opening Width", "Clear Opening Height"])
         self.assertEqual(h["dimension_basis"], "clear_opening")
         self.assertIn("clear opening", h["basis_source"])
 
@@ -970,6 +970,48 @@ class TestCompoundHeadingParsing(unittest.TestCase):
         e = entries[0]
         self.assertEqual(e.dimension_basis, "rough_opening")
 
+    def test_ro_width_x_height_combined(self):
+        """Mark | RO Width x Height → dims column, basis=rough_opening."""
+        rows = [
+            _row("Mark\tRO Width x Height"),
+            _row("D01\t820x2100"),
+        ]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        e = entries[0]
+        self.assertEqual(e.width_mm, 820)
+        self.assertEqual(e.height_mm, 2100)
+        self.assertEqual(e.parse_source, "header_dims")
+        self.assertEqual(e.dimension_basis, "rough_opening")
+
+    def test_frame_width_x_height_combined(self):
+        """Mark | Frame Width x Height → dims column, basis=frame."""
+        rows = [
+            _row("Mark\tFrame Width x Height"),
+            _row("D01\t820x2100"),
+        ]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        e = entries[0]
+        self.assertEqual(e.width_mm, 820)
+        self.assertEqual(e.height_mm, 2100)
+        self.assertEqual(e.parse_source, "header_dims")
+        self.assertEqual(e.dimension_basis, "frame")
+
+    def test_generic_width_x_height_combined(self):
+        """Mark | Width x Height → dims column, basis='' (unknown)."""
+        rows = [
+            _row("Mark\tWidth x Height"),
+            _row("D01\t820x2100"),
+        ]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        e = entries[0]
+        self.assertEqual(e.width_mm, 820)
+        self.assertEqual(e.height_mm, 2100)
+        self.assertEqual(e.parse_source, "header_dims")
+        self.assertEqual(e.dimension_basis, "")
+
 
 class TestMixedBasisAmbiguity(unittest.TestCase):
     """Width basis ≠ height basis → unknown (mixed measurement bundle)."""
@@ -986,9 +1028,10 @@ class TestMixedBasisAmbiguity(unittest.TestCase):
         self.assertEqual(h["dimension_basis"], "rough_opening")
 
     def test_one_generic_one_explicit(self):
-        """Width + Rough Opening Height → basis=rough_opening (only height has basis)."""
+        """Width + Rough Opening Height → basis unknown (generic width)."""
         h = detect_header(["Mark", "Width", "Rough Opening Height"])
-        self.assertEqual(h["dimension_basis"], "rough_opening")
+        # Generic Width cannot establish basis for the bundle
+        self.assertEqual(h["dimension_basis"], "")
 
     def test_mixed_in_notes_not_affecting_basis(self):
         """Width | Height | Rough Opening Notes → basis unknown (notes not a dim col)."""
