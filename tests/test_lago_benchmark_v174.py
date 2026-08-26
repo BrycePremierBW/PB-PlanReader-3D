@@ -1,56 +1,49 @@
+"""LAGO Birtinya authoritative opening-evidence benchmark (v1.7.4).
+
+Authoritative sources:
+  - PDF page 170 / index 169: CD6307/05 Window Schedule 01
+  - PDF page 174 / index 173: CD6313/05 External Door Schedule 01
+  - PDF page 179 / index 178: CD6319/05 Internal Door Schedule 01
+  - PDF page 23 / index 22: CD1161/06 GA - Level 08
+  - Premier Brushworks tender reference: 47 apartment entry doors
+
+Safety authority:
+  LAGO schedule WIDTH/HEIGHT headings are generic.  They do not prove a
+  rough-opening basis, so schedule dimensions alone must never create an
+  automatic wall-void deduction.
+
+The GA fixture is a source-derived vector crop committed under tests/fixtures.
+It intentionally does not force the offset ED04 callout onto geometry when B1
+cannot prove the association.  A conservative miss/review is acceptable; a
+confident false subtraction is not.
 """
-LAGO Birtinya Authoritative Benchmark Fixture (v1.7.4)
+from __future__ import annotations
 
-Source documents:
-  A. 260617_004-LAGO-BRITINYA_ARCH-DRAWINGS_COMBINED 2.pdf
-     - PDF page 170 (0-based index 169) = CD6307/05 Window Schedule 01
-     - PDF page 174 (0-based index 173) = CD6313/05 External Door Schedule 01
-     - PDF page 179 (0-based index 178) = CD6319/05 Internal Door Schedule 01
-     - PDF page 103 (0-based index 102) = CD3304 Basement Wall Setout 01
-
-  B. Premier_Brushworks_LAGO_Birtinya_Full_Priced_Takeoff.xlsx
-     - Summary sheet: 47 apartment entry doors (1 per unit x 47 units)
-
-Expected values are extracted directly from these authoritative sources.
-If PlanReader disagrees, investigate PlanReader.  Do not alter expected values.
-
-Dimension basis policy:
-  The LAGO schedules use generic column headings "WIDTH" / "HEIGHT".
-  No schedule heading says "Rough Opening", "RO Size", "Frame Width",
-  or similar.  Therefore dimension_basis must remain "" (unknown) for
-  all schedule entries.  No automatic wall-void deductions should occur
-  from schedule-sourced dimensions alone.
-"""
-import fitz
-import re
+import json
 import unittest
 from pathlib import Path
 
 from pb_opening_schedule_v171 import (
     ScheduleEntry,
     detect_header,
-    parse_schedule_rows,
     enrich_opening_evidence,
+    extract_mark,
+    parse_schedule_rows,
 )
 from pb_opening_evidence_v170 import (
-    OpeningEvidence,
-    DEDUCTION_REVIEW,
-    DEDUCTION_NONE,
     DEDUCTION_NOT_DEDUCTED,
+    DEDUCTION_REVIEW,
+    OpeningEvidence,
 )
-from pb_opening_deduction_v174 import (
-    apply_deductions,
-    passes_eligibility_gate,
-)
-from pb_opening_reconciliation_v173 import (
-    reconcile_opening_evidence,
+from pb_opening_deduction_v174 import apply_deductions
+from pb_opening_reconciliation_v173 import reconcile_opening_evidence
+from pb_plan_opening_detection_v171 import (
+    Segment,
+    TextWord,
+    _classify_tag,
+    plan_opening_candidates,
 )
 
-# ---------------------------------------------------------------------------
-# Source document references
-# ---------------------------------------------------------------------------
-
-# PDF page numbers: 1-based page number and 0-based index
 WINDOW_SCHEDULE_PAGE_1BASED = 170
 WINDOW_SCHEDULE_PAGE_0BASED = 169
 WINDOW_DRAWING_REF = "CD6307/05"
@@ -63,32 +56,18 @@ INT_DOOR_SCHEDULE_PAGE_1BASED = 179
 INT_DOOR_SCHEDULE_PAGE_0BASED = 178
 INT_DOOR_DRAWING_REF = "CD6319/05"
 
-FLOOR_PLAN_PAGE_1BASED = 103
-FLOOR_PLAN_PAGE_0BASED = 102
-FLOOR_PLAN_DRAWING_REF = "CD3304"
-
-# Scale: 1:20 at A1 (from page title block)
-# 1 pt = (25.4/72) mm on paper; at 1:20 -> (25.4/72)*20 = 7.056 mm real
-# 1 m = 1000/7.056 = 141.7 pt
-FLOOR_PLAN_SCALE_PT_PER_M = 141.7
+GA08_PAGE_1BASED = 23
+GA08_PAGE_0BASED = 22
+GA08_DRAWING_REF = "CD1161/06"
+GA08_SCALE_PT_PER_M = 28.346456693  # 1:100 @ A1
 
 TENDER_TOTAL_ENTRY_DOORS = 47
-
-# ---------------------------------------------------------------------------
-# Source-derived schedule header rows (lowercased for detect_header())
-# ---------------------------------------------------------------------------
 
 WINDOW_HEADER = ["w#", "width", "height", "sill height"]
 EXT_DOOR_HEADER = ["level/unit", "door type", "d#", "width", "height"]
 INT_DOOR_HEADER = ["level/unit", "door type", "d#", "width", "height"]
 
-# ---------------------------------------------------------------------------
-# Complete source-derived schedule rows from the actual PDF pages.
-# Each tuple: (mark, width_mm, height_mm)
-# Repeated marks with different dims are REAL ambiguities in the source.
-# ---------------------------------------------------------------------------
-
-# Page 170 (CD6307/05): Window Schedule 01 — 14 rows
+# Complete source-derived rows from CD6307/05, page 170.
 WINDOW_ROWS = [
     ("EW03", 2900, 2630),
     ("EW04", 1100, 2630),
@@ -106,7 +85,10 @@ WINDOW_ROWS = [
     ("EW04", 2400, 1665),
 ]
 
-# Page 174 (CD6313/05): External Door Schedule 01 — 42 rows
+# Complete source-derived rows from CD6313/05, page 174.
+# Repeated marks belong to different LEVEL/UNIT rows.  Different dimensions
+# therefore mean mark-only association is insufficient, not that the architect
+# necessarily made a drafting error.
 EXT_DOOR_ROWS = [
     ("ED18", 1000, 2340),
     ("ED19", 1000, 2340),
@@ -152,7 +134,7 @@ EXT_DOOR_ROWS = [
     ("ED13", 2200, 2665),
 ]
 
-# Page 179 (CD6319/05): Internal Door Schedule 01 — 31 rows
+# Complete source-derived rows from CD6319/05, page 179.
 INT_DOOR_ROWS = [
     ("ID02", 1000, 2340),
     ("ID03", 1000, 2340),
@@ -188,454 +170,329 @@ INT_DOOR_ROWS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Helper: construct parse_schedule_rows()-compatible row dicts from source data
-# ---------------------------------------------------------------------------
-
 def _make_parser_rows(header_words, data_rows):
-    """Build row dicts for parse_schedule_rows() from source data.
-
-    Args:
-        header_words: lowercased header column names (e.g. ["d#", "width", "height"])
-        data_rows: list of (mark, width_mm, height_mm) tuples
-
-    Returns:
-        list of {"text": "col1\\tcol2\\t...", "bbox": (...)} dicts
-    """
-    rows = []
-    # Header row
-    rows.append({"text": "\t".join(header_words), "bbox": (0, 0, 100, 20)})
-    for mark, w, h in data_rows:
-        # Build a tab-separated row matching the header columns
+    rows = [{"text": "\t".join(header_words), "bbox": (0, 0, 100, 20)}]
+    for mark, width, height in data_rows:
         cells = [""] * len(header_words)
-        for i, hw in enumerate(header_words):
-            if hw in ("d#", "w#", "mark", "type", "code"):
+        for i, heading in enumerate(header_words):
+            if heading in ("d#", "w#", "mark", "type", "code"):
                 cells[i] = mark
-            elif hw == "width":
-                cells[i] = f"{w:,}"
-            elif hw == "height":
-                cells[i] = f"{h:,}"
+            elif heading == "width":
+                cells[i] = f"{width:,}"
+            elif heading == "height":
+                cells[i] = f"{height:,}"
             else:
                 cells[i] = "-"
         rows.append({"text": "\t".join(cells), "bbox": (0, 0, 100, 20)})
     return rows
 
 
-# ===========================================================================
-# Test classes
-# ===========================================================================
+def _parsed(header, rows, page_no):
+    return parse_schedule_rows(_make_parser_rows(header, rows), page_no=page_no)
+
+
+def _plan_instance(mark):
+    return OpeningEvidence(
+        type_mark=mark,
+        width_m=None,
+        height_m=None,
+        dimension_basis="",
+        dimension_source="plan_detection",
+        extraction_method="plan_detection",
+        page_no=0,
+    )
+
+
+def _fixture_path():
+    return Path(__file__).resolve().parent / "fixtures" / "lago_b1_ga08_ed04_cluster.json"
+
+
+def _load_b1_fixture():
+    with _fixture_path().open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _fixture_inputs():
+    fixture = _load_b1_fixture()
+    segments = [
+        Segment(
+            x1=row["x1"], y1=row["y1"],
+            x2=row["x2"], y2=row["y2"],
+            drawing_index=row.get("drawing_index", 0),
+        )
+        for row in fixture["segments"]
+    ]
+    words = [
+        TextWord(
+            text=row["text"], x0=row["x0"], y0=row["y0"],
+            x1=row["x1"], y1=row["y1"], page_no=GA08_PAGE_1BASED,
+        )
+        for row in fixture["words"]
+    ]
+    return fixture, segments, words
+
 
 class TestLAGO_SourceReferences(unittest.TestCase):
-    """Verify source document references are correctly recorded."""
+    def test_schedule_page_numbers(self):
+        self.assertEqual((WINDOW_SCHEDULE_PAGE_1BASED, WINDOW_SCHEDULE_PAGE_0BASED), (170, 169))
+        self.assertEqual((EXT_DOOR_SCHEDULE_PAGE_1BASED, EXT_DOOR_SCHEDULE_PAGE_0BASED), (174, 173))
+        self.assertEqual((INT_DOOR_SCHEDULE_PAGE_1BASED, INT_DOOR_SCHEDULE_PAGE_0BASED), (179, 178))
 
-    def test_window_schedule_page_numbers(self):
-        self.assertEqual(WINDOW_SCHEDULE_PAGE_1BASED, 170)
-        self.assertEqual(WINDOW_SCHEDULE_PAGE_0BASED, 169)
+    def test_ga08_page_numbers(self):
+        self.assertEqual((GA08_PAGE_1BASED, GA08_PAGE_0BASED), (23, 22))
+        self.assertEqual(GA08_DRAWING_REF, "CD1161/06")
 
-    def test_ext_door_schedule_page_numbers(self):
-        self.assertEqual(EXT_DOOR_SCHEDULE_PAGE_1BASED, 174)
-        self.assertEqual(EXT_DOOR_SCHEDULE_PAGE_0BASED, 173)
-
-    def test_int_door_schedule_page_numbers(self):
-        self.assertEqual(INT_DOOR_SCHEDULE_PAGE_1BASED, 179)
-        self.assertEqual(INT_DOOR_SCHEDULE_PAGE_0BASED, 178)
-
-    def test_drawing_references(self):
+    def test_schedule_drawing_references(self):
         self.assertEqual(WINDOW_DRAWING_REF, "CD6307/05")
         self.assertEqual(EXT_DOOR_DRAWING_REF, "CD6313/05")
         self.assertEqual(INT_DOOR_DRAWING_REF, "CD6319/05")
 
     def test_source_row_counts(self):
-        """Verify complete extraction — all rows from the real schedules."""
-        self.assertEqual(len(WINDOW_ROWS), 14)
-        self.assertEqual(len(EXT_DOOR_ROWS), 42)
-        self.assertEqual(len(INT_DOOR_ROWS), 31)
+        self.assertEqual((len(WINDOW_ROWS), len(EXT_DOOR_ROWS), len(INT_DOOR_ROWS)), (14, 42, 31))
 
     def test_tender_entry_door_count(self):
         self.assertEqual(TENDER_TOTAL_ENTRY_DOORS, 47)
 
 
+class TestLAGO_MarkRecognition(unittest.TestCase):
+    def test_b2_real_lago_marks_are_structural_opening_marks(self):
+        self.assertEqual(extract_mark("EW03"), "EW03")
+        self.assertEqual(extract_mark("L8.00 ED04"), "ED04")
+        self.assertEqual(extract_mark("BA.00 ID02"), "ID02")
+        self.assertEqual(extract_mark("D01"), "D01")
+        self.assertEqual(extract_mark("W01"), "W01")
+
+    def test_b2_roman_numerals_are_not_opening_marks(self):
+        for value in ("I", "II", "III", "IV", "IX", "X"):
+            self.assertEqual(extract_mark(value), "", value)
+
+    def test_b1_real_lago_tag_classes(self):
+        self.assertEqual(_classify_tag("ED04"), "door")
+        self.assertEqual(_classify_tag("ID02"), "door")
+        self.assertEqual(_classify_tag("EW03"), "window")
+        self.assertEqual(_classify_tag("D01"), "door")
+        self.assertEqual(_classify_tag("W01"), "window")
+
+    def test_b1_roman_numerals_are_not_tags(self):
+        for value in ("I", "II", "III", "IV", "IX", "X"):
+            self.assertEqual(_classify_tag(value), "", value)
+
+
 class TestLAGO_ScheduleBasisDetection(unittest.TestCase):
-    """Verify that LAGO schedule headings produce unknown basis.
-
-    The LAGO schedules use generic "WIDTH" / "HEIGHT" headings.
-    No heading says "Rough Opening", "Frame Size", etc.
-    """
-
     def test_window_heading_unknown_basis(self):
-        h = detect_header(WINDOW_HEADER)
-        self.assertIn("width", h)
-        self.assertIn("height", h)
-        self.assertEqual(h["dimension_basis"], "")
-        self.assertEqual(h["basis_source"], "")
+        header = detect_header(WINDOW_HEADER)
+        self.assertIn("width", header)
+        self.assertIn("height", header)
+        self.assertEqual(header["dimension_basis"], "")
 
-    def test_ext_door_heading_unknown_basis(self):
-        h = detect_header(EXT_DOOR_HEADER)
-        self.assertIn("width", h)
-        self.assertIn("height", h)
-        self.assertEqual(h["dimension_basis"], "")
-        self.assertEqual(h["basis_source"], "")
+    def test_external_door_heading_unknown_basis(self):
+        header = detect_header(EXT_DOOR_HEADER)
+        self.assertIn("width", header)
+        self.assertIn("height", header)
+        self.assertEqual(header["dimension_basis"], "")
 
-    def test_int_door_heading_unknown_basis(self):
-        h = detect_header(INT_DOOR_HEADER)
-        self.assertIn("width", h)
-        self.assertIn("height", h)
-        self.assertEqual(h["dimension_basis"], "")
-        self.assertEqual(h["basis_source"], "")
+    def test_internal_door_heading_unknown_basis(self):
+        header = detect_header(INT_DOOR_HEADER)
+        self.assertIn("width", header)
+        self.assertIn("height", header)
+        self.assertEqual(header["dimension_basis"], "")
 
 
 class TestLAGO_ScheduleParsing(unittest.TestCase):
-    """Parse actual LAGO schedule data through parse_schedule_rows().
-
-    These tests feed source-derived rows through the real B2 parser and
-    verify exact output — not hand-constructed ScheduleEntry objects.
-    """
-
-    def test_window_schedule_rows_parsed(self):
-        """CD6307: parse 14 real window rows, verify mark/dims/basis."""
-        rows = _make_parser_rows(WINDOW_HEADER, WINDOW_ROWS)
-        entries = parse_schedule_rows(rows, page_no=WINDOW_SCHEDULE_PAGE_1BASED)
+    def test_window_schedule_all_rows(self):
+        entries = _parsed(WINDOW_HEADER, WINDOW_ROWS, WINDOW_SCHEDULE_PAGE_1BASED)
         self.assertEqual(len(entries), 14)
-        for e in entries:
-            # LAGO window marks start with EW (external window)
-            self.assertTrue(e.type_mark.startswith("EW"),
-                            f"Expected EW-mark, got {e.type_mark}")
-            self.assertIsNotNone(e.width_mm)
-            self.assertIsNotNone(e.height_mm)
-            self.assertEqual(e.dimension_basis, "",
-                             f"{e.type_mark}: generic heading must yield unknown basis")
+        self.assertEqual([(e.type_mark, e.width_mm, e.height_mm) for e in entries], WINDOW_ROWS)
+        self.assertTrue(all(e.dimension_basis == "" for e in entries))
 
-    def test_window_entry_exact_values(self):
-        """Verify exact first window entry from CD6307."""
-        rows = _make_parser_rows(WINDOW_HEADER, WINDOW_ROWS)
-        entries = parse_schedule_rows(rows, page_no=WINDOW_SCHEDULE_PAGE_1BASED)
-        first = entries[0]
-        self.assertEqual(first.type_mark, "EW03")
-        self.assertEqual(first.width_mm, 2900)
-        self.assertEqual(first.height_mm, 2630)
-        self.assertEqual(first.dimension_basis, "")
-        self.assertEqual(first.page_no, WINDOW_SCHEDULE_PAGE_1BASED)
-
-    def test_ext_door_schedule_rows_parsed(self):
-        """CD6313: parse 42 real external door rows."""
-        rows = _make_parser_rows(EXT_DOOR_HEADER, EXT_DOOR_ROWS)
-        entries = parse_schedule_rows(rows, page_no=EXT_DOOR_SCHEDULE_PAGE_1BASED)
+    def test_external_door_schedule_all_rows(self):
+        entries = _parsed(EXT_DOOR_HEADER, EXT_DOOR_ROWS, EXT_DOOR_SCHEDULE_PAGE_1BASED)
         self.assertEqual(len(entries), 42)
-        for e in entries:
-            self.assertTrue(e.type_mark.startswith("E"),
-                            f"Expected E-mark, got {e.type_mark}")
-            self.assertIsNotNone(e.width_mm)
-            self.assertIsNotNone(e.height_mm)
-            self.assertEqual(e.dimension_basis, "")
+        self.assertEqual([(e.type_mark, e.width_mm, e.height_mm) for e in entries], EXT_DOOR_ROWS)
+        self.assertTrue(all(e.dimension_basis == "" for e in entries))
 
-    def test_int_door_schedule_rows_parsed(self):
-        """CD6319: parse 31 real internal door rows."""
-        rows = _make_parser_rows(INT_DOOR_HEADER, INT_DOOR_ROWS)
-        entries = parse_schedule_rows(rows, page_no=INT_DOOR_SCHEDULE_PAGE_1BASED)
+    def test_internal_door_schedule_all_rows(self):
+        entries = _parsed(INT_DOOR_HEADER, INT_DOOR_ROWS, INT_DOOR_SCHEDULE_PAGE_1BASED)
         self.assertEqual(len(entries), 31)
-        for e in entries:
-            self.assertTrue(e.type_mark.startswith("I"),
-                            f"Expected I-mark, got {e.type_mark}")
-            self.assertIsNotNone(e.width_mm)
-            self.assertIsNotNone(e.height_mm)
-            self.assertEqual(e.dimension_basis, "")
+        self.assertEqual([(e.type_mark, e.width_mm, e.height_mm) for e in entries], INT_DOOR_ROWS)
+        self.assertTrue(all(e.dimension_basis == "" for e in entries))
 
-    def test_int_door_entry_exact_values(self):
-        """Verify exact first internal door entry."""
-        rows = _make_parser_rows(INT_DOOR_HEADER, INT_DOOR_ROWS)
-        entries = parse_schedule_rows(rows, page_no=INT_DOOR_SCHEDULE_PAGE_1BASED)
-        first = entries[0]
-        self.assertEqual(first.type_mark, "ID02")
-        self.assertEqual(first.width_mm, 1000)
-        self.assertEqual(first.height_mm, 2340)
-        self.assertEqual(first.dimension_basis, "")
+    def test_exact_window_source_value(self):
+        entries = _parsed(WINDOW_HEADER, WINDOW_ROWS, WINDOW_SCHEDULE_PAGE_1BASED)
+        self.assertEqual((entries[0].type_mark, entries[0].width_mm, entries[0].height_mm),
+                         ("EW03", 2900, 2630))
 
-    def test_ext_door_ed01_first_occurrence(self):
-        """ED01 first occurrence: 3000 x 2630."""
-        rows = _make_parser_rows(EXT_DOOR_HEADER, EXT_DOOR_ROWS)
-        entries = parse_schedule_rows(rows, page_no=EXT_DOOR_SCHEDULE_PAGE_1BASED)
-        ed01_entries = [e for e in entries if e.type_mark == "ED01"]
-        self.assertGreaterEqual(len(ed01_entries), 1)
-        # First ED01 at 3000x2630
-        self.assertEqual(ed01_entries[0].width_mm, 3000)
-        self.assertEqual(ed01_entries[0].height_mm, 2630)
+    def test_exact_external_door_source_value(self):
+        entries = _parsed(EXT_DOOR_HEADER, EXT_DOOR_ROWS, EXT_DOOR_SCHEDULE_PAGE_1BASED)
+        ed04 = [(e.width_mm, e.height_mm) for e in entries if e.type_mark == "ED04"]
+        self.assertEqual(ed04, [(2600, 2630), (3000, 2665)])
 
-    def test_duplicate_mark_preserved_as_separate_entries(self):
-        """Same mark with different dims appears as separate parser entries."""
-        rows = _make_parser_rows(EXT_DOOR_HEADER, EXT_DOOR_ROWS)
-        entries = parse_schedule_rows(rows, page_no=EXT_DOOR_SCHEDULE_PAGE_1BASED)
-        ed04_entries = [e for e in entries if e.type_mark == "ED04"]
-        self.assertEqual(len(ed04_entries), 2,
-                         "ED04 should appear twice with different dims")
-        widths = sorted(e.width_mm for e in ed04_entries)
-        self.assertEqual(widths, [2600, 3000])
+    def test_duplicate_marks_are_preserved(self):
+        entries = _parsed(WINDOW_HEADER, WINDOW_ROWS, WINDOW_SCHEDULE_PAGE_1BASED)
+        self.assertEqual(len([e for e in entries if e.type_mark == "EW02"]), 2)
+        self.assertEqual(len([e for e in entries if e.type_mark == "EW03"]), 2)
+        self.assertEqual(len([e for e in entries if e.type_mark == "EW04"]), 2)
 
 
-class TestLAGO_AmbiguityDetection(unittest.TestCase):
-    """Real LAGO schedule ambiguities: same mark, different dimensions.
-
-    These are genuine contradictions in the source document. B2 must not
-    silently choose one — it must flag ambiguity.
-    """
-
-    def _enrich_with_schedule(self, mark, schedule_entries):
-        """Create a plan instance and enrich with schedule data."""
-        inst = OpeningEvidence(
-            type_mark=mark, width_m=None, height_m=None,
-            dimension_basis="", dimension_source="plan_detection",
-            extraction_method="plan_detection", page_no=0,
-        )
-        return enrich_opening_evidence([inst], schedule_entries)
-
-    def test_ew02_ambiguous_different_widths(self):
-        """EW02: 2000x1000 vs 900x1665 — genuine ambiguity."""
-        sched = [
-            ScheduleEntry(type_mark="EW02", width_mm=2000, height_mm=1000,
-                          parse_source="header_separate", dimension_basis=""),
-            ScheduleEntry(type_mark="EW02", width_mm=900, height_mm=1665,
-                          parse_source="header_separate", dimension_basis=""),
-        ]
-        result = self._enrich_with_schedule("EW02", sched)
-        # Must NOT be enriched — conflicting dims
+class TestLAGO_MarkOnlyAssociationAmbiguity(unittest.TestCase):
+    def _assert_ambiguous(self, mark, schedule_entries):
+        result = enrich_opening_evidence([_plan_instance(mark)], schedule_entries)
+        self.assertEqual(len(result), 1)
         self.assertIsNone(result[0].width_m)
-        # Ambiguity recorded
-        obs = result[0].source_observations
-        ambig = [o for o in obs if o.get("status") == "ambiguous"]
-        self.assertEqual(len(ambig), 1)
+        ambiguous = [o for o in result[0].source_observations if o.get("status") == "ambiguous"]
+        self.assertEqual(len(ambiguous), 1)
+        return ambiguous[0]
 
-    def test_ew03_ambiguous_different_widths(self):
-        """EW03: 2900x2630 vs 1800x1665 — genuine ambiguity."""
-        sched = [
-            ScheduleEntry(type_mark="EW03", width_mm=2900, height_mm=2630,
-                          parse_source="header_separate", dimension_basis=""),
-            ScheduleEntry(type_mark="EW03", width_mm=1800, height_mm=1665,
-                          parse_source="header_separate", dimension_basis=""),
-        ]
-        result = self._enrich_with_schedule("EW03", sched)
-        self.assertIsNone(result[0].width_m)
+    def test_ew02_mark_only_association_is_ambiguous(self):
+        entries = _parsed(WINDOW_HEADER, WINDOW_ROWS, WINDOW_SCHEDULE_PAGE_1BASED)
+        self._assert_ambiguous("EW02", [e for e in entries if e.type_mark == "EW02"])
 
-    def test_ew04_ambiguous_different_widths(self):
-        """EW04: 1100x2630 vs 2400x1665 — genuine ambiguity."""
-        sched = [
-            ScheduleEntry(type_mark="EW04", width_mm=1100, height_mm=2630,
-                          parse_source="header_separate", dimension_basis=""),
-            ScheduleEntry(type_mark="EW04", width_mm=2400, height_mm=1665,
-                          parse_source="header_separate", dimension_basis=""),
-        ]
-        result = self._enrich_with_schedule("EW04", sched)
-        self.assertIsNone(result[0].width_m)
+    def test_ew03_mark_only_association_is_ambiguous(self):
+        entries = _parsed(WINDOW_HEADER, WINDOW_ROWS, WINDOW_SCHEDULE_PAGE_1BASED)
+        self._assert_ambiguous("EW03", [e for e in entries if e.type_mark == "EW03"])
 
-    def test_ed04_ambiguous_different_widths(self):
-        """ED04: 2600x2630 vs 3000x2665 — genuine ambiguity."""
-        sched = [
-            ScheduleEntry(type_mark="ED04", width_mm=2600, height_mm=2630,
-                          parse_source="header_separate", dimension_basis=""),
-            ScheduleEntry(type_mark="ED04", width_mm=3000, height_mm=2665,
-                          parse_source="header_separate", dimension_basis=""),
-        ]
-        result = self._enrich_with_schedule("ED04", sched)
-        self.assertIsNone(result[0].width_m)
-        obs = result[0].source_observations
-        ambig = [o for o in obs if o.get("status") == "ambiguous"]
-        self.assertEqual(len(ambig), 1)
+    def test_ew04_mark_only_association_is_ambiguous(self):
+        entries = _parsed(WINDOW_HEADER, WINDOW_ROWS, WINDOW_SCHEDULE_PAGE_1BASED)
+        self._assert_ambiguous("EW04", [e for e in entries if e.type_mark == "EW04"])
 
-    def test_consistent_mark_enriched_normally(self):
-        """ED01: 3000x2630 twice — consistent, should enrich."""
-        sched = [
-            ScheduleEntry(type_mark="ED01", width_mm=3000, height_mm=2630,
-                          parse_source="header_separate", dimension_basis=""),
-            ScheduleEntry(type_mark="ED01", width_mm=3000, height_mm=2630,
-                          parse_source="heuristic", dimension_basis=""),
-        ]
-        result = self._enrich_with_schedule("ED01", sched)
-        self.assertIsNotNone(result[0].width_m)
-        self.assertAlmostEqual(result[0].width_m, 3.0, places=2)
+    def test_ed04_mark_only_association_is_ambiguous(self):
+        entries = _parsed(EXT_DOOR_HEADER, EXT_DOOR_ROWS, EXT_DOOR_SCHEDULE_PAGE_1BASED)
+        obs = self._assert_ambiguous("ED04", [e for e in entries if e.type_mark == "ED04"])
+        alternatives = {(a["width_mm"], a["height_mm"]) for a in obs["alternatives"]}
+        self.assertEqual(alternatives, {(2600, 2630), (3000, 2665)})
+
+    def test_ew01_identical_rows_can_enrich(self):
+        entries = _parsed(WINDOW_HEADER, WINDOW_ROWS, WINDOW_SCHEDULE_PAGE_1BASED)
+        ew01 = [e for e in entries if e.type_mark == "EW01"]
+        self.assertEqual([(e.width_mm, e.height_mm) for e in ew01], [(900, 1665), (900, 1665)])
+        result = enrich_opening_evidence([_plan_instance("EW01")], ew01)
+        self.assertAlmostEqual(result[0].width_m, 0.9, places=3)
+        self.assertAlmostEqual(result[0].height_m, 1.665, places=3)
+        self.assertEqual(result[0].dimension_basis, "unknown")
 
 
-class TestLAGO_EndToEndSafety(unittest.TestCase):
-    """End-to-end: real parsed LAGO row -> enrich -> reconcile -> B5 gate.
-
-    Proves that generic WIDTH/HEIGHT schedule entries do NOT enable
-    automatic wall-void deductions through the full pipeline.
-    """
-
-    def test_no_deduction_from_generic_schedule(self):
-        """Parsed LAGO row with unknown basis must not produce deduct=True."""
-        # 1. Parse a real LAGO schedule row
-        rows = _make_parser_rows(INT_DOOR_HEADER, [("ID02", 1000, 2340)])
-        entries = parse_schedule_rows(rows, page_no=INT_DOOR_SCHEDULE_PAGE_1BASED)
-        self.assertEqual(len(entries), 1)
-        sched_entry = entries[0]
-        self.assertEqual(sched_entry.dimension_basis, "")
-
-        # 2. Create a plan-detected instance (B1 output)
+class TestLAGO_EndToEndScheduleSafety(unittest.TestCase):
+    def test_generic_internal_schedule_never_enables_deduction(self):
+        entries = _parsed(INT_DOOR_HEADER, [("ID02", 1000, 2340)], INT_DOOR_SCHEDULE_PAGE_1BASED)
         inst = OpeningEvidence(
             type_mark="ID02",
-            width_m=None, height_m=None,
+            width_m=None,
+            height_m=None,
             dimension_basis="",
             dimension_source="plan_detection",
             extraction_method="plan_detection",
-            page_no=INT_DOOR_SCHEDULE_PAGE_1BASED,
+            page_no=14,
             geometry_confidence=0.85,
             dimension_confidence=0.0,
             association_confidence=0.80,
             wall_ref="W-ID02",
         )
-
-        # 3. Enrich with schedule (B2)
-        enriched = enrich_opening_evidence([inst], [sched_entry])
-        self.assertEqual(len(enriched), 1)
-        e = enriched[0]
-        self.assertIsNotNone(e.width_m, "Dims should be enriched from schedule")
-        self.assertEqual(e.dimension_basis, "unknown",
-                         "Generic WIDTH/HEIGHT must stay unknown")
-
-        # 4. Reconcile (B4)
-        reconciled, conflicts = reconcile_opening_evidence(enriched)
-        self.assertEqual(len(reconciled), 1)
-        r = reconciled[0]
-        self.assertTrue(r.reconciliation_complete)
-
-        # 5. Compute deduction status
-        r.compute_deduction_status()
-        # Unknown basis → review (not eligible)
-        self.assertEqual(r.deduction_status, DEDUCTION_REVIEW)
-
-        # 6. Apply deductions (B5)
-        deducted = apply_deductions([r])
-        self.assertFalse(deducted[0].deduct,
-                         "Generic schedule dims must NOT produce deduct=True")
-        self.assertEqual(deducted[0].deduction_decision, DEDUCTION_NOT_DEDUCTED)
-
-    def test_no_deduction_from_window_schedule(self):
-        """Parsed CD6307 window row must not produce deduct=True."""
-        rows = _make_parser_rows(WINDOW_HEADER, [("EW01", 900, 1665)])
-        entries = parse_schedule_rows(rows, page_no=WINDOW_SCHEDULE_PAGE_1BASED)
-        self.assertEqual(len(entries), 1)
-
-        inst = OpeningEvidence(
-            type_mark="EW01", width_m=None, height_m=None,
-            dimension_basis="", dimension_source="plan_detection",
-            extraction_method="plan_detection", page_no=0,
-            geometry_confidence=0.80, dimension_confidence=0.0,
-            association_confidence=0.75, wall_ref="W-EW01",
-        )
         enriched = enrich_opening_evidence([inst], entries)
         self.assertEqual(enriched[0].dimension_basis, "unknown")
-
         reconciled, _ = reconcile_opening_evidence(enriched)
         reconciled[0].compute_deduction_status()
         self.assertEqual(reconciled[0].deduction_status, DEDUCTION_REVIEW)
-
         result = apply_deductions(reconciled)
         self.assertFalse(result[0].deduct)
+        self.assertEqual(result[0].deduction_decision, DEDUCTION_NOT_DEDUCTED)
 
-
-class TestLAGO_PlanVectorB1(unittest.TestCase):
-    """Real B1 plan-vector extraction from an actual LAGO floor-plan page.
-
-    Exercises the unmocked B1 detection pipeline against real PDF vector
-    data (segments + text words) from CD3304 Basement Wall Setout 01.
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        """Extract vector data from the real PDF once for all tests."""
-        pdf_path = r"C:\Users\bryce\Downloads\260617_004-LAGO-BRITINYA_ARCH-DRAWINGS_COMBINED 2.pdf"
-        if not Path(pdf_path).exists():
-            raise unittest.SkipTest("LAGO source PDF not available")
-
-        doc = fitz.open(pdf_path)
-        page = doc[FLOOR_PLAN_PAGE_0BASED]
-
-        from pb_plan_opening_detection_v171 import Segment, TextWord
-
-        # Extract line segments
-        segments = []
-        for d in page.get_drawings():
-            for item in d["items"]:
-                if item[0] == "l":
-                    p1, p2 = item[1], item[2]
-                    segments.append(Segment(x1=p1.x, y1=p1.y,
-                                            x2=p2.x, y2=p2.y))
-        cls.segments = segments
-
-        # Extract text words
-        words_raw = page.get_text("words")
-        cls.words = [TextWord(text=str(w[4]), x0=w[0], y0=w[1],
-                              x1=w[2], y1=w[3]) for w in words_raw]
-
-        # Tags on this page
-        cls.tags = sorted(set(w.text for w in cls.words
-                              if re.match(r'^W\d{1,3}$', w.text)))
-
-        doc.close()
-
-    def test_segments_extracted(self):
-        """Real PDF page yields a substantial number of line segments."""
-        self.assertGreater(len(self.segments), 1000)
-
-    def test_words_extracted(self):
-        """Real PDF page yields text words."""
-        self.assertGreater(len(self.words), 100)
-
-    def test_window_tags_present(self):
-        """Floor-plan page contains W## tags."""
-        self.assertGreater(len(self.tags), 5)
-        self.assertIn("W1", self.tags)
-
-    def test_b1_finds_candidates_from_real_data(self):
-        """Unmocked B1 detection produces candidates from real vector data."""
-        from pb_plan_opening_detection_v171 import plan_opening_candidates
-
-        result = plan_opening_candidates(
-            segments=self.segments,
-            words=self.words,
-            scale_px_per_m=FLOOR_PLAN_SCALE_PT_PER_M,
-            page_no=FLOOR_PLAN_PAGE_1BASED,
-            min_wall_length_pt=300.0,  # reduce false positives from hatching
+    def test_generic_window_schedule_never_enables_deduction(self):
+        entries = _parsed(WINDOW_HEADER, [("EW01", 900, 1665)], WINDOW_SCHEDULE_PAGE_1BASED)
+        inst = OpeningEvidence(
+            type_mark="EW01",
+            width_m=None,
+            height_m=None,
+            dimension_basis="",
+            dimension_source="plan_detection",
+            extraction_method="plan_detection",
+            page_no=23,
+            geometry_confidence=0.80,
+            dimension_confidence=0.0,
+            association_confidence=0.75,
+            wall_ref="W-EW01",
         )
-        # B1 must produce candidates (doors + windows + gaps)
-        total = result.door_count + result.window_count + result.gap_count
-        self.assertGreater(total, 0,
-                           "B1 must find at least one candidate from real data")
+        enriched = enrich_opening_evidence([inst], entries)
+        reconciled, _ = reconcile_opening_evidence(enriched)
+        reconciled[0].compute_deduction_status()
+        self.assertEqual(reconciled[0].deduction_status, DEDUCTION_REVIEW)
+        self.assertFalse(apply_deductions(reconciled)[0].deduct)
 
-    def test_b1_candidates_have_expected_structure(self):
-        """B1 candidates carry the OpeningEvidence contract fields."""
-        from pb_plan_opening_detection_v171 import plan_opening_candidates
 
-        result = plan_opening_candidates(
-            segments=self.segments,
-            words=self.words,
-            scale_px_per_m=FLOOR_PLAN_SCALE_PT_PER_M,
-            page_no=FLOOR_PLAN_PAGE_1BASED,
-            min_wall_length_pt=300.0,
+class TestLAGO_B1_GA08Fixture(unittest.TestCase):
+    def test_fixture_is_self_contained_and_source_traced(self):
+        fixture = _load_b1_fixture()
+        source = fixture["source"]
+        self.assertEqual(source["pdf_page_1based"], 23)
+        self.assertEqual(source["pdf_page_0based"], 22)
+        self.assertEqual(source["drawing_ref"], GA08_DRAWING_REF)
+        self.assertEqual(source["scale_a1"], "1:100")
+        self.assertEqual(fixture["expected"]["source_tags"], ["ED04"])
+
+    def test_fixture_contains_real_ed04_word(self):
+        fixture = _load_b1_fixture()
+        tags = [w for w in fixture["words"] if w["text"] == "ED04"]
+        self.assertEqual(len(tags), 1)
+        self.assertEqual(
+            [tags[0]["x0"], tags[0]["y0"], tags[0]["x1"], tags[0]["y1"]],
+            fixture["expected"]["tag_bboxes"]["ED04"],
         )
+
+    def test_fixture_contains_verified_door_leaf_vectors(self):
+        fixture = _load_b1_fixture()
+        actual = {
+            tuple(round(row[key], 3) for key in ("x1", "y1", "x2", "y2"))
+            for row in fixture["segments"]
+        }
+        for expected in fixture["expected"]["verified_door_leaf_segments"]:
+            self.assertIn(tuple(round(v, 3) for v in expected), actual)
+
+    def test_unmocked_b1_runs_on_checked_in_real_vectors(self):
+        fixture, segments, words = _fixture_inputs()
+        result = plan_opening_candidates(
+            segments=segments,
+            words=words,
+            scale_px_per_m=fixture["source"]["scale_pt_per_m"],
+            page_no=GA08_PAGE_1BASED,
+            min_wall_length_pt=200.0,
+        )
+        self.assertGreater(result.wall_lines_found, 0)
         self.assertGreater(len(result.candidates), 0)
-        for c in result.candidates[:5]:
-            self.assertIsInstance(c, OpeningEvidence)
-            self.assertEqual(c.page_no, FLOOR_PLAN_PAGE_1BASED)
-            self.assertIn(c.opening_type, ("door", "window", "other"))
-            # B1 never determines basis
-            self.assertEqual(c.dimension_basis, "unknown")
+        for candidate in result.candidates:
+            self.assertEqual(candidate.page_no, GA08_PAGE_1BASED)
+            self.assertEqual(candidate.dimension_basis, "unknown")
+            self.assertFalse(candidate.deduct)
 
-    def test_b1_tagged_candidates_match_source_tags(self):
-        """B1 assigns W## tags that appear on the real page."""
-        from pb_plan_opening_detection_v171 import plan_opening_candidates
-
+    def test_real_vector_tag_is_never_retyped_as_window(self):
+        fixture, segments, words = _fixture_inputs()
         result = plan_opening_candidates(
-            segments=self.segments,
-            words=self.words,
-            scale_px_per_m=FLOOR_PLAN_SCALE_PT_PER_M,
-            page_no=FLOOR_PLAN_PAGE_1BASED,
-            min_wall_length_pt=300.0,
+            segments=segments,
+            words=words,
+            scale_px_per_m=fixture["source"]["scale_pt_per_m"],
+            page_no=GA08_PAGE_1BASED,
+            min_wall_length_pt=200.0,
         )
-        b1_marks = set(c.type_mark for c in result.candidates if c.type_mark)
-        # At least some B1 marks should be real page tags
-        overlap = b1_marks.intersection(self.tags)
-        # B1 may not find all tags (depends on geometry), but should find some
-        # or at minimum produce candidates
-        self.assertGreater(len(result.candidates), 0)
+        for candidate in result.candidates:
+            if candidate.type_mark == "ED04":
+                self.assertEqual(candidate.opening_type, "door")
+
+    def test_real_vector_pipeline_remains_non_deducting(self):
+        fixture, segments, words = _fixture_inputs()
+        b1 = plan_opening_candidates(
+            segments=segments,
+            words=words,
+            scale_px_per_m=fixture["source"]["scale_pt_per_m"],
+            page_no=GA08_PAGE_1BASED,
+            min_wall_length_pt=200.0,
+        )
+        schedule = _parsed(EXT_DOOR_HEADER, EXT_DOOR_ROWS, EXT_DOOR_SCHEDULE_PAGE_1BASED)
+        ed04_schedule = [entry for entry in schedule if entry.type_mark == "ED04"]
+        enriched = enrich_opening_evidence(b1.candidates, ed04_schedule)
+        reconciled, _ = reconcile_opening_evidence(enriched)
+        for candidate in reconciled:
+            candidate.compute_deduction_status()
+        deducted = apply_deductions(reconciled)
+        self.assertTrue(deducted)
+        self.assertFalse(any(candidate.deduct for candidate in deducted))
 
 
 if __name__ == "__main__":
