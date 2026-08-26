@@ -35,6 +35,8 @@ from pb_opening_deduction_v174 import (
     deducted_total_area_m2,
     net_wall_area_after_deductions,
     _marks_conflict,
+    same_location,
+    _types_conflict,
 )
 
 
@@ -106,6 +108,52 @@ class TestMarksConflict(unittest.TestCase):
         a = _make_instance(mark="d01")
         b = _make_instance(mark="D01")
         self.assertFalse(_marks_conflict(a, b))
+
+
+# ============================================================================
+# Location and type conflict checks
+# ============================================================================
+class TestSameLocation(unittest.TestCase):
+    """same_location detects physical proximity without type compatibility."""
+
+    def test_same_wall_same_position(self):
+        a = _make_instance(wall="W01", position=1.5)
+        b = _make_instance(wall="W01", position=1.5)
+        self.assertTrue(same_location(a, b))
+
+    def test_different_wall(self):
+        a = _make_instance(wall="W01", position=1.5)
+        b = _make_instance(wall="W02", position=1.5)
+        self.assertFalse(same_location(a, b))
+
+    def test_far_position(self):
+        a = _make_instance(wall="W01", position=1.0)
+        b = _make_instance(wall="W01", position=5.0)
+        self.assertFalse(same_location(a, b))
+
+    def test_no_position(self):
+        a = _make_instance(wall="W01", position=1.5)
+        b = _make_instance(wall="W01", position=None)
+        self.assertFalse(same_location(a, b))
+
+
+class TestTypesConflict(unittest.TestCase):
+    """_types_conflict detects incompatible opening types."""
+
+    def test_door_window_conflicts(self):
+        a = _make_instance(opening_type=OPENING_TYPE_DOOR)
+        b = _make_instance(opening_type=OPENING_TYPE_WINDOW)
+        self.assertTrue(_types_conflict(a, b))
+
+    def test_same_type_no_conflict(self):
+        a = _make_instance(opening_type=OPENING_TYPE_DOOR)
+        b = _make_instance(opening_type=OPENING_TYPE_DOOR)
+        self.assertFalse(_types_conflict(a, b))
+
+    def test_opening_compatible_with_any(self):
+        a = _make_instance(opening_type="opening")
+        b = _make_instance(opening_type=OPENING_TYPE_DOOR)
+        self.assertFalse(_types_conflict(a, b))
 
 
 # ============================================================================
@@ -696,9 +744,8 @@ class TestB4ConflictSurvivesDedup(unittest.TestCase):
             self.assertFalse(inst.deduct)
 
     def test_door_window_same_position_forces_review(self):
-        """Door + window at same position → same_physical_opening rejects
-        type conflict → both survive separately. B4 may still force review
-        if observations conflict."""
+        """Door + window at same position → same_location detects type conflict
+        → physical_instance_conflict on both → B4 forces review → B5 rejects."""
         from pb_opening_reconciliation_v173 import reconcile_opening_evidence
         door = _make_instance(
             mark="D01", opening_type=OPENING_TYPE_DOOR,
@@ -710,15 +757,24 @@ class TestB4ConflictSurvivesDedup(unittest.TestCase):
             position=1.5, width=0.82,
             geom_conf=0.95, dim_conf=0.95, assoc_conf=0.95,
         )
-        # same_physical_opening rejects door vs window → both survive
+        # same_location detects type conflict → conflict on both
         deduped = resolve_physical_duplicates([door, window])
         self.assertEqual(len(deduped), 2)
-        # B4 reconciles each independently — no physical_instance_conflict
-        # observation (type conflict is structural, not mark-based)
+        for inst in deduped:
+            pic = [o for o in inst.source_observations
+                   if o["source"] == "physical_instance_conflict"]
+            self.assertEqual(len(pic), 1)
+        # B4 forces both to review
         reconciled, conflicts = reconcile_opening_evidence(deduped)
-        pic = [c for c in conflicts
-               if c.conflict_type == "physical_instance_conflict"]
-        self.assertEqual(len(pic), 0)
+        pic_conflicts = [c for c in conflicts
+                         if c.conflict_type == "physical_instance_conflict"]
+        self.assertGreaterEqual(len(pic_conflicts), 2)
+        for inst in reconciled:
+            self.assertEqual(inst.deduction_status, DEDUCTION_REVIEW)
+        # B5 rejects both
+        apply_deductions(reconciled)
+        for inst in reconciled:
+            self.assertFalse(inst.deduct)
 
 
 # ============================================================================
@@ -799,6 +855,89 @@ class TestPipelineOrchestration(unittest.TestCase):
         for inst in instances:
             self.assertFalse(inst.deduct)
             self.assertEqual(inst.deduction_status, DEDUCTION_REVIEW)
+
+    def test_run_opening_pipeline_with_mocked_b1(self):
+        """Actual run_opening_pipeline() call with mocked B1 result.
+
+        Exercises the full pipeline order:
+        B1 → dedup → B2 → B3 → B4 → B5
+
+        and asserts reconciliation_complete=True before any deduct=True.
+        """
+        from unittest.mock import patch, MagicMock
+        from pb_opening_deduction_v174 import run_opening_pipeline
+
+        # Mock B1 result with D01 + D02 at SAME position → identity conflict
+        inst_a = _make_instance(
+            mark="D01", wall="W01", position=1.5, width=0.82,
+            geom_conf=0.95, dim_conf=0.95, assoc_conf=0.95,
+        )
+        inst_b = _make_instance(
+            mark="D02", wall="W01", position=1.5, width=0.82,
+            geom_conf=0.95, dim_conf=0.95, assoc_conf=0.95,
+        )
+        mock_result = MagicMock()
+        mock_result.candidates = [inst_a, inst_b]
+        mock_result.door_count = 2
+        mock_result.window_count = 0
+        mock_result.gap_count = 0
+
+        with patch(
+            "pb_plan_opening_detection_v171.plan_opening_candidates",
+            return_value=mock_result,
+        ):
+            result = run_opening_pipeline(
+                segments=[], words=[], page_no=1,
+                gross_wall_m2=20.0, wall_ref="W01",
+            )
+
+        # Pipeline produced instances
+        self.assertEqual(len(result["instances"]), 2)
+        # B4 ran on every instance
+        for inst in result["instances"]:
+            self.assertTrue(inst.reconciliation_complete)
+        # D01 + D02 at same position → physical_instance_conflict → review
+        for inst in result["instances"]:
+            self.assertEqual(inst.deduction_status, DEDUCTION_REVIEW)
+            self.assertFalse(inst.deduct)
+        # Net wall area: no deductions → full gross
+        self.assertAlmostEqual(
+            result["net_wall"]["net_area_m2"], 20.0, places=4
+        )
+        self.assertTrue(result["net_wall"]["valid"])
+
+    def test_run_opening_pipeline_eligible_single(self):
+        """run_opening_pipeline() with a single eligible instance → deduct."""
+        from unittest.mock import patch, MagicMock
+        from pb_opening_deduction_v174 import run_opening_pipeline
+
+        inst = _make_instance(
+            mark="D01", wall="W01", position=1.5, width=0.82,
+            geom_conf=0.95, dim_conf=0.95, assoc_conf=0.95,
+        )
+        mock_result = MagicMock()
+        mock_result.candidates = [inst]
+        mock_result.door_count = 1
+        mock_result.window_count = 0
+        mock_result.gap_count = 0
+
+        with patch(
+            "pb_plan_opening_detection_v171.plan_opening_candidates",
+            return_value=mock_result,
+        ):
+            result = run_opening_pipeline(
+                segments=[], words=[], page_no=1,
+                gross_wall_m2=20.0, wall_ref="W01",
+            )
+
+        self.assertEqual(len(result["instances"]), 1)
+        self.assertTrue(result["instances"][0].reconciliation_complete)
+        self.assertTrue(result["instances"][0].deduct)
+        self.assertEqual(result["instances"][0].deduction_decision, "deducted")
+        expected_net = round(20.0 - 0.82 * 2.10, 4)
+        self.assertAlmostEqual(
+            result["net_wall"]["net_area_m2"], expected_net, places=4
+        )
 
 
 if __name__ == "__main__":

@@ -35,13 +35,77 @@ from pb_opening_evidence_v170 import (
     merge_opening_evidence,
     net_wall_area_m2,
     same_physical_opening,
+    TOLERANCE_POSITION_M,
+    TOLERANCE_WIDTH_M,
 )
 
 VERSION = "1.7.4"
 
 # ---------------------------------------------------------------------------
-# Mark conflict check — prevents silent merge of contradictory identities
+# Location and type checks for conflict detection
 # ---------------------------------------------------------------------------
+# Types that are geometrically incompatible at the same physical location
+_INCOMPATIBLE_TYPES = {
+    frozenset({"door", "window"}),
+    frozenset({"door", "glazed_opening"}),
+    frozenset({"window", "glazed_opening"}),
+    frozenset({"door", "garage_door"}),
+    frozenset({"door", "roller_door"}),
+}
+
+
+def _types_conflict(a: OpeningEvidence, b: OpeningEvidence) -> bool:
+    """True if both have specific, incompatible opening types.
+
+    Door vs window at the same location is a physical-identity conflict.
+    Generic "opening" is compatible with anything.
+    """
+    if not a.opening_type or not b.opening_type:
+        return False
+    if a.opening_type == b.opening_type:
+        return False
+    # Generic "opening" is compatible with everything
+    if a.opening_type == "opening" or b.opening_type == "opening":
+        return False
+    pair = frozenset({a.opening_type, b.opening_type})
+    return pair in _INCOMPATIBLE_TYPES
+
+
+def same_location(a: OpeningEvidence, b: OpeningEvidence) -> bool:
+    """True if two candidates are at the same physical wall location.
+
+    Checks wall_ref, level, position, and dimensional compatibility
+    WITHOUT checking opening_type.  This is intentionally broader than
+    same_physical_opening() which also checks type compatibility.
+
+    Used to detect type conflicts (door vs window) at the same location.
+    """
+    # Wall reference required
+    if not a.wall_ref or not b.wall_ref:
+        return False
+    if a.wall_ref != b.wall_ref:
+        return False
+
+    # Level compatible
+    if a.level and b.level and a.level != b.level:
+        return False
+
+    # Position required from both
+    if a.position_along_wall_m is None or b.position_along_wall_m is None:
+        return False
+    if abs(a.position_along_wall_m - b.position_along_wall_m) > (
+        TOLERANCE_POSITION_M + 1e-9
+    ):
+        return False
+
+    # Width compatible when both present
+    if (a.width_m is not None and b.width_m is not None
+            and abs(a.width_m - b.width_m) > TOLERANCE_WIDTH_M + 1e-9):
+        return False
+
+    return True
+
+
 def _marks_conflict(a: OpeningEvidence, b: OpeningEvidence) -> bool:
     """True if both instances have nonblank, different type marks.
 
@@ -65,13 +129,13 @@ def resolve_physical_duplicates(
     Catches any remaining duplicates from B1 (e.g. door + gap detectors
     flagging the same physical opening) BEFORE enrichment and reconciliation.
 
-    Uses same_physical_opening() which requires position anchor from
-    both records.  When both have nonblank, conflicting marks (D01 + D02),
-    neither is merged AND both receive a physical_instance_conflict
-    observation that B4 will force to review.
+    Three paths for candidates at the same physical location:
+      1. Compatible marks + compatible types → merge via merge_opening_evidence()
+      2. Conflicting marks (D01 + D02) → keep separate, record conflict on both
+      3. Conflicting types (door + window) → keep separate, record conflict on both
 
-    Merged dimensions come from the higher-confidence source via
-    merge_opening_evidence().
+    Paths 2 and 3 produce physical_instance_conflict observations that B4
+    will force to deduction_status=review, preventing either from deducting.
     """
     result: List[OpeningEvidence] = []
     for new in instances:
@@ -79,45 +143,76 @@ def resolve_physical_duplicates(
         for i, existing in enumerate(result):
             if same_physical_opening(existing, new):
                 if _marks_conflict(existing, new):
-                    # Conflicting marks: do NOT merge. Record a structured
-                    # conflict observation on BOTH candidates so B4 forces
-                    # both to review — neither can become a deduction.
-                    conflict_obs = {
-                        "source": "physical_instance_conflict",
-                        "width_m": None,
-                        "height_m": None,
-                        "dimension_basis": "unknown",
-                        "dimension_confidence": 0.0,
-                        "type_mark": new.type_mark,
-                        "page_no": None,
-                        "accepted": False,
-                        "conflicting_id": existing.opening_instance_id,
-                        "conflicting_mark": existing.type_mark,
-                        "description": (
-                            f"Conflicting identity marks at same physical "
-                            f"location: '{existing.type_mark}' vs "
-                            f"'{new.type_mark}'"
-                        ),
-                    }
-                    # Add to BOTH candidates
-                    existing.source_observations = (
-                        list(existing.source_observations) + [conflict_obs]
-                    )
-                    new.source_observations = (
-                        list(new.source_observations) + [conflict_obs]
-                    )
+                    # Same location, compatible types, conflicting marks
+                    _record_physical_conflict(existing, new, "conflicting_marks")
                     new.notes += (
-                        f" [B5: not merged with {existing.opening_instance_id} "
-                        f"due to conflicting marks '{existing.type_mark}' vs "
-                        f"'{new.type_mark}']"
+                        f" [B5: not merged with "
+                        f"{existing.opening_instance_id} due to conflicting "
+                        f"marks '{existing.type_mark}' vs '{new.type_mark}']"
                     )
                     continue
                 result[i] = merge_opening_evidence(existing, new)
                 matched = True
                 break
+            elif same_location(existing, new) and _types_conflict(existing, new):
+                # Same location but incompatible types (door vs window)
+                _record_physical_conflict(existing, new, "conflicting_types")
+                new.notes += (
+                    f" [B5: not merged with "
+                    f"{existing.opening_instance_id} due to type conflict "
+                    f"'{existing.opening_type}' vs '{new.opening_type}']"
+                )
+                continue
         if not matched:
             result.append(new)
     return result
+
+
+def _record_physical_conflict(
+    a: OpeningEvidence,
+    b: OpeningEvidence,
+    reason: str,
+) -> None:
+    """Record a physical_instance_conflict observation on both candidates.
+
+    B4 _detect_conflicts() will see this and force both to review.
+    """
+    conflict_obs_a = {
+        "source": "physical_instance_conflict",
+        "width_m": None,
+        "height_m": None,
+        "dimension_basis": "unknown",
+        "dimension_confidence": 0.0,
+        "type_mark": a.type_mark,
+        "page_no": None,
+        "accepted": False,
+        "conflicting_id": b.opening_instance_id,
+        "conflicting_mark": b.type_mark,
+        "description": (
+            f"Conflicting identities at same physical location "
+            f"({reason}): '{a.type_mark or a.opening_type}' vs "
+            f"'{b.type_mark or b.opening_type}'"
+        ),
+    }
+    conflict_obs_b = {
+        "source": "physical_instance_conflict",
+        "width_m": None,
+        "height_m": None,
+        "dimension_basis": "unknown",
+        "dimension_confidence": 0.0,
+        "type_mark": b.type_mark,
+        "page_no": None,
+        "accepted": False,
+        "conflicting_id": a.opening_instance_id,
+        "conflicting_mark": a.type_mark,
+        "description": (
+            f"Conflicting identities at same physical location "
+            f"({reason}): '{b.type_mark or b.opening_type}' vs "
+            f"'{a.type_mark or a.opening_type}'"
+        ),
+    }
+    a.source_observations = list(a.source_observations) + [conflict_obs_a]
+    b.source_observations = list(b.source_observations) + [conflict_obs_b]
 
 
 # ---------------------------------------------------------------------------
