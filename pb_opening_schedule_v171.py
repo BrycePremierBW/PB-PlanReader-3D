@@ -58,6 +58,7 @@ class ScheduleEntry:
 _HEADER_MARK_KEYWORDS = frozenset({
     "mark", "marks", "type", "code", "no", "num", "number",
     "door", "window", "tag", "ref", "label", "item",
+    "d#", "w#",  # LAGO schedule column headers
 })
 
 _HEADER_WIDTH_KEYWORDS = frozenset({
@@ -172,7 +173,7 @@ def _resolve_dimension_basis(
 
 # Patterns for mark extraction
 _MARK_PATTERNS = [
-    re.compile(r"\b([DW](?:D|W)?\d{1,4})\b"),         # D01, W01, WD01, DW01
+    re.compile(r"\b((?:E|I)?[DW](?:D|W)?\d{1,4})\b"),  # D01, W01, EW01, ED01, ID01, WD01, DW01
     re.compile(r"\b(I{1,3}|IV|V|VI{0,3}|IX|X{1,3}|XL|L|XC|C{1,3})\b"),  # Roman
 ]
 
@@ -348,8 +349,8 @@ def extract_mark(text: str) -> str:
         m = pat.search(t_upper)
         if m:
             mark = m.group(1).upper()
-            # Accept D, W, WD, DW prefixes
-            if mark and (mark[0] in ("D", "W")):
+            # Accept D, W, E+D/W, I+D/W, WD, DW prefixes
+            if mark and (mark[0] in ("D", "W", "E", "I")):
                 return mark
     return ""
 
@@ -519,7 +520,7 @@ def parse_schedule_rows(
             continue
 
         # Skip non-door/window marks
-        if not (mark.startswith("D") or mark.startswith("W")):
+        if not (mark[0] in ("D", "W", "E", "I")):
             continue
 
         # Extract dimensions
