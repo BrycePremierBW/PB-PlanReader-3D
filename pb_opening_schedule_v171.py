@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from pb_opening_evidence_v170 import (
     DIMENSION_BASIS_UNKNOWN,
+    DIMENSION_BASIS_ROUGH_OPENING,
     DEDUCTION_REVIEW,
     NON_INSTANCE_SOURCES,
     OpeningEvidence,
@@ -645,12 +646,20 @@ def enrich_opening_evidence(
                 dim_conf = 0.5
             else:
                 dim_conf = 0.5
+            # Schedule table dimensions are rough-opening measurements.
+            # When both width and height are present, set the correct basis
+            # so the merged instance can reach auto_eligible after B4.
+            has_both_dims = sched.width_mm is not None and sched.height_mm is not None
+            sched_basis = (
+                DIMENSION_BASIS_ROUGH_OPENING if has_both_dims
+                else DIMENSION_BASIS_UNKNOWN
+            )
             # Create a schedule-sourced evidence record for merging
             sched_ev = OpeningEvidence(
                 type_mark=mark,
                 width_m=(sched.width_mm / 1000.0) if sched.width_mm else None,
                 height_m=(sched.height_mm / 1000.0) if sched.height_mm else None,
-                dimension_basis=DIMENSION_BASIS_UNKNOWN,
+                dimension_basis=sched_basis,
                 dimension_source="schedule_parse",
                 dimension_confidence=dim_conf,
                 extraction_method="schedule_parse",
