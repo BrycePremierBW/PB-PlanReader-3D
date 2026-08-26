@@ -110,8 +110,8 @@ _CLEAR_HEADING_KEYWORDS = re.compile(
 )
 
 
-def _infer_dimension_basis(heading_cells: Sequence[str]) -> Tuple[str, str]:
-    """Infer dimension basis from schedule heading text.
+def _infer_column_basis(heading_text: str) -> Tuple[str, str]:
+    """Infer dimension basis from a single column heading.
 
     Returns (dimension_basis, basis_source) where:
       - dimension_basis is "rough_opening", "frame", "leaf",
@@ -122,19 +122,50 @@ def _infer_dimension_basis(heading_cells: Sequence[str]) -> Tuple[str, str]:
     "Width", "Height", "Size" return ("", "") because the parser cannot
     determine what physical measurement those dimensions represent.
     """
-    combined = " ".join(heading_cells).lower()
-    if _RO_HEADING_KEYWORDS.search(combined):
-        m = _RO_HEADING_KEYWORDS.search(combined)
-        return "rough_opening", m.group(0) if m else combined
-    if _FRAME_HEADING_KEYWORDS.search(combined):
-        m = _FRAME_HEADING_KEYWORDS.search(combined)
-        return "frame", m.group(0) if m else combined
-    if _LEAF_HEADING_KEYWORDS.search(combined):
-        m = _LEAF_HEADING_KEYWORDS.search(combined)
-        return "leaf", m.group(0) if m else combined
-    if _CLEAR_HEADING_KEYWORDS.search(combined):
-        m = _CLEAR_HEADING_KEYWORDS.search(combined)
-        return "clear_opening", m.group(0) if m else combined
+    text = heading_text.lower().strip()
+    if _RO_HEADING_KEYWORDS.search(text):
+        m = _RO_HEADING_KEYWORDS.search(text)
+        return "rough_opening", m.group(0) if m else text
+    if _FRAME_HEADING_KEYWORDS.search(text):
+        m = _FRAME_HEADING_KEYWORDS.search(text)
+        return "frame", m.group(0) if m else text
+    if _LEAF_HEADING_KEYWORDS.search(text):
+        m = _LEAF_HEADING_KEYWORDS.search(text)
+        return "leaf", m.group(0) if m else text
+    if _CLEAR_HEADING_KEYWORDS.search(text):
+        m = _CLEAR_HEADING_KEYWORDS.search(text)
+        return "clear_opening", m.group(0) if m else text
+    return "", ""
+
+
+def _resolve_dimension_basis(
+    width_basis: str, width_source: str,
+    height_basis: str, height_source: str,
+    dims_basis: str, dims_source: str,
+) -> Tuple[str, str]:
+    """Resolve the final dimension basis from individual column bases.
+
+    Rules:
+      - If a combined Size/dims column was used, its basis applies.
+      - If both width and height were used and agree on basis → use it.
+      - If they disagree → unknown (mixed measurement bundle).
+      - If only one was used → use that one's basis.
+      - If none have basis → unknown.
+    """
+    # Combined Size/dims column takes precedence
+    if dims_basis:
+        return dims_basis, dims_source
+    # Both width and height present
+    if width_basis and height_basis:
+        if width_basis == height_basis:
+            return width_basis, width_source
+        # Disagreeing bases → unsafe, treat as unknown
+        return "", ""
+    # Only one present
+    if width_basis:
+        return width_basis, width_source
+    if height_basis:
+        return height_basis, height_source
     return "", ""
 
 # Patterns for mark extraction
@@ -327,7 +358,9 @@ def extract_mark(text: str) -> str:
 def detect_header(words: Sequence[str]) -> Dict[str, Any]:
     """Detect which columns hold mark, width, height, dims, count, description.
 
-    Also infers dimension basis from heading text (rough_opening, frame, etc.).
+    Also infers dimension basis from the actual selected column headings.
+    Compound headings like "Rough Opening Width" are parsed into both
+    the role (width) and the basis (rough_opening).
 
     Args:
         words: list of column header texts (one per column, lowercased)
@@ -339,25 +372,73 @@ def detect_header(words: Sequence[str]) -> Dict[str, Any]:
           - "basis_source": heading text that established the basis
     """
     mapping: Dict[str, Any] = {}
+    # Track per-column basis for the selected dimension columns
+    width_basis = ""
+    width_basis_source = ""
+    height_basis = ""
+    height_basis_source = ""
+    dims_basis = ""
+    dims_basis_source = ""
+
     for i, w in enumerate(words):
         w_clean = w.strip().lower()
         if not w_clean:
             continue
         if w_clean in _HEADER_MARK_KEYWORDS and "mark" not in mapping:
             mapping["mark"] = i
-        elif w_clean in _HEADER_WIDTH_KEYWORDS and "width" not in mapping:
-            mapping["width"] = i
-        elif w_clean in _HEADER_HEIGHT_KEYWORDS and "height" not in mapping:
-            mapping["height"] = i
-        elif w_clean in _HEADER_DIMS_KEYWORDS and "dims" not in mapping:
-            mapping["dims"] = i
-        elif w_clean in _HEADER_COUNT_KEYWORDS and "count" not in mapping:
-            mapping["count"] = i
-        elif w_clean in _HEADER_DESC_KEYWORDS and "desc" not in mapping:
-            mapping["desc"] = i
+            continue
 
-    # Infer dimension basis from heading text
-    basis, basis_source = _infer_dimension_basis(words)
+        # Infer basis for this column
+        col_basis, col_source = _infer_column_basis(w)
+
+        # Check role: exact match first, then substring for compound headings
+        if "width" not in mapping:
+            is_width = (
+                w_clean in _HEADER_WIDTH_KEYWORDS
+                or any(kw in w_clean for kw in _HEADER_WIDTH_KEYWORDS)
+            )
+            if is_width:
+                mapping["width"] = i
+                width_basis = col_basis
+                width_basis_source = col_source
+                continue
+
+        if "height" not in mapping:
+            is_height = (
+                w_clean in _HEADER_HEIGHT_KEYWORDS
+                or any(kw in w_clean for kw in _HEADER_HEIGHT_KEYWORDS)
+            )
+            if is_height:
+                mapping["height"] = i
+                height_basis = col_basis
+                height_basis_source = col_source
+                continue
+
+        if "dims" not in mapping:
+            is_dims = (
+                w_clean in _HEADER_DIMS_KEYWORDS
+                or any(kw in w_clean for kw in _HEADER_DIMS_KEYWORDS)
+            )
+            if is_dims:
+                mapping["dims"] = i
+                dims_basis = col_basis
+                dims_basis_source = col_source
+                continue
+
+        if "count" not in mapping and w_clean in _HEADER_COUNT_KEYWORDS:
+            mapping["count"] = i
+            continue
+
+        if "desc" not in mapping and w_clean in _HEADER_DESC_KEYWORDS:
+            mapping["desc"] = i
+            continue
+
+    # Resolve the final basis from the selected dimension columns
+    basis, basis_source = _resolve_dimension_basis(
+        width_basis, width_basis_source,
+        height_basis, height_basis_source,
+        dims_basis, dims_basis_source,
+    )
     mapping["dimension_basis"] = basis
     mapping["basis_source"] = basis_source
     return mapping
@@ -659,10 +740,12 @@ def enrich_opening_evidence(
         if len(entries_list) == 1:
             mark_authority[mark] = entries_list[0]
         else:
-            # Multiple rows for same mark — check dimension consistency
+            # Multiple rows for same mark — check dimension AND basis consistency.
+            # Equal numbers with contradictory measurement meaning (frame vs
+            # rough_opening) are still contradictory evidence.
             dims_set = set()
             for e in entries_list:
-                dims_set.add((e.width_mm, e.height_mm))
+                dims_set.add((e.width_mm, e.height_mm, e.dimension_basis))
             if len(dims_set) == 1:
                 # All identical → safe; pick strongest provenance
                 best = max(entries_list,
@@ -698,6 +781,8 @@ def enrich_opening_evidence(
                             "height_mm": e.height_mm,
                             "page_no": e.page_no,
                             "parse_source": e.parse_source,
+                            "dimension_basis": e.dimension_basis,
+                            "basis_source": e.basis_source,
                         }
                         for e in alternatives
                     ],

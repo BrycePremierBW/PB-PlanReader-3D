@@ -896,5 +896,172 @@ class TestFRLPlusRealDimensions(unittest.TestCase):
         self.assertEqual(h, 2040)
 
 
+# ---------------------------------------------------------------------------
+# Compound-heading parser tests — prove basis flows through actual parsing
+# ---------------------------------------------------------------------------
+class TestCompoundHeadingParsing(unittest.TestCase):
+    """Compound headings like 'Rough Opening Width' must map both role AND basis."""
+
+    def test_rough_opening_width_height_parsed(self):
+        """Mark | Rough Opening Width | Rough Opening Height → w=820, h=2100, basis=rough_opening."""
+        rows = [
+            _row("Mark\tRough Opening Width\tRough Opening Height"),
+            _row("D01\t820\t2100"),
+        ]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        e = entries[0]
+        self.assertEqual(e.width_mm, 820)
+        self.assertEqual(e.height_mm, 2100)
+        self.assertEqual(e.parse_source, "header_separate")
+        self.assertEqual(e.dimension_basis, "rough_opening")
+        self.assertIn("rough opening", e.basis_source.lower())
+
+    def test_frame_size_parsed(self):
+        """Mark | Frame Size → dims extracted, basis=frame."""
+        rows = [
+            _row("Mark\tFrame Size"),
+            _row("D01\t820x2100"),
+        ]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        e = entries[0]
+        self.assertEqual(e.width_mm, 820)
+        self.assertEqual(e.height_mm, 2100)
+        self.assertEqual(e.dimension_basis, "frame")
+        self.assertIn("frame", e.basis_source.lower())
+
+    def test_leaf_width_height_parsed(self):
+        """Mark | Leaf Width | Leaf Height → w=820, h=2100, basis=leaf."""
+        rows = [
+            _row("Mark\tLeaf Width\tLeaf Height"),
+            _row("D01\t820\t2100"),
+        ]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        e = entries[0]
+        self.assertEqual(e.width_mm, 820)
+        self.assertEqual(e.height_mm, 2100)
+        self.assertEqual(e.dimension_basis, "leaf")
+        self.assertIn("leaf", e.basis_source.lower())
+
+    def test_generic_width_height_unknown_basis(self):
+        """Mark | Width | Height → w=820, h=2100, basis='' (unknown)."""
+        rows = [
+            _row("Mark\tWidth\tHeight"),
+            _row("D01\t820\t2100"),
+        ]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        e = entries[0]
+        self.assertEqual(e.width_mm, 820)
+        self.assertEqual(e.height_mm, 2100)
+        self.assertEqual(e.dimension_basis, "")
+        self.assertEqual(e.basis_source, "")
+
+    def test_ro_abbreviation_width_height(self):
+        """Mark | RO Width | RO Height → w=820, h=2100, basis=rough_opening."""
+        rows = [
+            _row("Mark\tRO Width\tRO Height"),
+            _row("D01\t820\t2100"),
+        ]
+        entries = parse_schedule_rows(rows)
+        self.assertEqual(len(entries), 1)
+        e = entries[0]
+        self.assertEqual(e.dimension_basis, "rough_opening")
+
+
+class TestMixedBasisAmbiguity(unittest.TestCase):
+    """Width basis ≠ height basis → unknown (mixed measurement bundle)."""
+
+    def test_mixed_ro_frame_yields_unknown(self):
+        """Rough Opening Width + Frame Height → basis unknown (disagree)."""
+        h = detect_header(["Mark", "Rough Opening Width", "Frame Height"])
+        self.assertEqual(h["dimension_basis"], "")
+        self.assertEqual(h["basis_source"], "")
+
+    def test_same_basis_width_height_agree(self):
+        """Rough Opening Width + Rough Opening Height → basis=rough_opening."""
+        h = detect_header(["Mark", "Rough Opening Width", "Rough Opening Height"])
+        self.assertEqual(h["dimension_basis"], "rough_opening")
+
+    def test_one_generic_one_explicit(self):
+        """Width + Rough Opening Height → basis=rough_opening (only height has basis)."""
+        h = detect_header(["Mark", "Width", "Rough Opening Height"])
+        self.assertEqual(h["dimension_basis"], "rough_opening")
+
+    def test_mixed_in_notes_not_affecting_basis(self):
+        """Width | Height | Rough Opening Notes → basis unknown (notes not a dim col)."""
+        h = detect_header(["Mark", "Width", "Height", "Rough Opening Notes"])
+        # Width and Height columns are generic → basis stays unknown
+        self.assertEqual(h["dimension_basis"], "")
+        self.assertIn("width", h)
+        self.assertIn("height", h)
+
+
+class TestDuplicateBasisConsistency(unittest.TestCase):
+    """Same dims + different basis → schedule ambiguity (contradictory evidence)."""
+
+    def test_same_dims_different_basis_ambiguous(self):
+        """820x2100 frame + 820x2100 rough_opening → conflicting, no enrichment."""
+        inst = _inst(mark="D01")
+        from pb_opening_schedule_v171 import ScheduleEntry
+        sched = [
+            ScheduleEntry(type_mark="D01", width_mm=820, height_mm=2100,
+                          parse_source="header_separate",
+                          dimension_basis="frame", basis_source="Frame Size"),
+            ScheduleEntry(type_mark="D01", width_mm=820, height_mm=2100,
+                          parse_source="header_separate",
+                          dimension_basis="rough_opening",
+                          basis_source="Rough Opening Width"),
+        ]
+        result = enrich_opening_evidence([inst], sched)
+        # Should be marked ambiguous, not enriched
+        self.assertIsNone(result[0].width_m)
+        self.assertEqual(result[0].dimension_basis, "unknown")
+
+    def test_same_dims_same_basis_consistent(self):
+        """820x2100 rough_opening × 2 → consistent, enriched."""
+        inst = _inst(mark="D01")
+        from pb_opening_schedule_v171 import ScheduleEntry
+        sched = [
+            ScheduleEntry(type_mark="D01", width_mm=820, height_mm=2100,
+                          parse_source="header_separate",
+                          dimension_basis="rough_opening",
+                          basis_source="Rough Opening"),
+            ScheduleEntry(type_mark="D01", width_mm=820, height_mm=2100,
+                          parse_source="heuristic",
+                          dimension_basis="rough_opening",
+                          basis_source="Rough Opening"),
+        ]
+        result = enrich_opening_evidence([inst], sched)
+        self.assertAlmostEqual(result[0].width_m, 0.82, places=2)
+        self.assertEqual(result[0].dimension_basis, "rough_opening")
+
+    def test_ambiguity_alternatives_include_basis(self):
+        """Ambiguity alternatives must include dimension_basis and basis_source."""
+        inst = _inst(mark="D01")
+        from pb_opening_schedule_v171 import ScheduleEntry
+        sched = [
+            ScheduleEntry(type_mark="D01", width_mm=820, height_mm=2100,
+                          parse_source="header_separate",
+                          dimension_basis="frame", basis_source="Frame Size"),
+            ScheduleEntry(type_mark="D01", width_mm=820, height_mm=2100,
+                          parse_source="header_separate",
+                          dimension_basis="rough_opening",
+                          basis_source="Rough Opening"),
+        ]
+        result = enrich_opening_evidence([inst], sched)
+        obs = result[0].source_observations
+        ambig = [o for o in obs if o.get("status") == "ambiguous"]
+        self.assertEqual(len(ambig), 1)
+        alts = ambig[0]["alternatives"]
+        bases = {a["dimension_basis"] for a in alts}
+        self.assertIn("frame", bases)
+        self.assertIn("rough_opening", bases)
+        for a in alts:
+            self.assertIn("basis_source", a)
+
+
 if __name__ == "__main__":
     unittest.main()
