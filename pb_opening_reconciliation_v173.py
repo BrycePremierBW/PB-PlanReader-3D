@@ -42,6 +42,7 @@ DIMENSION_CONFLICT_THRESHOLD_M = 0.05  # 50 mm — plan vs schedule disagreement
 SOURCE_PLAN = "plan_vector"
 SOURCE_SCHEDULE = "schedule_parse"
 SOURCE_ELEVATION = "elevation_rect"
+SOURCE_PHYSICAL_CONFLICT = "physical_instance_conflict"
 
 # ---------------------------------------------------------------------------
 # Source diversity confidence table
@@ -302,6 +303,26 @@ def _detect_conflicts(inst: OpeningEvidence) -> List[ConflictRecord]:
                 value_b=str(len(alternatives)) if alternatives else "",
                 severity="error",
                 description=desc,
+            ))
+
+    # --- Physical instance identity conflict ---
+    # B5 marks candidates when geometric identity says they are the same
+    # physical opening but their explicit marks conflict (D01 + D02).
+    for obs in inst.source_observations:
+        if obs.get("source") == SOURCE_PHYSICAL_CONFLICT:
+            conflicts.append(ConflictRecord(
+                opening_instance_id=iid,
+                conflict_type="physical_instance_conflict",
+                source_a=obs.get("conflicting_id", ""),
+                source_b=obs.get("type_mark", ""),
+                field_name="type_mark",
+                value_a=obs.get("conflicting_mark", ""),
+                value_b=obs.get("type_mark", ""),
+                severity="error",
+                description=obs.get("description", (
+                    "Geometrically overlapping candidates have "
+                    "conflicting identity marks"
+                )),
             ))
 
     return conflicts

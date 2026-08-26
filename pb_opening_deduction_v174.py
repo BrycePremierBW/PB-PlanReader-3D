@@ -66,17 +66,46 @@ def resolve_physical_duplicates(
     flagging the same physical opening) BEFORE enrichment and reconciliation.
 
     Uses same_physical_opening() which requires position anchor from
-    both records.  Rejects merges when both have nonblank, conflicting
-    marks (D01 + D02 → not merged).  Merged dimensions come from the
-    higher-confidence source via merge_opening_evidence().
+    both records.  When both have nonblank, conflicting marks (D01 + D02),
+    neither is merged AND both receive a physical_instance_conflict
+    observation that B4 will force to review.
+
+    Merged dimensions come from the higher-confidence source via
+    merge_opening_evidence().
     """
     result: List[OpeningEvidence] = []
     for new in instances:
         matched = False
         for i, existing in enumerate(result):
             if same_physical_opening(existing, new):
-                # Reject merge if both have conflicting marks
                 if _marks_conflict(existing, new):
+                    # Conflicting marks: do NOT merge. Record a structured
+                    # conflict observation on BOTH candidates so B4 forces
+                    # both to review — neither can become a deduction.
+                    conflict_obs = {
+                        "source": "physical_instance_conflict",
+                        "width_m": None,
+                        "height_m": None,
+                        "dimension_basis": "unknown",
+                        "dimension_confidence": 0.0,
+                        "type_mark": new.type_mark,
+                        "page_no": None,
+                        "accepted": False,
+                        "conflicting_id": existing.opening_instance_id,
+                        "conflicting_mark": existing.type_mark,
+                        "description": (
+                            f"Conflicting identity marks at same physical "
+                            f"location: '{existing.type_mark}' vs "
+                            f"'{new.type_mark}'"
+                        ),
+                    }
+                    # Add to BOTH candidates
+                    existing.source_observations = (
+                        list(existing.source_observations) + [conflict_obs]
+                    )
+                    new.source_observations = (
+                        list(new.source_observations) + [conflict_obs]
+                    )
                     new.notes += (
                         f" [B5: not merged with {existing.opening_instance_id} "
                         f"due to conflicting marks '{existing.type_mark}' vs "
@@ -198,9 +227,13 @@ def deducted_total_area_m2(
 def net_wall_area_after_deductions(
     gross_wall_m2: float,
     instances: Sequence[OpeningEvidence],
+    wall_ref: str,
     tolerance: float = 0.001,
 ) -> Dict[str, Any]:
-    """Net wall area after B5 deductions.
+    """Net wall area for a specific wall after B5 deductions.
+
+    Only subtracts instances whose wall_ref matches the target wall.
+    This prevents cross-wall leakage where W02 deductions reduce W01.
 
     Returns dict with keys:
       - net_area_m2: float — net wall area (clamped to 0.0 minimum)
@@ -211,7 +244,12 @@ def net_wall_area_after_deductions(
     measurement state (over-deduction from duplicate, wall-association,
     or dimension error).  valid=False signals this to the caller.
     """
-    d_area = deducted_area_m2(instances)
+    wall_instances = [
+        i for i in instances
+        if i.wall_ref == wall_ref and i.deduct and i.area_m2 is not None
+    ]
+    d_area = sum(i.area_m2 for i in wall_instances)
+    d_area = round(d_area, 4)
     excess = d_area - _num(gross_wall_m2) - tolerance
     if excess > 0:
         return {
@@ -219,8 +257,8 @@ def net_wall_area_after_deductions(
             "valid": False,
             "error": (
                 f"Deducted area ({d_area:.4f} m²) exceeds gross wall area "
-                f"({gross_wall_m2:.4f} m²) — possible duplicate detection, "
-                f"wall-association, or dimension error"
+                f"({gross_wall_m2:.4f} m²) for wall '{wall_ref}' — possible "
+                f"duplicate detection, wall-association, or dimension error"
             ),
         }
     return {
@@ -250,6 +288,7 @@ def run_opening_pipeline(
     scale_px_per_m: float = 0.0,
     page_no: int = 0,
     gross_wall_m2: Optional[float] = None,
+    wall_ref: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Full pipeline: B1 → dedup → B2 → B3 → B4 → B5 gate → deduct.
 
@@ -295,7 +334,7 @@ def run_opening_pipeline(
             "deducted_area_m2": 0.0,
             "pipeline_notes": notes,
         }
-        if gross_wall_m2 is not None:
+        if gross_wall_m2 is not None and wall_ref is not None:
             result["net_wall"] = {
                 "net_area_m2": gross_wall_m2,
                 "valid": True,
@@ -348,9 +387,9 @@ def run_opening_pipeline(
         "deducted_area_m2": d_area,
         "pipeline_notes": notes,
     }
-    if gross_wall_m2 is not None:
+    if gross_wall_m2 is not None and wall_ref is not None:
         result["net_wall"] = net_wall_area_after_deductions(
-            gross_wall_m2, instances
+            gross_wall_m2, instances, wall_ref
         )
 
     return result
