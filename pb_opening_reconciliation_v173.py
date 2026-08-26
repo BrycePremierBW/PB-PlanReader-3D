@@ -405,6 +405,9 @@ def reconcile_opening_evidence(
             else:
                 inst.notes = suffix
 
+        # 5. Mark reconciliation complete (B5 requires this)
+        inst.reconciliation_complete = True
+
         reconciled.append(inst)
 
     return reconciled, all_conflicts

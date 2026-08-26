@@ -198,6 +198,12 @@ class OpeningEvidence:
 
     # --- Commercial decision (set ONLY by B5 / estimator) ---
     deduct: bool = False
+    deduction_decision: str = ""  # "deducted" / "not_deducted" / "" (pending)
+
+    # --- Reconciliation state (set ONLY by B4) ---
+    # True after reconcile_opening_evidence() has run on this instance.
+    # B5 requires this to be True before applying deductions.
+    reconciliation_complete: bool = False
 
     # --- Source observations (structured provenance for B4 reconciliation) ---
     # Each dict: {"source": str, "width_m": float|None, "height_m": float|None,
@@ -468,6 +474,18 @@ def merge_opening_evidence(
 
     # Merge evidence sources (ordered dedup, not set)
     merged.evidence = _ordered_dedup(existing.evidence + new.evidence)
+
+    # Merge source observations (append non-duplicate observations from new)
+    # Keyed by (source, accepted) to avoid exact duplicates while preserving
+    # observations from both records for B4 reconciliation.
+    obs_keys: set = set()
+    for obs in merged.source_observations:
+        obs_keys.add((obs.get("source", ""), obs.get("accepted", False)))
+    for obs in new.source_observations:
+        key = (obs.get("source", ""), obs.get("accepted", False))
+        if key not in obs_keys:
+            merged.source_observations.append(obs)
+            obs_keys.add(key)
 
     # Upgrade geometry and association confidence (not dimension yet)
     merged.geometry_confidence = max(
