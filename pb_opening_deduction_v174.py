@@ -163,9 +163,32 @@ def resolve_physical_duplicates(
                     f"'{existing.opening_type}' vs '{new.opening_type}']"
                 )
                 continue
+            elif _same_plan_geometry(existing, new):
+                # Same plan-space geometry but different wall_ref
+                # → wall-association ambiguity
+                _record_physical_conflict(
+                    existing, new, "wall_association_conflict"
+                )
+                new.notes += (
+                    f" [B5: wall association conflict with "
+                    f"{existing.opening_instance_id} — same geometry "
+                    f"on wall '{existing.wall_ref}' vs '{new.wall_ref}']"
+                )
+                continue
         if not matched:
             result.append(new)
     return result
+
+
+def _same_plan_geometry(a: OpeningEvidence, b: OpeningEvidence) -> bool:
+    """True if two instances have the same plan-space geometry signature.
+
+    Detects the same physical opening assigned to different wall refs.
+    Signature must exist on both and match exactly.
+    """
+    if a.plan_geometry_signature is None or b.plan_geometry_signature is None:
+        return False
+    return a.plan_geometry_signature == b.plan_geometry_signature
 
 
 def _record_physical_conflict(

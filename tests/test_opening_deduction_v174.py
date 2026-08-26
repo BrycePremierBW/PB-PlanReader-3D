@@ -37,6 +37,7 @@ from pb_opening_deduction_v174 import (
     _marks_conflict,
     same_location,
     _types_conflict,
+    _same_plan_geometry,
 )
 
 
@@ -154,6 +155,101 @@ class TestTypesConflict(unittest.TestCase):
         a = _make_instance(opening_type="opening")
         b = _make_instance(opening_type=OPENING_TYPE_DOOR)
         self.assertFalse(_types_conflict(a, b))
+
+
+# ============================================================================
+# Cross-wall duplicate detection
+# ============================================================================
+class TestCrossWallDuplicate(unittest.TestCase):
+    """Same plan-space geometry on different wall refs → conflict."""
+
+    def test_same_geometry_different_walls_conflict(self):
+        """Same signature + different wall_ref → physical_instance_conflict."""
+        a = _make_instance(
+            mark="D01", wall="W01", position=1.5, width=0.82,
+        )
+        a.plan_geometry_signature = (1, 100.0, 200.0, 0.82, "door")
+        b = _make_instance(
+            mark="D01", wall="W02", position=1.5, width=0.82,
+        )
+        b.plan_geometry_signature = (1, 100.0, 200.0, 0.82, "door")
+        result = resolve_physical_duplicates([a, b])
+        self.assertEqual(len(result), 2)
+        for inst in result:
+            pic = [o for o in inst.source_observations
+                   if o["source"] == "physical_instance_conflict"]
+            self.assertEqual(len(pic), 1)
+
+    def test_different_geometry_different_walls_no_conflict(self):
+        """Different signature + different wall_ref → independent records."""
+        a = _make_instance(
+            mark="D01", wall="W01", position=1.0, width=0.82,
+        )
+        a.plan_geometry_signature = (1, 100.0, 200.0, 0.82, "door")
+        b = _make_instance(
+            mark="D02", wall="W02", position=5.0, width=0.90,
+        )
+        b.plan_geometry_signature = (1, 500.0, 600.0, 0.90, "door")
+        result = resolve_physical_duplicates([a, b])
+        self.assertEqual(len(result), 2)
+        for inst in result:
+            pic = [o for o in inst.source_observations
+                   if o["source"] == "physical_instance_conflict"]
+            self.assertEqual(len(pic), 0)
+
+    def test_same_geometry_same_wall_merges(self):
+        """Same signature + same wall_ref → normal merge."""
+        a = _make_instance(
+            mark="D01", wall="W01", position=1.5, width=0.82,
+            geom_conf=0.6,
+        )
+        a.plan_geometry_signature = (1, 100.0, 200.0, 0.82, "door")
+        b = _make_instance(
+            mark="D01", wall="W01", position=1.5, width=0.82,
+            geom_conf=0.9,
+        )
+        b.plan_geometry_signature = (1, 100.0, 200.0, 0.82, "door")
+        result = resolve_physical_duplicates([a, b])
+        self.assertEqual(len(result), 1)
+        self.assertAlmostEqual(result[0].geometry_confidence, 0.9, places=2)
+
+    def test_cross_wall_conflict_forces_review_via_b4(self):
+        """Same geometry, W01 + W02 → B4 forces review → neither deducted."""
+        from pb_opening_reconciliation_v173 import reconcile_opening_evidence
+        a = _make_instance(
+            mark="D01", wall="W01", position=1.5, width=0.82,
+            geom_conf=0.95, dim_conf=0.95, assoc_conf=0.95,
+        )
+        a.plan_geometry_signature = (1, 100.0, 200.0, 0.82, "door")
+        b = _make_instance(
+            mark="D01", wall="W02", position=1.5, width=0.82,
+            geom_conf=0.95, dim_conf=0.95, assoc_conf=0.95,
+        )
+        b.plan_geometry_signature = (1, 100.0, 200.0, 0.82, "door")
+        deduped = resolve_physical_duplicates([a, b])
+        reconciled, conflicts = reconcile_opening_evidence(deduped)
+        pic = [c for c in conflicts
+               if c.conflict_type == "physical_instance_conflict"]
+        self.assertGreaterEqual(len(pic), 2)
+        for inst in reconciled:
+            self.assertEqual(inst.deduction_status, DEDUCTION_REVIEW)
+        apply_deductions(reconciled)
+        for inst in reconciled:
+            self.assertFalse(inst.deduct)
+
+    def test_no_signature_no_cross_wall_check(self):
+        """No signature → cross-wall check is skipped (can't detect)."""
+        a = _make_instance(wall="W01", position=1.5, width=0.82)
+        a.plan_geometry_signature = None
+        b = _make_instance(wall="W02", position=1.5, width=0.82)
+        b.plan_geometry_signature = None
+        result = resolve_physical_duplicates([a, b])
+        self.assertEqual(len(result), 2)
+        # No conflict observation — can't detect without signature
+        for inst in result:
+            pic = [o for o in inst.source_observations
+                   if o["source"] == "physical_instance_conflict"]
+            self.assertEqual(len(pic), 0)
 
 
 # ============================================================================
@@ -937,6 +1033,58 @@ class TestPipelineOrchestration(unittest.TestCase):
         expected_net = round(20.0 - 0.82 * 2.10, 4)
         self.assertAlmostEqual(
             result["net_wall"]["net_area_m2"], expected_net, places=4
+        )
+
+    def test_run_opening_pipeline_cross_wall_duplicate(self):
+        """run_opening_pipeline() with same geometry on W01 + W02.
+
+        Both candidates have the same plan_geometry_signature but
+        different wall_ref. B5 dedup detects the conflict, B4 forces
+        review on both, neither deducts. This is a regression for the
+        cross-wall duplicate case that was deferred from B1.
+        """
+        from unittest.mock import patch, MagicMock
+        from pb_opening_deduction_v174 import run_opening_pipeline
+
+        # Mock two candidates with same geometry signature, different walls
+        inst_a = _make_instance(
+            mark="D01", wall="W01", position=1.5, width=0.82,
+            geom_conf=0.95, dim_conf=0.95, assoc_conf=0.95,
+        )
+        inst_a.plan_geometry_signature = (1, 100.0, 200.0, 0.82, "door")
+        inst_b = _make_instance(
+            mark="D01", wall="W02", position=1.5, width=0.82,
+            geom_conf=0.95, dim_conf=0.95, assoc_conf=0.95,
+        )
+        inst_b.plan_geometry_signature = (1, 100.0, 200.0, 0.82, "door")
+
+        mock_result = MagicMock()
+        mock_result.candidates = [inst_a, inst_b]
+        mock_result.door_count = 2
+        mock_result.window_count = 0
+        mock_result.gap_count = 0
+
+        with patch(
+            "pb_plan_opening_detection_v171.plan_opening_candidates",
+            return_value=mock_result,
+        ):
+            result = run_opening_pipeline(
+                segments=[], words=[], page_no=1,
+                gross_wall_m2=20.0, wall_ref="W01",
+            )
+
+        # Both instances present
+        self.assertEqual(len(result["instances"]), 2)
+        # B4 ran on every instance
+        for inst in result["instances"]:
+            self.assertTrue(inst.reconciliation_complete)
+        # Cross-wall conflict → review on both
+        for inst in result["instances"]:
+            self.assertEqual(inst.deduction_status, DEDUCTION_REVIEW)
+            self.assertFalse(inst.deduct)
+        # Net wall: no deductions → full gross
+        self.assertAlmostEqual(
+            result["net_wall"]["net_area_m2"], 20.0, places=4
         )
 
 

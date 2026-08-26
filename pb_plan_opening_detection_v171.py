@@ -993,6 +993,11 @@ def door_to_opening_evidence(cand: DoorCandidate) -> OpeningEvidence:
     ev.set_quantity(1, source="geometric")
     ev.compute_area()
     ev.compute_deduction_status()
+    # Plan-space geometry signature from jamb segment centroid
+    if cand.jamb_segment is not None:
+        cx = (cand.jamb_segment.x1 + cand.jamb_segment.x2) / 2.0
+        cy = (cand.jamb_segment.y1 + cand.jamb_segment.y2) / 2.0
+        ev.compute_plan_geometry_signature(centroid_x=cx, centroid_y=cy)
     record_plan_observation(ev)
     return ev
 
@@ -1020,6 +1025,16 @@ def window_to_opening_evidence(cand: WindowCandidate) -> OpeningEvidence:
     ev.set_quantity(1, source="geometric")
     ev.compute_area()
     ev.compute_deduction_status()
+    # Plan-space geometry signature from parallel-segment midpoints centroid
+    if cand.parallel_segments:
+        midpoints_x = []
+        midpoints_y = []
+        for seg in cand.parallel_segments:
+            midpoints_x.append((seg.x1 + seg.x2) / 2.0)
+            midpoints_y.append((seg.y1 + seg.y2) / 2.0)
+        cx = sum(midpoints_x) / len(midpoints_x)
+        cy = sum(midpoints_y) / len(midpoints_y)
+        ev.compute_plan_geometry_signature(centroid_x=cx, centroid_y=cy)
     record_plan_observation(ev)
     return ev
 
@@ -1048,6 +1063,18 @@ def gap_to_opening_evidence(cand: GapCandidate) -> OpeningEvidence:
     ev.set_quantity(1, source="geometric")
     ev.compute_area()
     ev.compute_deduction_status()
+    # Gap candidates lack absolute geometry (jamb segments/pairs).
+    # Use position_along_wall_m as a weaker proxy for cross-wall matching.
+    # This won't catch cross-wall duplicates as reliably as door/window,
+    # but is better than no signature at all.
+    if cand.position_along_wall_m is not None:
+        ev.plan_geometry_signature = (
+            cand.page_no,
+            round(cand.position_along_wall_m, 2),
+            0.0,  # no y coordinate available for gaps
+            round(cand.width_m or 0.0, 3),
+            opening_type,
+        )
     record_plan_observation(ev)
     return ev
 

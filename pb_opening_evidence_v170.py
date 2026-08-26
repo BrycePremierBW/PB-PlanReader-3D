@@ -182,6 +182,12 @@ class OpeningEvidence:
     elevation_geometry: Optional[Dict[str, Any]] = None
     source_bbox: Optional[Tuple[float, float, float, float]] = None
 
+    # --- Plan-space physical identity (set by B1, used by B5 dedup) ---
+    # Stable signature from the detected jamb/pair/gap geometry.
+    # Allows duplicate detection even when wall_ref differs.
+    # Format: (page_no, centroid_x, centroid_y, width, opening_type)
+    plan_geometry_signature: Optional[Tuple] = None
+
     # --- Evidence provenance ---
     schedule_ref: str = ""              # schedule page/mark reference
     extraction_method: str = ""         # plan_vector, elevation_rect,
@@ -262,6 +268,30 @@ class OpeningEvidence:
     def _is_geometric_source(self) -> bool:
         """True if this record came from geometric detection (not manual/schedule)."""
         return self.extraction_method not in ("", "manual", "schedule_parse")
+
+    def compute_plan_geometry_signature(
+        self,
+        centroid_x: Optional[float] = None,
+        centroid_y: Optional[float] = None,
+    ) -> None:
+        """Compute a stable plan-space geometry identity from detected coordinates.
+
+        Called by B1 after creating the OpeningEvidence instance.
+        Signature: (page_no, cx, cy, width, opening_type)
+        where cx/cy are centroid coordinates in PDF points, rounded to 0.1pt
+        (~0.035mm at 72 DPI) for floating-point tolerance.
+
+        Used by B5 to detect duplicates when the same opening is assigned
+        to different wall refs by B1.
+        """
+        if centroid_x is not None and centroid_y is not None:
+            self.plan_geometry_signature = (
+                self.page_no,
+                round(centroid_x, 1),
+                round(centroid_y, 1),
+                round(self.width_m or 0.0, 3),
+                self.opening_type,
+            )
 
     def compute_deduction_status(self) -> None:
         """Set deduction_status based on confidence thresholds and dimension_basis.
