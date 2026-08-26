@@ -1,16 +1,23 @@
 """
-B6: Opening pipeline benchmark validation (v1.7.4)
+B6: Opening pipeline integration / acceptance tests (v1.7.4)
 
-Integration tests exercising the full pipeline (B1→dedup→B2→B3→B4→B5)
-with realistic mocked B1 output.  Each test asserts the expected final
-state of the pipeline output — deduction decisions, net wall area,
-conflict records, and reconciliation status.
+Synthetic integration tests exercising the full pipeline
+(B1→dedup→B2→B3→B4→B5) with realistic mocked B1 output.  Each test
+asserts the expected final state of the pipeline output — deduction
+decisions, net wall area, conflict records, and reconciliation status.
 
-Benchmark authority: if PlanReader disagrees with an expected benchmark,
-investigate and fix extraction/reconciliation/deduction logic rather
-than changing expected values.
+These are NOT benchmark validations against real drawings.  Real
+benchmark fixtures require actual PDF/vector data from authoritative
+sources (e.g. the LAGO revised tender basis) and should exercise the
+full unmocked extraction chain.
 
-Total: 28 tests
+These tests validate the pipeline's internal logic contracts:
+  - Schedule basis must be explicit for deduction eligibility
+  - Generic schedule dims must NOT enable deduction
+  - Conflicts block deduction
+  - Wall-scoped net area is isolated per wall
+
+Total: 33 tests
 """
 import unittest
 from unittest.mock import patch, MagicMock
@@ -107,6 +114,8 @@ class TestBenchmark_SingleDoor(unittest.TestCase):
             type_mark="D01", width_mm=820, height_mm=2100,
             description="Standard door", count=4, page_no=2,
             parse_source="header_separate",
+            dimension_basis="rough_opening",
+            basis_source="Rough Opening Width",
         )]
 
         with patch(
@@ -162,6 +171,8 @@ class TestBenchmark_SingleWindow(unittest.TestCase):
             type_mark="W01", width_mm=1200, height_mm=1500,
             description="Standard window", count=6, page_no=2,
             parse_source="header_separate",
+            dimension_basis="rough_opening",
+            basis_source="Rough Opening",
         )]
 
         with patch(
@@ -207,6 +218,8 @@ class TestBenchmark_TwoIndependentDoors(unittest.TestCase):
             type_mark="D01", width_mm=820, height_mm=2100,
             description="Standard door", count=4, page_no=2,
             parse_source="header_separate",
+            dimension_basis="rough_opening",
+            basis_source="Rough Opening Width",
         )]
 
         with patch(
@@ -362,6 +375,8 @@ class TestBenchmark_ScheduleOnly(unittest.TestCase):
             type_mark="D01", width_mm=820, height_mm=2100,
             description="Standard door", count=4, page_no=2,
             parse_source="header_separate",
+            dimension_basis="rough_opening",
+            basis_source="Rough Opening Width",
         )]
 
         with patch(
@@ -442,6 +457,8 @@ class TestBenchmark_WallScopedNet(unittest.TestCase):
             type_mark="D01", width_mm=820, height_mm=2100,
             description="Standard door", count=4, page_no=2,
             parse_source="header_separate",
+            dimension_basis="rough_opening",
+            basis_source="Rough Opening Width",
         )]
 
         with patch(
@@ -493,11 +510,15 @@ class TestBenchmark_OverDeductionDetection(unittest.TestCase):
                 type_mark="D01", width_mm=820, height_mm=2100,
                 count=1, page_no=2,
                 parse_source="header_separate",
+                dimension_basis="rough_opening",
+                basis_source="Rough Opening",
             ),
             ScheduleEntry(
                 type_mark="D02", width_mm=820, height_mm=2100,
                 count=1, page_no=2,
                 parse_source="header_separate",
+                dimension_basis="rough_opening",
+                basis_source="Rough Opening",
             ),
         ]
 
@@ -566,6 +587,8 @@ class TestBenchmark_DedupMerge(unittest.TestCase):
             type_mark="D01", width_mm=820, height_mm=2100,
             count=4, page_no=2,
             parse_source="header_separate",
+            dimension_basis="rough_opening",
+            basis_source="Rough Opening",
         )]
 
         with patch(
@@ -607,6 +630,8 @@ class TestBenchmark_ScheduleAndElevation(unittest.TestCase):
             type_mark="D01", width_mm=820, height_mm=2100,
             count=4, page_no=2,
             parse_source="header_separate",
+            dimension_basis="rough_opening",
+            basis_source="Rough Opening",
         )]
         elev = [ElevationOpening(
             elevation_page_no=3,
@@ -681,6 +706,8 @@ class TestBenchmark_IdempotentDeduction(unittest.TestCase):
             type_mark="D01", width_mm=820, height_mm=2100,
             count=4, page_no=2,
             parse_source="header_separate",
+            dimension_basis="rough_opening",
+            basis_source="Rough Opening",
         )]
 
         with patch(
@@ -722,6 +749,8 @@ class TestBenchmark_PipelineNotes(unittest.TestCase):
             type_mark="D01", width_mm=820, height_mm=2100,
             count=4, page_no=2,
             parse_source="header_separate",
+            dimension_basis="rough_opening",
+            basis_source="Rough Opening",
         )]
 
         with patch(
@@ -758,6 +787,8 @@ class TestBenchmark_LowConfidenceNoDeduct(unittest.TestCase):
             type_mark="D01", width_mm=820, height_mm=2100,
             count=4, page_no=2,
             parse_source="header_separate",
+            dimension_basis="rough_opening",
+            basis_source="Rough Opening",
         )]
 
         with patch(
@@ -803,11 +834,15 @@ class TestBenchmark_MixedStatus(unittest.TestCase):
                 type_mark="D01", width_mm=820, height_mm=2100,
                 count=4, page_no=2,
                 parse_source="header_separate",
+                dimension_basis="rough_opening",
+                basis_source="Rough Opening",
             ),
             ScheduleEntry(
                 type_mark="D02", width_mm=900, height_mm=2100,
                 count=1, page_no=2,
                 parse_source="header_separate",
+                dimension_basis="rough_opening",
+                basis_source="Rough Opening",
             ),
         ]
 
@@ -857,6 +892,8 @@ class TestBenchmark_SameMarkDifferentPositions(unittest.TestCase):
             type_mark="D01", width_mm=820, height_mm=2100,
             count=4, page_no=2,
             parse_source="header_separate",
+            dimension_basis="rough_opening",
+            basis_source="Rough Opening",
         )]
 
         with patch(
@@ -938,11 +975,15 @@ class TestBenchmark_ThreeDoorsOneConflict(unittest.TestCase):
                 type_mark="D01", width_mm=820, height_mm=2100,
                 count=4, page_no=2,
                 parse_source="header_separate",
+                dimension_basis="rough_opening",
+                basis_source="Rough Opening",
             ),
             ScheduleEntry(
                 type_mark="D02", width_mm=820, height_mm=2100,
                 count=1, page_no=2,
                 parse_source="header_separate",
+                dimension_basis="rough_opening",
+                basis_source="Rough Opening",
             ),
         ]
 
@@ -1041,11 +1082,15 @@ class TestBenchmark_MultiWall(unittest.TestCase):
                 type_mark="D01", width_mm=820, height_mm=2100,
                 count=4, page_no=2,
                 parse_source="header_separate",
+                dimension_basis="rough_opening",
+                basis_source="Rough Opening",
             ),
             ScheduleEntry(
                 type_mark="D02", width_mm=900, height_mm=2100,
                 count=1, page_no=2,
                 parse_source="header_separate",
+                dimension_basis="rough_opening",
+                basis_source="Rough Opening",
             ),
         ]
 
@@ -1119,6 +1164,8 @@ class TestBenchmark_DeductedCountInNotes(unittest.TestCase):
             type_mark="D01", width_mm=820, height_mm=2100,
             count=4, page_no=2,
             parse_source="header_separate",
+            dimension_basis="rough_opening",
+            basis_source="Rough Opening",
         )]
 
         with patch(
@@ -1153,6 +1200,8 @@ class TestBenchmark_WidthConsistency(unittest.TestCase):
             type_mark="D01", width_mm=820, height_mm=2100,
             count=4, page_no=2,
             parse_source="header_separate",
+            dimension_basis="rough_opening",
+            basis_source="Rough Opening",
         )]
 
         with patch(
@@ -1186,6 +1235,8 @@ class TestBenchmark_DeductionDecisionField(unittest.TestCase):
             type_mark="D01", width_mm=820, height_mm=2100,
             count=4, page_no=2,
             parse_source="header_separate",
+            dimension_basis="rough_opening",
+            basis_source="Rough Opening",
         )]
 
         with patch(
@@ -1200,6 +1251,202 @@ class TestBenchmark_DeductionDecisionField(unittest.TestCase):
 
         inst = result["instances"][0]
         self.assertIn(inst.deduction_decision, ("deducted", "not_deducted"))
+
+
+# ============================================================================
+# Basis-differentiation tests — the core safety property
+# ============================================================================
+class TestBenchmark_GenericScheduleNoDeduct(unittest.TestCase):
+    """Generic schedule dims (Width/Height) → basis unknown → no deduction.
+
+    Knowing an opening's width and height is NOT the same thing as knowing
+    those dimensions represent the wall void.
+    """
+
+    def test_generic_width_height_no_deduction(self):
+        from pb_opening_schedule_v171 import ScheduleEntry
+
+        door = _b1_candidate(
+            mark="D01", wall="W01", position=1.5, width=0.82,
+            geom_conf=0.95, assoc_conf=0.95,
+        )
+        # Generic "Width/Height" heading — no basis provenance
+        schedule = [ScheduleEntry(
+            type_mark="D01", width_mm=820, height_mm=2100,
+            count=4, page_no=2,
+            parse_source="header_separate",
+            dimension_basis="",  # unknown — generic heading
+            basis_source="",
+        )]
+
+        with patch(
+            "pb_plan_opening_detection_v171.plan_opening_candidates",
+            return_value=_mock_b1([door]),
+        ):
+            result = run_opening_pipeline(
+                segments=[], words=[], page_no=1,
+                schedule_entries=schedule,
+                gross_wall_m2=20.0, wall_ref="W01",
+            )
+
+        inst = result["instances"][0]
+        self.assertTrue(inst.reconciliation_complete)
+        # Basis stays unknown — dims enriched but not eligible
+        self.assertEqual(inst.dimension_basis, "unknown")
+        self.assertFalse(inst.deduct)
+        self.assertAlmostEqual(
+            result["net_wall"]["net_area_m2"], 20.0, places=4
+        )
+
+
+class TestBenchmark_RoughOpeningScheduleDeducts(unittest.TestCase):
+    """Explicit 'Rough Opening' schedule heading → basis rough_opening → eligible."""
+
+    def test_rough_opening_enables_deduction(self):
+        from pb_opening_schedule_v171 import ScheduleEntry
+
+        door = _b1_candidate(
+            mark="D01", wall="W01", position=1.5, width=0.82,
+            geom_conf=0.95, assoc_conf=0.95,
+        )
+        schedule = [ScheduleEntry(
+            type_mark="D01", width_mm=820, height_mm=2100,
+            count=4, page_no=2,
+            parse_source="header_separate",
+            dimension_basis="rough_opening",
+            basis_source="Rough Opening Width",
+        )]
+
+        with patch(
+            "pb_plan_opening_detection_v171.plan_opening_candidates",
+            return_value=_mock_b1([door]),
+        ):
+            result = run_opening_pipeline(
+                segments=[], words=[], page_no=1,
+                schedule_entries=schedule,
+                gross_wall_m2=20.0, wall_ref="W01",
+            )
+
+        inst = result["instances"][0]
+        self.assertTrue(inst.reconciliation_complete)
+        self.assertEqual(inst.dimension_basis, "rough_opening")
+        self.assertTrue(inst.deduct)
+        expected_net = round(20.0 - 0.82 * 2.10, 4)
+        self.assertAlmostEqual(
+            result["net_wall"]["net_area_m2"], expected_net, places=4
+        )
+
+
+class TestBenchmark_FrameScheduleNoDeduct(unittest.TestCase):
+    """Frame size schedule → basis frame → no wall-void deduction."""
+
+    def test_frame_basis_blocks_deduction(self):
+        from pb_opening_schedule_v171 import ScheduleEntry
+
+        door = _b1_candidate(
+            mark="D01", wall="W01", position=1.5, width=0.82,
+            geom_conf=0.95, assoc_conf=0.95,
+        )
+        schedule = [ScheduleEntry(
+            type_mark="D01", width_mm=820, height_mm=2100,
+            count=4, page_no=2,
+            parse_source="header_separate",
+            dimension_basis="frame",
+            basis_source="Frame Size",
+        )]
+
+        with patch(
+            "pb_plan_opening_detection_v171.plan_opening_candidates",
+            return_value=_mock_b1([door]),
+        ):
+            result = run_opening_pipeline(
+                segments=[], words=[], page_no=1,
+                schedule_entries=schedule,
+                gross_wall_m2=20.0, wall_ref="W01",
+            )
+
+        inst = result["instances"][0]
+        self.assertTrue(inst.reconciliation_complete)
+        # Frame dims are NOT wall-void dims
+        self.assertEqual(inst.dimension_basis, "frame")
+        self.assertFalse(inst.deduct)
+        self.assertAlmostEqual(
+            result["net_wall"]["net_area_m2"], 20.0, places=4
+        )
+
+
+class TestBenchmark_LeafScheduleNoDeduct(unittest.TestCase):
+    """Leaf size schedule → basis leaf → no wall-void deduction."""
+
+    def test_leaf_basis_blocks_deduction(self):
+        from pb_opening_schedule_v171 import ScheduleEntry
+
+        door = _b1_candidate(
+            mark="D01", wall="W01", position=1.5, width=0.82,
+            geom_conf=0.95, assoc_conf=0.95,
+        )
+        schedule = [ScheduleEntry(
+            type_mark="D01", width_mm=820, height_mm=2100,
+            count=4, page_no=2,
+            parse_source="header_separate",
+            dimension_basis="leaf",
+            basis_source="Leaf Width",
+        )]
+
+        with patch(
+            "pb_plan_opening_detection_v171.plan_opening_candidates",
+            return_value=_mock_b1([door]),
+        ):
+            result = run_opening_pipeline(
+                segments=[], words=[], page_no=1,
+                schedule_entries=schedule,
+                gross_wall_m2=20.0, wall_ref="W01",
+            )
+
+        inst = result["instances"][0]
+        self.assertTrue(inst.reconciliation_complete)
+        self.assertEqual(inst.dimension_basis, "leaf")
+        self.assertFalse(inst.deduct)
+        self.assertAlmostEqual(
+            result["net_wall"]["net_area_m2"], 20.0, places=4
+        )
+
+
+class TestBenchmark_ClearOpeningScheduleNoDeduct(unittest.TestCase):
+    """Clear opening schedule → basis clear_opening → no wall-void deduction."""
+
+    def test_clear_opening_basis_blocks_deduction(self):
+        from pb_opening_schedule_v171 import ScheduleEntry
+
+        door = _b1_candidate(
+            mark="D01", wall="W01", position=1.5, width=0.82,
+            geom_conf=0.95, assoc_conf=0.95,
+        )
+        schedule = [ScheduleEntry(
+            type_mark="D01", width_mm=820, height_mm=2100,
+            count=4, page_no=2,
+            parse_source="header_separate",
+            dimension_basis="clear_opening",
+            basis_source="Clear Opening Width",
+        )]
+
+        with patch(
+            "pb_plan_opening_detection_v171.plan_opening_candidates",
+            return_value=_mock_b1([door]),
+        ):
+            result = run_opening_pipeline(
+                segments=[], words=[], page_no=1,
+                schedule_entries=schedule,
+                gross_wall_m2=20.0, wall_ref="W01",
+            )
+
+        inst = result["instances"][0]
+        self.assertTrue(inst.reconciliation_complete)
+        self.assertEqual(inst.dimension_basis, "clear_opening")
+        self.assertFalse(inst.deduct)
+        self.assertAlmostEqual(
+            result["net_wall"]["net_area_m2"], 20.0, places=4
+        )
 
 
 if __name__ == "__main__":

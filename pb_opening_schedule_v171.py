@@ -48,6 +48,8 @@ class ScheduleEntry:
     page_no: int = 0
     bbox: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     parse_source: str = ""      # "header_dims", "header_separate", "heuristic"
+    dimension_basis: str = ""    # "rough_opening", "frame", "leaf", "clear_opening", ""
+    basis_source: str = ""       # provenance for dimension_basis (heading text)
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +82,60 @@ _HEADER_DESC_KEYWORDS = frozenset({
     "description", "desc", "notes", "note", "detail", "remarks",
     "type_desc", "material", "finish", "spec",
 })
+
+# ---------------------------------------------------------------------------
+# Dimension basis inference from schedule heading text
+# ---------------------------------------------------------------------------
+# Only explicit heading labels can establish basis.  Generic "Width/Height"
+# must remain unknown — knowing dimensions is not the same as knowing
+# they represent the wall void.
+
+_RO_HEADING_KEYWORDS = re.compile(
+    r"\b(rough\s*opening|ro\s*size|ro\s*wdth|ro\s*ht|structural\s*opening"
+    r"|rough\s*opening\s*(width|height|wdth|ht|hgt)"
+    r"|r\.?o\.?\s*(width|height|wdth|ht|hgt))\b",
+    re.IGNORECASE,
+)
+_FRAME_HEADING_KEYWORDS = re.compile(
+    r"\b(frame\s*(size|width|height|wdth|ht|hgt)|fr\s*size)\b",
+    re.IGNORECASE,
+)
+_LEAF_HEADING_KEYWORDS = re.compile(
+    r"\b(leaf\s*(size|width|height|wdth|ht|hgt))\b",
+    re.IGNORECASE,
+)
+_CLEAR_HEADING_KEYWORDS = re.compile(
+    r"\b(clear\s*(opening|size|width|height|wdth|ht|hgt))\b",
+    re.IGNORECASE,
+)
+
+
+def _infer_dimension_basis(heading_cells: Sequence[str]) -> Tuple[str, str]:
+    """Infer dimension basis from schedule heading text.
+
+    Returns (dimension_basis, basis_source) where:
+      - dimension_basis is "rough_opening", "frame", "leaf",
+        "clear_opening", or "" (unknown).
+      - basis_source is the matched heading text for provenance.
+
+    Only explicit heading labels establish basis.  Generic headings like
+    "Width", "Height", "Size" return ("", "") because the parser cannot
+    determine what physical measurement those dimensions represent.
+    """
+    combined = " ".join(heading_cells).lower()
+    if _RO_HEADING_KEYWORDS.search(combined):
+        m = _RO_HEADING_KEYWORDS.search(combined)
+        return "rough_opening", m.group(0) if m else combined
+    if _FRAME_HEADING_KEYWORDS.search(combined):
+        m = _FRAME_HEADING_KEYWORDS.search(combined)
+        return "frame", m.group(0) if m else combined
+    if _LEAF_HEADING_KEYWORDS.search(combined):
+        m = _LEAF_HEADING_KEYWORDS.search(combined)
+        return "leaf", m.group(0) if m else combined
+    if _CLEAR_HEADING_KEYWORDS.search(combined):
+        m = _CLEAR_HEADING_KEYWORDS.search(combined)
+        return "clear_opening", m.group(0) if m else combined
+    return "", ""
 
 # Patterns for mark extraction
 _MARK_PATTERNS = [
@@ -268,16 +324,21 @@ def extract_mark(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Header detection and column mapping
 # ---------------------------------------------------------------------------
-def detect_header(words: Sequence[str]) -> Dict[str, int]:
+def detect_header(words: Sequence[str]) -> Dict[str, Any]:
     """Detect which columns hold mark, width, height, dims, count, description.
+
+    Also infers dimension basis from heading text (rough_opening, frame, etc.).
 
     Args:
         words: list of column header texts (one per column, lowercased)
 
     Returns:
-        dict mapping role → column index.  Missing roles are absent.
+        dict with:
+          - role → column index for each detected role
+          - "dimension_basis": inferred basis ("" = unknown)
+          - "basis_source": heading text that established the basis
     """
-    mapping: Dict[str, int] = {}
+    mapping: Dict[str, Any] = {}
     for i, w in enumerate(words):
         w_clean = w.strip().lower()
         if not w_clean:
@@ -294,6 +355,11 @@ def detect_header(words: Sequence[str]) -> Dict[str, int]:
             mapping["count"] = i
         elif w_clean in _HEADER_DESC_KEYWORDS and "desc" not in mapping:
             mapping["desc"] = i
+
+    # Infer dimension basis from heading text
+    basis, basis_source = _infer_dimension_basis(words)
+    mapping["dimension_basis"] = basis
+    mapping["basis_source"] = basis_source
     return mapping
 
 
@@ -427,6 +493,8 @@ def parse_schedule_rows(
             page_no=page_no,
             bbox=tuple(bbox) if len(bbox) >= 4 else (0, 0, 0, 0),
             parse_source=parse_source,
+            dimension_basis=col_map.get("dimension_basis", ""),
+            basis_source=col_map.get("basis_source", ""),
         ))
 
     return entries
@@ -646,14 +714,10 @@ def enrich_opening_evidence(
                 dim_conf = 0.5
             else:
                 dim_conf = 0.5
-            # Schedule table dimensions are rough-opening measurements.
-            # When both width and height are present, set the correct basis
-            # so the merged instance can reach auto_eligible after B4.
-            has_both_dims = sched.width_mm is not None and sched.height_mm is not None
-            sched_basis = (
-                DIMENSION_BASIS_ROUGH_OPENING if has_both_dims
-                else DIMENSION_BASIS_UNKNOWN
-            )
+            # Use the ScheduleEntry's dimension_basis — inferred from
+            # heading text.  Only explicit headings like "Rough Opening"
+            # produce rough_opening; generic "Width/Height" stays unknown.
+            sched_basis = sched.dimension_basis or DIMENSION_BASIS_UNKNOWN
             # Create a schedule-sourced evidence record for merging
             sched_ev = OpeningEvidence(
                 type_mark=mark,

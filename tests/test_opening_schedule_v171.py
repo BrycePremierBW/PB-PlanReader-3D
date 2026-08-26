@@ -184,17 +184,54 @@ class TestHeaderDetection(unittest.TestCase):
 
     def test_empty_header(self):
         h = detect_header([])
-        self.assertEqual(h, {})
+        self.assertNotIn("mark", h)
+        self.assertNotIn("width", h)
+        self.assertEqual(h.get("dimension_basis"), "")
 
     def test_no_match(self):
         h = detect_header(["foo", "bar", "baz"])
-        self.assertEqual(h, {})
+        self.assertNotIn("mark", h)
+        self.assertNotIn("width", h)
+        self.assertEqual(h.get("dimension_basis"), "")
 
     def test_case_insensitive(self):
         h = detect_header(["MARK", "WIDTH", "HEIGHT"])
         self.assertEqual(h["mark"], 0)
         self.assertEqual(h["width"], 1)
         self.assertEqual(h["height"], 2)
+
+    def test_rough_opening_basis(self):
+        h = detect_header(["Mark", "Rough Opening Width", "Rough Opening Height"])
+        self.assertEqual(h["dimension_basis"], "rough_opening")
+        self.assertIn("rough opening", h["basis_source"])
+
+    def test_frame_basis(self):
+        h = detect_header(["Mark", "Frame Size", "Height"])
+        self.assertEqual(h["dimension_basis"], "frame")
+        self.assertIn("frame", h["basis_source"])
+
+    def test_leaf_basis(self):
+        h = detect_header(["Mark", "Leaf Width", "Leaf Height"])
+        self.assertEqual(h["dimension_basis"], "leaf")
+        self.assertIn("leaf", h["basis_source"])
+
+    def test_clear_opening_basis(self):
+        h = detect_header(["Mark", "Clear Opening Width", "Height"])
+        self.assertEqual(h["dimension_basis"], "clear_opening")
+        self.assertIn("clear opening", h["basis_source"])
+
+    def test_generic_width_height_unknown_basis(self):
+        h = detect_header(["Mark", "Width", "Height"])
+        self.assertEqual(h["dimension_basis"], "")
+        self.assertEqual(h["basis_source"], "")
+
+    def test_generic_size_unknown_basis(self):
+        h = detect_header(["Mark", "Size"])
+        self.assertEqual(h["dimension_basis"], "")
+
+    def test_ro_abbreviation_basis(self):
+        h = detect_header(["Mark", "RO Width", "RO Height"])
+        self.assertEqual(h["dimension_basis"], "rough_opening")
 
 
 class TestScheduleRowParsing(unittest.TestCase):
@@ -396,10 +433,8 @@ class TestEnrichment(unittest.TestCase):
         inst.deduction_status = DEDUCTION_REVIEW
         sched = [_entry("D01", w=820, h=2040)]
         result = enrich_opening_evidence([inst], sched)
-        # Enrichment may upgrade basis to rough_opening, which triggers
-        # compute_deduction_status(). With test-zero confidences, the
-        # status becomes "none" — but never "deducted".
-        self.assertIn(result[0].deduction_status, (DEDUCTION_REVIEW, "none"))
+        # Generic schedule dims have unknown basis → stays review
+        self.assertEqual(result[0].deduction_status, DEDUCTION_REVIEW)
 
     def test_no_new_instances_created(self):
         """Schedule entries must not create new OpeningEvidence records."""
