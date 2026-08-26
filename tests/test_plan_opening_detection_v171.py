@@ -1156,6 +1156,22 @@ class TestGapDetection(unittest.TestCase):
         self.assertAlmostEqual(gaps[0].semantic_confidence, 0.80)
         self.assertAlmostEqual(gaps[0].geometry_confidence, 0.75)
 
+    def test_gap_candidate_has_centroid(self):
+        """GapCandidate stores absolute midpoint coordinates."""
+        wall_a = WallLine(segment=_horiz_seg(0, 100, 200, 100))
+        wall_b = WallLine(segment=_horiz_seg(300, 100, 600, 100))
+
+        gaps = detect_gap_candidates(
+            [wall_a.segment, wall_b.segment], [wall_a, wall_b], [],
+            scale_info=SCALE_INFO_1X,
+        )
+        self.assertEqual(len(gaps), 1)
+        # Centroid is midpoint of gap endpoints: (200+300)/2, (100+100)/2
+        self.assertIsNotNone(gaps[0].centroid_x)
+        self.assertIsNotNone(gaps[0].centroid_y)
+        self.assertAlmostEqual(gaps[0].centroid_x, 250.0, places=1)
+        self.assertAlmostEqual(gaps[0].centroid_y, 100.0, places=1)
+
 
 # ---------------------------------------------------------------------------
 # 7b. Gap suppression — blank wall_ref safety
@@ -1540,6 +1556,8 @@ class TestConversionToEvidence(unittest.TestCase):
             semantic_confidence=0.0,
             evidence=["test_evidence"],
             page_no=3,
+            centroid_x=250.0,
+            centroid_y=100.0,
         )
         ev = gap_to_opening_evidence(cand)
 
@@ -1549,6 +1567,27 @@ class TestConversionToEvidence(unittest.TestCase):
         self.assertEqual(ev.quantity, 1)
         self.assertFalse(ev.deduct)
         self.assertAlmostEqual(ev.geometry_confidence, 0.75)
+        # Real centroid → plan_geometry_signature present
+        self.assertIsNotNone(ev.plan_geometry_signature)
+        self.assertEqual(ev.plan_geometry_signature[0], 3)  # page_no
+        self.assertAlmostEqual(ev.plan_geometry_signature[1], 250.0)
+        self.assertAlmostEqual(ev.plan_geometry_signature[2], 100.0)
+
+    def test_gap_without_centroid_no_signature(self):
+        """Gap without centroid → no plan_geometry_signature."""
+        cand = GapCandidate(
+            wall_ref="N01",
+            position_along_wall_m=4.0,
+            width_m=1.5,
+            tag="",
+            geometry_confidence=0.75,
+            association_confidence=0.70,
+            semantic_confidence=0.0,
+            evidence=["test_evidence"],
+            page_no=3,
+        )
+        ev = gap_to_opening_evidence(cand)
+        self.assertIsNone(ev.plan_geometry_signature)
 
     def test_gap_with_door_tag_classifies_as_door(self):
         cand = GapCandidate(

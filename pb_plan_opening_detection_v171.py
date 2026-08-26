@@ -781,6 +781,8 @@ class GapCandidate:
     semantic_confidence: float = 0.0
     evidence: List[str] = field(default_factory=list)
     page_no: int = 0
+    centroid_x: Optional[float] = None
+    centroid_y: Optional[float] = None
 
 
 def detect_gap_candidates(
@@ -956,6 +958,8 @@ def detect_gap_candidates(
                 semantic_confidence=sem_conf,
                 evidence=ev,
                 page_no=page_no,
+                centroid_x=mid_cx,
+                centroid_y=mid_cy,
             ))
 
     return candidates
@@ -1063,17 +1067,11 @@ def gap_to_opening_evidence(cand: GapCandidate) -> OpeningEvidence:
     ev.set_quantity(1, source="geometric")
     ev.compute_area()
     ev.compute_deduction_status()
-    # Gap candidates lack absolute geometry (jamb segments/pairs).
-    # Use position_along_wall_m as a weaker proxy for cross-wall matching.
-    # This won't catch cross-wall duplicates as reliably as door/window,
-    # but is better than no signature at all.
-    if cand.position_along_wall_m is not None:
-        ev.plan_geometry_signature = (
-            cand.page_no,
-            round(cand.position_along_wall_m, 2),
-            0.0,  # no y coordinate available for gaps
-            round(cand.width_m or 0.0, 3),
-            opening_type,
+    # Plan-space geometry signature from gap midpoint (absolute PDF coords)
+    if cand.centroid_x is not None and cand.centroid_y is not None:
+        ev.compute_plan_geometry_signature(
+            centroid_x=cand.centroid_x,
+            centroid_y=cand.centroid_y,
         )
     record_plan_observation(ev)
     return ev

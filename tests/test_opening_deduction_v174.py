@@ -251,6 +251,45 @@ class TestCrossWallDuplicate(unittest.TestCase):
                    if o["source"] == "physical_instance_conflict"]
             self.assertEqual(len(pic), 0)
 
+    def test_same_gap_midpoint_different_walls_conflict(self):
+        """Same absolute gap midpoint on W01 + W02 → conflict on both."""
+        a = _make_instance(
+            mark="", wall="W01", position=1.5, width=0.50,
+            opening_type="opening",
+        )
+        a.plan_geometry_signature = (1, 350.0, 420.0, 0.50, "opening")
+        b = _make_instance(
+            mark="", wall="W02", position=2.1, width=0.50,
+            opening_type="opening",
+        )
+        b.plan_geometry_signature = (1, 350.0, 420.0, 0.50, "opening")
+        result = resolve_physical_duplicates([a, b])
+        self.assertEqual(len(result), 2)
+        for inst in result:
+            pic = [o for o in inst.source_observations
+                   if o["source"] == "physical_instance_conflict"]
+            self.assertEqual(len(pic), 1)
+
+    def test_different_gap_midpoint_same_relative_pos_no_conflict(self):
+        """Different absolute midpoint, same relative position → independent."""
+        a = _make_instance(
+            mark="", wall="W01", position=1.5, width=0.50,
+            opening_type="opening",
+        )
+        a.plan_geometry_signature = (1, 350.0, 420.0, 0.50, "opening")
+        b = _make_instance(
+            mark="", wall="W02", position=1.5, width=0.50,
+            opening_type="opening",
+        )
+        # Different absolute midpoint
+        b.plan_geometry_signature = (1, 800.0, 600.0, 0.50, "opening")
+        result = resolve_physical_duplicates([a, b])
+        self.assertEqual(len(result), 2)
+        for inst in result:
+            pic = [o for o in inst.source_observations
+                   if o["source"] == "physical_instance_conflict"]
+            self.assertEqual(len(pic), 0)
+
 
 # ============================================================================
 # Eligibility gate tests
@@ -1083,6 +1122,54 @@ class TestPipelineOrchestration(unittest.TestCase):
             self.assertEqual(inst.deduction_status, DEDUCTION_REVIEW)
             self.assertFalse(inst.deduct)
         # Net wall: no deductions → full gross
+        self.assertAlmostEqual(
+            result["net_wall"]["net_area_m2"], 20.0, places=4
+        )
+
+    def test_run_opening_pipeline_cross_wall_gap(self):
+        """run_opening_pipeline() with same gap midpoint on W01 + W02.
+
+        Same absolute midpoint coordinates but different wall_ref.
+        The real centroid signature (not wall-relative position) detects
+        the duplicate. Both forced to review, neither deducted.
+        """
+        from unittest.mock import patch, MagicMock
+        from pb_opening_deduction_v174 import run_opening_pipeline
+
+        inst_a = _make_instance(
+            mark="", wall="W01", position=1.5, width=0.50,
+            opening_type="opening",
+            geom_conf=0.75, dim_conf=0.0, assoc_conf=0.70,
+        )
+        inst_a.plan_geometry_signature = (1, 350.0, 420.0, 0.50, "opening")
+        inst_b = _make_instance(
+            mark="", wall="W02", position=2.1, width=0.50,
+            opening_type="opening",
+            geom_conf=0.75, dim_conf=0.0, assoc_conf=0.70,
+        )
+        inst_b.plan_geometry_signature = (1, 350.0, 420.0, 0.50, "opening")
+
+        mock_result = MagicMock()
+        mock_result.candidates = [inst_a, inst_b]
+        mock_result.door_count = 0
+        mock_result.window_count = 0
+        mock_result.gap_count = 2
+
+        with patch(
+            "pb_plan_opening_detection_v171.plan_opening_candidates",
+            return_value=mock_result,
+        ):
+            result = run_opening_pipeline(
+                segments=[], words=[], page_no=1,
+                gross_wall_m2=20.0, wall_ref="W01",
+            )
+
+        self.assertEqual(len(result["instances"]), 2)
+        for inst in result["instances"]:
+            self.assertTrue(inst.reconciliation_complete)
+        for inst in result["instances"]:
+            self.assertEqual(inst.deduction_status, DEDUCTION_REVIEW)
+            self.assertFalse(inst.deduct)
         self.assertAlmostEqual(
             result["net_wall"]["net_area_m2"], 20.0, places=4
         )
