@@ -294,10 +294,12 @@ def test_missing_b2_or_b3_evidence_fails_closed():
     assert result["deducted_area_m2"] == 0.0
 
 
-def _register_app(register_records=None, *, geom_attach, b5_payload=None):
+def _register_app(register_records=None, *, geom_attach, b5_payload=None, live_pages=None):
     store = {}
     if register_records:
         store[(7, legacy_v134.SETTING_KEY)] = json.dumps(register_records, separators=(",", ":"))
+
+    live = dict(live_pages) if live_pages else {}
 
     def workspace_setting(wid, key, default=""):
         return store.get((int(wid), key), default)
@@ -305,31 +307,47 @@ def _register_app(register_records=None, *, geom_attach, b5_payload=None):
     def set_workspace_setting(wid, key, value):
         store[(int(wid), key)] = value
 
+    def lquery(sql, params=()):
+        # Simulates the live `pages` table: a page id exists iff present in
+        # `live` (mapping page_id -> workspace_id).
+        sql_l = str(sql).lower()
+        if " from pages" in sql_l or "pages " in sql_l or "pages p" in sql_l:
+            if params:
+                pid = int(params[0])
+                ws = live.get(pid)
+                if ws is None:
+                    return []
+                return [{"id": pid, "workspace_id": ws, "document_id": 1,
+                         "page_no": 1, "path": "", "render_zoom": 1.0}]
+        return []
+
     app = SimpleNamespace(
         workspace_setting=workspace_setting,
         set_workspace_setting=set_workspace_setting,
         attach_openings_v137=lambda wid, walls: geom_attach(app, int(wid), walls),
+        lquery=lquery,
+        live_pages=live,
     )
     # Persist a completed B5 payload the way the bridge would, so the consumer
     # (safe_attach) can pick up the authoritative instances.
     if b5_payload:
         store[(7, f"{prod.SETTING_PREFIX}5")] = json.dumps(b5_payload, separators=(",", ":"))
         store[(7, prod.PAGES_INDEX_KEY)] = json.dumps([5], separators=(",", ":"))
+        live.setdefault(5, 7)
     return app, store
 
 
 def _b5_payload(wall_ref="W01", mark="D01"):
-    return {
-        "instances": [{
-            "deduct": True, "wall_ref": wall_ref, "resolved_wall_ref": wall_ref,
-            "type_mark": mark, "width_m": 0.82, "height_m": 2.1,
-            "quantity": 1, "page_no": 1,
-            "reconciliation_complete": True, "deduction_status": "auto_eligible",
-            "deduction_decision": "deducted", "dimension_basis": "rough_opening",
-            "geometry_confidence": 0.9, "dimension_confidence": 0.9,
-            "association_confidence": 0.9,
-        }],
+    inst = {
+        "deduct": True, "wall_ref": wall_ref, "resolved_wall_ref": wall_ref,
+        "type_mark": mark, "width_m": 0.82, "height_m": 2.1,
+        "quantity": 1, "page_no": 1, "page_id": 5, "workspace_id": 7,
+        "reconciliation_complete": True, "deduction_status": "auto_eligible",
+        "deduction_decision": "deducted", "dimension_basis": "rough_opening",
+        "geometry_confidence": 0.9, "dimension_confidence": 0.9,
+        "association_confidence": 0.9,
     }
+    return {"page_id": 5, "workspace_id": 7, "instances": [inst]}
 
 
 def test_b5_authoritative_reduces_only_assigned_wall_once():
@@ -515,11 +533,11 @@ def test_explicit_manual_exclude_persists_and_blocks_b5():
                            b5_payload=_b5_payload(wall_ref="W01", mark="D01"))
     try:
         prod.install_legacy_safety_fence(app)
-        # The estimator saves this opening with Deduct unchecked.
+        # The estimator saves this opening with Deduct unchecked (Save choices).
         legacy_v134._save(app, 7, [{
             "kind": "Door", "label": "D01", "wall_ref": "W01",
             "width_m": 0.82, "height_m": 2.1, "deduct": False,
-        }])
+        }], confirm_all=True)
         # Reload from the register (real load path): the exclusion persisted and
         # is remembered as an explicit estimator decision.
         loaded = legacy_v134._load(app, 7)
@@ -549,7 +567,7 @@ def test_explicit_manual_include_persists_and_stays_authorised():
         legacy_v134._save(app, 7, [{
             "kind": "Door", "label": "D01", "wall_ref": "W01",
             "width_m": 0.82, "height_m": 2.1, "deduct": True,
-        }])
+        }], confirm_all=True)
         loaded = legacy_v134._load(app, 7)
         assert len(loaded) == 1
         assert loaded[0]["deduct"] is True
@@ -560,6 +578,108 @@ def test_explicit_manual_include_persists_and_stays_authorised():
         # the confirmed manual include remains a single authorised deduction
         assert sum(1 for o in w01 if o.get("deduct")) == 1
         assert abs(sum(o["area_m2"] for o in w01 if o.get("deduct")) - 0.82 * 2.1) < 1e-6
+    finally:
+        importlib.reload(accuracy_v145)
+        importlib.reload(legacy_v134)
+
+
+def _wall_deduction(attached, wall):
+    rows = [o for o in attached if o.get("resolved_wall_ref") == wall]
+    return round(sum(o["area_m2"] for o in rows if o.get("deduct")), 4)
+
+
+def test_valid_b5_with_live_page_is_deducted():
+    # Fix 1 (positive): valid persisted B5 + the source page still exists in the
+    # current workspace -> the deduction is consumed.
+    from pb_opening_geometry_v137 import attach_openings as _geom_attach
+    app, _ = _register_app([], geom_attach=_geom_attach, b5_payload=_b5_payload())
+    try:
+        prod.install_legacy_safety_fence(app)
+        walls = [{"wall_ref": "W01", "length_m": 5.0, "side": "North"}]
+        attached = app.attach_openings_v137(7, walls)
+        assert abs(_wall_deduction(attached, "W01") - 0.82 * 2.1) < 1e-3
+    finally:
+        importlib.reload(accuracy_v145)
+        importlib.reload(legacy_v134)
+
+
+def test_stale_b5_with_deleted_page_is_not_deducted():
+    # Fix 1: persisted B5 whose source page has been deleted/replaced must fail
+    # closed (zero deduction), even though the proof bundle is still valid.
+    from pb_opening_geometry_v137 import attach_openings as _geom_attach
+    app, _ = _register_app([], geom_attach=_geom_attach, b5_payload=_b5_payload())
+    app.live_pages.pop(5, None)  # page deleted from the live pages table
+    try:
+        prod.install_legacy_safety_fence(app)
+        walls = [{"wall_ref": "W01", "length_m": 5.0, "side": "North"}]
+        attached = app.attach_openings_v137(7, walls)
+        assert _wall_deduction(attached, "W01") == 0.0
+    finally:
+        importlib.reload(accuracy_v145)
+        importlib.reload(legacy_v134)
+
+
+def test_stale_b5_for_page_in_another_workspace_is_not_deducted():
+    # Fix 1: persisted B5 page now belongs to another workspace -> fail closed.
+    from pb_opening_geometry_v137 import attach_openings as _geom_attach
+    app, _ = _register_app([], geom_attach=_geom_attach, b5_payload=_b5_payload())
+    app.live_pages[5] = 99  # page re-homed to another workspace
+    try:
+        prod.install_legacy_safety_fence(app)
+        walls = [{"wall_ref": "W01", "length_m": 5.0, "side": "North"}]
+        attached = app.attach_openings_v137(7, walls)
+        assert _wall_deduction(attached, "W01") == 0.0
+    finally:
+        importlib.reload(accuracy_v145)
+        importlib.reload(legacy_v134)
+
+
+def test_stale_b5_with_identity_mismatch_is_not_deducted():
+    # Fix 1: persisted payload claims a page/workspace identity that does not
+    # agree with the live page/index -> fail closed.
+    from pb_opening_geometry_v137 import attach_openings as _geom_attach
+    bad = _b5_payload(wall_ref="W01", mark="D01")
+    bad["workspace_id"] = 99
+    bad["instances"][0]["workspace_id"] = 99
+    app, _ = _register_app([], geom_attach=_geom_attach, b5_payload=bad)
+    try:
+        prod.install_legacy_safety_fence(app)
+        walls = [{"wall_ref": "W01", "length_m": 5.0, "side": "North"}]
+        attached = app.attach_openings_v137(7, walls)
+        assert _wall_deduction(attached, "W01") == 0.0
+    finally:
+        importlib.reload(accuracy_v145)
+        importlib.reload(legacy_v134)
+
+
+def test_add_opening_does_not_promote_existing_openings():
+    # Fix 2: the Add-opening action carries existing rows along but only the NEW
+    # opening is confirmed manual.  Existing unproven openings keep
+    # manual_override_confirmed=False so later valid B5 evidence can still deduct.
+    from pb_opening_geometry_v137 import attach_openings as _geom_attach
+    app, _ = _register_app([], geom_attach=_geom_attach,
+                           b5_payload=_b5_payload(wall_ref="W01", mark="D01"))
+    try:
+        prod.install_legacy_safety_fence(app)
+        existing = {"id": "existing-1", "kind": "Door", "label": "D01",
+                    "wall_ref": "W01", "width_m": 0.82, "height_m": 2.1,
+                    "deduct": False}  # unproven auto opening, no manual override
+        new_item = {"id": "new-1", "kind": "Window", "label": "W01",
+                    "wall_ref": "W01", "width_m": 1.2, "height_m": 1.2,
+                    "deduct": True}  # manually added opening
+        # Add-opening action: full list saved, only the new id is confirmed.
+        legacy_v134._save(app, 7, [existing, new_item], confirm_ids={"new-1"})
+        loaded = {o["id"]: o for o in legacy_v134._load(app, 7)}
+        assert loaded["existing-1"]["manual_override_confirmed"] is False
+        assert loaded["new-1"]["manual_override_confirmed"] is True
+        # later valid B5 evidence for the existing opening is still allowed to deduct
+        walls = [{"wall_ref": "W01", "length_m": 6.0, "side": "North"}]
+        attached = app.attach_openings_v137(7, walls)
+        d01_ded = [o for o in attached
+                   if o.get("resolved_wall_ref") == "W01"
+                   and o.get("type_mark") == "D01" and o.get("deduct")]
+        assert len(d01_ded) == 1
+        assert abs(d01_ded[0]["area_m2"] - 0.82 * 2.1) < 1e-6
     finally:
         importlib.reload(accuracy_v145)
         importlib.reload(legacy_v134)

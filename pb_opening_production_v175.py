@@ -100,17 +100,23 @@ def _safe_legacy_normaliser(original_normalise):
 
 
 def _safe_legacy_save(original_save, safe_normalise):
-    def safe_save(app: Any, workspace_id: int, openings: Iterable[Dict[str, Any]]) -> None:
+    def safe_save(app: Any, workspace_id: int, openings: Iterable[Dict[str, Any]],
+                  confirm_all: bool = False,
+                  confirm_ids: Optional[Iterable[Any]] = None) -> None:
+        confirm = set(str(x) for x in (confirm_ids or []))
         payload: List[Dict[str, Any]] = []
         for raw in openings or []:
             row = dict(raw or {})
-            # Saving choices through the estimator panel is an explicit decision
-            # on each opening's deduct state.  `manual_override_confirmed` means
-            # "the estimator explicitly decided this physical opening", NOT
-            # "the estimator chose deduct=True" - so an explicit EXCLUDE
-            # (deduct=False) is preserved and a later B5 result cannot re-enable
-            # an opening the estimator deliberately excluded.
-            row["manual_override_confirmed"] = True
+            # `manual_override_confirmed` means "the estimator explicitly decided
+            # this physical opening", NOT "the estimator chose deduct=True", so an
+            # explicit EXCLUDE (deduct=False) is preserved and a later B5 result
+            # cannot re-enable an opening the estimator deliberately excluded.
+            # Confirmation is ACTION-scoped: only rows the estimator explicitly
+            # acted on are promoted, and every other row keeps its prior state
+            # (never cleared, never blanket-promoted).
+            prior = bool(row.get("manual_override_confirmed", False))
+            explicitly_confirmed = bool(confirm_all) or (str(row.get("id")) in confirm)
+            row["manual_override_confirmed"] = prior or explicitly_confirmed
             payload.append(safe_normalise(row))
         original_save(app, int(workspace_id), payload)
     return safe_save
@@ -450,6 +456,43 @@ def _is_authorised_b5_automatic(row: Dict[str, Any]) -> bool:
 PAGES_INDEX_KEY = "opening_evidence_v175_pages"
 
 
+def _verify_b5_page(app: Any, workspace_id: int, page_id: int, payload: Dict[str, Any]) -> bool:
+    """Fail-closed check that persisted page-scoped P5 evidence is still live.
+
+    Returns True only when the source page can be verified to still exist in the
+    current workspace's ``pages`` table AND the payload's own page/workspace
+    identity agrees.  Orphaned / deleted / re-homed / mismatched evidence is
+    rejected so stale persisted B5 deductions never keep reducing wall area.
+    """
+    query = getattr(app, "lquery", None)
+    if not callable(query):
+        return False  # cannot verify current page existence -> fail closed
+    try:
+        rows = query("SELECT id, workspace_id FROM pages WHERE id=?", (int(page_id),))
+    except Exception:
+        return False
+    if not rows:
+        return False  # page no longer exists in the live table
+    live = dict(rows[0])
+    if int(_num(live.get("workspace_id"), -1)) != int(workspace_id):
+        return False  # page has been moved to another workspace
+    pl = dict(payload or {})
+    if "page_id" in pl and _num(pl.get("page_id")) != int(page_id):
+        return False
+    if "workspace_id" in pl and _num(pl.get("workspace_id")) != int(workspace_id):
+        return False
+    return True
+
+
+def _row_identity_agrees(row: Dict[str, Any], workspace_id: int, page_id: int) -> bool:
+    """Where a row carries its own page/workspace identity, require it to agree."""
+    if "page_id" in row and _num(row.get("page_id")) != int(page_id):
+        return False
+    if "workspace_id" in row and _num(row.get("workspace_id")) != int(workspace_id):
+        return False
+    return True
+
+
 def _b5_authoritative_instances(app: Any, workspace_id: int) -> List[Dict[str, Any]]:
     """Collect completed B5 (``deduct``) instances from persisted P5 payloads.
 
@@ -457,6 +500,10 @@ def _b5_authoritative_instances(app: Any, workspace_id: int) -> List[Dict[str, A
     pristine in the page-scoped evidence setting, not rewritten through the
     legacy register, because ``attach_openings_v137`` stamps a visual-only
     ``geometry_confidence="Review"`` that would otherwise strip B5 authority.
+
+    Each page-scoped payload is only trusted after the source page is verified
+    to still exist in the current workspace (fail closed otherwise) and its own
+    page/workspace identity agrees.
     """
     out: List[Dict[str, Any]] = []
     try:
@@ -475,7 +522,15 @@ def _b5_authoritative_instances(app: Any, workspace_id: int) -> List[Dict[str, A
                 ) or "{}"))
         except Exception:
             continue
+        if not isinstance(payload, dict):
+            continue
+        # Reject stale/orphaned evidence: the source page must still exist in the
+        # live pages table, owned by the current workspace, with agreeing identity.
+        if not _verify_b5_page(app, int(workspace_id), int(page_id), payload):
+            continue
         for row in (payload.get("instances") or []):
+            if not _row_identity_agrees(row, int(workspace_id), int(page_id)):
+                continue
             # Re-authorise: never trust a persisted ``deduct`` flag alone.  The
             # complete automatic-B5 proof must still hold at consumption time.
             if _is_authorised_b5_automatic(row):

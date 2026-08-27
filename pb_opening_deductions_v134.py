@@ -77,7 +77,13 @@ def _load(app: Any, workspace_id: int) -> List[Dict[str, Any]]:
     return [normalise_opening(item) for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
 
 
-def _save(app: Any, workspace_id: int, openings: Iterable[Dict[str, Any]]) -> None:
+def _save(app: Any, workspace_id: int, openings: Iterable[Dict[str, Any]],
+          confirm_all: bool = False, confirm_ids: Iterable[Any] = ()) -> None:
+    # `confirm_all` / `confirm_ids` carry the estimator's explicit action intent
+    # for the production safety fence: which openings are confirmed manual
+    # decisions (Save choices / Deduct all / Deduct none / the Added opening).
+    # The raw persister below only stores normalised rows; the fence wrapper
+    # (safe_save) uses the intent to stamp manual_override_confirmed precisely.
     payload = [normalise_opening(item) for item in openings or []]
     app.set_workspace_setting(workspace_id, SETTING_KEY, json.dumps(payload, separators=(",", ":")))
 
@@ -121,18 +127,18 @@ def opening_panel(app: Any, workspace: Dict[str, Any]) -> None:
         actions = app.st.columns(4)
         if actions[0].button("Save opening choices", type="primary", key=f"save_openings_{wid}"):
             records = edited.to_dict("records")
-            _save(app, wid, records)
+            _save(app, wid, records, confirm_all=True)
             app.st.success("Door/window deduction choices saved.")
             app.st.rerun()
         if actions[1].button("Deduct all", key=f"deduct_all_{wid}"):
             for item in openings:
                 item["deduct"] = True
-            _save(app, wid, openings)
+            _save(app, wid, openings, confirm_all=True)
             app.st.rerun()
         if actions[2].button("Deduct none", key=f"deduct_none_{wid}"):
             for item in openings:
                 item["deduct"] = False
-            _save(app, wid, openings)
+            _save(app, wid, openings, confirm_all=True)
             app.st.rerun()
         if actions[3].button("Remove all", key=f"remove_openings_{wid}"):
             _save(app, wid, [])
@@ -163,7 +169,7 @@ def opening_panel(app: Any, workspace: Dict[str, Any]) -> None:
         height = dims[1].number_input("Height (m)", min_value=0.0, value=0.0, step=0.01, key=f"new_opening_height_{wid}")
         quantity = dims[2].number_input("Quantity", min_value=1, value=1, step=1, key=f"new_opening_qty_{wid}")
         if app.st.button("Add opening", key=f"add_opening_{wid}"):
-            openings.append(normalise_opening({
+            new_item = normalise_opening({
                 "kind": kind,
                 "label": label or kind,
                 "wall_ref": wall_ref or "Unassigned wall",
@@ -172,8 +178,11 @@ def opening_panel(app: Any, workspace: Dict[str, Any]) -> None:
                 "quantity": quantity,
                 "deduct": deduct,
                 "confidence": "Manual estimator entry",
-            }))
-            _save(app, wid, openings)
+            })
+            openings.append(new_item)
+            # Only the newly added opening is a confirmed manual decision;
+            # existing openings keep their own (possibly no) override state.
+            _save(app, wid, openings, confirm_ids={new_item["id"]})
             app.st.rerun()
 
 
