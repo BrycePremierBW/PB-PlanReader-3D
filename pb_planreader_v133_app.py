@@ -48,7 +48,7 @@ apply_opening_production_v175(app)
 # This is a safety-critical integration: refuse startup if later import-order
 # changes leave any known legacy automatic-deduction alias live.
 verify_opening_production_v175(app)
-app.APP_VERSION = "1.5.2-p5"
+app.APP_VERSION = "1.5.1"
 
 if __name__ == "__main__":
     app.main()
