@@ -1,7 +1,9 @@
 name: P5 B0-B6 temporary validation
 on:
   push:
-    branches: [feature/opening-evidence-pipeline]
+    branches:
+      - feature/opening-evidence-pipeline
+      - integration/p5-opening-pipeline
   workflow_dispatch:
 jobs:
   test:
@@ -28,4 +30,5 @@ jobs:
             tests/test_opening_reconciliation_v173.py \
             tests/test_opening_deduction_v174.py \
             tests/test_pipeline_integration_v174.py \
-            tests/test_lago_benchmark_v174.py
+            tests/test_lago_benchmark_v174.py \
+            tests/test_opening_safety_fence_v175.py
