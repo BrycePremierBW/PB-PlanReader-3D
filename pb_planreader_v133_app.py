@@ -30,6 +30,7 @@ from pb_quick_takeoff_v153 import apply as apply_quick_takeoff_v153
 from pb_takeoff_colours_v153 import apply as apply_takeoff_colours_v153
 from pb_editor_ux_v154 import install as install_editor_ux_v154
 from pb_opening_production_v175 import apply as apply_opening_production_v175
+from pb_opening_production_guard_v175 import verify as verify_opening_production_v175
 
 install_editor_ux_v154()
 
@@ -44,6 +45,9 @@ apply_takeoff_colours_v153(app)
 # Must run after the full reconstruction/accuracy stack so the safety fence
 # replaces the already-bound v145 app aliases as well as module globals.
 apply_opening_production_v175(app)
+# This is a safety-critical integration: refuse startup if later import-order
+# changes leave any known legacy automatic-deduction alias live.
+verify_opening_production_v175(app)
 app.APP_VERSION = "1.5.2-p5"
 
 if __name__ == "__main__":
