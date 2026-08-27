@@ -41,6 +41,8 @@ def verify(app: Any) -> None:
         raise RuntimeError("P5 opening production guard missing required bindings: " + ", ".join(missing))
     if not getattr(app, "_pb_opening_legacy_safety_v175", False):
         raise RuntimeError("P5 legacy deduction safety fence was not installed")
+    if not getattr(app, "_pb_opening_consumer_attach_v175", False):
+        raise RuntimeError("P5 authoritative attach_openings_v137 consumer wrapper was not installed")
     if not getattr(app, "_pb_opening_native_bridge_v175", False):
         raise RuntimeError("P5 native-vector opening bridge was not installed")
 

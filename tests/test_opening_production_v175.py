@@ -240,9 +240,9 @@ def test_generic_lago_width_height_cannot_deduct():
 
 
 def test_ambiguous_repeated_mark_stays_review_no_deduction():
-    # Two distinct physical D01 openings of unrelated sizes on the same wall:
-    # a schedule mark cannot reliably attribute a single dimension, so both must
-    # remain review / no-deduction rather than confidently subtract.
+    # Two B1 physical instances share the repeated mark D01, and the schedule
+    # carries CONFLICTING dimensions for D01.  B2 must not arbitrarily enrich
+    # either instance; both stay review / no-deduction.
     a = _b1_candidate(
         mark="D01", wall="W01", position=1.0, width=0.7,
         geom_conf=0.95, assoc_conf=0.90,
@@ -253,11 +253,34 @@ def test_ambiguous_repeated_mark_stays_review_no_deduction():
         geom_conf=0.95, assoc_conf=0.90,
         sig=(2, 500.0, 200.0, 2.2, "door"),
     )
-    result = _run_payload_with_schedule(_rough_door_schedule(), candidate=a)
-    # actual B1/B4 dedup over the two candidates decides; assert no confident
-    # double-deduction of a single ambiguous mark exceeds available evidence
-    result2 = _run_payload_with_schedule([], candidate=a)  # missing B2 -> closed
-    assert result2["deducted_count"] == 0
+    # Conflicting schedule dimensions for the same mark D01 -> ambiguous.
+    ambiguous_schedule = [
+        ScheduleEntry(type_mark="D01", width_mm=700, height_mm=2100,
+                      description="Door A", count=1, page_no=2,
+                      parse_source="header_separate",
+                      dimension_basis="rough_opening", basis_source="Rough Opening Width"),
+        ScheduleEntry(type_mark="D01", width_mm=2200, height_mm=2100,
+                      description="Door B", count=1, page_no=2,
+                      parse_source="header_separate",
+                      dimension_basis="rough_opening", basis_source="Rough Opening Width"),
+    ]
+    native = {"segments": [], "words": []}
+    with patch(
+        "pb_plan_opening_detection_v171.plan_opening_candidates",
+        return_value=_mock_b1([a, b]),
+    ):
+        result = prod.run_p5_native_payload(
+            native, page_no=1, scale_info={"px_per_m": 28.3},
+            schedule_entries=ambiguous_schedule,
+        )
+    instances = result["instances"]
+    assert len(instances) == 2
+    # neither physical instance was arbitrarily dimensioned or authorised
+    assert result["deducted_count"] == 0
+    assert result["deducted_area_m2"] == 0.0
+    for inst in instances:
+        assert inst["deduct"] is False
+        assert inst["dimension_basis"] != "rough_opening"
 
 
 def test_missing_b2_or_b3_evidence_fails_closed():
@@ -331,7 +354,10 @@ def test_b5_authoritative_reduces_only_assigned_wall_once():
         attached = app.attach_openings_v137(7, walls)
         w01 = [o for o in attached if o.get("resolved_wall_ref") == "W01"]
         w02 = [o for o in attached if o.get("resolved_wall_ref") == "W02"]
-        assert len(w01) == 1 and w01[0]["deduct"] is True
+        # exactly ONE deducting row on W01 (the proven B5 row); the unproven
+        # legacy record is retained but carries deduct=False, so never double-deducts
+        assert sum(1 for o in w01 if o.get("deduct")) == 1
+        assert any(o.get("deduct") for o in w01)
         assert w02 == []
         d_w01 = sum(o["area_m2"] for o in w01 if o.get("deduct"))
         # exactly once: 0.82 * 2.1
@@ -364,6 +390,63 @@ def test_b5_merges_without_double_counting_legacy_same_openings():
         # one deducting row, area counted once
         assert len(w01) == 1 and w01[0]["deduct"] is True
         assert abs(sum(o["area_m2"] for o in w01 if o.get("deduct")) - 0.82 * 2.1) < 1e-6
+    finally:
+        importlib.reload(accuracy_v145)
+        importlib.reload(legacy_v134)
+
+
+def test_two_distinct_same_sized_doors_each_deduct_once():
+    # Fix 3: two SEPARATE physical 820x2100 doors on the same wall must NOT be
+    # collapsed into one deduction.  Distinct instance identity -> 2x area.
+    from pb_opening_geometry_v137 import attach_openings as _geom_attach
+
+    def two_door_payload():
+        base = dict(_b5_payload(wall_ref="W01", mark="D01")["instances"][0])
+        d1 = dict(base, opening_instance_id="inst-aaaa",
+                  plan_geometry_signature="sig-aaaa", position_along_wall_m=1.0)
+        d2 = dict(base, opening_instance_id="inst-bbbb",
+                  plan_geometry_signature="sig-bbbb", position_along_wall_m=3.0)
+        return {"instances": [d1, d2]}
+
+    app, _ = _register_app([], geom_attach=_geom_attach,
+                           b5_payload=two_door_payload())
+    try:
+        prod.install_legacy_safety_fence(app)
+        walls = [{"wall_ref": "W01", "length_m": 9.0, "side": "North"}]
+        attached = app.attach_openings_v137(7, walls)
+        w01 = [o for o in attached if o.get("resolved_wall_ref") == "W01"
+               and o.get("deduct")]
+        # two distinct physical openings survive and both deduct
+        assert len(w01) == 2
+        total = sum(o["area_m2"] for o in w01)
+        assert abs(total - 2 * (0.82 * 2.1)) < 1e-6
+        # each deducts exactly once
+        assert abs(sum(o["area_m2"] for o in w01) - 2 * 0.82 * 2.1) < 1e-6
+    finally:
+        importlib.reload(accuracy_v145)
+        importlib.reload(legacy_v134)
+
+
+def test_persisted_invalid_b5_proof_is_never_deducted():
+    # Fix 1: a persisted payload carrying deduct=True but INVALID/incomplete B5
+    # proof must reach the wall consumer as ZERO deduction (re-authorised at
+    # consumption, not trusted by the deduct flag alone).
+    from pb_opening_geometry_v137 import attach_openings as _geom_attach
+
+    # deduct=True but reconciliation never completed -> must be refused.
+    broken = dict(_b5_payload()["instances"][0])
+    broken.pop("reconciliation_complete")
+    broken["deduct"] = True
+    app, _ = _register_app([], geom_attach=_geom_attach,
+                           b5_payload={"instances": [broken]})
+    try:
+        prod.install_legacy_safety_fence(app)
+        walls = [{"wall_ref": "W01", "length_m": 5.0, "side": "North"}]
+        attached = app.attach_openings_v137(7, walls)
+        w01 = [o for o in attached if o.get("resolved_wall_ref") == "W01"]
+        # the persisted deduct flag is NOT trusted: no deduction reaches the wall
+        assert not any(o.get("deduct") for o in w01)
+        assert all(not o.get("deduct") for o in w01)
     finally:
         importlib.reload(accuracy_v145)
         importlib.reload(legacy_v134)
@@ -536,13 +619,39 @@ def test_startup_guard_detects_unfenced_legacy_path():
         analyse_stored_page_v130=lambda page_id: {},
         run_p5_opening_native_payload_v175=lambda *a, **k: {},
         is_authorised_opening_deduction_v175=lambda row: False,
+        attach_openings_v137=lambda wid, walls: [],
     )
     prod.install_legacy_safety_fence(fenced)
     prod.install_native_vector_bridge(fenced)
     assert getattr(fenced, "_pb_opening_legacy_safety_v175", False) is True
+    assert getattr(fenced, "_pb_opening_consumer_attach_v175", False) is True
     assert getattr(fenced, "_pb_opening_native_bridge_v175", False) is True
     assert not hasattr(fenced, "_bp_pb_opening_legacy_safety_v175")
     guard.verify(fenced)  # must NOT raise once fully fenced
+
+
+def test_startup_guard_detects_missing_consumer_wrapper():
+    # Regression: production integration must not report itself installed if the
+    # authoritative attach_openings_v137 B5 consumer wrapper was never installed.
+    import pb_opening_production_guard_v175 as guard
+
+    app = SimpleNamespace(
+        detect_openings_v145=lambda rows: [dict(r, deduct=False) for r in rows],
+        room_quantity_summary_v145=lambda rooms, openings: {"opening_deduction_m2": 0.0},
+        facade_net_area_v145=lambda regions, openings: {},
+        normalise_opening=lambda row: dict(row, deduct=False),
+        deducted_opening_area_m2=lambda openings: 0.0,
+        analyse_stored_page_v130=lambda page_id: {},
+        run_p5_opening_native_payload_v175=lambda *a, **k: {},
+        is_authorised_opening_deduction_v175=lambda row: False,
+        _pb_opening_legacy_safety_v175=True,
+        _pb_opening_native_bridge_v175=True,
+        # NOTE: `_pb_opening_consumer_attach_v175` ABSENT; attach_openings_v137
+        # never bound, so the authoritative B5 consumer is not installed.
+    )
+    with pytest.raises(RuntimeError) as exc:
+        guard.verify(app)
+    assert "consumer wrapper was not installed" in str(exc.value)
 
 
 def test_schedule_alone_creates_no_physical_instance():
@@ -563,17 +672,32 @@ def test_schedule_alone_creates_no_physical_instance():
     assert result["deducted_area_m2"] == 0.0
 
 
-def test_opening_physical_key_categorises_door_and_window():
-    # The no-double-deduction physical key treats D01 (mark) and a legacy
-    # "Door" kind record as the SAME opening category, but never collapses a
-    # door into a window.
+def test_mark_family_classification_ed_id_ew_iw():
+    # Fix 2: the anchored classifier must read full approved mark families, not
+    # the first character. ED/ID are DOORS, EW/IW are WINDOWS.
     from pb_opening_deductions_v134 import normalise_opening
 
-    b5 = {"wall_ref": "W01", "type_mark": "D01", "width_m": 0.82, "height_m": 2.1}
-    legacy = normalise_opening({"wall_ref": "W01", "kind": "Door", "width_m": 0.82,
-                                "height_m": 2.1})
-    assert prod._physical_key(b5) == prod._physical_key(legacy)
-    window_b5 = {"wall_ref": "W01", "type_mark": "W01", "width_m": 1.2, "height_m": 1.2}
-    assert prod._physical_key(b5) != prod._physical_key(window_b5)
+    for mark, expected in (
+        ("D01", "door"), ("ED01", "door"), ("ID02", "door"),
+        ("W01", "window"), ("EW03", "window"), ("IW05", "window"),
+    ):
+        assert prod._opening_category({"type_mark": mark}) == expected, mark
+    # A genuine opening_type field takes precedence over the mark fallback.
+    assert prod._opening_category(
+        {"type_mark": "ED01", "opening_type": "window"}) == "window"
+    # Legacy kind form:
+    legacy = normalise_opening({"wall_ref": "W01", "kind": "Door",
+                                "width_m": 0.82, "height_m": 2.1})
+    assert prod._opening_category(legacy) == "door"
+    # Same-opening: D01 mark and legacy Door record on the same wall+dims.
+    b5 = {"wall_ref": "W01", "type_mark": "D01", "width_m": 0.82, "height_m": 2.1,
+          "opening_instance_id": "x1"}
+    other = {"wall_ref": "W01", "kind": "Door", "label": "D01",
+             "width_m": 0.82, "height_m": 2.1}
+    assert prod._same_opening(b5, other) is True
+    # A door and a window on the same wall are NOT the same opening.
+    window_b5 = {"wall_ref": "W01", "type_mark": "W01",
+                 "width_m": 1.2, "height_m": 1.2, "opening_instance_id": "x2"}
+    assert prod._same_opening(b5, window_b5) is False
 
 

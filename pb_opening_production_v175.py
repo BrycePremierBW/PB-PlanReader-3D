@@ -15,6 +15,7 @@ from dataclasses import asdict
 import json
 import math
 from pathlib import Path
+import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from pb_opening_evidence_v170 import (
@@ -218,6 +219,8 @@ def install_legacy_safety_fence(app: Any) -> None:
                 pass
             return result
         app.attach_openings_v137 = safe_attach
+        # Dedicated marker: the authoritative B5 consumer wrapper is installed.
+        app._pb_opening_consumer_attach_v175 = True
 
     app._pb_opening_legacy_safety_v175 = True
 
@@ -303,40 +306,133 @@ def extract_schedule_entries(pdf: Any) -> List[Any]:
     return entries
 
 
-def _opening_category(row: Dict[str, Any]) -> str:
-    """Canonical opening type shared by both representations.
+_DOOR_MARK_RE = re.compile(r"^(?:D|ED|ID)\d", re.IGNORECASE)
+_WINDOW_MARK_RE = re.compile(r"^(?:W|EW|IW)\d", re.IGNORECASE)
 
-    B5 instances store ``type_mark`` (e.g. D01/W01); legacy register records
-    (as normalised by v134) store ``kind``/``label`` (Door/Window) and drop the
-    original mark.  This derives a stable type token ("door"|"window"|"other")
-    from whichever form is present so a B5 decision and its legacy counterpart
-    can be recognised as the same physical opening for no-double-deduction.
+
+def _opening_category(row: Dict[str, Any]) -> str:
+    """Canonical opening type ("door"|"window"|"other") for a record.
+
+    Preference order:
+      1. a genuine ``opening_type`` field (the B5 dataclass carries
+         "door"/"window"/"other");
+      2. the legacy ``kind``/``label``/``unit_type`` (Door/Window) that v134
+         preserves (it drops the original mark);
+      3. an anchored/full-match classifier over the approved mark families:
+         doors ``D##``/``ED##``/``ID##``, windows ``W##``/``EW##``/``IW##``.
+
+    The classifier is anchored so prefixes like ``ED01``/``IW05`` are read as
+    the full approved family, never misread from their first character.
     """
-    mark = str(row.get("type_mark") or "").strip().upper()
-    if mark:
-        first = mark[0]
-        if first in ("D", "I"):
-            return "door"
-        if first in ("W", "E"):
-            return "window"
-        return "other"
+    opening_type = str(row.get("opening_type") or "").strip().lower()
+    if opening_type in ("door", "window"):
+        return opening_type
     for key in ("kind", "label", "unit_type"):
         value = str(row.get(key) or "").lower()
-        if "door" in value or "window" in value or "opening" in value:
-            if "window" in value:
-                return "window"
-            if "door" in value:
-                return "door"
-            return "other"
+        if "window" in value and "door" not in value:
+            return "window"
+        if "door" in value and "window" not in value:
+            return "door"
+    mark = str(row.get("type_mark") or row.get("label") or "").strip()
+    if mark:
+        if _WINDOW_MARK_RE.match(mark):
+            return "window"
+        if _DOOR_MARK_RE.match(mark):
+            return "door"
     return "other"
 
 
-def _physical_key(row: Dict[str, Any]) -> Tuple[str, str, float, float]:
-    wall = str(row.get("resolved_wall_ref") or row.get("wall_ref") or "").strip().upper()
-    category = _opening_category(row)
+def _mark_token(row: Dict[str, Any]) -> str:
+    """The specific mark token used as an opening-identity signal (e.g. D01)."""
+    value = str(row.get("type_mark") or row.get("label") or "").strip()
+    return re.sub(r"[^A-Z0-9]", "", value.upper())
+
+
+def _b5_instance_key(row: Dict[str, Any]) -> Tuple:
+    """Physical-instance identity for a B5 opening.
+
+    Distinct physical openings must never be collapsed, so this prioritises
+    instance-level evidence: a unique ``opening_instance_id``, a plan-geometry
+    signature, then page/location/position.  It intentionally does NOT use
+    (wall, category, width, height) alone, which would merge two equal-sized
+    openings on the same wall.
+    """
+    instance_id = str(row.get("opening_instance_id") or "").strip()
+    signature = str(row.get("plan_geometry_signature") or "").strip()
+    page = int(_num(row.get("page_no"), 0))
+    position = round(_num(row.get("position_along_wall_m"), -1.0), 4)
     width = round(_num(row.get("width_m")), 3)
     height = round(_num(row.get("height_m")), 3)
-    return (wall, category, width, height)
+    return (instance_id, signature, page, position, width, height)
+
+
+def _canonical_wall(row: Dict[str, Any]) -> str:
+    return str(row.get("resolved_wall_ref") or row.get("wall_ref") or "").strip().upper()
+
+
+def _same_opening(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """Conservative same-physical-opening test between a B5 row and a legacy row.
+
+    Returns True only with sufficient evidence:
+      - identical non-empty ``opening_instance_id``, or
+      - identical specific mark token + wall + category + width + height.
+    This suppresses a B5 row against a manual legacy row only for the same
+    physical opening and never merges two distinct openings (prefer under-
+    deduction/review over a false merge).
+    """
+    ia = str(a.get("opening_instance_id") or "").strip()
+    ib = str(b.get("opening_instance_id") or "").strip()
+    if ia and ib and ia == ib:
+        return True
+    ma = _mark_token(a)
+    mb = _mark_token(b)
+    if not ma or not mb or ma != mb:
+        return False
+    return (
+        _canonical_wall(a) == _canonical_wall(b)
+        and _opening_category(a) == _opening_category(b)
+        and round(_num(a.get("width_m")), 3) == round(_num(b.get("width_m")), 3)
+        and round(_num(a.get("height_m")), 3) == round(_num(b.get("height_m")), 3)
+    )
+
+
+def _is_authorised_b5_automatic(row: Dict[str, Any]) -> bool:
+    """Full automatic-B5 proof gate, independent of any persisted ``deduct`` flag.
+
+    Unlike ``is_authorised_deduction`` (which also honours an explicit manual
+    estimator override), a persisted automatic P5 row must prove the complete
+    B5 bundle itself so a stale/corrupted/incomplete payload can never reach
+    the wall/net-area consumer as a deduction:
+      - assigned wall;
+      - positive width/height;
+      - ``reconciliation_complete`` True;
+      - eligible deduction status (auto/derived);
+      - ``deduction_decision == "deducted"``;
+      - ``dimension_basis == "rough_opening"``;
+      - min confidence at the deduction floor.
+    """
+    raw = dict(row or {})
+    if not _assigned_wall(raw):
+        return False
+    if _num(raw.get("width_m")) <= 0 or _num(raw.get("height_m")) <= 0:
+        return False
+    if not bool(raw.get("reconciliation_complete")):
+        return False
+    if str(raw.get("deduction_status") or "") not in {
+        DEDUCTION_AUTO_ELIGIBLE,
+        DEDUCTION_DERIVED_ELIGIBLE,
+    }:
+        return False
+    if str(raw.get("deduction_decision") or "") != DEDUCTION_DEDUCTED:
+        return False
+    if str(raw.get("dimension_basis") or "") != DIMENSION_BASIS_ROUGH_OPENING:
+        return False
+    minimum = min(
+        _num(raw.get("geometry_confidence")),
+        _num(raw.get("dimension_confidence")),
+        _num(raw.get("association_confidence")),
+    )
+    return minimum >= MIN_DEDUCTION_CONFIDENCE
 
 
 PAGES_INDEX_KEY = "opening_evidence_v175_pages"
@@ -368,7 +464,9 @@ def _b5_authoritative_instances(app: Any, workspace_id: int) -> List[Dict[str, A
         except Exception:
             continue
         for row in (payload.get("instances") or []):
-            if bool(row.get("deduct")):
+            # Re-authorise: never trust a persisted ``deduct`` flag alone.  The
+            # complete automatic-B5 proof must still hold at consumption time.
+            if _is_authorised_b5_automatic(row):
                 out.append(dict(row))
     return out
 
@@ -393,37 +491,39 @@ def _record_p5_page(app: Any, workspace_id: int, page_id: int) -> None:
 def merge_b5_authoritative(
     attached: Sequence[Dict[str, Any]], b5_rows: Iterable[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """Merge completed B5 decisions into the net-area consumer's opening list.
+    """Merge re-authorised B5 decisions into the net-area consumer's list.
 
-    Reconciliation rules (no double-deduction, estimator intent preserved):
-      - Only rows with ``deduct`` True (a proven B5 proof bundle) are merged.
-      - A B5-authorised row replaces any legacy no-proof row with the same
-        physical key (wall, mark, width, height) so a single physical opening is
-        never counted twice.
-      - A legacy row carrying an explicit ``manual_override_confirmed`` estimator
-        decision is NOT overridden; the estimator's choice stays authoritative.
+    Reconciliation rules (distinct physical openings preserved, estimator
+    intent honoured, no double-deduction):
+      - Every B5 row is re-verified with ``_is_authorised_b5_automatic``; a
+        persisted ``deduct`` flag alone is never trusted at the consumer.
+      - B5-to-B5 uniqueness uses physical-instance identity
+        (``opening_instance_id`` / ``plan_geometry_signature`` / position), so
+        two distinct equal-sized openings on the same wall each deduct once.
+      - Legacy records are NOT aggressively removed: an unproven legacy record
+        already carries ``deduct=False``, so it cannot double-deduct.
+      - A B5 row is only suppressed against a legacy ``manual_override_confirmed``
+        record when ``_same_opening`` shows strong evidence they are the same
+        physical opening.
       - B5 rows carry their own numeric confidences (unlike ``attach_openings``
-        which stamps a visual-only ``geometry_confidence="Review"``), so an
-        ``is_authorised_deduction`` recomputation keeps them deducible.
+        which stamps a visual-only ``geometry_confidence="Review"``), so they
+        remain deducible.
     """
-    b5_list = [dict(r) for r in (b5_rows or []) if bool(r.get("deduct"))]
+    b5_list = [dict(r) for r in (b5_rows or []) if _is_authorised_b5_automatic(r)]
+    result: List[Dict[str, Any]] = [dict(r) for r in (attached or [])]
     if not b5_list:
-        return [dict(r) for r in (attached or [])]
-    b5_keys = {_physical_key(r) for r in b5_list}
-    result: List[Dict[str, Any]] = []
-    for r in (attached or []):
-        row = dict(r or {})
-        if _physical_key(row) in b5_keys and not bool(row.get("manual_override_confirmed")):
-            continue  # superseded by the proven B5 decision
-        result.append(row)
-    manual_keys = {
-        _physical_key(r) for r in result if bool(r.get("manual_override_confirmed"))
-    }
+        return result
+    # Preserve explicit estimator decisions: only suppress a B5 row against a
+    # legacy manual record that is the same physical opening (strong evidence).
+    manual_rows = [r for r in result if bool(r.get("manual_override_confirmed"))]
     added = set()
     for row in b5_list:
-        key = _physical_key(row)
-        if key in manual_keys or key in added:
-            continue
+        if any(_same_opening(row, m) for m in manual_rows):
+            continue  # estimator explicitly decided this opening
+        inst_key = _b5_instance_key(row)
+        if inst_key in added:
+            continue  # same physical instance already merged
+        added.add(inst_key)
         rec = dict(row)
         rec.setdefault("resolved_wall_ref", rec.get("wall_ref") or "")
         rec.setdefault("area_m2", round(
@@ -431,7 +531,6 @@ def merge_b5_authoritative(
             * max(1, int(_num(rec.get("quantity"), 1))), 4))
         rec["deduct"] = True
         result.append(rec)
-        added.add(key)
     return result
 
 
