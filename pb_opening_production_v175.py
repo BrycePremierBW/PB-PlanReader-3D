@@ -15,7 +15,7 @@ from dataclasses import asdict
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from pb_opening_evidence_v170 import (
     DEDUCTION_AUTO_ELIGIBLE,
@@ -207,6 +207,15 @@ def install_legacy_safety_fence(app: Any) -> None:
                 row = dict(raw or {})
                 row["deduct"] = is_authorised_deduction(row)
                 result.append(row)
+            # Merge completed B5 decisions so they are the authoritative net-area
+            # deductions (deduped against any legacy record for the same opening;
+            # estimator manual overrides are never overridden).
+            try:
+                b5_rows = _b5_authoritative_instances(app, int(workspace_id))
+                if b5_rows:
+                    result = merge_b5_authoritative(result, b5_rows)
+            except Exception:
+                pass
             return result
         app.attach_openings_v137 = safe_attach
 
@@ -240,14 +249,202 @@ def _word_from_native(raw: Dict[str, Any], page_no: int) -> TextWord:
     )
 
 
+def _looks_like_door_window_schedule(page_text: str) -> bool:
+    """Conservative door/window schedule page detector.
+
+    A page is treated as a door/window schedule only when its text explicitly
+    references a door/window schedule heading.  Plan pages and generic material
+    schedules are not parsed as opening schedules, so the bridge never invents
+    schedule evidence (the approved B2 parser still decides marks/basis from the
+    actual PDF words, and generic WIDTH/HEIGHT never becomes rough-opening).
+    """
+    text = (" " + str(page_text or "") + " ").lower()
+    if "schedule" not in text:
+        return False
+    return any(tok in text for tok in ("door", "window", "doors", "windows", "door/window", "door / window"))
+
+
+def _page_text(pdf_page: Any) -> str:
+    try:
+        words = pdf_page.get_text("words") or []
+        return " ".join(str(w[4]) for w in words if len(w) >= 5)
+    except Exception:
+        return ""
+
+
+def extract_schedule_entries(pdf: Any) -> List[Any]:
+    """Parse real door/window schedule rows from a document's schedule pages.
+
+    Uses the approved B2 parser (pb_opening_schedule_v171.parse_schedule_page)
+    over the genuine PDF words.  dimension_basis is derived only from explicit
+    headings (e.g. "Rough Opening"), never invented.  Returns ScheduleEntry list;
+    empty when no door/window schedule page is present (B2 evidence missing).
+    """
+    try:
+        from pb_opening_schedule_v171 import parse_schedule_page
+    except Exception:
+        return []
+    entries: List[Any] = []
+    try:
+        count = pdf.page_count
+    except Exception:
+        return []
+    for idx in range(count):
+        try:
+            page = pdf.load_page(idx)
+        except Exception:
+            continue
+        if not _looks_like_door_window_schedule(_page_text(page)):
+            continue
+        try:
+            entries.extend(parse_schedule_page(page, page_no=idx + 1))
+        except Exception:
+            continue
+    return entries
+
+
+def _opening_category(row: Dict[str, Any]) -> str:
+    """Canonical opening type shared by both representations.
+
+    B5 instances store ``type_mark`` (e.g. D01/W01); legacy register records
+    (as normalised by v134) store ``kind``/``label`` (Door/Window) and drop the
+    original mark.  This derives a stable type token ("door"|"window"|"other")
+    from whichever form is present so a B5 decision and its legacy counterpart
+    can be recognised as the same physical opening for no-double-deduction.
+    """
+    mark = str(row.get("type_mark") or "").strip().upper()
+    if mark:
+        first = mark[0]
+        if first in ("D", "I"):
+            return "door"
+        if first in ("W", "E"):
+            return "window"
+        return "other"
+    for key in ("kind", "label", "unit_type"):
+        value = str(row.get(key) or "").lower()
+        if "door" in value or "window" in value or "opening" in value:
+            if "window" in value:
+                return "window"
+            if "door" in value:
+                return "door"
+            return "other"
+    return "other"
+
+
+def _physical_key(row: Dict[str, Any]) -> Tuple[str, str, float, float]:
+    wall = str(row.get("resolved_wall_ref") or row.get("wall_ref") or "").strip().upper()
+    category = _opening_category(row)
+    width = round(_num(row.get("width_m")), 3)
+    height = round(_num(row.get("height_m")), 3)
+    return (wall, category, width, height)
+
+
+PAGES_INDEX_KEY = "opening_evidence_v175_pages"
+
+
+def _b5_authoritative_instances(app: Any, workspace_id: int) -> List[Dict[str, Any]]:
+    """Collect completed B5 (``deduct``) instances from persisted P5 payloads.
+
+    These carry the full proof bundle with numeric confidences.  They are kept
+    pristine in the page-scoped evidence setting, not rewritten through the
+    legacy register, because ``attach_openings_v137`` stamps a visual-only
+    ``geometry_confidence="Review"`` that would otherwise strip B5 authority.
+    """
+    out: List[Dict[str, Any]] = []
+    try:
+        index = json.loads(
+            str(app.workspace_setting(int(workspace_id), PAGES_INDEX_KEY, "[]") or "[]")
+        )
+    except Exception:
+        index = []
+    if not isinstance(index, list):
+        index = []
+    for page_id in index:
+        try:
+            payload = json.loads(str(
+                app.workspace_setting(
+                    int(workspace_id), f"{SETTING_PREFIX}{int(page_id)}", "{}"
+                ) or "{}"))
+        except Exception:
+            continue
+        for row in (payload.get("instances") or []):
+            if bool(row.get("deduct")):
+                out.append(dict(row))
+    return out
+
+
+def _record_p5_page(app: Any, workspace_id: int, page_id: int) -> None:
+    """Track which pages have a persisted P5 payload for this workspace."""
+    try:
+        index = json.loads(str(
+            app.workspace_setting(int(workspace_id), PAGES_INDEX_KEY, "[]") or "[]"))
+        if not isinstance(index, list):
+            index = []
+        if int(page_id) not in [int(x) for x in index]:
+            index.append(int(page_id))
+        app.set_workspace_setting(
+            int(workspace_id), PAGES_INDEX_KEY,
+            json.dumps(index, separators=(",", ":")),
+        )
+    except Exception:
+        pass
+
+
+def merge_b5_authoritative(
+    attached: Sequence[Dict[str, Any]], b5_rows: Iterable[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Merge completed B5 decisions into the net-area consumer's opening list.
+
+    Reconciliation rules (no double-deduction, estimator intent preserved):
+      - Only rows with ``deduct`` True (a proven B5 proof bundle) are merged.
+      - A B5-authorised row replaces any legacy no-proof row with the same
+        physical key (wall, mark, width, height) so a single physical opening is
+        never counted twice.
+      - A legacy row carrying an explicit ``manual_override_confirmed`` estimator
+        decision is NOT overridden; the estimator's choice stays authoritative.
+      - B5 rows carry their own numeric confidences (unlike ``attach_openings``
+        which stamps a visual-only ``geometry_confidence="Review"``), so an
+        ``is_authorised_deduction`` recomputation keeps them deducible.
+    """
+    b5_list = [dict(r) for r in (b5_rows or []) if bool(r.get("deduct"))]
+    if not b5_list:
+        return [dict(r) for r in (attached or [])]
+    b5_keys = {_physical_key(r) for r in b5_list}
+    result: List[Dict[str, Any]] = []
+    for r in (attached or []):
+        row = dict(r or {})
+        if _physical_key(row) in b5_keys and not bool(row.get("manual_override_confirmed")):
+            continue  # superseded by the proven B5 decision
+        result.append(row)
+    manual_keys = {
+        _physical_key(r) for r in result if bool(r.get("manual_override_confirmed"))
+    }
+    added = set()
+    for row in b5_list:
+        key = _physical_key(row)
+        if key in manual_keys or key in added:
+            continue
+        rec = dict(row)
+        rec.setdefault("resolved_wall_ref", rec.get("wall_ref") or "")
+        rec.setdefault("area_m2", round(
+            _num(rec.get("width_m")) * _num(rec.get("height_m"))
+            * max(1, int(_num(rec.get("quantity"), 1))), 4))
+        rec["deduct"] = True
+        result.append(rec)
+        added.add(key)
+    return result
+
+
 def run_p5_native_payload(
     native: Dict[str, Any], *, page_no: int, page_id: int = 0,
     workspace_id: int = 0, scale_info: Dict[str, Any] | None = None,
+    schedule_entries: Optional[Sequence[Any]] = None,
 ) -> Dict[str, Any]:
     segments = [_segment_from_native(row) for row in native.get("segments") or []]
     words = [_word_from_native(row, page_no) for row in native.get("words") or []]
     pipeline = run_opening_pipeline(
-        segments=segments, words=words, schedule_entries=None, elevation_openings=None,
+        segments=segments, words=words,
+        schedule_entries=schedule_entries, elevation_openings=None,
         scale_info=scale_info or {}, page_no=int(page_no),
     )
     for inst in pipeline.get("instances") or []:
@@ -283,6 +480,7 @@ def analyse_stored_page_openings(app: Any, page_id: int, vector_result: Dict[str
     px_per_m = _num((vector_result.get("scale") or {}).get("px_per_m"), _num(row.get("px_per_m"), 0.0))
     pdf = app.fitz.open(path)
     try:
+        schedule_entries = extract_schedule_entries(pdf)
         native = app.extract_native_page_v130(pdf.load_page(page_no - 1))
     finally:
         pdf.close()
@@ -290,6 +488,7 @@ def analyse_stored_page_openings(app: Any, page_id: int, vector_result: Dict[str
         native, page_no=page_no, page_id=int(page_id),
         workspace_id=int(row.get("workspace_id") or 0),
         scale_info={"px_per_m": px_per_m, "render_zoom": render_zoom},
+        schedule_entries=schedule_entries,
     )
 
 
@@ -323,6 +522,10 @@ def install_native_vector_bridge(app: Any) -> None:
             }
         if workspace_id:
             _persist_p5_result(app, workspace_id, int(page_id), payload)
+            # Completed B5 decisions are consumed by the net-area path at attach
+            # time (see safe_attach / merge_b5_authoritative); track the page so
+            # the consumer can find this workspace's B5-authoritative instances.
+            _record_p5_page(app, workspace_id, int(page_id))
         result["p5_openings"] = {
             "version": VERSION, "status": payload.get("status"),
             "candidate_count": int(payload.get("candidate_count") or 0),
@@ -336,6 +539,8 @@ def install_native_vector_bridge(app: Any) -> None:
     app.analyse_stored_page_v130 = analyse_with_openings
     app.run_p5_opening_native_payload_v175 = run_p5_native_payload
     app.is_authorised_opening_deduction_v175 = is_authorised_deduction
+    app.merge_p5_authoritative_v175 = merge_b5_authoritative
+    app.extract_p5_schedule_entries_v175 = extract_schedule_entries
     app._pb_opening_native_bridge_v175 = True
 
 
