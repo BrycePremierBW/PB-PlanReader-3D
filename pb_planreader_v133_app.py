@@ -2,7 +2,8 @@
 
 Keeps the v1.4.x reconstruction/accuracy stack, the familiar sidebar, the combined
 Upload + Drawing Register page, narrow-screen dropdown protection, runtime caches,
-document-processing/ETA fast paths, and the v1.5.1 cold-start bootstrap.
+document-processing/ETA fast paths, the v1.5.1 cold-start bootstrap, and the
+fail-closed P5 opening-evidence production bridge.
 """
 
 import os
@@ -28,6 +29,7 @@ from pb_material_preview_guard_v152 import apply as apply_material_preview_guard
 from pb_quick_takeoff_v153 import apply as apply_quick_takeoff_v153
 from pb_takeoff_colours_v153 import apply as apply_takeoff_colours_v153
 from pb_editor_ux_v154 import install as install_editor_ux_v154
+from pb_opening_production_v175 import apply as apply_opening_production_v175
 
 install_editor_ux_v154()
 
@@ -39,7 +41,10 @@ apply_processing_fastpath_v150(app)
 apply_material_preview_guard_v152(app)
 apply_quick_takeoff_v153(app)
 apply_takeoff_colours_v153(app)
-app.APP_VERSION = "1.5.1"
+# Must run after the full reconstruction/accuracy stack so the safety fence
+# replaces the already-bound v145 app aliases as well as module globals.
+apply_opening_production_v175(app)
+app.APP_VERSION = "1.5.2-p5"
 
 if __name__ == "__main__":
     app.main()
