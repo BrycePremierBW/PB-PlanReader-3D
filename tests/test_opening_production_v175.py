@@ -505,6 +505,66 @@ def test_manual_override_is_not_overridden_by_b5():
         importlib.reload(legacy_v134)
 
 
+def test_explicit_manual_exclude_persists_and_blocks_b5():
+    # End-to-end: the estimator explicitly saves an opening as DO-NOT-DEDUCT
+    # through the REAL patched save path (legacy._save -> safe_save after
+    # fencing).  That confirmed exclusion must persist, and a later completed B5
+    # result for the same physical opening must NOT re-enable it -> 0 m2.
+    from pb_opening_geometry_v137 import attach_openings as _geom_attach
+    app, _ = _register_app([], geom_attach=_geom_attach,
+                           b5_payload=_b5_payload(wall_ref="W01", mark="D01"))
+    try:
+        prod.install_legacy_safety_fence(app)
+        # The estimator saves this opening with Deduct unchecked.
+        legacy_v134._save(app, 7, [{
+            "kind": "Door", "label": "D01", "wall_ref": "W01",
+            "width_m": 0.82, "height_m": 2.1, "deduct": False,
+        }])
+        # Reload from the register (real load path): the exclusion persisted and
+        # is remembered as an explicit estimator decision.
+        loaded = legacy_v134._load(app, 7)
+        assert len(loaded) == 1
+        assert loaded[0]["deduct"] is False
+        assert loaded[0]["manual_override_confirmed"] is True
+        # Completed B5 evidence for the same physical opening becomes available.
+        walls = [{"wall_ref": "W01", "length_m": 5.0, "side": "North"}]
+        attached = app.attach_openings_v137(7, walls)
+        w01 = [o for o in attached if o.get("resolved_wall_ref") == "W01"]
+        # still zero deduction: the explicit estimator exclusion is honoured
+        assert not any(o.get("deduct") for o in w01)
+        assert sum(o["area_m2"] for o in w01 if o.get("deduct")) == 0.0
+    finally:
+        importlib.reload(accuracy_v145)
+        importlib.reload(legacy_v134)
+
+
+def test_explicit_manual_include_persists_and_stays_authorised():
+    # Positive case: an opening explicitly saved as DEDUCT via the real patched
+    # save path persists as a confirmed manual decision and remains a deduction.
+    from pb_opening_geometry_v137 import attach_openings as _geom_attach
+    app, _ = _register_app([], geom_attach=_geom_attach,
+                           b5_payload=_b5_payload(wall_ref="W01", mark="D01"))
+    try:
+        prod.install_legacy_safety_fence(app)
+        legacy_v134._save(app, 7, [{
+            "kind": "Door", "label": "D01", "wall_ref": "W01",
+            "width_m": 0.82, "height_m": 2.1, "deduct": True,
+        }])
+        loaded = legacy_v134._load(app, 7)
+        assert len(loaded) == 1
+        assert loaded[0]["deduct"] is True
+        assert loaded[0]["manual_override_confirmed"] is True
+        walls = [{"wall_ref": "W01", "length_m": 5.0, "side": "North"}]
+        attached = app.attach_openings_v137(7, walls)
+        w01 = [o for o in attached if o.get("resolved_wall_ref") == "W01"]
+        # the confirmed manual include remains a single authorised deduction
+        assert sum(1 for o in w01 if o.get("deduct")) == 1
+        assert abs(sum(o["area_m2"] for o in w01 if o.get("deduct")) - 0.82 * 2.1) < 1e-6
+    finally:
+        importlib.reload(accuracy_v145)
+        importlib.reload(legacy_v134)
+
+
 def test_end_to_end_b5_reaches_wall_net_area_exactly_once():
     # Real end-to-end authoritative trace: a completed B5 decision is merged at
     # the registered-wall consumer (attach_openings_v137) and reduces the net
@@ -680,8 +740,21 @@ def test_mark_family_classification_ed_id_ew_iw():
     for mark, expected in (
         ("D01", "door"), ("ED01", "door"), ("ID02", "door"),
         ("W01", "window"), ("EW03", "window"), ("IW05", "window"),
+        ("D0", "door"), ("W0", "window"), ("D12", "door"), ("EW120", "window"),
     ):
         assert prod._opening_category({"type_mark": mark}) == expected, mark
+    # Fix 2 cleanup: true full-match rejects trailing junk and bare prefixes.
+    for junk, not_expected in (
+        ("ED01XYZ", "door"), ("ID02junk", "door"),
+        ("IW05junk", "window"), ("EW03abc", "window"),
+        ("I", "door"), ("II", "door"), ("E", "window"),
+        ("DD01", "door"), ("WW01", "window"), ("", "door"), ("D-01", "door"),
+        ("D01 1", "door"), ("W01/1", "window"),
+    ):
+        assert prod._opening_category({"type_mark": junk}) != not_expected, junk
+    # bare I/II must not be classified as any family
+    for bare in ("I", "II", "E"):
+        assert prod._opening_category({"type_mark": bare}) == "other", bare
     # A genuine opening_type field takes precedence over the mark fallback.
     assert prod._opening_category(
         {"type_mark": "ED01", "opening_type": "window"}) == "window"

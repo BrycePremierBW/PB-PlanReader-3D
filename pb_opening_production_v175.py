@@ -104,7 +104,13 @@ def _safe_legacy_save(original_save, safe_normalise):
         payload: List[Dict[str, Any]] = []
         for raw in openings or []:
             row = dict(raw or {})
-            row["manual_override_confirmed"] = bool(row.get("deduct", False))
+            # Saving choices through the estimator panel is an explicit decision
+            # on each opening's deduct state.  `manual_override_confirmed` means
+            # "the estimator explicitly decided this physical opening", NOT
+            # "the estimator chose deduct=True" - so an explicit EXCLUDE
+            # (deduct=False) is preserved and a later B5 result cannot re-enable
+            # an opening the estimator deliberately excluded.
+            row["manual_override_confirmed"] = True
             payload.append(safe_normalise(row))
         original_save(app, int(workspace_id), payload)
     return safe_save
@@ -306,8 +312,12 @@ def extract_schedule_entries(pdf: Any) -> List[Any]:
     return entries
 
 
-_DOOR_MARK_RE = re.compile(r"^(?:D|ED|ID)\d", re.IGNORECASE)
-_WINDOW_MARK_RE = re.compile(r"^(?:W|EW|IW)\d", re.IGNORECASE)
+# Same approved families and digit range as the B1 classifier
+# (D##/ED##/ID## doors, W##/EW##/IW## windows).  True full-match: a mark like
+# ``ED01XYZ`` or ``IW05junk`` is never accepted as a family, and bare ``I``/``II``
+# are not opening families.
+_DOOR_MARK_RE = re.compile(r"^(?:D|ED|ID)\d{1,3}$", re.IGNORECASE)
+_WINDOW_MARK_RE = re.compile(r"^(?:W|EW|IW)\d{1,3}$", re.IGNORECASE)
 
 
 def _opening_category(row: Dict[str, Any]) -> str:
@@ -318,11 +328,13 @@ def _opening_category(row: Dict[str, Any]) -> str:
          "door"/"window"/"other");
       2. the legacy ``kind``/``label``/``unit_type`` (Door/Window) that v134
          preserves (it drops the original mark);
-      3. an anchored/full-match classifier over the approved mark families:
+      3. an anchored full-match classifier over the approved mark families:
          doors ``D##``/``ED##``/``ID##``, windows ``W##``/``EW##``/``IW##``.
 
-    The classifier is anchored so prefixes like ``ED01``/``IW05`` are read as
-    the full approved family, never misread from their first character.
+    The classifier uses the same families and digit range as B1 and full-matches
+    the whole token, so prefixes like ``ED01``/``IW05`` are read as the full
+    approved family (never misread from their first character) and strings with
+    trailing junk are rejected.
     """
     opening_type = str(row.get("opening_type") or "").strip().lower()
     if opening_type in ("door", "window"):
@@ -335,9 +347,9 @@ def _opening_category(row: Dict[str, Any]) -> str:
             return "door"
     mark = str(row.get("type_mark") or row.get("label") or "").strip()
     if mark:
-        if _WINDOW_MARK_RE.match(mark):
+        if _WINDOW_MARK_RE.fullmatch(mark):
             return "window"
-        if _DOOR_MARK_RE.match(mark):
+        if _DOOR_MARK_RE.fullmatch(mark):
             return "door"
     return "other"
 
