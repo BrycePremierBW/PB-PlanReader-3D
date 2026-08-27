@@ -24,12 +24,21 @@ from pb_sidebar_viewport_guard_v146 import apply as apply_sidebar_viewport_guard
 from pb_upload_register_v147 import apply as apply_upload_register_v147
 from pb_runtime_performance_v149 import apply as apply_runtime_performance_v149
 from pb_processing_fastpath_v150 import apply as apply_processing_fastpath_v150
+from pb_material_preview_guard_v152 import apply as apply_material_preview_guard_v152
+from pb_quick_takeoff_v153 import apply as apply_quick_takeoff_v153
+from pb_takeoff_colours_v153 import apply as apply_takeoff_colours_v153
+from pb_editor_ux_v154 import install as install_editor_ux_v154
+
+install_editor_ux_v154()
 
 app = base.base.launcher.app
 apply_upload_register_v147(app)
 apply_sidebar_viewport_guard_v146(app)
 apply_runtime_performance_v149(app)
 apply_processing_fastpath_v150(app)
+apply_material_preview_guard_v152(app)
+apply_quick_takeoff_v153(app)
+apply_takeoff_colours_v153(app)
 app.APP_VERSION = "1.5.1"
 
 if __name__ == "__main__":

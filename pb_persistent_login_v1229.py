@@ -108,7 +108,11 @@ def apply(app) -> None:
         result = base_set_page_config(*args, **kwargs)
         if st.session_state.pop(_CLEAR_KEY, False):
             clear_browser_token()
-        else:
+        elif not st.session_state.get("planreader_user"):
+            # localStorage recovery is a cold-start/login-screen path only.
+            # Running location.replace() during an ordinary authenticated
+            # Streamlit rerun (for example Create workspace / switch job)
+            # starts a fresh browser session and can appear to log the user out.
             browser_bootstrap()
         return result
 
