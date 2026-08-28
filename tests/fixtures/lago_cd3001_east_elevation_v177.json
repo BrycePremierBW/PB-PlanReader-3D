@@ -1,0 +1,73 @@
+{
+  "fixture_version": 2,
+  "source": {
+    "pdf": "260617_004-LAGO-BRITINYA_ARCH-DRAWINGS_COMBINED.pdf",
+    "page_1_based": 86,
+    "page_0_based": 85,
+    "drawing_no": "CD3001",
+    "drawing_title": "ELEVATIONS 01",
+    "elevation_side": "East",
+    "elevation_label": "E1",
+    "stated_scale": "1:100 @ A1",
+    "coordinate_space": "pdf_point"
+  },
+  "calibration": {
+    "coordinate_space": "pdf_point",
+    "scale_pt_per_m": 28.346503,
+    "method": "measured_graphic_scale_bar",
+    "represented_length_m": 10.0,
+    "measured_bar_geometry": {
+      "label_positions_x_pt": [408.987, 437.333, 465.679, 494.026, 522.372, 550.719, 579.065, 607.412, 635.758, 664.105],
+      "division_spacings_pt": [28.346, 28.346, 28.347, 28.346, 28.347, 28.346, 28.347, 28.346, 28.347],
+      "divisions": 9,
+      "uniform": true
+    },
+    "confidence": 0.95,
+    "valid": true,
+    "notes": "scale_pt_per_m measured from the ten labelled divisions (0..10) of the graphic scale bar on page 86 (E1 East Elevation, CD3001). Each division represents 1 m; 10 m total; uniform 28.3465 pt spacing consistent with the stated 1:100 scale (1 m = 10 mm = 28.35 pt)."
+  },
+  "render": {
+    "dpi": 150.0,
+    "matrix_scale": 2.083333,
+    "pdf_point_to_pixel_scale": 2.083333,
+    "derived_px_per_m": 59.055,
+    "notes": "Rendered page 86 with fitz.Matrix(150/72, 150/72). derived_px_per_m = scale_pt_per_m x pdf_point_to_pixel_scale = 28.346503 x 2.083333. No assumed 96-DPI is used."
+  },
+  "benchmark_regions": [
+    {
+      "region_id": "src-east-repeated-facade-cell",
+      "region_role": "repeated facade opening geometry ROI",
+      "coordinate_space": "pdf_point",
+      "source_bbox_pt": [2007.9, 690.5, 2092.7, 1147.7],
+      "render_bbox_px": [4183.1, 1438.5, 4359.8, 2391.0],
+      "known_geometry_facts": {
+        "observed_vertical_cell_period_pt": 83.9,
+        "observed_vertical_cell_period_m": 2.96,
+        "observed_column_extent_pt": [2007.9, 2092.7],
+        "source_note": "Horizontal structural ribs measured directly from the source PDF vector linework in column x[1980,2120] pt repeat with a clean ~83.9 pt (= 2.96 m) vertical period. This is a measurable geometric periodicity in the drawing, annotated independently from the source vector geometry (not from the rectangular-candidate detector)."
+      },
+      "unknown_identity_facts": {
+        "commercial_identity": "unproven",
+        "opening_count": null,
+        "type_marks": null,
+        "note": "The repeated cells are NOT asserted to be windows, doors, panels, or balustrades from geometry alone. No opening count or type identity is claimed without independent drawing annotation."
+      },
+      "safety": {
+        "dimension_basis": "unknown",
+        "deduction_authority": false,
+        "no_instance_creation": true
+      }
+    }
+  ],
+  "safety_expectations": {
+    "generic_candidates": {"dimension_basis": "unknown"},
+    "deduct": false,
+    "no_instance_creation": true,
+    "ambiguous_overlap_review": true,
+    "wrong_side_rejected": true,
+    "wrong_level_rejected_when_level_known": true,
+    "equal_score_no_match": true,
+    "rough_opening_authority": false
+  }
+}
+

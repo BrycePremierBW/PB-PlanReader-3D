@@ -65,8 +65,17 @@ def _dimension_m(token: Any) -> Optional[float]:
 
 
 def extract_native_page(pdf_page: Any) -> Dict[str, Any]:
-    """Extract line primitives, text geometry and PDF layer hints from one page."""
+    """Extract line primitives, text geometry and PDF layer hints from one page.
+
+    Additive native-rectangle retention: in addition to the per-edge
+    ``rect_edge`` segments produced historically (unchanged), native ``re``
+    rectangle primitives are ALSO retained as closed ``rects`` with their
+    full ``bbox``.  ``rects`` is ADDITIVE metadata — it does not alter the
+    existing ``segments`` output contract, so B1 (which consumes
+    ``segments``) is unaffected.
+    """
     segments: List[Dict[str, Any]] = []
+    rects: List[Dict[str, Any]] = []   # ADDITIVE: closed native rectangles
     drawings = pdf_page.get_drawings() or []
     for draw_index, drawing in enumerate(drawings):
         width = _num(drawing.get("width"), 0.0) if isinstance(drawing, dict) else 0.0
@@ -102,6 +111,13 @@ def extract_native_page(pdf_page: Any) -> Dict[str, Any]:
                 except Exception:
                     continue
                 pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+                # ADDITIVE: retain the closed native rectangle identity too.
+                rects.append({
+                    "kind": "rect",
+                    "bbox": [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)],
+                    "width": width, "stroke": stroke, "fill": fill,
+                    "layer": layer, "dashes": dashes,
+                })
                 for edge in range(4):
                     a, b = pts[edge], pts[(edge + 1) % 4]
                     segments.append({
@@ -126,7 +142,9 @@ def extract_native_page(pdf_page: Any) -> Dict[str, Any]:
     return {
         "width": float(pdf_page.rect.width), "height": float(pdf_page.rect.height),
         "segments": segments, "words": words,
+        "rects": rects,
         "segment_count": len(segments), "word_count": len(words),
+        "rect_count": len(rects),
     }
 
 
