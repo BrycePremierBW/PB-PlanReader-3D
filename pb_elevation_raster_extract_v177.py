@@ -142,18 +142,26 @@ def detect_raster_rect_candidates(
     min_side_px: int = 8,
     min_area_px: int = 0,
     drawing_region: Optional[Sequence[int]] = None,
+    calibration_source: str = "",
 ) -> List[ElevationRectCandidate]:
     """Detect conservative rectangular opening candidates in a rendered page.
 
     Args:
         image: A numpy HxWx3 (BGR) or HxW grayscale uint8 image of the page
-            render.  Coordinates are in the SAME pixel space as
-            calibration.px_per_m (i.e. calibration.coord_space must be
-            render_pixel for metred output).
-        calibration: Calibration for this page (may be invalid → page is
-            non-dimensional; measured widths/heights are then None).
-        source_filename / source_page / drawing_ref / elevation_side:
-            Provenance attached to every candidate.
+            render.  Every emitted candidate's bbox/centroid are in THIS
+            image's PIXEL space, so coord_space is ALWAYS render_pixel —
+            regardless of the calibration object supplied.
+        calibration: Calibration for this page.  Metred output (width_m /
+            height_m) is produced ONLY when the calibration is a proven,
+            dimensional render_pixel calibration (px_per_m is not None).  A
+            pdf_point calibration (pt/m only) or any invalid calibration
+            still permits non-dimensional geometric observations: the bbox is
+            correctly labelled render_pixel while width_m / height_m stay
+            None.
+        source_filename / source_page / drawing_ref / elevation_side /
+            calibration_source: Provenance attached to every candidate.  This
+            must come from the CALLER's context (never hard-coded to a
+            specific sheet/project).
         dark_threshold: Grayscale value below which a pixel counts as dark
             linework.
         min_side_px: Drop candidates smaller than this side length.
@@ -187,8 +195,8 @@ def detect_raster_rect_candidates(
             drawing_ref=drawing_ref, elevation_side=elevation_side,
             bbox=(0, 0, 0, 0), centroid=(0.0, 0.0),
             calibration_method=calibration.method,
-            calibration_source="page-86-cd3001",
-            coord_space=calibration.coord_space,
+            calibration_source=calibration_source,
+            coord_space=COORD_SPACE_RENDER_PIXEL,
             render_dpi=calibration.render_dpi,
             review_status=STATUS_REJECTED,
             notes=["empty image"])]
@@ -253,8 +261,8 @@ def detect_raster_rect_candidates(
             bbox=bbox,
             centroid=centroid,
             calibration_method=calibration.method,
-            calibration_source="page-86-cd3001",
-            coord_space=calibration.coord_space,
+            calibration_source=calibration_source,
+            coord_space=COORD_SPACE_RENDER_PIXEL,
             render_dpi=calibration.render_dpi,
             width_m=width_m,
             height_m=height_m,

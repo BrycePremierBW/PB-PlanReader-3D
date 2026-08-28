@@ -1,8 +1,11 @@
 {
-  "fixture_version": 3,
+  "fixture_version": 4,
   "source": {
+    "original_source_filename": "260617_004-LAGO-BRITINYA_ARCH-DRAWINGS_COMBINED 2.pdf",
+    "local_source_alias": "260617_004-LAGO-BRITINYA_ARCH-DRAWINGS_COMBINED.pdf",
+    "filename_provenance": "The upstream/issued archive name is '260617_004-LAGO-BRITINYA_ARCH-DRAWINGS_COMBINED 2.pdf'. The locally stored working copy was deliberately renamed to drop the ' 2' suffix ('260617_004-LAGO-BRITINYA_ARCH-DRAWINGS_COMBINED.pdf') so it collides cleanly with the canonical combined archive naming. The renamed alias is a LOCAL working copy, NOT the verbatim canonical source name; the canonical/original name is recorded in original_source_filename. All crop/scale facts below are measured from the locally stored alias file.",
     "pdf": "260617_004-LAGO-BRITINYA_ARCH-DRAWINGS_COMBINED.pdf",
-    "pdf_provenance": "canonical combined archive PDF; copied verbatim into planreader_data/elevation_sources/ from the LAGO BRITINYA issuance. All crop/scale facts below are measured from THIS file.",
+    "pdf_provenance": "local working copy stored at planreader_data/elevation_sources/; original issued filename recorded as original_source_filename. All crop/scale facts below are measured from THIS local file.",
     "page_1_based": 86,
     "page_0_based": 85,
     "drawing_no": "CD3001",
@@ -38,6 +41,65 @@
     "derived_px_per_m": 59.055,
     "notes": "Rendered page 86 with fitz.Matrix(150/72, 150/72), alpha=False. derived_px_per_m = scale_pt_per_m x pdf_point_to_pixel_scale = 28.346 x 2.083333 = 59.055. No assumed 96-DPI is used."
   },
+  "positive_benchmark": {
+    "role": "AUTHORITATIVE POSITIVE real 'glazed opening detected' benchmark (clearly-visible opening group)",
+    "crop": {
+      "filename": "lago_cd3001_p86_e1east_glazed_open_group_150dpi.png",
+      "sha256": "caa153588deab01c70a507c37df9278b664d5a63670e1253d277050631e802c2",
+      "width_px": 817,
+      "height_px": 198,
+      "source_bbox_pt": [1020.0, 634.0, 1412.0, 729.0],
+      "render_bbox_px": [2125, 1321, 2942, 1519],
+      "provenance": "Committed real render crop (grayscale PNG) of a CLEARLY-VISIBLE glazed window opening group on the left/centre facade of E1 East, page 86 / CD3001. 3 structural bays, 9 glazed window lights. Cropped directly from the 150-DPI render of the source PDF to source PDF-point bbox [1020,634,1412,729]. This is the authoritative POSITIVE real-opening benchmark, in contrast to the negative/ambiguous repeated-cell crop (benchmark.crop). Geometry below is an independent annotation measured from the SOURCE vector linework, NOT from the detector."
+    },
+    "independent_annotation": {
+      "method": "measured_from_source_vector_geometry",
+      "notes": "Opening head/sill and every glazed light are measured from the source PDF vector linework (structural mullions and head/sill frame members). True positives are the 9 glazed window lights. A known non-opening (the solid spandrel band below the glazing) is annotated separately.",
+      "window_band_bottom_pt": 648.3,
+      "window_band_top_pt": 690.5,
+      "opening_height_pt": 42.2,
+      "opening_height_m": 1.489,
+      "light_width_pt": 21.9,
+      "light_width_m": 0.773,
+      "true_positive_openings_count": 9,
+      "true_positive_openings": [
+        {"id": "bay1-light1", "x0_pt": 1024.8, "x1_pt": 1046.7},
+        {"id": "bay1-light2", "x0_pt": 1052.4, "x1_pt": 1074.3},
+        {"id": "bay1-light3", "x0_pt": 1080.0, "x1_pt": 1101.9},
+        {"id": "bay2-light1", "x0_pt": 1207.4, "x1_pt": 1229.4},
+        {"id": "bay2-light2", "x0_pt": 1235.0, "x1_pt": 1257.0},
+        {"id": "bay2-light3", "x0_pt": 1262.6, "x1_pt": 1284.5},
+        {"id": "bay3-light1", "x0_pt": 1328.9, "x1_pt": 1350.8},
+        {"id": "bay3-light2", "x0_pt": 1356.5, "x1_pt": 1378.4},
+        {"id": "bay3-light3", "x0_pt": 1384.1, "x1_pt": 1406.0}
+      ],
+      "true_positive_y_extent_pt": [648.3, 690.5],
+      "non_opening_regions": [
+        {
+          "id": "solid-spandrel-below-glazing",
+          "role": "known non-opening solid facade panel (no glazing/opening)",
+          "source_bbox_pt": [978.1, 690.5, 1426.0, 722.5],
+          "note": "Solid spandrel band immediately below the glazing band; correctly must NOT be detected as an opening by a well-behaved detector."
+        }
+      ],
+      "commercial_identity": "unproven",
+      "opening_type_note": "The annotated true positives are glazed window lights (visibly glazed openings within the facade framing). No D/W door/window mark is required because the drawing does not clearly show one at this scale; the glazing itself is the visible opening evidence."
+    },
+    "dimension_basis": "unknown",
+    "deduction_authority": false,
+    "no_instance_creation": true,
+    "diagnostics": {
+      "note": "The following detector observations are DIAGNOSTICS / regression observations ONLY and are NOT treated as benchmark truth. Benchmark truth is the independent_annotation above (9 true-positive openings).",
+      "observed_total_candidates": 32,
+      "observed_opening_sized_candidates": 16,
+      "detected_tp_matches": 9,
+      "annotated_tp_openings": 9,
+      "recall_tp": 1.0,
+      "precision_tp": 0.562,
+      "noise_fp_fraction": 0.438,
+      "assessment": "Phase 2A only requires the detector to demonstrate useful signal above background noise. On this real positive crop all 9 independently-annotated openings are recovered (100% recall). The modest precision (0.562) reflects geometric over-segmentation fragments of the dense glazing bars and merged bay-frame boxes; no opening is fabricated elsewhere in the crop at opening scale. Precision/noise are computed from the independent annotation only, not from setting a threshold at the current output."
+    }
+  },
   "benchmark": {
     "crop": {
       "filename": "lago_cd3001_p86_e1east_roi_150dpi.png",
@@ -46,7 +108,7 @@
       "height_px": 952,
       "source_bbox_pt": [2007.9, 690.5, 2092.7, 1147.7],
       "render_bbox_px": [4183, 1439, 4360, 2391],
-      "provenance": "Committed real render crop (grayscale PNG) taken directly from the page-86 (0-based 85) 150-DPI render of the canonical source PDF, cropped to the source PDF-point bbox above (241 pt deep, 84.8 pt wide). NOT a synthetic/debug render; this is the authoritative real-pixel benchmark artifact."
+      "provenance": "Committed real render crop (grayscale PNG) taken directly from the page-86 (0-based 85) 150-DPI render of the source PDF, cropped to the source PDF-point bbox above (241 pt deep, 84.8 pt wide). This crop is a NEGATIVE / AMBIGUOUS repeated facade-cell benchmark: its commercial identity, opening count, and type are NOT asserted (see benchmark_regions). It is NOT the authoritative positive real-opening benchmark; that is positive_benchmark.crop."
     },
     "independently_measured_cell": {
       "width_m": 2.96,
@@ -62,13 +124,32 @@
       "observed_total_candidates": 46,
       "observed_opening_sized": 30,
       "false_positive_limit_opening_sized": 40,
-      "notes": "Honest real-pixel measurement: on the real crop the extractor returns ~46 total / ~30 opening-sized candidates. Of the opening-sized candidates, ~10 match the independently-measured 2.96 m repeated-cell width and 5 are clean single-cell boxes (2.96 x 1.57 m). The remaining opening-sized candidates are over-segmentation fragments of the dense mullion/sash linework (0.5-2.05 m wide) and are counted as false positives; the documented conservative limit is 40. All candidates stay dimension_basis=unknown and review."
+      "notes": "Honest real-pixel measurement on the NEGATIVE/ambiguous repeated-cell crop: the extractor returns ~46 total / ~30 opening-sized candidates, of which ~10 match the independently-measured 2.96 m repeated-cell width and 5 are clean single-cell boxes (2.96 x 1.57 m). The remaining opening-sized candidates are over-segmentation fragments of the dense mullion/sash linework (0.5-2.05 m wide). The opening-sized limit of 40 is a documented engagement/sanity cap: the crop is only ~241 pt deep and holds a handful of real facade cells, so sustained output above 40 opening-sized candidates would clearly indicate runaway over-segmentation. This cap is an independent engineering guard, not a value tuned to the current detector output. All candidates stay dimension_basis=unknown and review."
     }
   },
+  "positive_regions": [
+    {
+      "region_id": "src-east-glazed-opening-group",
+      "region_role": "clearly-visible glazed opening group (positive benchmark)",
+      "coordinate_space": "pdf_point",
+      "source_bbox_pt": [1020.0, 634.0, 1412.0, 729.0],
+      "render_bbox_px": [2125, 1321, 2942, 1519],
+      "true_positive_openings": "9 glazed window lights, each 0.773 m wide x 1.489 m high, in the band y[648.3, 690.5] pt (see positive_benchmark.independent_annotation for full per-light geometry).",
+      "non_openings": "solid spandrel band y[690.5, 722.5] pt, x[978.1, 1426.0] pt — known non-opening solid facade (see positive_benchmark.independent_annotation.non_opening_regions).",
+      "source_note": "Independent annotation measured from the source PDF vector linework: 9 structural glazed lights are bounded by mullion pairs spanning ~21.9 pt (0.773 m) within the window band between the head frame (y=648.3 pt) and the sill (y=690.5 pt). Repeated across 3 identical bays on the left/centre facade of E1 East.",
+      "commercial_identity": "unproven",
+      "opening_type": "glazed window lights (visible glazing); no D/W mark required",
+      "safety": {
+        "dimension_basis": "unknown",
+        "deduction_authority": false,
+        "no_instance_creation": true
+      }
+    }
+  ],
   "benchmark_regions": [
     {
       "region_id": "src-east-repeated-facade-cell",
-      "region_role": "repeated facade opening geometry ROI",
+      "region_role": "repeated facade opening geometry ROI (negative/ambiguous benchmark)",
       "coordinate_space": "pdf_point",
       "source_bbox_pt": [2007.9, 690.5, 2092.7, 1147.7],
       "render_bbox_px": [4183, 1439, 4360, 2391],
@@ -82,7 +163,7 @@
         "commercial_identity": "unproven",
         "opening_count": null,
         "type_marks": null,
-        "note": "The repeated cells are NOT asserted to be windows, doors, panels, or balustrades from geometry alone. No opening count or type identity is claimed without independent drawing annotation."
+        "note": "The repeated cells are NOT asserted to be windows, doors, panels, or balustrades from geometry alone. No opening count or type identity is claimed without independent drawing annotation. This region serves as a negative/ambiguous facade-cell benchmark."
       },
       "safety": {
         "dimension_basis": "unknown",

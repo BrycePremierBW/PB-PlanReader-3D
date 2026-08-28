@@ -31,6 +31,18 @@ Focused correction regressions:
   G   recover_vector_rects ALWAYS returns List[VectorRectCandidate] — never
       raw tuples — and signals truncation/review when the work cap is hit.
 
+Final Phase-2A issues:
+  POS  A genuinely-visible POSITIVE opening benchmark (9 independently
+       annotated glazed window lights) whose precision/noise is measured
+       against the independent annotation — not against a threshold set at
+       the detector's current output.
+  R1   A raster extractor's bbox/centroid are ALWAYS render_pixel regardless
+       of the calibration, and width/height stay None with a non-render cal.
+  R2   calibration/source provenance comes from caller arguments — never a
+       hard-coded "page-86-cd3001".
+  R3   The fixture records original_source_filename AND local_source_alias;
+       the renamed alias is not the verbatim canonical source.
+
 Preserved safety requirements:
   1-12 as before (real calibration; unknown dimension basis; no deduct; no
   instance creation; ambiguous/duplicate review; wrong side/level rejected;
@@ -83,6 +95,9 @@ from pb_opening_evidence_v170 import (
 
 _FIXTURE = Path(__file__).resolve().parent / "fixtures" / "lago_cd3001_east_elevation_v177.json"
 _CROP = Path(__file__).resolve().parent / "fixtures" / "lago_cd3001_p86_e1east_roi_150dpi.png"
+# Positive real-opening benchmark crop (clearly-visible glazed window group).
+_POS_CROP = Path(__file__).resolve().parent / "fixtures" / \
+    "lago_cd3001_p86_e1east_glazed_open_group_150dpi.png"
 
 # Derived render transform used for the benchmark render (150 DPI).
 _RENDER_DPI = 150.0
@@ -114,6 +129,52 @@ def _load_real_crop():
     if img is None:
         raise AssertionError(f"real benchmark crop not readable: {_CROP}")
     return img
+
+
+def _load_positive_crop():
+    """Load the committed REAL page-86 glazed-opening-group crop (positive)."""
+    img = cv2.imread(str(_POS_CROP), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise AssertionError(f"positive benchmark crop not readable: {_POS_CROP}")
+    return img
+
+
+def _overlap_frac(a0, a1, b0, b1):
+    """Fraction of the shorter interval [b0,b1] overlapped by [a0,a1]."""
+    lo, hi = max(a0, b0), min(a1, b1)
+    width = min(a1 - a0, b1 - b0)
+    if width <= 1e-9:
+        return 0.0
+    return max(0.0, hi - lo) / width
+
+
+def _positive_precision_recall(cands, tp_xs, tp_y, x0_pt, y0_pt, scale_pt_per_px,
+                               x_tol_frac=0.5, y_tol_frac=0.45):
+    """Match detected candidates (crop-local pixels) to independent TP openings
+    (source PDF-points).  Uses independent annotations ONLY, never
+    detector-derived truth.
+
+    Returns (tp_matched_count, detected_tp_count, fp_count).
+    """
+    head, sill = tp_y
+    tp_matched = set()
+    detected_tp = set()
+    for ci, c in enumerate(cands):
+        xl, yl, xr, yr = c.bbox
+        # candidate crop-local pixel -> source PDF-point
+        sxl = x0_pt + xl * scale_pt_per_px
+        sxr = x0_pt + xr * scale_pt_per_px
+        syl = y0_pt + yl * scale_pt_per_px
+        syr = y0_pt + yr * scale_pt_per_px
+        for ti, (tx0, tx1) in enumerate(tp_xs):
+            xo = _overlap_frac(sxl, sxr, tx0, tx1)
+            yo = _overlap_frac(syl, syr, head, sill)
+            if xo > x_tol_frac and yo > y_tol_frac:
+                tp_matched.add(ti)
+                detected_tp.add(ci)
+                break
+    fp = len(cands) - len(detected_tp)
+    return len(tp_matched), len(detected_tp), fp
 
 
 # ---------------------------------------------------------------------------
@@ -262,10 +323,13 @@ class TestCoordinateSpaceDiscipline(unittest.TestCase):
         img = np.full((60, 60), 255, dtype=np.uint8)
         img[10:50, 10:50] = 0
         cands = detect_raster_rect_candidates(img, pcal, source_page=86)
-        # dimensional is False for a pt/m cal on a raster -> no metre widths
+        # dimensional is False for a pt/m cal on a raster -> no metre widths,
+        # and the bbox is STILL correctly labelled render_pixel.
+        self.assertTrue(cands)
         for c in cands:
             self.assertIsNone(c.width_m)
             self.assertIsNone(c.height_m)
+            self.assertEqual(c.coord_space, COORD_SPACE_RENDER_PIXEL)
 
     def test_raster_calibration_must_have_render_dpi(self):
         """render_pixel calibration without DPI fails closed (space ambiguity)."""
@@ -723,6 +787,203 @@ class TestMaxCellsReturnContract(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Positive real-opening benchmark (Issues 1 & 2)
+# ---------------------------------------------------------------------------
+class TestPositiveOpeningBenchmark(unittest.TestCase):
+    """AUTHORITATIVE positive benchmark: a clearly-visible glazed opening
+    group whose true-positive openings are annotated INDEPENDENTLY from the
+    source drawing, and whose detector precision/noise is measured against
+    that annotation (not by setting a threshold above detector output)."""
+
+    def _pos_crop_meta(self, fx):
+        return fx["positive_benchmark"]["crop"]
+
+    def _run_detector(self, fx):
+        cal = _render_pixel_calibration(fx)
+        img = _load_positive_crop()
+        return detect_raster_rect_candidates(
+            img, cal,
+            source_filename=fx["source"]["local_source_alias"],
+            source_page=fx["source"]["page_1_based"],
+            drawing_ref=fx["source"]["drawing_no"],
+            elevation_side=fx["source"]["elevation_side"],
+            calibration_source="page-86-cd3001-e1-east",
+        )
+
+    def test_positive_crop_committed_and_checksum(self):
+        """Issue 1: the positive crop is present, sized, checksum-proven, and
+        is distinct from the negative/ambiguous repeated-cell crop."""
+        fx = _load_fixture()
+        meta = self._pos_crop_meta(fx)
+        self.assertTrue(_POS_CROP.exists(),
+                        "positive benchmark crop must be committed")
+        img = _load_positive_crop()
+        self.assertEqual(img.shape[1], meta["width_px"])
+        self.assertEqual(img.shape[0], meta["height_px"])
+        checksum = hashlib.sha256(_POS_CROP.read_bytes()).hexdigest()
+        self.assertEqual(checksum, meta["sha256"])
+        # Distinct ROI from the negative repeated-cell crop.
+        self.assertNotEqual(meta["source_bbox_pt"],
+                            fx["benchmark"]["crop"]["source_bbox_pt"])
+        # Render transform matches the shared 150-DPI render.
+        self.assertEqual(fx["render"]["dpi"], _RENDER_DPI)
+
+    def test_positive_crop_has_independent_truth_ahead_of_detector(self):
+        """Issue 2: benchmark truth is an independent annotation, not
+        detector output.  The annotation exists with measured geometry and
+        does not encode a detector-derived count as truth."""
+        fx = _load_fixture()
+        ann = fx["positive_benchmark"]["independent_annotation"]
+        self.assertEqual(ann["method"], "measured_from_source_vector_geometry")
+        tp = ann["true_positive_openings"]
+        self.assertEqual(ann["true_positive_openings_count"], 9)
+        self.assertEqual(len(tp), 9)
+        self.assertEqual(fx["positive_benchmark"]["dimension_basis"], "unknown")
+        self.assertFalse(fx["positive_benchmark"]["deduction_authority"])
+        self.assertTrue(fx["positive_benchmark"]["no_instance_creation"])
+        # Diagnostics are recorded separately from truth, never as truth.
+        diag = fx["positive_benchmark"]["diagnostics"]
+        self.assertIn("note", diag)
+        self.assertIn("DIAGNOSTICS", diag["note"])
+
+    def test_positive_crop_recovers_all_independent_openings(self):
+        """Issue 2: on the positive crop the detector recovers EVERY
+        independently-annotated glazed light (useful signal), and any
+        un-matched candidates are counted as noise against the annotation."""
+        fx = _load_fixture()
+        ann = fx["positive_benchmark"]["independent_annotation"]
+        tp_xs = [(o["x0_pt"], o["x1_pt"]) for o in ann["true_positive_openings"]]
+        tp_y = tuple(ann["true_positive_y_extent_pt"])
+
+        cands = self._run_detector(fx)
+        sized = [c for c in cands if opening_sized(c.width_m, c.height_m)]
+        # All candidates stay pure geometry observations.
+        for c in cands:
+            self.assertEqual(c.dimension_basis, DIMENSION_BASIS_UNKNOWN)
+            self.assertEqual(c.elevation_side, fx["source"]["elevation_side"])
+        for c in sized:
+            self.assertEqual(c.drawing_ref, fx["source"]["drawing_no"])
+
+        meta = self._pos_crop_meta(fx)
+        x0_pt, y0_pt = meta["source_bbox_pt"][0], meta["source_bbox_pt"][1]
+        scale_pt_per_px = 1.0 / _PDF_POINT_TO_PIXEL  # pt per px at 150 DPI
+
+        tp_matched, detected_tp, fp = _positive_precision_recall(
+            sized, tp_xs, tp_y, x0_pt, y0_pt, scale_pt_per_px)
+
+        # Useful signal: all 9 independent openings are recovered.
+        self.assertEqual(tp_matched, ann["true_positive_openings_count"],
+                         "every independently-annotated glazed opening must "
+                         "be recovered (useful signal above noise)")
+
+        # Precision / noise computed against the independent annotation.
+        precision = detected_tp / len(sized) if sized else 0.0
+        recall = tp_matched / ann["true_positive_openings_count"]
+        self.assertGreaterEqual(recall, 0.9)
+        # Phase 2A requires useful signal, not perfect classification.
+        self.assertGreaterEqual(precision, 0.25)
+
+    def test_positive_crop_does_not_require_d_or_w_mark(self):
+        """Issue 1: annotation records no D/W mark (drawing shows none), and
+        does not over-claim a commercial identity from geometry."""
+        fx = _load_fixture()
+        ann = fx["positive_benchmark"]["independent_annotation"]
+        self.assertIn("No D/W door/window mark", ann["opening_type_note"])
+        self.assertEqual(ann["commercial_identity"], "unproven")
+        reg = fx["positive_regions"][0]
+        self.assertEqual(reg["opening_type"],
+                         "glazed window lights (visible glazing); no D/W mark required")
+
+
+# ---------------------------------------------------------------------------
+# Issue 3 — raster coordinate/provenance semantics
+# ---------------------------------------------------------------------------
+class TestRasterProvenanceSemantics(unittest.TestCase):
+    """A raster extractor's bbox/centroid are ALWAYS render_pixel, regardless
+    of the calibration object; calibration/source provenance comes from the
+    caller, never hard-coded to a specific sheet/project."""
+
+    def test_raster_bbox_is_always_render_pixel_with_pdf_calibration(self):
+        """raster image + PDF-point calibration -> coord_space==render_pixel,
+        width_m/height_m None (no metres for a pt/m cal on a raster)."""
+        pcal = calibration_from_scale_bar_positions(
+            [0.0, 28.346, 56.692, 85.038], 1.0,
+            coord_space=COORD_SPACE_PDF_POINT)
+        img = np.full((60, 60), 255, dtype=np.uint8)
+        img[10:50, 10:50] = 0
+        cands = detect_raster_rect_candidates(img, pcal, source_page=86)
+        self.assertTrue(cands)
+        for c in cands:
+            self.assertEqual(c.coord_space, COORD_SPACE_RENDER_PIXEL)
+            self.assertIsNone(c.width_m)
+            self.assertIsNone(c.height_m)
+            # geometric (non-dimensional) observation still emitted
+            self.assertGreater(c.bbox[2] - c.bbox[0], 0)
+
+    def test_raster_bbox_is_always_render_pixel_with_render_calibration(self):
+        """A render_pixel calibration keeps coord_space==render_pixel."""
+        rcal = calibration_from_scale_bar_positions(
+            [0.0, 59.055, 118.11, 177.17], 1.0,
+            coord_space=COORD_SPACE_RENDER_PIXEL, render_dpi=_RENDER_DPI)
+        img = np.full((60, 60), 255, dtype=np.uint8)
+        img[10:50, 10:50] = 0
+        cands = detect_raster_rect_candidates(img, rcal, source_page=86)
+        self.assertTrue(cands)
+        for c in cands:
+            self.assertEqual(c.coord_space, COORD_SPACE_RENDER_PIXEL)
+            self.assertIsNotNone(c.width_m)
+
+    def test_provenance_comes_from_caller_not_hardcoded_cd3001(self):
+        """Issue 3: a page-87 / other-project call does NOT receive CD3001
+        provenance; calibration_source is propagated from the caller."""
+        pcal = calibration_from_scale_bar_positions(
+            [0.0, 28.346, 56.692, 85.038], 1.0,
+            coord_space=COORD_SPACE_PDF_POINT)
+        img = np.full((60, 60), 255, dtype=np.uint8)
+        img[10:50, 10:50] = 0
+        cands = detect_raster_rect_candidates(
+            img, pcal, source_page=87, drawing_ref="CD-OTHER-PROJECT",
+            elevation_side="North",
+            calibration_source="page-87-other-project-primary",
+        )
+        self.assertTrue(cands)
+        for c in cands:
+            self.assertNotIn("cd3001", c.calibration_source.lower())
+            self.assertNotIn("cd3001", c.drawing_ref.lower())
+            self.assertEqual(c.calibration_source,
+                             "page-87-other-project-primary")
+            self.assertEqual(c.source_page, 87)
+            self.assertEqual(c.elevation_side, "North")
+            # bbox is still render_pixel for a raster even on this other page.
+            self.assertEqual(c.coord_space, COORD_SPACE_RENDER_PIXEL)
+
+
+# ---------------------------------------------------------------------------
+# Issue 4 — source filename provenance
+# ---------------------------------------------------------------------------
+class TestSourceFilenameProvenance(unittest.TestCase):
+    """The local renamed alias is recorded alongside the original issued name;
+    the alias is never presented as the verbatim canonical source."""
+
+    def test_original_and_local_alias_both_recorded(self):
+        fx = _load_fixture()
+        src = fx["source"]
+        self.assertEqual(src["original_source_filename"],
+                         "260617_004-LAGO-BRITINYA_ARCH-DRAWINGS_COMBINED 2.pdf")
+        self.assertEqual(src["local_source_alias"],
+                         "260617_004-LAGO-BRITINYA_ARCH-DRAWINGS_COMBINED.pdf")
+        self.assertNotEqual(src["original_source_filename"],
+                            src["local_source_alias"])
+        self.assertIn("renamed", src["filename_provenance"].lower())
+
+    def test_alias_not_presented_as_original(self):
+        fx = _load_fixture()
+        prov = fx["source"]["filename_provenance"].lower()
+        self.assertIn("original_source_filename", prov)
+        self.assertIn("not the verbatim canonical source name", prov)
+
+
+# ---------------------------------------------------------------------------
 # benchmark fixture integrity (no circular/tautological truth)
 # ---------------------------------------------------------------------------
 class TestBenchmarkFixtureIntegrity(unittest.TestCase):
@@ -731,7 +992,7 @@ class TestBenchmarkFixtureIntegrity(unittest.TestCase):
         roi = fx["benchmark_regions"][0]
         self.assertIsNone(roi["unknown_identity_facts"]["opening_count"])
         self.assertEqual(roi["unknown_identity_facts"]["commercial_identity"], "unproven")
-        self.assertIn(roi["region_role"], "repeated facade opening geometry ROI")
+        self.assertTrue(roi["region_role"].startswith("repeated facade opening geometry ROI"))
         # Independently measured scales/pitches are present and non-tautological.
         known = roi["known_geometry_facts"]
         self.assertAlmostEqual(known["observed_vertical_cell_period_m"], 2.96, delta=0.05)
