@@ -13,7 +13,7 @@ Safety contract
   - Calibration is only authoritative when it can be MEASURED from drawing
     geometry and its provenance recorded.
   - If calibration cannot be proven, the page remains NON-DIMENSIONAL and
-    FAILS CLOSED (valid=False, px_per_m=0.0).
+    FAILS CLOSED (valid=False, units_per_m=0.0).
   - Calibration does NOT by itself enable any deduction (B5 remains the sole
     deduct authority and is not touched here).
   - The coordinate space (rendered-pixel vs PDF-point) must be explicit and
@@ -47,13 +47,15 @@ class Calibration:
     """A measured, provenance-carrying elevation calibration.
 
     Attributes:
-        px_per_m: Measured pixels-per-metre in the page's coordinate space.
-            Zero when calibration could not be proven (fail-closed).
+        units_per_m: Measured units-per-metre in the page's coordinate space
+            (units are PDF points when coord_space == "pdf_point", or
+            render pixels when coord_space == "render_pixel").  Zero when
+            calibration could not be proven (fail-closed).
         valid: True only when measurement is trustworthy AND coordinate
             space is explicit.
         method: How the calibration was derived (e.g. "graphic_scale_bar").
         source_page: 0-based or 1-based page identifier for the elevation.
-        coord_space: One of COORD_SPACE_* — the units of px_per_m.
+        coord_space: One of COORD_SPACE_* — the units of units_per_m.
         render_dpi: Render DPI when coord_space == "render_pixel" else None.
         calibration_geometry: The measured drawing evidence (division
             positions, spans) used to derive the result.
@@ -61,7 +63,7 @@ class Calibration:
         review_status: "accepted" | "review" | "rejected".
         notes: Human-readable provenance / reasoning.
     """
-    px_per_m: float
+    units_per_m: float
     coord_space: str
     valid: bool
     method: str = ""
@@ -74,9 +76,31 @@ class Calibration:
 
     def is_dimensional(self) -> bool:
         """True only when a proven, valid calibration exists."""
-        return self.valid and self.px_per_m > 0.0
+        return self.valid and self.units_per_m > 0.0
 
-    def to_meters(self, px: float) -> Optional[float]:
+    # ------------------------------------------------------------------
+    # Typed, coordinate-aware accessors.  The GENERAL stored value is
+    # units_per_m; the coordinate space decides whether those units are
+    # PDF points or render pixels.  These accessors return None when the
+    # requested unit does NOT match the calibration's coordinate space, so
+    # a value can never be silently mis-described (e.g. 28.346 pt/m must
+    # never be returned as pixels-per-metre).
+    # ------------------------------------------------------------------
+    @property
+    def pt_per_m(self) -> Optional[float]:
+        """PDF-points per metre, ONLY for a pdf_point calibration."""
+        if self.coord_space == COORD_SPACE_PDF_POINT:
+            return self.units_per_m
+        return None
+
+    @property
+    def px_per_m(self) -> Optional[float]:
+        """Render pixels per metre, ONLY for a render_pixel calibration."""
+        if self.coord_space == COORD_SPACE_RENDER_PIXEL:
+            return self.units_per_m
+        return None
+
+    def to_meters(self, units: float) -> Optional[float]:
         """Convert a length in the calibration's coordinate space to metres.
 
         Returns None (not a number) when the page is not dimensional —
@@ -84,13 +108,15 @@ class Calibration:
         """
         if not self.is_dimensional():
             return None
-        return px / self.px_per_m
+        return units / self.units_per_m
 
     def as_dict(self) -> Dict[str, Any]:
         """Serialize for provenance / fixtures / pipelines."""
         return {
             "version": VERSION,
-            "px_per_m": self.px_per_m,
+            "units_per_m": self.units_per_m,
+            "pt_per_m": self.pt_per_m,        # None unless pdf_point
+            "px_per_m": self.px_per_m,        # None unless render_pixel
             "valid": self.valid,
             "is_dimensional": self.is_dimensional(),
             "method": self.method,
@@ -108,7 +134,7 @@ def _fail_closed(reason: str, coord_space: str, source_page: Optional[int] = Non
                  render_dpi: Optional[float] = None) -> Calibration:
     """Return a non-dimensional, rejected calibration (fail-closed)."""
     return Calibration(
-        px_per_m=0.0,
+        units_per_m=0.0,
         coord_space=coord_space,
         valid=False,
         method="none",
@@ -138,11 +164,13 @@ def measured_calibration_from_divisions(
     caller locates the graphic scale bar divisions (their positions in the
     page's coordinate space) and states how many metres each division
     represents (from the bar's own labels / annotation).  The result carries
-    the measured px_per_m and full provenance.
+    the measured units_per_m (PDF points or render pixels depending on
+    coord_space) and full provenance.
 
     Args:
         division_positions: Positions (monotonic) of scale-bar division
-            boundaries, e.g. the centres of labels 0..10 on a 10 m bar.
+            boundaries, e.g. the 11 tick positions of labels 0..10 (10
+            divisions) on a 10 m bar.
         metre_per_division: Real-world metres each full division represents.
         coord_space: COORD_SPACE_PDF_POINT or COORD_SPACE_RENDER_PIXEL.
         method: Provenance, e.g. "graphic_scale_bar".
@@ -155,7 +183,7 @@ def measured_calibration_from_divisions(
 
     Returns:
         A Calibration.  If the measurement is not provable/consistent, the
-        result FAILS CLOSED (valid=False, px_per_m=0.0).
+        result FAILS CLOSED (valid=False, units_per_m=0.0).
     """
     if coord_space not in COORD_SPACES:
         return _fail_closed(
@@ -214,10 +242,10 @@ def measured_calibration_from_divisions(
             f"minimum {_MIN_METRE_SPAN_M} m",
             coord_space, source_page, render_dpi)
 
-    px_per_m_value = mean_spacing / metre_per_division
-    if px_per_m_value <= 0.0 or not math.isfinite(px_per_m_value):
+    units_per_m_value = mean_spacing / metre_per_division
+    if units_per_m_value <= 0.0 or not math.isfinite(units_per_m_value):
         return _fail_closed(
-            "invalid px_per_m derived from measurements",
+            "invalid units_per_m derived from measurements",
             coord_space, source_page, render_dpi)
 
     # Confidence: penalise some residual scatter, reward a valid measurement.
@@ -236,7 +264,7 @@ def measured_calibration_from_divisions(
     }
 
     return Calibration(
-        px_per_m=round(px_per_m_value, 6),
+        units_per_m=round(units_per_m_value, 6),
         coord_space=coord_space,
         valid=True,
         method=method,
@@ -248,7 +276,7 @@ def measured_calibration_from_divisions(
         notes=[
             f"measured {len(spacings)} divisions at mean spacing "
             f"{mean_spacing:.3f} {coord_space} units each representing "
-            f"{metre_per_division} m → px_per_m={px_per_m_value:.4f}",
+            f"{metre_per_division} m → units_per_m={units_per_m_value:.4f}",
         ],
     )
 

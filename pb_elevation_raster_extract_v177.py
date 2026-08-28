@@ -208,7 +208,11 @@ def detect_raster_rect_candidates(
         if w == 0 or h == 0:
             return [_unavailable_candidate("empty drawing region")]
 
-    dimensional = calibration.is_dimensional()
+    dimensional = calibration.is_dimensional() and calibration.px_per_m is not None
+    # Hard coordinate discipline: metred output only when the calibration is
+    # genuinely in the SAME render-pixel space as the supplied image.  A
+    # pdf_point calibration (pt/m only, px_per_m is None) must NOT be applied
+    # to a raster image — that would silently describe 28.346 pt/m as px/m.
     px_per_m = calibration.px_per_m if dimensional else 0.0
 
     # Segment dark linework.

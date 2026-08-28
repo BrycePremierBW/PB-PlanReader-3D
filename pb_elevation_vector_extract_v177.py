@@ -106,28 +106,57 @@ def _classify_segment(
     return None
 
 
+# Gap tolerance (PDF points): collinear segments are merged into ONE
+# continuous line ONLY when they overlap or touch within this distance.
+# A real gap between two collinear fragments means they are SEPARATE sides —
+# they must NOT be bridged into an invented continuous line (which could let
+# two separated fragments form a rectangle side that does not actually exist).
+_GAP_TOLERANCE_PT = 2.0
+
+
 def _cluster_lines(extents: Sequence[Tuple[float, float, float]],
                    tol: float = 1.5) -> List[Tuple[float, float, float]]:
-    """Cluster collinear segments into lines by fixed-coordinate proximity.
+    """Cluster collinear segments into continuous lines by fixed-coordinate proximity.
 
-    extents: (fixed_coord, lo, hi). Returns merged (fixed_coord, min_lo,
-    max_hi) lines.
+    extents: (fixed_coord, lo, hi) axis-aligned segments.
+
+    Segments are first grouped into bands by fixed-coordinate proximity
+    (within ``tol``).  Within a band, intervals are merged ONLY when they
+    overlap or touch within ``_GAP_TOLERANCE_PT``.  Spatially separated
+    collinear fragments (a real gap wider than the tolerance) are kept as
+    SEPARATE lines — they are never bridged into an invented continuous side.
+
+    Returns merged (fixed_coord, min_lo, max_hi) lines; each returned line is
+    guaranteed to be a contiguous coverage (no internal gap beyond tolerance).
     """
-    merged: list
-    # Sort by fixed coordinate then merge overlapping ranges with nearby fixed values.
-    ordered = sorted(extents, key=lambda e: (e[0], e[1]))
-    result: List[Tuple[float, float, float]] = []
-    for fixed, lo, hi in ordered:
+    # 1) Bucket by fixed-coordinate proximity.
+    buckets: List[List[Tuple[float, float, float]]] = []
+    for fixed, lo, hi in sorted(extents, key=lambda e: (e[0], e[1])):
         placed = False
-        for i, (f, l, h) in enumerate(result):
-            if abs(f - fixed) <= tol:
-                # same line band; extend range
-                nl, nh = min(l, lo), max(h, hi)
-                result[i] = (f, nl, nh)
+        for b in buckets:
+            if abs(b[0][0] - fixed) <= tol:
+                b.append((fixed, lo, hi))
                 placed = True
                 break
         if not placed:
-            result.append((fixed, lo, hi))
+            buckets.append([(fixed, lo, hi)])
+
+    # 2) Within each band, merge only intervals that overlap/touch (gap-safe).
+    result: List[Tuple[float, float, float]] = []
+    for bucket in buckets:
+        fixed_rep = bucket[0][0]
+        intervals = sorted((lo, hi) for _, lo, hi in bucket)
+        cur_lo, cur_hi = intervals[0]
+        for lo, hi in intervals[1:]:
+            if lo - cur_hi <= _GAP_TOLERANCE_PT:
+                # overlap or touch (within documented tolerance) → contiguous
+                if hi > cur_hi:
+                    cur_hi = hi
+            else:
+                # real gap: separated fragments → separate continuous lines
+                result.append((fixed_rep, cur_lo, cur_hi))
+                cur_lo, cur_hi = lo, hi
+        result.append((fixed_rep, cur_lo, cur_hi))
     return result
 
 
@@ -164,7 +193,7 @@ def recover_vector_rects(
     # Coordinate-space guard: vector geometry is in PDF points; we only
     # convert to metres when the calibration is in pdf_point space.
     dimensional = (calibration.valid and calibration.coord_space == COORD_SPACE_PDF_POINT)
-    px_per_m = calibration.px_per_m if dimensional else 0.0
+    pt_per_m = calibration.pt_per_m if dimensional else 0.0
 
     h_extents: List[Tuple[float, float, float]] = []
     v_extents: List[Tuple[float, float, float]] = []
@@ -198,6 +227,7 @@ def recover_vector_rects(
         h_by_y.setdefault(round(fixed, 3), []).append((lo, hi))
 
     cells: List[Tuple[float, float, float, float]] = []
+    truncated = False  # explicit truncation/review signal (never return raw tuples)
     y_pairs = list(zip(y_coords, y_coords[1:]))
     cells_run = 0
     for y_b, y_t in y_pairs:
@@ -227,7 +257,12 @@ def recover_vector_rects(
                 continue
             cells_run += 1
             if cells_run > max_cells:
-                return cells  # keep what we have
+                # Work cap hit: stop collecting, flag truncation.  We do NOT
+                # return raw tuples here — we always return a properly
+                # constructed List[VectorRectCandidate] with an explicit
+                # truncation/review signal (see below).
+                truncated = True
+                break
             # both verticals must span y_b..y_t AND both horizontals must
             # span x_l..x_r (already ensured via xs membership + the bot/top
             # loops enforce horizontal span for their own line, but we must
@@ -248,13 +283,19 @@ def recover_vector_rects(
             if not spans_both_h:
                 continue
             cells.append((x_l, y_b, x_r, y_t))
+        if truncated:
+            break
 
     candidates: List[VectorRectCandidate] = []
+    base_notes = ["closed rectangle recovered from drawn linework; generic"]
+    if truncated:
+        base_notes.append(
+            f"WORK-CAP HIT at {max_cells} cells — result TRUNCATED; review required")
     for (x_l, y_b, x_r, y_t) in cells:
         width_m = height_m = None
         if dimensional:
-            width_m = round((x_r - x_l) / px_per_m, 4)
-            height_m = round((y_t - y_b) / px_per_m, 4)
+            width_m = round((x_r - x_l) / pt_per_m, 4)
+            height_m = round((y_t - y_b) / pt_per_m, 4)
         candidates.append(VectorRectCandidate(
             source_filename=source_filename,
             source_page=source_page,
@@ -270,6 +311,6 @@ def recover_vector_rects(
             extraction_method="vector_line_closure",
             geometry_confidence=0.6,
             review_status=STATUS_REVIEW,
-            notes=["closed rectangle recovered from drawn linework; generic"],
+            notes=list(base_notes),
         ))
     return candidates

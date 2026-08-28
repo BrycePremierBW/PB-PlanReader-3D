@@ -200,7 +200,7 @@ def detect_elevation_openings(
     elevation_side: str,
     rects: Sequence[Dict[str, Any]],
     words: Sequence[Dict[str, Any]],
-    scale_px_per_m: float,
+    units_per_m: float,
     *,
     coord_space: str = "render_pixel",
     render_dpi: Optional[float] = None,
@@ -217,19 +217,31 @@ def detect_elevation_openings(
     Args:
         elevation_page_no: Page number of the elevation drawing.
         elevation_side: Cardinal side ("North", "South", etc.).
-        rects: Rectangle dicts with keys "bbox" → [x0, y0, x1, y1] in
-               page pixel coordinates.  May also have "confidence", and
-               provenance keys ("coord_space", "level", "wall_ref",
+        rects: Rectangle dicts with keys "bbox" → [x0, y0, x1, y1] in the
+               calibration's coordinate units.  May also have "confidence",
+               and provenance keys ("coord_space", "level", "wall_ref",
                "drawing_ref", "calibration", ...).
         words: Word dicts from PDF extraction (positioned text).
-        scale_px_per_m: Calibration factor (pixels per metre) in the rects'
-            coordinate space.
-        coord_space: Explicit coordinate space ("render_pixel" or
-            "pdf_point").  Never mix coordinate systems.
+        units_per_m: Measured calibration factor (units per metre) expressed
+            in ``coord_space`` units — render pixels when coord_space is
+            "render_pixel", PDF points when coord_space is "pdf_point".
+            This value is NEVER described as pixels-per-metre unless
+            coord_space == "render_pixel" (see Calibration.pt_per_m /
+            Calibration.px_per_m for the typed accessors).
+        coord_space: The explicit coordinate space of BOTH the calibration
+            factor above AND the rect bboxes: "render_pixel" or "pdf_point".
         render_dpi: Render DPI when coord_space == "render_pixel".
         source_page_id / source_page_no / drawing_ref / drawing_title /
         level / wall_ref / calibration: Provenance carried onto every
             candidate.
+
+    Coordinate-space compatibility (HARD GUARD):
+        Dimensioned candidates are only produced when the rect's declared
+        coordinate space is PROVEN identical to the calibration's space
+        (``coord_space``).  Any rect that declares a different space than the
+        calibration (e.g. a pdf_point rect against a render-pixel calibration,
+        or vice versa) FAILS CLOSED — it produces NO dimensional candidate and
+        is skipped.  Coordinate spaces are never mixed.
 
     Returns:
         List of ElevationOpening candidates.  These are NOT confirmed
@@ -237,11 +249,11 @@ def detect_elevation_openings(
 
     Sill/head are None until an elevation datum/baseline is registered.
     """
-    if scale_px_per_m <= 0:
+    if units_per_m <= 0:
         return []
 
-    # Convert physical label search radius to pixels
-    label_radius_px = _LABEL_SEARCH_RADIUS_M * scale_px_per_m
+    # Convert physical label search radius to calibration units
+    label_radius_units = _LABEL_SEARCH_RADIUS_M * units_per_m
 
     candidates: List[ElevationOpening] = []
     for rect in rects:
@@ -250,18 +262,28 @@ def detect_elevation_openings(
             continue
         x0, y0, x1, y1 = [float(v) for v in bbox[:4]]
 
-        # Measure in metres
-        width_px = abs(x1 - x0)
-        height_px = abs(y1 - y0)
-        width_m = width_px / scale_px_per_m
-        height_m = height_px / scale_px_per_m
+        # Hard coordinate-space guard: the rect MUST be in the same proven
+        # coordinate space as the calibration before any dimension is
+        # calculated.  A rect declaring a different space fails closed — it
+        # contributes no dimensional candidate (spaces are never mixed).
+        r_coord = rect.get("coord_space", coord_space)
+        if r_coord != coord_space:
+            # Dimensionally incommensurable with the calibration space:
+            # fail closed, do NOT emit a candidate with invented metres.
+            continue
+
+        # Measure in metres (space is known equal to the calibration space)
+        width_units = abs(x1 - x0)
+        height_units = abs(y1 - y0)
+        width_m = width_units / units_per_m
+        height_m = height_units / units_per_m
 
         if not _is_opening_sized(width_m, height_m):
             continue
 
         # Look for a mark label near this rectangle (scale-aware radius)
         label = _extract_label_near_rect(
-            words, (x0, y0, x1, y1), max_distance_px=label_radius_px
+            words, (x0, y0, x1, y1), max_distance_px=label_radius_units
         )
 
         # Confidence: higher for clearly opening-sized, lower for borderline
@@ -274,7 +296,6 @@ def detect_elevation_openings(
 
         # Per-rect provenance, falling back to the function-level args so
         # rects produced by the extraction layer carry their own metadata.
-        r_coord = rect.get("coord_space", coord_space)
         r_render = rect.get("render_dpi", render_dpi) if rect.get("render_dpi") is not None else render_dpi
         r_level = rect.get("level", level)
         r_wall = rect.get("wall_ref", wall_ref)
@@ -320,11 +341,32 @@ def _mark_compatible(mark1: str, mark2: str) -> bool:
     return mark1.upper() == mark2.upper()
 
 
-def _mark_type(mark: str) -> str:
-    """Return the type prefix of a mark: 'D', 'W', or ''."""
-    if mark and mark[0].upper() in ("D", "W"):
-        return mark[0].upper()
+def _mark_family_prefix(mark: str) -> str:
+    """Return 'D' or 'W' for an approved door/window mark family.
+
+    Uses the approved mark-family classifier, NEVER the first character:
+        D / ED / ID (+ digits)  => 'D'  (door)
+        W / EW / IW (+ digits)  => 'W'  (window)
+    Anything else (junk, lone I/II, etc.) => ''.
+
+    Rationale: ``ED01`` must classify as a DOOR (family 'D'), not as an
+    unknown 'E'; ``IW03`` must classify as a WINDOW ('W').  Using ``mark[0]``
+    would misclassify every ED/ID/EW/IW mark.
+    """
+    if mark and _is_approved_door_mark(mark):
+        return "D"
+    if mark and _is_approved_window_mark(mark):
+        return "W"
     return ""
+
+
+def _mark_type(mark: str) -> str:
+    """Return the type prefix of a mark: 'D', 'W', or ``''``.
+
+    Uses the approved mark-family classifier (_mark_family_prefix), so
+    ED01/ID01 are 'D' (door) and EW01/IW01 are 'W' (window).
+    """
+    return _mark_family_prefix(mark)
 
 
 def _marks_conflict(inst_mark: str, elev_label: str) -> bool:
@@ -347,7 +389,7 @@ def _opening_type_conflicts(inst: OpeningEvidence, elev_label: str) -> bool:
     """
     if not elev_label:
         return False
-    elev_type = elev_label[0].upper()
+    elev_type = _mark_family_prefix(elev_label)
     if inst.opening_type == OPENING_TYPE_WINDOW and elev_type == "D":
         return True
     if inst.opening_type == OPENING_TYPE_DOOR and elev_type == "W":
