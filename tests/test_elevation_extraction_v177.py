@@ -57,6 +57,7 @@ import json
 import os
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import cv2
@@ -151,30 +152,52 @@ def _overlap_frac(a0, a1, b0, b1):
 def _positive_precision_recall(cands, tp_xs, tp_y, x0_pt, y0_pt, scale_pt_per_px,
                                x_tol_frac=0.5, y_tol_frac=0.45):
     """Match detected candidates (crop-local pixels) to independent TP openings
-    (source PDF-points).  Uses independent annotations ONLY, never
-    detector-derived truth.
+    (source PDF-points) with ONE-TO-ONE assignment.  Uses independent
+    annotations ONLY, never detector-derived truth.
+
+    A true opening can accept at most ONE candidate; once a candidate is
+    assigned to an opening, a second candidate overlapping that same opening
+    is counted as a duplicate -> false positive (noise).  This is what makes
+    precision a meaningful measure of detector noise.
 
     Returns (tp_matched_count, detected_tp_count, fp_count).
     """
     head, sill = tp_y
-    tp_matched = set()
-    detected_tp = set()
-    for ci, c in enumerate(cands):
+    # Candidate crop-local pixel bb -> source PDF-point bb.
+    boxes = []
+    for c in cands:
         xl, yl, xr, yr = c.bbox
-        # candidate crop-local pixel -> source PDF-point
-        sxl = x0_pt + xl * scale_pt_per_px
-        sxr = x0_pt + xr * scale_pt_per_px
-        syl = y0_pt + yl * scale_pt_per_px
-        syr = y0_pt + yr * scale_pt_per_px
-        for ti, (tx0, tx1) in enumerate(tp_xs):
+        boxes.append((x0_pt + xl * scale_pt_per_px,
+                      y0_pt + yl * scale_pt_per_px,
+                      x0_pt + xr * scale_pt_per_px,
+                      y0_pt + yr * scale_pt_per_px))
+
+    claimed = [False] * len(cands)
+    tp_matched = 0
+    # For each true opening, assign its BEST (most-filled) still-unclaimed
+    # candidate.  Greedy-by-opening is deterministic regardless of the order
+    # the detector returned its candidates.
+    for ti, (tx0, tx1) in enumerate(tp_xs):
+        best_ci = None
+        best_score = 0.0
+        for ci, (sxl, syl, sxr, syr) in enumerate(boxes):
+            if claimed[ci]:
+                continue
             xo = _overlap_frac(sxl, sxr, tx0, tx1)
             yo = _overlap_frac(syl, syr, head, sill)
             if xo > x_tol_frac and yo > y_tol_frac:
-                tp_matched.add(ti)
-                detected_tp.add(ci)
-                break
-    fp = len(cands) - len(detected_tp)
-    return len(tp_matched), len(detected_tp), fp
+                score = min(xo, yo)
+                if score > best_score:
+                    best_score = score
+                    best_ci = ci
+        if best_ci is not None:
+            claimed[best_ci] = True
+            tp_matched += 1
+
+    detected_tp = sum(claimed)  # 1-to-1: each claimed candidate maps to one opening
+    assert detected_tp == tp_matched
+    fp = len(cands) - detected_tp
+    return tp_matched, detected_tp, fp
 
 
 # ---------------------------------------------------------------------------
@@ -768,13 +791,15 @@ class TestMaxCellsReturnContract(unittest.TestCase):
         segs = self._grid_segments()
         result = recover_vector_rects(segs, cal, source_page=86, max_cells=1)
         self.assertIsInstance(result, list)
+        # A cap hit must NEVER be an empty, indistinguishable return: because
+        # the cap counts accepted cells, at least the first valid cell exists
+        # and carries the WORK-CAP truncation note.
+        self.assertTrue(result, "cap hit must not return an empty list")
         for item in result:
             self.assertIsInstance(item, VectorRectCandidate,
                                   "must never return raw tuples on cap hit")
-        # Any candidate must be a properly constructed observation.
-        if result:
-            self.assertEqual(result[0].dimension_basis, DIMENSION_BASIS_UNKNOWN)
-            self.assertIn("WORK-CAP", " ".join(result[0].notes))
+            self.assertEqual(item.dimension_basis, DIMENSION_BASIS_UNKNOWN)
+            self.assertIn("WORK-CAP", " ".join(item.notes))
 
     def test_no_cap_return_has_no_truncation_note(self):
         cal = self._cal()
@@ -784,6 +809,29 @@ class TestMaxCellsReturnContract(unittest.TestCase):
         for item in result:
             self.assertIsInstance(item, VectorRectCandidate)
             self.assertNotIn("WORK-CAP", " ".join(item.notes))
+
+    def test_cap_hit_around_first_cell_still_signals_truncation(self):
+        """Regression: with max_cells=1 the FIRST accepted cell is collected,
+        the cap is hit immediately, and every returned candidate still carries
+        a visible WORK-CAP truncation signal (never `[]` silently)."""
+        cal = self._cal()
+        # A single closed rectangle (one usable cell) plus a large grid so the
+        # first accepted cell immediately trips the max_cells=1 cap.
+        segs = self._grid_segments()
+        result = recover_vector_rects(segs, cal, source_page=86, max_cells=1)
+        self.assertIsInstance(result, list)
+        self.assertEqual(len(result), 1, "cap=1 must collect exactly one cell")
+        self.assertIn("WORK-CAP", " ".join(result[0].notes))
+        self.assertIn("TRUNCATED", " ".join(result[0].notes))
+
+    def test_max_cells_lt_one_is_rejected(self):
+        """Regression: max_cells < 1 would make a cap hit indistinguishable
+        from an ordinary empty return, so it is rejected up front."""
+        cal = self._cal()
+        segs = self._grid_segments()
+        for bad in (0, -1):
+            with self.assertRaises(ValueError):
+                recover_vector_rects(segs, cal, source_page=86, max_cells=bad)
 
 
 # ---------------------------------------------------------------------------
@@ -893,6 +941,56 @@ class TestPositiveOpeningBenchmark(unittest.TestCase):
         reg = fx["positive_regions"][0]
         self.assertEqual(reg["opening_type"],
                          "glazed window lights (visible glazing); no D/W mark required")
+
+    def test_positive_precision_is_one_to_one(self):
+        """Issue 2 blocker: a true opening accepts at most ONE candidate; a
+        second candidate overlapping the SAME opening is a duplicate -> FP."""
+        # One annotated opening at source x[0,10] y[0,10].  Using origin 0 and
+        # scale_pt_per_px=1 makes crop-px bbox == source-pt bbox.
+        tp_xs = [(0.0, 10.0)]
+        tp_y = (0.0, 10.0)
+        # Two candidates BOTH fully overlapping the single opening.
+        cand_a = SimpleNamespace(bbox=(0, 0, 10, 10))
+        cand_b = SimpleNamespace(bbox=(2, 0, 8, 10))
+        tp_matched, detected_tp, fp = _positive_precision_recall(
+            [cand_a, cand_b], tp_xs, tp_y, 0.0, 0.0, 1.0)
+        self.assertEqual(tp_matched, 1,
+                         "only one candidate may claim a given opening")
+        self.assertEqual(detected_tp, 1)
+        self.assertEqual(fp, 1,
+                         "the duplicate overlapping candidate must count as noise/FP")
+
+    def test_positive_diagnostics_not_stale(self):
+        """Issue 3: the recorded diagnostic counts must match CURRENT detector
+        output on the committed crop, so a detector change can never silently
+        leave the fixture telling an outdated story."""
+        fx = _load_fixture()
+        diag = fx["positive_benchmark"]["diagnostics"]
+        self.assertIn("DIAGNOSTICS", diag["note"])
+
+        ann = fx["positive_benchmark"]["independent_annotation"]
+        tp_xs = [(o["x0_pt"], o["x1_pt"]) for o in ann["true_positive_openings"]]
+        tp_y = tuple(ann["true_positive_y_extent_pt"])
+
+        cands = self._run_detector(fx)
+        sized = [c for c in cands if opening_sized(c.width_m, c.height_m)]
+        meta = self._pos_crop_meta(fx)
+        x0_pt, y0_pt = meta["source_bbox_pt"][0], meta["source_bbox_pt"][1]
+        scale_pt_per_px = 1.0 / _PDF_POINT_TO_PIXEL
+
+        tp_matched, detected_tp, fp = _positive_precision_recall(
+            sized, tp_xs, tp_y, x0_pt, y0_pt, scale_pt_per_px)
+        precision = detected_tp / len(sized) if sized else 0.0
+        recall = tp_matched / ann["true_positive_openings_count"]
+        noise = fp / len(sized) if sized else 0.0
+
+        # Recompute-and-assert: recorded diagnostics must equal actual output.
+        self.assertEqual(len(cands), diag["observed_total_candidates"])
+        self.assertEqual(len(sized), diag["observed_opening_sized_candidates"])
+        self.assertEqual(tp_matched, diag["detected_tp_matches"])
+        self.assertAlmostEqual(recall, diag["recall_tp"], places=3)
+        self.assertAlmostEqual(precision, diag["precision_tp"], places=3)
+        self.assertAlmostEqual(noise, diag["noise_fp_fraction"], places=3)
 
 
 # ---------------------------------------------------------------------------

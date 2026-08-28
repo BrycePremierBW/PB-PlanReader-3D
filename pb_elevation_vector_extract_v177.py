@@ -185,15 +185,27 @@ def recover_vector_rects(
         ...provenance fields...
         angle_tol_deg: allow segments within this angle of axis-aligned.
         min_side_pt: drop cells with any side shorter than this.
-        max_cells: safety cap on cells examined.
+        max_cells: safety cap on COMPLETED/ACCEPTED cells.  Must be >= 1.  A
+            cap hit sets a WORK-CAP truncation note; because the cap counts
+            accepted cells and max_cells >= 1, a cap hit NEVER returns an
+            empty list with no truncation signal.
 
     Returns:
-        List of VectorRectCandidate.
+        List of VectorRectCandidate.  When the cap is hit the returned list is
+        non-empty and every candidate carries an explicit WORK-CAP truncation
+        note.
     """
     # Coordinate-space guard: vector geometry is in PDF points; we only
     # convert to metres when the calibration is in pdf_point space.
     dimensional = (calibration.valid and calibration.coord_space == COORD_SPACE_PDF_POINT)
     pt_per_m = calibration.pt_per_m if dimensional else 0.0
+
+    # The cap counts COMPLETED/ACCEPTED cells.  A cap of 0 or negative would
+    # make a cap hit indistinguishable from an ordinary empty result (no
+    # legitimate cell could ever exist before truncation), so it is rejected
+    # up front rather than silently returning [].
+    if max_cells < 1:
+        raise ValueError("max_cells must be >= 1")
 
     h_extents: List[Tuple[float, float, float]] = []
     v_extents: List[Tuple[float, float, float]] = []
@@ -255,18 +267,10 @@ def recover_vector_rects(
         for x_l, x_r in zip(x_sorted, x_sorted[1:]):
             if x_r - x_l < min_side_pt:
                 continue
-            cells_run += 1
-            if cells_run > max_cells:
-                # Work cap hit: stop collecting, flag truncation.  We do NOT
-                # return raw tuples here — we always return a properly
-                # constructed List[VectorRectCandidate] with an explicit
-                # truncation/review signal (see below).
-                truncated = True
-                break
-            # both verticals must span y_b..y_t AND both horizontals must
-            # span x_l..x_r (already ensured via xs membership + the bot/top
-            # loops enforce horizontal span for their own line, but we must
-            # confirm the PAIR shares both xs).
+            # Validate closure BEFORE counting anything: the cap counts only
+            # COMPLETED/ACCEPTED cells, so a cap hit can only ever occur after
+            # at least one legitimate cell has been appended (never returning
+            # an empty list with no truncation signal).
             vl = v_by_x.get(round(x_l, 3))
             vr = v_by_x.get(round(x_r, 3))
             if not vl or not vr:
@@ -283,6 +287,15 @@ def recover_vector_rects(
             if not spans_both_h:
                 continue
             cells.append((x_l, y_b, x_r, y_t))
+            # Accepted/complete cell -> count toward the work cap.
+            cells_run += 1
+            if cells_run >= max_cells:
+                # Work cap hit: stop collecting, flag truncation.  Because the
+                # cap counts accepted cells and max_cells >= 1, `cells` is
+                # guaranteed non-empty here, so the WORK-CAP truncation signal
+                # is always visible in the returned candidates.
+                truncated = True
+                break
         if truncated:
             break
 

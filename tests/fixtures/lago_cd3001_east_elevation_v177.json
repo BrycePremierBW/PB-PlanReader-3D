@@ -1,5 +1,5 @@
 {
-  "fixture_version": 4,
+  "fixture_version": 5,
   "source": {
     "original_source_filename": "260617_004-LAGO-BRITINYA_ARCH-DRAWINGS_COMBINED 2.pdf",
     "local_source_alias": "260617_004-LAGO-BRITINYA_ARCH-DRAWINGS_COMBINED.pdf",
@@ -95,9 +95,9 @@
       "detected_tp_matches": 9,
       "annotated_tp_openings": 9,
       "recall_tp": 1.0,
-      "precision_tp": 0.562,
-      "noise_fp_fraction": 0.438,
-      "assessment": "Phase 2A only requires the detector to demonstrate useful signal above background noise. On this real positive crop all 9 independently-annotated openings are recovered (100% recall). The modest precision (0.562) reflects geometric over-segmentation fragments of the dense glazing bars and merged bay-frame boxes; no opening is fabricated elsewhere in the crop at opening scale. Precision/noise are computed from the independent annotation only, not from setting a threshold at the current output."
+      "precision_tp": 0.5625,
+      "noise_fp_fraction": 0.4375,
+      "assessment": "Phase 2A only requires the detector to demonstrate useful signal above background noise. On this real positive crop all 9 independently-annotated openings are recovered (100% recall). The modest precision (0.5625) reflects geometric over-segmentation fragments of the dense glazing bars and merged bay-frame boxes; no opening is fabricated elsewhere in the crop at opening scale. Precision/noise are computed from the independent annotation only, not from setting a threshold at the current output."
     }
   },
   "benchmark": {
