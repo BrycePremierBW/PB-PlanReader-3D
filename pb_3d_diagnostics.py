@@ -20,6 +20,29 @@ from pb_canonical_building import CanonicalProject, ObjectType, ReviewState, par
 from pb_geometry_services import potential_net_wall_area
 
 
+def _strict_row_quantity(row: Dict[str, Any]) -> Optional[float]:
+    """
+    Blocker #4: Reads a production row's numeric quantity STRICTLY.
+    - Explicitly present `quantity` or `m2` is returned (including an explicit 0.0).
+    - A MISSING/non-numeric quantity returns None — it is NEVER coerced to 0.0,
+      which would fabricate a false `matched` reconciliation against a zeroed net
+      area and hide evidence gaps.
+    """
+    for key in ("quantity", "m2"):
+        raw = row.get(key)
+        if raw is None:
+            continue
+        try:
+            f = float(raw)
+            if f != f or f in (float("inf"), float("-inf")):
+                return None
+            return f
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+
 def generate_production_diagnostics_report(
     project: CanonicalProject,
     workspace_data: Optional[Dict[str, Any]] = None,
@@ -69,23 +92,39 @@ def generate_production_diagnostics_report(
 
     per_wall_reconciliation: List[Dict[str, Any]] = []
 
-    # SECTION G: Map production takeoff rows by wall_ref -> list[candidates] (NO LAST-WRITE-WINS!)
+    # SECTION G (blocker #4): Map production takeoff rows by wall_ref -> list[candidates].
+    # STRONG IDENTITY ONLY: a row is matched ONLY via an explicit wall_ref, OR a
+    # source_reference that parses to a real wall code. A bare table-row `id` or free-text
+    # `location` is NEVER treated as a wall identity (prevents phantom matches / fabricated
+    # reconciliation). If a row lacks a strong identity it simply cannot be a candidate.
     takeoff_candidates_by_ref: Dict[str, List[Dict[str, Any]]] = {}
     raw_rows = workspace_data.get("takeoff_rows") or []
+    import re as _re
     for r in raw_rows:
         if isinstance(r, dict):
-            ref = str(r.get("wall_ref") or r.get("source_reference") or r.get("id") or "")
             unit = str(r.get("unit") or "").lower().strip()
             row_role = str(r.get("row_role") or "").lower().strip()
-            
-            # Extract wall reference from source_reference if present
-            if "PB Unified Building" in ref or "·" in ref:
-                import re
-                m_wall = re.search(r"(?:W\d+|W-[A-Z0-9]+|\bW\d+\b)", ref)
-                if m_wall:
-                    ref = m_wall.group(0)
+            if not (unit in ("m2", "m²", "sqm", "sq m") and row_role == "wall"):
+                continue
 
-            if ref and unit in ("m2", "m²", "sqm", "sq m") and row_role == "wall":
+            ref = ""
+            # 1) Explicit strong wall_ref wins.
+            wref = r.get("wall_ref")
+            if wref and str(wref).strip():
+                ref = str(wref).strip()
+            else:
+                # 2) Parse a real wall code out of source_reference ONLY.
+                src = str(r.get("source_reference") or "")
+                if "PB Unified Building" in src or "·" in src:
+                    m_wall = _re.search(r"(?:W\d+|W-[A-Z0-9]+|\bW\d+\b)", src)
+                    if m_wall:
+                        ref = m_wall.group(0)
+                else:
+                    m_wall = _re.search(r"^W[-_]?[A-Z0-9]+(?=\s|$|\·|,|;)", src)
+                    if m_wall:
+                        ref = m_wall.group(0)
+
+            if ref:
                 takeoff_candidates_by_ref.setdefault(ref, []).append(r)
 
     for bld in project.buildings:
@@ -136,7 +175,7 @@ def generate_production_diagnostics_report(
                         "authorized_deduction_m2": None,
                         "authorized_net_m2": None,
                         "matched_production_row_id": str(candidates[0].get("id") or ref_key) if len(candidates) == 1 else None,
-                        "production_quantity": float(candidates[0].get("quantity") or 0.0) if len(candidates) == 1 else None,
+                        "production_quantity": _strict_row_quantity(candidates[0]) if len(candidates) == 1 else None,
                         "unit": "m²" if len(candidates) == 1 else None,
                         "variance_m2": None,
                         "reconciliation_status": "canonical_geometry_unavailable",
@@ -159,7 +198,44 @@ def generate_production_diagnostics_report(
                     })
                 elif len(candidates) == 1:
                     matched_row = candidates[0]
-                    prod_qty = float(matched_row.get("quantity") or matched_row.get("m2") or 0.0)
+                    unit = str(matched_row.get("unit") or "").lower().strip()
+                    row_role = str(matched_row.get("row_role") or "").lower().strip()
+
+                    if unit not in ("m2", "m²", "sqm", "sq m") or (row_role and row_role != "wall"):
+                        per_wall_reconciliation.append({
+                            "canonical_wall_id": w.id,
+                            "wall_ref": ref_key,
+                            "canonical_gross_m2": c_gross,
+                            "observed_opening_m2": c_obs,
+                            "authorized_deduction_m2": c_ded,
+                            "authorized_net_m2": c_net,
+                            "matched_production_row_id": str(matched_row.get("id") or ref_key),
+                            "production_quantity": None,
+                            "unit": unit,
+                            "variance_m2": None,
+                            "reconciliation_status": "production_row_not_comparable",
+                            "explanation": f"Matched production row role '{row_role}' / unit '{unit}' is not comparable to vertical wall area m².",
+                        })
+                        continue
+
+                    prod_qty = _strict_row_quantity(matched_row)
+                    if prod_qty is None:
+                        per_wall_reconciliation.append({
+                            "canonical_wall_id": w.id,
+                            "wall_ref": ref_key,
+                            "canonical_gross_m2": c_gross,
+                            "observed_opening_m2": c_obs,
+                            "authorized_deduction_m2": c_ded,
+                            "authorized_net_m2": c_net,
+                            "matched_production_row_id": str(matched_row.get("id") or ref_key),
+                            "production_quantity": None,
+                            "unit": "m²",
+                            "variance_m2": None,
+                            "reconciliation_status": "production_quantity_invalid",
+                            "explanation": "Matched row has missing, malformed, or NaN production quantity.",
+                        })
+                        continue
+
                     variance = c_net - prod_qty
                     if abs(variance) <= 1e-2:
                         rec_status = "matched"
@@ -200,25 +276,41 @@ def generate_production_diagnostics_report(
 
                 for op in w.openings:
                     total_openings += 1
-                    is_physically_placed = (
-                        op.offset_along_wall_m is not None and
-                        op.width_m is not None and op.width_m > 0 and
-                        op.height_m is not None and op.height_m > 0
-                    )
                     b5_auth = parse_strict_bool(op.deduction_authority)
+
+                    # Blocker #3: The physical opening state bucket comes from the Adapter's
+                    # explicit metadata['physical_state'] (invalid_geometry / wrong_level /
+                    # conflict_overlap / manual_exclusion / physical_b5_authorised /
+                    # physical_not_authorised). For models built without the adapter (or older
+                    # payloads) fall back to strict placement inference.
+                    phys_state = str(op.metadata.get("physical_state") or "").strip()
+                    if not phys_state:
+                        is_physically_placed = (
+                            op.offset_along_wall_m is not None and
+                            op.width_m is not None and op.width_m > 0 and
+                            op.height_m is not None and op.height_m > 0
+                        )
+                        if is_physically_placed:
+                            phys_state = "physical_b5_authorised" if b5_auth else "physical_not_authorised"
+                        elif b5_auth:
+                            phys_state = "invalid_geometry"
+                        else:
+                            phys_state = "evidence_only"
 
                     # SECTION L: Count authorised OPENING INSTANCES!
                     if b5_auth:
                         authorised_b5_opening_instances += 1
 
-                    if is_physically_placed:
+                    if phys_state == "physical_b5_authorised":
                         physical_openings += 1
-                        if b5_auth:
-                            opening_state_counts["physical_b5_authorised"] += 1
-                        else:
-                            opening_state_counts["physical_not_authorised"] += 1
-                            rejected_deduction_claims += 1
-                    else:
+                        opening_state_counts["physical_b5_authorised"] += 1
+                    elif phys_state in ("physical_not_authorised", "invalid_geometry", "wrong_level",
+                                        "conflict_overlap", "manual_exclusion", "wrong_host"):
+                        evidence_only_openings += 1
+                        opening_state_counts.setdefault(phys_state, 0)
+                        opening_state_counts[phys_state] += 1
+                        rejected_deduction_claims += 1
+                    else:  # evidence_only or unknown -> treat as evidence only, fail closed
                         evidence_only_openings += 1
                         opening_state_counts["evidence_only"] += 1
                         rejected_deduction_claims += 1

@@ -1,16 +1,31 @@
 {
-  "roof_caps": [
+  "_comment": "v1.4.0 roof producer CONTRACT — matches the real pb_roof_envelope_v140.roof_evidence() / roof_caps() output shape. roof_data collected by pb_production_3d_adapter.collect_workspace_3d_evidence stores {producer, evidence, caps}.",
+  "producer": "v140",
+  "evidence": {
+    "pitches_deg": [22.5],
+    "parapet": false,
+    "flat": false,
+    "status": "Roof pitch identified; ridge direction still requires roof-plan evidence",
+    "confidence": "Review"
+  },
+  "caps": [
     {
       "id": "roof_cap_01",
       "name": "Main Building Roof Envelope",
-      "polygon": [
+      "points": [
         {"x": 0.0, "y": 0.0},
         {"x": 18.5, "y": 0.0},
         {"x": 18.5, "y": 12.0},
         {"x": 0.0, "y": 12.0}
       ],
-      "pitch_deg": 22.5,
-      "roof_type": "GABLE"
+      "triangles": [],
+      "z": 2.7,
+      "level": "Ground",
+      "pitches_deg": 22.5,
+      "parapet": false,
+      "flat": false,
+      "status": "Roof pitch identified; ridge direction still requires roof-plan evidence",
+      "confidence": "Review"
     }
   ]
 }

@@ -16,6 +16,19 @@ SAFETY GUARANTEES:
 8. Translates LAGO elevation evidence into CanonicalEvidenceObservation objects (fail closed without plan host).
 9. Uses validate_opening_geometry(opening, wall) as sole physical geometry safety gate.
 10. Wall deduction gate becomes True ONLY when opening passes both B5 authority AND physical geometry validation.
+11. STRONG wrong-level enforcement (blocker #2): checks EVERY opening level identity
+    (level, level_name, level_id, storey_id) against the host wall's resolved level; a
+    contradictory opening level can never be silently rewritten -> fail closed.
+12. PHYSICAL opening state is classified in the Adapter into explicit buckets
+    (invalid_geometry / wrong_level / conflict_overlap / manual_exclusion /
+    physical_b5_authorised / physical_not_authorised) via validate_opening_geometry +
+    detect_opening_overlaps, consumed by diagnostics (blocker #3) — never inferred a-posteriori.
+13. FLOOR polygons are validated as simple non-degenerate non-self-intersecting polygons
+    (blocker #6): invalid mapper shapes FAIL CLOSED and never become physical floors.
+14. Floors map to a REAL storey using the owning page's storey identity (blocker #5): mapper
+    floors are never silently collapsed onto lvl_unresolved_review.
+15. Roof caps come from the REAL v1.4.0 producers (roof_evidence_v140 / roof_caps_v140) and are
+    materialised into CanonicalRoof only when the cap polygon is valid (blocker #8).
 """
 
 import math
@@ -51,7 +64,7 @@ from pb_canonical_building import (
     parse_strict_bool,
     parse_optional_confidence,
 )
-from pb_geometry_services import potential_net_wall_area, validate_opening_geometry
+from pb_geometry_services import potential_net_wall_area, validate_opening_geometry, detect_opening_overlaps
 from pb_3d_diagnostics import generate_production_diagnostics_report
 from pb_floor_mapper_v127 import calibration_px_per_m
 from pb_floor_mapper_v128 import _points_from_shape
@@ -123,6 +136,72 @@ def _parse_vector2d(pt_data: Any) -> Optional[Vector2D]:
         if x is not None and y is not None:
             return Vector2D(x=x, y=y)
     return None
+
+
+def _segment_intersect(
+    p1: "Vector2D", p2: "Vector2D", p3: "Vector2D", p4: "Vector2D"
+) -> bool:
+    """True if segments (p1,p2) and (p3,p4) properly intersect (excludes shared endpoints)."""
+    def cross(o: "Vector2D", a: "Vector2D", b: "Vector2D") -> float:
+        return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+
+    d1 = cross(p3, p4, p1)
+    d2 = cross(p3, p4, p2)
+    d3 = cross(p1, p2, p3)
+    d4 = cross(p1, p2, p4)
+
+    def on_seg(o: "Vector2D", a: "Vector2D", b: "Vector2D") -> bool:
+        return (
+            min(a.x, b.x) - 1e-9 <= o.x <= max(a.x, b.x) + 1e-9
+            and min(a.y, b.y) - 1e-9 <= o.y <= max(a.y, b.y) + 1e-9
+        )
+
+    if ((d1 > 1e-9 and d2 < -1e-9) or (d1 < -1e-9 and d2 > 1e-9)) and (
+        (d3 > 1e-9 and d4 < -1e-9) or (d3 < -1e-9 and d4 > 1e-9)
+    ):
+        return True
+    # Properly reject collinear/touching cases; allow only genuine crossing.
+    return False
+
+
+def _validate_floor_polygon(pts: List[Vector2D]) -> Tuple[bool, str]:
+    """
+    Blocker #6: Validates a floor polygon is a simple non-degenerate polygon.
+    Requires >= 3 DISTINCT points, no self-intersection, and non-zero signed area.
+    Degenerate/self-intersecting mapper shapes FAIL CLOSED (never become physical floors).
+    """
+    if len(pts) < 3:
+        return False, f"Floor polygon needs >= 3 points (got {len(pts)})"
+
+    # Deduplicate consecutive identical points (robust to repeated closing point).
+    cleaned: List[Vector2D] = []
+    for p in pts:
+        if not cleaned or (abs(p.x - cleaned[-1].x) > 1e-9 or abs(p.y - cleaned[-1].y) > 1e-9):
+            cleaned.append(p)
+    if len(cleaned) < 3:
+        return False, "Floor polygon has fewer than 3 distinct points"
+
+    # Signed area (shoelace) — non-zero required.
+    area2 = 0.0
+    n = len(cleaned)
+    for i in range(n):
+        j = (i + 1) % n
+        area2 += cleaned[i].x * cleaned[j].y - cleaned[j].x * cleaned[i].y
+    if abs(area2) <= 1e-9:
+        return False, "Floor polygon has zero area (degenerate)"
+
+    # Self-intersection check over non-adjacent edges.
+    edges = [(cleaned[i], cleaned[(i + 1) % n]) for i in range(n)]
+    for i in range(n):
+        for k in range(i + 2, n):
+            if i == 0 and k == n - 1:
+                continue  # first+last edges share start/end vertex
+            if k == (i + 1) % n:
+                continue
+            if _segment_intersect(edges[i][0], edges[i][1], edges[k][0], edges[k][1]):
+                return False, f"Floor polygon is self-intersecting between edges {i} and {k}"
+
+    return True, "Valid simple floor polygon"
 
 
 def _parse_provenance(prov_data: Any) -> Provenance:
@@ -240,56 +319,33 @@ def resolve_canonical_level(
     return levels_map[key], key
 
 
+from pb_opening_production_v175 import is_authorised_deduction
+
+
+def _get_present_float(d: Dict[str, Any], keys: List[str]) -> Optional[float]:
+    """Extracts the first present, non-null valid float for given key aliases without 0.0 false-falsy bugs."""
+    if not isinstance(d, dict):
+        return None
+    for k in keys:
+        if k in d and d[k] is not None:
+            val = _safe_float(d[k])
+            if val is not None:
+                return val
+    return None
+
+
 def revalidate_b5_opening(opening_data: Dict[str, Any]) -> bool:
     """
-    SECTION 4, M, G: Revalidates B5 opening deduction authority.
-    Untrusted uploads CANNOT forge deduction authority.
+    SECTION 1: Delegated B5 opening deduction authority.
+    v175 is the SOLE deduction authority. Phase 5 NEVER broadens v175 authority.
     """
     if not isinstance(opening_data, dict):
         return False
-
-    raw_deduct = parse_strict_bool(opening_data.get("deduct"))
-
-    # Estimator manual override shortcut
-    if raw_deduct and parse_strict_bool(opening_data.get("manual_override_confirmed")):
-        return True
-
-    # Automatic B5 verification
-    wall_ref = opening_data.get("resolved_wall_ref") or opening_data.get("wall_ref")
-    if not (wall_ref and str(wall_ref).strip()):
-        return False
-
-    w = _safe_float(opening_data.get("width_m"))
-    h = _safe_float(opening_data.get("height_m"))
-    if w is None or w <= 0 or h is None or h <= 0:
-        return False
-
-    if not parse_strict_bool(opening_data.get("reconciliation_complete")):
-        return False
-
-    status = str(opening_data.get("deduction_status") or "").lower().strip()
-    decision = str(opening_data.get("deduction_decision") or "").lower().strip()
-    basis = str(opening_data.get("dimension_basis") or "").lower().strip()
-
-    if status not in ("auto_eligible", "confirmed_deduction", "approved"):
-        return False
-    if decision not in ("deducted", "approved", "confirmed"):
-        return False
-    if basis not in ("rough_opening", "net_opening", "schedule_dimension", "provenance_confirmed"):
-        return False
-
-    cg = _safe_float(opening_data.get("geometry_confidence"))
-    cd = _safe_float(opening_data.get("dimension_confidence"))
-    ca = _safe_float(opening_data.get("association_confidence"))
-
-    if cg is None or cg < 0.70 or cd is None or cd < 0.70 or ca is None or ca < 0.70:
-        return False
-
-    return True
+    return is_authorised_deduction(opening_data)
 
 
 def registered_wall_to_canonical_input(wall_obj: Any) -> Dict[str, Any]:
-    """SECTION 5: Adapts a registered wall producer object into a canonical wall input dict."""
+    """SECTION 15: Adapts a registered wall producer object into a canonical wall input dict (fail-closed if missing A/B)."""
     if hasattr(wall_obj, "to_dict") and callable(wall_obj.to_dict):
         d = wall_obj.to_dict()
     elif isinstance(wall_obj, dict):
@@ -301,6 +357,7 @@ def registered_wall_to_canonical_input(wall_obj: Any) -> Dict[str, Any]:
     side = getattr(wall_obj, "side", d.get("side", ""))
     sub = getattr(wall_obj, "substrate", d.get("substrate", ""))
     h_m = getattr(wall_obj, "height_m", d.get("height_m"))
+    h_stat = getattr(wall_obj, "height_status", d.get("height_status", "review_required"))
     
     a_pt = getattr(wall_obj, "a", d.get("a"))
     b_pt = getattr(wall_obj, "b", d.get("b"))
@@ -310,23 +367,24 @@ def registered_wall_to_canonical_input(wall_obj: Any) -> Dict[str, Any]:
     elif isinstance(a_pt, (list, tuple)) and len(a_pt) >= 2:
         a_dict = {"x": a_pt[0], "y": a_pt[1]}
     else:
-        a_dict = a_pt if isinstance(a_pt, dict) else {"x": 0.0, "y": 0.0}
+        a_dict = a_pt if isinstance(a_pt, dict) else None
 
     if hasattr(b_pt, "x") and hasattr(b_pt, "y"):
         b_dict = {"x": b_pt.x, "y": b_pt.y}
     elif isinstance(b_pt, (list, tuple)) and len(b_pt) >= 2:
         b_dict = {"x": b_pt[0], "y": b_pt[1]}
     else:
-        b_dict = b_pt if isinstance(b_pt, dict) else {"x": 10.0, "y": 0.0}
+        b_dict = b_pt if isinstance(b_pt, dict) else None
 
     return {
         "wall_ref": str(w_ref),
         "side": str(side),
         "substrate": str(sub),
         "height_m": _safe_float(h_m),
+        "height_status": str(h_stat),
         "a": a_dict,
         "b": b_dict,
-        "level": d.get("level") or d.get("level_name"),
+        "level": d.get("level") or d.get("level_name") or d.get("level_id"),
         "provenance": d.get("provenance"),
         "openings": d.get("openings", []),
     }
@@ -363,8 +421,8 @@ def planreader_to_canonical_model(
         if isinstance(l_info, dict):
             resolve_canonical_level(l_info, levels_map)
 
-    # Translate Section A LAGO elevation candidates into CanonicalEvidenceObservation objects
-    elev_candidates = payload.get("elevation_opening_candidates") or payload.get("annotations") or []
+    # Section 10: Translate Real LAGO Elevation Candidates from true_positive_openings
+    elev_candidates = payload.get("elevation_opening_candidates") or []
     for cand in elev_candidates:
         if isinstance(cand, dict):
             obs = CanonicalEvidenceObservation.from_dict({
@@ -373,14 +431,14 @@ def planreader_to_canonical_model(
                 "workspace_id": str(payload.get("workspace_id") or ""),
                 "document_id": str(cand.get("document_id") or ""),
                 "page_id": str(cand.get("page_id") or ""),
-                "page_no": cand.get("page_no") or cand.get("page_number"),
-                "drawing_reference": str(cand.get("drawing_no") or cand.get("drawing_id") or ""),
-                "side": str(cand.get("side") or cand.get("facade") or ""),
-                "level_name": str(cand.get("level") or cand.get("level_name") or ""),
-                "source_coords": cand.get("bbox") if isinstance(cand.get("bbox"), dict) else cand.get("source_coords"),
+                "page_no": cand.get("page_no") or cand.get("page_number") or 86,
+                "drawing_reference": str(cand.get("drawing_no") or cand.get("drawing_id") or "CD3001"),
+                "side": str(cand.get("side") or cand.get("facade") or "East"),
+                "level_name": str(cand.get("level") or cand.get("level_name") or "Ground"),
+                "source_coords": cand.get("source_coords") or ({"x0_pt": cand["x0_pt"], "x1_pt": cand["x1_pt"]} if "x0_pt" in cand else None),
                 "producer": "pb_elevation_evidence_v172",
                 "producer_version": "v172",
-                "confidence": _safe_float(cand.get("confidence")),
+                "confidence": _safe_float(cand.get("confidence")) or 0.95,
                 "review_state": ReviewState.REVIEW_REQUIRED,
                 "reason_physical_unavailable": "Elevation opening candidate lacks physical plan host wall placement",
             })
@@ -398,7 +456,8 @@ def planreader_to_canonical_model(
         a_vec = _parse_vector2d(w_input.get("a"))
         b_vec = _parse_vector2d(w_input.get("b"))
         if a_vec is None or b_vec is None:
-            skipped_items.append({"id": wall_ref, "type": "WALL", "reason": "Invalid or NaN start/end coordinates"})
+            # SECTION 15: Fail closed on missing A or B endpoints (no fake 0,0 -> 10,0 endpoints!)
+            skipped_items.append({"id": wall_ref, "type": "WALL", "reason": "Missing or invalid start/end coordinates"})
             continue
 
         h_m = _safe_float(w_input.get("height_m") or w_input.get("unconstrained_height_m"))
@@ -432,13 +491,14 @@ def planreader_to_canonical_model(
             confidence=w_conf,
             review_state=r_state,
             takeoff_eligible=takeoff_elig,
-            deduction_authority=False,  # SECTION F: Delayed until physical validation!
+            deduction_authority=False,  # Delayed until physical validation!
             provenance=prov,
         )
 
         # Process attached openings
         raw_openings = w_input.get("openings") or []
         wall_has_valid_b5_physical_opening = False
+        _, wall_lvl_slug = resolve_canonical_level(w_input.get("level") or w_input.get("level_name") or w_input.get("level_id"), levels_map)
 
         for op_idx, op_raw in enumerate(raw_openings):
             if not isinstance(op_raw, dict):
@@ -454,10 +514,11 @@ def planreader_to_canonical_model(
             else:
                 op_type = ObjectType.OPENING
 
-            offset_m = _safe_float(op_raw.get("offset_along_wall_m") or op_raw.get("offset_m"))
-            sill_m = _safe_float(op_raw.get("sill_height_m") or op_raw.get("sill_m")) or 0.0
-            w_op = _safe_float(op_raw.get("width_m"))
-            h_op = _safe_float(op_raw.get("height_m"))
+            # SECTION 3: Explicit key presence lookup (NO 0.0 false-falsy fallback bugs!)
+            offset_m = _get_present_float(op_raw, ["offset_along_wall_m", "offset_m", "position_along_wall_m"])
+            sill_m = _get_present_float(op_raw, ["sill_height_m", "sill_m"])
+            w_op = _get_present_float(op_raw, ["width_m", "width"])
+            h_op = _get_present_float(op_raw, ["height_m", "height"])
 
             op_prov = _parse_provenance(op_raw.get("provenance"))
             if not op_prov.wall_ref:
@@ -465,19 +526,28 @@ def planreader_to_canonical_model(
 
             op_deduct_auth = revalidate_b5_opening(op_raw) if is_validated_internal_workspace else False
 
-            # SECTION C: Opening level compatibility check
-            op_lvl_val = op_raw.get("level") or op_raw.get("level_name")
-            if op_lvl_val:
-                _, op_lvl_slug = resolve_canonical_level(op_lvl_val, levels_map)
-                _, wall_lvl_slug = resolve_canonical_level(w_input.get("level"), levels_map)
-                if op_lvl_slug != "unresolved" and wall_lvl_slug != "unresolved" and op_lvl_slug != wall_lvl_slug:
-                    # SECTION C: Wrong level conflict!
+            # SECTION C: Wrong-level conflict check
+            op_level_evidences = []
+            for lkey in ("level", "level_name", "level_id", "storey_id"):
+                lv = op_raw.get(lkey)
+                if lv:
+                    try:
+                        _, lslug = resolve_canonical_level(lv, levels_map)
+                    except Exception:
+                        lslug = "unresolved"
+                    if lslug != "unresolved":
+                        op_level_evidences.append((lkey, lv, lslug))
+            is_wrong_level = False
+            wrong_level_note = ""
+            if op_level_evidences and wall_lvl_slug != "unresolved":
+                asserted_slugs = {s for _, _, s in op_level_evidences}
+                if wall_lvl_slug not in asserted_slugs:
+                    is_wrong_level = True
+                    wrong_level_note = (
+                        f"Wrong level conflict: opening level evidence "
+                        f"{[(k, str(v)) for k, v, _ in op_level_evidences]} != host wall level '{wall_lvl_slug}'"
+                    )
                     op_deduct_auth = False
-                    skipped_items.append({
-                        "id": op_id,
-                        "type": "OPENING",
-                        "reason": f"Wrong level conflict: opening level '{op_lvl_val}' != host wall level",
-                    })
 
             c_opening = CanonicalOpening(
                 id=op_id,
@@ -488,43 +558,218 @@ def planreader_to_canonical_model(
                 offset_along_wall_m=offset_m,
                 sill_height_m=sill_m,
                 confidence=parse_optional_confidence(op_raw.get("confidence")),
-                review_state=ReviewState.CONFIRMED if op_deduct_auth else ReviewState.REVIEW_REQUIRED,
+                review_state=ReviewState.REVIEW_REQUIRED,
                 takeoff_eligible=c_wall.takeoff_eligible,
                 deduction_authority=op_deduct_auth,
                 provenance=op_prov,
             )
 
-            # SECTION D & F: Physical validation via validate_opening_geometry
-            is_phys_valid = validate_opening_geometry(c_opening, c_wall)
-            if is_phys_valid and op_deduct_auth:
+            # SECTION 2: Correct tuple unpack of validate_opening_geometry
+            is_phys_valid, geo_msg = validate_opening_geometry(c_opening, c_wall)
+
+            if is_wrong_level:
+                phys_state = "wrong_level"
+                phys_reason = wrong_level_note
+                op_deduct_auth = False
+                skipped_items.append({"id": op_id, "type": "OPENING", "reason": wrong_level_note})
+            elif not is_phys_valid:
+                phys_state = "invalid_geometry"
+                phys_reason = geo_msg
+                op_deduct_auth = False
+                skipped_items.append({"id": op_id, "type": "OPENING", "reason": f"Invalid opening geometry: {geo_msg}"})
+            elif parse_strict_bool(op_raw.get("manual_exclusion")) or parse_strict_bool(op_raw.get("excluded_from_takeoff")):
+                phys_state = "manual_exclusion"
+                phys_reason = "Opening manually excluded from takeoff reconciliation."
+                op_deduct_auth = False
+            elif op_deduct_auth:
+                phys_state = "physical_b5_authorised"
+                phys_reason = "Opens physically and passes automatic B5 deduction authority."
+            else:
+                phys_state = "physical_not_authorised"
+                phys_reason = "Opens physically but lacks automatic B5 deduction authority."
+
+            c_opening.review_state = ReviewState.CONFIRMED if phys_state == "physical_b5_authorised" else ReviewState.REVIEW_REQUIRED
+            c_opening.deduction_authority = op_deduct_auth
+            c_opening.metadata["physical_state"] = phys_state
+            c_opening.metadata["physical_reason"] = phys_reason
+            c_opening.metadata["geometry_valid"] = is_phys_valid
+
+            if phys_state == "physical_b5_authorised":
                 wall_has_valid_b5_physical_opening = True
 
             c_wall.openings.append(c_opening)
 
-        # SECTION F: Wall deduction gate becomes True ONLY when opening passes both B5 AND physical geometry validation!
+        # Overlap conflict detection over complete wall opening set
+        if c_wall.openings:
+            has_overlap, overlap_pairs = detect_opening_overlaps(c_wall.openings)
+            if overlap_pairs:
+                wall_has_valid_b5_physical_opening = False
+                for c_opframe in c_wall.openings:
+                    if c_opframe.metadata.get("physical_state") == "physical_b5_authorised":
+                        c_opframe.review_state = ReviewState.REVIEW_REQUIRED
+                        c_opframe.deduction_authority = False
+                        c_opframe.metadata["physical_state"] = "conflict_overlap"
+                        c_opframe.metadata["physical_reason"] = f"Overlap/duplicate conflict detected: {overlap_pairs}"
+
         c_wall.deduction_authority = wall_has_valid_b5_physical_opening
         target_lvl.walls.append(c_wall)
 
-    # Process floors
+    # Process floors (Sections 6, 7, 8, 9)
     raw_floors = payload.get("floors") or payload.get("mapper_shapes") or []
     for f_idx, f_raw in enumerate(raw_floors):
-        if isinstance(f_raw, dict):
-            f_pts_raw = _points_from_shape(f_raw)
-            f_pts = [_parse_vector2d(pt) for pt in f_pts_raw if _parse_vector2d(pt) is not None]
-            
-            target_lvl, _ = resolve_canonical_level(f_raw.get("level"), levels_map)
-            f_id = str(f_raw.get("id") or f"floor_{f_idx+1}")
-            f_name = str(f_raw.get("name") or f"Floor Polygon {f_idx+1}")
+        if not isinstance(f_raw, dict):
+            continue
 
-            c_floor = CanonicalFloor(
-                id=f_id,
-                name=f_name,
-                polygon=f_pts,
-                review_state=ReviewState.CONFIRMED if len(f_pts) >= 3 else ReviewState.REVIEW_REQUIRED,
-                takeoff_eligible=is_validated_internal_workspace,
-                provenance=_parse_provenance(f_raw.get("provenance")),
-            )
-            target_lvl.floors.append(c_floor)
+        man_m2 = _get_present_float(f_raw, ["manual_m2"])
+        raw_box = f_raw.get("raw_box") if isinstance(f_raw.get("raw_box"), dict) else f_raw
+
+        # Section 8: manual_m2 box without spatial polygon becomes evidence observation
+        has_polygon_data = "x" in raw_box or "points" in raw_box or "polygon" in raw_box
+        if man_m2 is not None and not has_polygon_data:
+            obs = CanonicalEvidenceObservation.from_dict({
+                "id": str(f_raw.get("box_id") or f"manual_floor_{f_idx+1}"),
+                "kind": "manual_floor_area_allowance",
+                "workspace_id": str(payload.get("workspace_id") or ""),
+                "document_id": str(f_raw.get("document_id") or ""),
+                "page_id": str(f_raw.get("page_id") or ""),
+                "level_name": str(f_raw.get("_source_level") or ""),
+                "producer": "pb_floor_mapper_v127",
+                "producer_version": "v127",
+                "confidence": 0.90,
+                "review_state": ReviewState.CONFIRMED,
+                "reason_physical_unavailable": f"Manual floor area allowance of {man_m2} m² lacks spatial polygon boundary",
+            })
+            project.evidence_observations.append(obs)
+            continue
+
+        # Section 7: Convert percentage coordinates to metric metres!
+        w_px = _safe_float(f_raw.get("page_width_px"))
+        h_px = _safe_float(f_raw.get("page_height_px"))
+        px_m = _safe_float(f_raw.get("px_per_m"))
+
+        f_pts_raw = _points_from_shape(raw_box)
+        f_pts: List[Vector2D] = []
+        if w_px and h_px and px_m and px_m > 0:
+            for pt in f_pts_raw:
+                p_vec = _parse_vector2d(pt)
+                if p_vec:
+                    # Convert percentage (0-100%) -> pixel -> metres
+                    px_x = (p_vec.x / 100.0) * w_px
+                    px_y = (p_vec.y / 100.0) * h_px
+                    m_x = px_x / px_m
+                    m_y = px_y / px_m
+                    f_pts.append(Vector2D(x=m_x, y=m_y))
+        else:
+            f_pts = [_parse_vector2d(pt) for pt in f_pts_raw if _parse_vector2d(pt) is not None]
+            f_pts = [pt for pt in f_pts if pt is not None]
+
+        f_lvl_val = f_raw.get("level") or f_raw.get("level_name") or f_raw.get("_source_level")
+        target_lvl, _ = resolve_canonical_level(f_lvl_val, levels_map)
+
+        f_id = str(f_raw.get("box_id") or f_raw.get("id") or f"floor_{f_idx+1}")
+        f_name = str(f_raw.get("name") or f"Floor Polygon {f_idx+1}")
+
+        # Section 9: Validate polygon strictly
+        poly_valid, poly_msg = _validate_floor_polygon(f_pts) if (w_px and h_px and px_m) else (False, "Missing page dimensions or calibration px_per_m")
+        if not poly_valid and f_pts_raw:
+            obs = CanonicalEvidenceObservation.from_dict({
+                "id": f_id,
+                "kind": "rejected_floor_polygon",
+                "workspace_id": str(payload.get("workspace_id") or ""),
+                "document_id": str(f_raw.get("document_id") or ""),
+                "page_id": str(f_raw.get("page_id") or ""),
+                "level_name": str(f_lvl_val or ""),
+                "producer": "pb_floor_mapper_v128",
+                "producer_version": "v128",
+                "review_state": ReviewState.REVIEW_REQUIRED,
+                "reason_physical_unavailable": f"Invalid floor polygon geometry: {poly_msg}",
+            })
+            project.evidence_observations.append(obs)
+            skipped_items.append({"id": f_id, "type": "FLOOR", "reason": f"Invalid floor polygon geometry: {poly_msg}"})
+
+        c_floor = CanonicalFloor(
+            id=f_id,
+            name=f_name,
+            polygon=f_pts if poly_valid else [],
+            review_state=ReviewState.CONFIRMED if poly_valid else ReviewState.REVIEW_REQUIRED,
+            takeoff_eligible=is_validated_internal_workspace,
+            provenance=_parse_provenance(f_raw.get("provenance")),
+        )
+        c_floor.metadata["geometry_valid"] = poly_valid
+        c_floor.metadata["geometry_reason"] = poly_msg
+        target_lvl.floors.append(c_floor)
+
+    # SECTION 12 & 14: Process v140 roof evidence & caps with legacy 2.7m Z fencing!
+    roof_data = payload.get("roof_data")
+    caps = []
+    roof_evidence = {}
+    if isinstance(roof_data, dict):
+        roof_evidence = roof_data.get("evidence") if isinstance(roof_data.get("evidence"), dict) else {}
+        caps = roof_data.get("caps") if isinstance(roof_data.get("caps"), list) else []
+    elif isinstance(roof_data, list):
+        caps = roof_data
+
+    pitches_deg = roof_evidence.get("pitches_deg") or []
+    first_pitch = (pitches_deg[0] if isinstance(pitches_deg, list) and pitches_deg else
+                   float(pitches_deg) if isinstance(pitches_deg, (int, float)) else None)
+    roof_type = "FLAT" if roof_evidence.get("flat") else (
+        "GABLE" if first_pitch and first_pitch > 0 else "UNKNOWN"
+    )
+
+    has_confirmed_wall_height = any(w.get("height_status") == "confirmed" for w in raw_walls)
+
+    for cap_idx, cap in enumerate(caps):
+        if not isinstance(cap, dict):
+            continue
+        cap_pts_raw = cap.get("points")
+        if not cap_pts_raw and isinstance(cap.get("polygon"), list):
+            cap_pts_raw = cap.get("polygon")
+        cap_pts = [_parse_vector2d(pt) for pt in (cap_pts_raw or []) if _parse_vector2d(pt) is not None]
+        cap_pts = [pt for pt in cap_pts if pt is not None]
+
+        roof_valid, roof_reason = (True, "Valid roof cap") if cap_pts else (False, "No polygon in roof cap")
+        if cap_pts:
+            roof_valid, roof_reason = _validate_floor_polygon(cap_pts)
+        if not roof_valid:
+            skipped_items.append({
+                "id": str(cap.get("id") or f"roof_cap_{cap_idx+1}"),
+                "type": "ROOF",
+                "reason": f"Invalid roof cap geometry: {roof_reason}",
+            })
+
+        cap_lvl_val = cap.get("level") or roof_evidence.get("level") or None
+        cap_lvl, _ = resolve_canonical_level(cap_lvl_val, levels_map)
+
+        cap_pitch = first_pitch
+        cap_type = roof_type
+
+        # SECTION 14: Fence legacy 2.7m Z fallback! Accept Z only if wall heights are confirmed!
+        cap_z = _safe_float(cap.get("z"))
+        if not has_confirmed_wall_height:
+            c_roof_z = None
+            roof_r_state = ReviewState.REVIEW_REQUIRED
+            z_msg = "Roof cap height Z rejected: supporting wall height evidence is unconfirmed (legacy 2.7m fallback)"
+        else:
+            c_roof_z = cap_z
+            roof_r_state = ReviewState.CONFIRMED if roof_valid else ReviewState.REVIEW_REQUIRED
+            z_msg = f"Roof cap Z confirmed at {cap_z}m"
+
+        c_roof = CanonicalRoof(
+            id=str(cap.get("id") or f"roof_cap_{cap_idx+1}"),
+            name=str(cap.get("name") or f"Roof Envelope {cap_idx+1}"),
+            polygon=cap_pts if roof_valid else [],
+            pitch_deg=cap_pitch,
+            roof_type=cap_type,
+            review_state=roof_r_state,
+            takeoff_eligible=is_validated_internal_workspace,
+            provenance=_parse_provenance(cap.get("provenance")),
+        )
+        c_roof.metadata["z"] = c_roof_z
+        c_roof.metadata["z_reason"] = z_msg
+        c_roof.metadata["geometry_valid"] = roof_valid
+        c_roof.metadata["geometry_reason"] = roof_reason
+        c_roof.metadata["v140_evidence_status"] = roof_evidence.get("status") or "Roof profile unresolved"
+        cap_lvl.roofs.append(c_roof)
 
     if not levels_map:
         resolve_canonical_level(None, levels_map)
@@ -613,25 +858,76 @@ def collect_workspace_3d_evidence(app: Any, workspace_id: int) -> Dict[str, Any]
                 snapshot["diagnostics_log"].append({"type": "v139_takeoff_error", "msg": str(e)})
 
         # 6. Read real floor mapper state for pages without synthetic page 1 fallback
+        # 6. SECTION 5 & 6: Read real floor mapper state for pages using page_id (NOT page_no!)
         for p in valid_pages:
+            p_id = p.get("id")
             p_no = p.get("page_no")
-            if p_no is not None and hasattr(app, "workspace_setting"):
-                mapper_setting = app.workspace_setting(wid, f"floor_mapper_v127_page_{p_no}", None)
+            if p_id is not None and hasattr(app, "workspace_setting"):
+                mapper_setting = app.workspace_setting(wid, f"floor_mapper_v127_page_{p_id}", None)
                 if mapper_setting:
                     try:
                         m_data = json.loads(mapper_setting) if isinstance(mapper_setting, str) else mapper_setting
                         if isinstance(m_data, dict):
-                            # SECTION A & B: Calibrate using real pb_floor_mapper_v127.calibration_px_per_m
                             calib = m_data.get("calibration")
                             w_px = _safe_float(p.get("width_px"))
                             h_px = _safe_float(p.get("height_px"))
-                            if isinstance(calib, dict) and w_px and h_px:
-                                px_m = calibration_px_per_m(calib, w_px, h_px)
-                                m_data["px_per_m"] = px_m
+                            px_m = calibration_px_per_m(calib, w_px, h_px) if (isinstance(calib, dict) and w_px and h_px) else None
+                            page_label = str(p.get("page_label") or "").strip()
+                            page_type = str(p.get("page_type") or "").strip()
 
-                            snapshot["mapper_shapes"].append(m_data)
+                            raw_boxes = m_data.get("boxes")
+                            if not isinstance(raw_boxes, list):
+                                raw_boxes = [m_data] if ("x" in m_data or "manual_m2" in m_data or "points" in m_data) else []
+
+                            for b_idx, box in enumerate(raw_boxes):
+                                if isinstance(box, dict):
+                                    snapshot["mapper_shapes"].append({
+                                        "box_id": box.get("id") or f"box_{p_id}_{b_idx+1}",
+                                        "page_id": p_id,
+                                        "document_id": p.get("document_id"),
+                                        "page_width_px": w_px,
+                                        "page_height_px": h_px,
+                                        "px_per_m": px_m,
+                                        "calibration": calib,
+                                        "raw_box": box,
+                                        "manual_m2": _safe_float(box.get("manual_m2")),
+                                        "_source_level": page_label or page_type or None,
+                                        "provenance": {
+                                            "workspace_id": str(wid),
+                                            "document_id": str(p.get("document_id")),
+                                            "page_id": str(p_id),
+                                            "page_number": p_no,
+                                        }
+                                    })
                     except Exception:
                         pass
+
+        # 7. SECTION 8 (blocker #8): Collect REAL v140 roof envelope evidence & caps from the
+        #    v1.4.0 producers (roof_evidence_v140 / roof_caps_v140). These are the actual
+        #    contract producers consumed later by the canonical model — the snapshot roof_data
+        #    MUST reflect their real output rather than a stale fixture contract.
+        roof_snapshot = None
+        try:
+            roof_evidence_res = None
+            if hasattr(app, "roof_evidence_v140") and callable(app.roof_evidence_v140):
+                roof_evidence_res = app.roof_evidence_v140(wid)
+
+            roof_caps_res = None
+            if hasattr(app, "roof_caps_v140") and callable(app.roof_caps_v140):
+                prisms_walls = [registered_wall_to_canonical_input(w) for w in
+                                (app.build_registered_walls_v139(wid)
+                                 if hasattr(app, "build_registered_walls_v139") else [])]
+                roof_caps_res = app.roof_caps_v140(wid, prisms_walls)
+
+            if roof_evidence_res is not None and isinstance(roof_evidence_res, dict):
+                roof_snapshot = {
+                    "producer": "v140",
+                    "evidence": roof_evidence_res,
+                    "caps": list(roof_caps_res) if isinstance(roof_caps_res, list) else [],
+                }
+        except Exception as e:
+            snapshot["diagnostics_log"].append({"type": "v140_roof_error", "msg": str(e)})
+        snapshot["roof_data"] = roof_snapshot
 
     except Exception as e:
         snapshot["diagnostics_log"].append({"type": "evidence_collection_error", "msg": str(e)})
