@@ -1,9 +1,8 @@
-"""Production entry point for PlanReader using the original sidebar/navigation.
+"""Production entry point for PlanReader commercial estimator workflow.
 
-Keeps the v1.4.x reconstruction/accuracy stack, the familiar sidebar, the combined
-Upload + Drawing Register page, narrow-screen dropdown protection, runtime caches,
-document-processing/ETA fast paths, the v1.5.1 cold-start bootstrap, and the
-fail-closed P5 opening-evidence production bridge.
+Keeps the reviewed reconstruction/accuracy/3D stack and adds the Phase 6A
+read-only commercial workspace shell. Measurement, deduction, calibration and
+producer authority remain unchanged.
 """
 
 import os
@@ -32,6 +31,7 @@ from pb_editor_ux_v154 import install as install_editor_ux_v154
 from pb_opening_production_v175 import apply as apply_opening_production_v175
 from pb_opening_production_guard_v175 import verify as verify_opening_production_v175
 from pb_3d_workspace_integration import apply as apply_3d_canonical_integration
+from pb_commercial_workspace_v160 import apply as apply_commercial_workspace_v160
 
 install_editor_ux_v154()
 
@@ -49,9 +49,11 @@ apply_opening_production_v175(app)
 # This is a safety-critical integration: refuse startup if later import-order
 # changes leave any known legacy automatic-deduction alias live.
 verify_opening_production_v175(app)
-# Install Phase 5 3D Canonical WebGL Viewer extension hook
+# Install reviewed Phase 5 canonical 3D WebGL viewer extension hook.
 apply_3d_canonical_integration(app)
-app.APP_VERSION = "1.5.1"
+# Phase 6A is presentation/read-only and wraps the shared workspace hero only.
+apply_commercial_workspace_v160(app)
+app.APP_VERSION = "1.6.0"
 
 if __name__ == "__main__":
     app.main()
