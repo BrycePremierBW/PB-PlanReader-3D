@@ -51,7 +51,9 @@ def _run_isolated(code: str, desc: str = "composition check") -> None:
         path.write_text(wrapper, encoding="utf-8")
         result = subprocess.run(
             [sys.executable, str(path)],
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             cwd=str(_REPO_ROOT),
         )

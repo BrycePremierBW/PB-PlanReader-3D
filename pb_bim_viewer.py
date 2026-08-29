@@ -78,13 +78,21 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
 
                     op_gross = gross_opening_area(op)
                     op_rev = op.review_state.value if isinstance(op.review_state, ReviewState) else str(op.review_state or "REVIEW_REQUIRED")
+                    phys_state = str(op.metadata.get("physical_state") or ("physical_b5_authorised" if op.deduction_authority else "physical_not_authorised"))
+                    
+                    # SECTION 3 & 4: Do NOT replace op.wall_id with w.id for wrong-host or non-matching records!
+                    eff_wall_id = w.id if op.wall_id == w.id else None
+                    is_host_attached = (eff_wall_id == w.id) and (phys_state not in ("wrong_host", "wrong_level", "invalid_geometry", "conflict_overlap", "evidence_only"))
+
                     op_data = {
                         "id": op.id,
                         "name": op.name,
                         "type": op.object_type.value if isinstance(op.object_type, ObjectType) else str(op.object_type),
                         "opening_type": op.opening_type,
                         "level_id": lvl.id,
-                        "wall_id": w.id,
+                        "wall_id": eff_wall_id,
+                        "physical_state": phys_state,
+                        "is_host_attached": is_host_attached,
                         "offset_along_wall_m": op.offset_along_wall_m,
                         "sill_height_m": op.sill_height_m,
                         "width_m": op.width_m,
@@ -98,7 +106,8 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
                         "provenance": op.provenance.to_dict() if op.provenance else {},
                         "deduction_authorized": parse_strict_bool(op.deduction_authority),
                     }
-                    openings_data.append(op_data)
+                    if is_host_attached:
+                        openings_data.append(op_data)
                     objects_payload.append(op_data)
 
                 w_data = {
@@ -148,6 +157,12 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
                     if len(poly_pts) < 3:
                         continue
                     item_rev = item.review_state.value if isinstance(item.review_state, ReviewState) else str(item.review_state or "REVIEW_REQUIRED")
+                    
+                    elev_off = getattr(item, "elevation_offset_m", None)
+                    cap_z = getattr(item, "elevation", None)
+                    if cap_z is not None and lvl.elevation_m is not None:
+                        elev_off = cap_z - lvl.elevation_m
+
                     item_data = {
                         "id": item.id,
                         "name": item.name,
@@ -156,7 +171,8 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
                         "parent_id": item.parent_id,
                         "polygon": poly_pts,
                         "thickness_m": item.thickness_m,
-                        "elevation_offset_m": getattr(item, "elevation_offset_m", None),
+                        "elevation": cap_z,
+                        "elevation_offset_m": elev_off,
                         "substrate": item.substrate,
                         "finish": item.finish,
                         "confidence": item.confidence,
@@ -626,21 +642,27 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
 
             if (wall.openings && wall.openings.length > 0) {{
                 wall.openings.forEach(op => {{
-                    const off = op.offset_along_wall_m;
-                    const wOp = op.width_m;
-                    const hOp = op.height_m;
-                    const sill = op.sill_height_m;
+                    const isAttached = op.is_host_attached !== false && (!op.wall_id || op.wall_id === wall.id);
+                    const physState = op.physical_state || '';
+                    const isRejected = (physState === 'wrong_host' || physState === 'wrong_level' || physState === 'invalid_geometry' || physState === 'conflict_overlap' || physState === 'evidence_only');
 
-                    if (off !== null && off !== undefined && sill !== null && sill !== undefined &&
-                        wOp !== null && hOp !== null && wOp > 0 && hOp > 0 && off >= 0 && sill >= 0 &&
-                        (off + wOp) <= (len + 0.05) && (sill + hOp) <= (hWall + 0.05)) {{
-                        const hole = new THREE.Path();
-                        hole.moveTo(off, sill);
-                        hole.lineTo(off + wOp, sill);
-                        hole.lineTo(off + wOp, sill + hOp);
-                        hole.lineTo(off, sill + hOp);
-                        hole.closePath();
-                        shape.holes.push(hole);
+                    if (isAttached && !isRejected) {{
+                        const off = op.offset_along_wall_m;
+                        const wOp = op.width_m;
+                        const hOp = op.height_m;
+                        const sill = op.sill_height_m;
+
+                        if (off !== null && off !== undefined && sill !== null && sill !== undefined &&
+                            wOp !== null && hOp !== null && wOp > 0 && hOp > 0 && off >= 0 && sill >= 0 &&
+                            (off + wOp) <= (len + 0.05) && (sill + hOp) <= (hWall + 0.05)) {{
+                            const hole = new THREE.Path();
+                            hole.moveTo(off, sill);
+                            hole.lineTo(off + wOp, sill);
+                            hole.lineTo(off + wOp, sill + hOp);
+                            hole.lineTo(off, sill + hOp);
+                            hole.closePath();
+                            shape.holes.push(hole);
+                        }}
                     }}
                 }});
             }}
@@ -660,6 +682,11 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
         }}
 
         function createOpeningMesh(op, zElev, mat) {{
+            if (!op || op.is_host_attached === false || !op.wall_id) return null;
+            const physState = op.physical_state || '';
+            if (physState === 'wrong_host' || physState === 'wrong_level' || physState === 'invalid_geometry' || physState === 'conflict_overlap' || physState === 'evidence_only') {{
+                return null;
+            }}
             if (op.width_m === null || op.height_m === null || op.width_m <= 0 || op.height_m <= 0) return null;
             if (op.sill_height_m === null || op.sill_height_m === undefined || isNaN(op.sill_height_m) || op.sill_height_m < 0) return null;
             if (op.offset_along_wall_m === null || op.offset_along_wall_m === undefined || isNaN(op.offset_along_wall_m) || op.offset_along_wall_m < 0) return null;
@@ -698,11 +725,23 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
         function createPolygonMesh(polyObj, zElev, mat) {{
             if (!polyObj.polygon || polyObj.polygon.length < 3) return null;
 
-            // FAIL CLOSED: elevation_offset_m=None means offset is unknown. Do NOT silently render at level elevation 0.0!
-            if (polyObj.elevation_offset_m === null || polyObj.elevation_offset_m === undefined || isNaN(polyObj.elevation_offset_m)) {{
+            // FAIL CLOSED: elevation_offset_m === null means offset is unknown unless objective elevation is given!
+            if ((polyObj.elevation_offset_m === null || polyObj.elevation_offset_m === undefined) && (polyObj.elevation === null || polyObj.elevation === undefined)) {{
                 return null;
             }}
-            const elevOff = polyObj.elevation_offset_m;
+
+            let renderZ = null;
+            if (polyObj.elevation !== null && polyObj.elevation !== undefined && !isNaN(polyObj.elevation)) {{
+                renderZ = polyObj.elevation;
+            }} else if (polyObj.elevation_offset_m !== null && polyObj.elevation_offset_m !== undefined && !isNaN(polyObj.elevation_offset_m) && zElev !== null && zElev !== undefined && !isNaN(zElev)) {{
+                renderZ = zElev + polyObj.elevation_offset_m;
+            }} else if (zElev !== null && zElev !== undefined && !isNaN(zElev) && polyObj.type !== 'ROOF') {{
+                renderZ = zElev;
+            }}
+
+            if (renderZ === null || renderZ === undefined || isNaN(renderZ)) {{
+                return null;
+            }}
 
             const shape = new THREE.Shape();
             polyObj.polygon.forEach((pt, idx) => {{
@@ -716,7 +755,7 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
                 const geom = new THREE.ShapeGeometry(shape);
                 geom.rotateX(Math.PI / 2);
                 const mesh = new THREE.Mesh(geom, mat);
-                mesh.position.y = zElev + elevOff;
+                mesh.position.y = renderZ;
                 mesh.receiveShadow = true;
                 return mesh;
             }}
@@ -727,7 +766,7 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             geom.rotateX(Math.PI / 2);
 
             const mesh = new THREE.Mesh(geom, mat);
-            mesh.position.y = zElev + elevOff;
+            mesh.position.y = renderZ;
             mesh.receiveShadow = true;
             return mesh;
         }}

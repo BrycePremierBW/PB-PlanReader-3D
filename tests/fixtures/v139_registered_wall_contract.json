@@ -1,0 +1,29 @@
+{
+  "wall_ref": "W-E101",
+  "side": "EAST",
+  "a": {"x": 0.0, "y": 0.0},
+  "b": {"x": 18.5, "y": 0.0},
+  "length_m": 18.5,
+  "height_m": 3.2,
+  "height_status": "confirmed",
+  "height_confidence": "high",
+  "thickness_m": 0.23,
+  "substrate": "Concrete Masonry",
+  "finish": "Acrylic Render",
+  "is_external": true,
+  "openings": [
+    {
+      "id": "op_e101_01",
+      "opening_instance_id": "inst_d01_99",
+      "mark": "D-01",
+      "opening_type": "DOOR",
+      "offset_m": 2.5,
+      "sill_m": 0.0,
+      "width_m": 1.2,
+      "height_m": 2.4,
+      "deduct": true,
+      "is_authorised_deduction": true,
+      "plan_geometry_signature": "sig_door_v175_d01"
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "title": "SYNTHETIC CONTRACT FIXTURE — NOT BENCHMARK TRUTH",
+  "producer_module": "pb_floor_mapper_v127",
+  "contract_version": "1.2.8",
+  "sample_v127_rectangle": {
+    "boxes": [
+      {
+        "id": "box_rect_1",
+        "name": "Office Floor Rect",
+        "x": 10.0,
+        "y": 10.0,
+        "w": 50.0,
+        "h": 40.0
+      }
+    ],
+    "calibration": {
+      "x1": 10.0,
+      "y1": 10.0,
+      "x2": 60.0,
+      "y2": 10.0,
+      "len_m": 10.0
+    }
+  },
+  "sample_v128_polygon": {
+    "boxes": [
+      {
+        "id": "shape_poly_1",
+        "name": "Irregular Main Hall",
+        "points": [
+          {"x": 10.0, "y": 10.0},
+          {"x": 60.0, "y": 10.0},
+          {"x": 60.0, "y": 50.0},
+          {"x": 10.0, "y": 50.0}
+        ]
+      }
+    ],
+    "calibration": {
+      "x1": 10.0,
+      "y1": 10.0,
+      "x2": 60.0,
+      "y2": 10.0,
+      "len_m": 10.0
+    }
+  },
+  "sample_manual_m2_only": {
+    "boxes": [
+      {
+        "id": "shape_manual_1",
+        "name": "Manual Allowance Only",
+        "manual_m2": 45.0
+      }
+    ]
+  },
+  "sample_invalid_calibration": {
+    "boxes": [
+      {
+        "id": "shape_invalid_calib",
+        "points": [{"x": 10, "y": 10}, {"x": 20, "y": 10}, {"x": 20, "y": 20}]
+      }
+    ],
+    "calibration": {
+      "x1": 0, "y1": 0, "x2": 0, "y2": 0, "len_m": 0.0
+    }
+  }
+}

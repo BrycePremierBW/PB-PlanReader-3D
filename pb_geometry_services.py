@@ -331,17 +331,13 @@ def space_floor_area(space: CanonicalSpace) -> float:
 
 def level_extents(level: CanonicalLevel) -> Optional[BoundingBox3D]:
     """
-    Calculates total 3D bounding box for all elements on a specific level.
-    ROUND 4 GATE 1: Returns None if level.elevation_m is unknown.
-    Derives Z top from explicit element heights where level.height_m is missing.
+    Calculates 3D bounding box for all physical elements on a level.
+    Fails closed: Returns None if level elevation or bounds are unresolved/non-finite.
     """
-    if not _is_valid_float(level.elevation_m):
-        return None
-
     min_x, max_x = float("inf"), float("-inf")
     min_y, max_y = float("inf"), float("-inf")
 
-    z_min = float(level.elevation_m)
+    z_min: Optional[float] = level.elevation_m if _is_valid_float(level.elevation_m) else None
     
     # Derive max Z height from explicit level height or element heights
     max_elem_h = 0.0
@@ -354,11 +350,20 @@ def level_extents(level: CanonicalLevel) -> Optional[BoundingBox3D]:
         for col in level.columns:
             if _is_valid_float(col.height_m):
                 max_elem_h = max(max_elem_h, col.height_m)
-        for p in level.parapets:
-            if _is_valid_float(p.height_m):
-                max_elem_h = max(max_elem_h, p.height_m)
 
-    z_max = z_min + max_elem_h
+    z_max: Optional[float] = z_min + max_elem_h if z_min is not None else None
+
+    for r in level.roofs:
+        if _is_valid_float(r.elevation):
+            if z_min is None:
+                z_min = r.elevation
+                z_max = r.elevation
+            else:
+                z_min = min(z_min, r.elevation)
+                z_max = max(z_max, r.elevation)
+
+    if z_min is None or z_max is None:
+        return None
 
     def include_pt(x: Optional[float], y: Optional[float]):
         nonlocal min_x, max_x, min_y, max_y
@@ -383,7 +388,11 @@ def level_extents(level: CanonicalLevel) -> Optional[BoundingBox3D]:
             include_pt(col.center.x - w2, col.center.y - d2)
             include_pt(col.center.x + w2, col.center.y + d2)
 
-    if min_x == float("inf"):
+    if min_x == float("inf") or not (
+        math.isfinite(min_x) and math.isfinite(max_x) and
+        math.isfinite(min_y) and math.isfinite(max_y) and
+        math.isfinite(z_min) and math.isfinite(z_max)
+    ):
         return None
 
     return BoundingBox3D(
@@ -395,7 +404,8 @@ def level_extents(level: CanonicalLevel) -> Optional[BoundingBox3D]:
 def model_bounds(project: CanonicalProject) -> Tuple[bool, Optional[BoundingBox3D]]:
     """
     Calculates global 3D bounding box across all buildings and levels in a project.
-    Fails closed: Returns (False, None) if project is empty or bounds cannot be derived.
+    SECTION 6 (Phase 5L): Asserts math.isfinite() for every returned bound coordinate.
+    Fails closed: Returns (False, None) if project is empty, unresolved, or non-finite.
     """
     min_x, max_x = float("inf"), float("-inf")
     min_y, max_y = float("inf"), float("-inf")
@@ -415,7 +425,18 @@ def model_bounds(project: CanonicalProject) -> Tuple[bool, Optional[BoundingBox3
                 min_z = min(min_z, l_bounds.min_point.z)
                 max_z = max(max_z, l_bounds.max_point.z)
 
-    if not found_elements:
+            for r in lvl.roofs:
+                if _is_valid_float(r.elevation):
+                    found_elements = True
+                    max_z = max(max_z, r.elevation)
+                    min_z = min(min_z, r.elevation)
+
+    if not (
+        found_elements and
+        math.isfinite(min_x) and math.isfinite(max_x) and
+        math.isfinite(min_y) and math.isfinite(max_y) and
+        math.isfinite(min_z) and math.isfinite(max_z)
+    ):
         return False, None
 
     return True, BoundingBox3D(

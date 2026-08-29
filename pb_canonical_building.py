@@ -99,6 +99,15 @@ class Provenance:
     drawing_id: Optional[str] = None
     source_coords: Optional[Dict[str, Any]] = None
     scale_source: Optional[str] = None
+    workspace_id: Optional[str] = None
+    document_id: Optional[str] = None
+    page_id: Optional[str] = None
+    wall_ref: Optional[str] = None
+    opening_instance_id: Optional[str] = None
+    plan_geometry_signature: Optional[str] = None
+    coordinate_space: Optional[str] = None
+    producer_module: Optional[str] = None
+    producer_version: Optional[str] = None
     contributing_evidence: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -108,6 +117,15 @@ class Provenance:
             "drawing_id": self.drawing_id,
             "source_coords": self.source_coords,
             "scale_source": self.scale_source,
+            "workspace_id": self.workspace_id,
+            "document_id": self.document_id,
+            "page_id": self.page_id,
+            "wall_ref": self.wall_ref,
+            "opening_instance_id": self.opening_instance_id,
+            "plan_geometry_signature": self.plan_geometry_signature,
+            "coordinate_space": self.coordinate_space,
+            "producer_module": self.producer_module,
+            "producer_version": self.producer_version,
             "contributing_evidence": list(self.contributing_evidence),
         }
 
@@ -121,6 +139,15 @@ class Provenance:
             drawing_id=data.get("drawing_id"),
             source_coords=data.get("source_coords") if isinstance(data.get("source_coords"), dict) else None,
             scale_source=data.get("scale_source"),
+            workspace_id=data.get("workspace_id"),
+            document_id=data.get("document_id"),
+            page_id=data.get("page_id"),
+            wall_ref=data.get("wall_ref"),
+            opening_instance_id=data.get("opening_instance_id"),
+            plan_geometry_signature=data.get("plan_geometry_signature"),
+            coordinate_space=data.get("coordinate_space"),
+            producer_module=data.get("producer_module"),
+            producer_version=data.get("producer_version"),
             contributing_evidence=list(data.get("contributing_evidence", []) or []) if isinstance(data.get("contributing_evidence"), list) else [],
         )
 
@@ -132,6 +159,11 @@ class Vector2D:
 
     def is_valid(self) -> bool:
         return self.x is not None and self.y is not None
+
+    def distance_to(self, other: "Vector2D") -> float:
+        if not (self.is_valid() and other and other.is_valid()):
+            return 0.0
+        return math.hypot(other.x - self.x, other.y - self.y)
 
     def to_dict(self) -> Dict[str, Optional[float]]:
         return {"x": self.x, "y": self.y}
@@ -410,6 +442,7 @@ class PolygonElement(CanonicalElement):
     polygon: List[Vector2D] = field(default_factory=list)
     thickness_m: Optional[float] = None
     elevation_offset_m: Optional[float] = None
+    specified_floor_area_m2: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         res = self.base_to_dict()
@@ -417,6 +450,7 @@ class PolygonElement(CanonicalElement):
             "polygon": [pt.to_dict() for pt in self.polygon],
             "thickness_m": self.thickness_m,
             "elevation_offset_m": self.elevation_offset_m,
+            "specified_floor_area_m2": self.specified_floor_area_m2,
         })
         return res
 
@@ -430,6 +464,7 @@ class PolygonElement(CanonicalElement):
             polygon=poly,
             thickness_m=parse_optional_float(data.get("thickness_m")),
             elevation_offset_m=parse_optional_float(data.get("elevation_offset_m")),
+            specified_floor_area_m2=parse_optional_float(data.get("specified_floor_area_m2")),
         )
 
 
@@ -451,7 +486,8 @@ class CanonicalCeiling(PolygonElement):
 class CanonicalRoof(PolygonElement):
     pitch_deg: Optional[float] = None
     overhang_m: Optional[float] = None
-    roof_type: str = "FLAT"
+    roof_type: str = "UNKNOWN"
+    elevation: Optional[float] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -463,6 +499,7 @@ class CanonicalRoof(PolygonElement):
             "pitch_deg": self.pitch_deg,
             "overhang_m": self.overhang_m,
             "roof_type": self.roof_type,
+            "elevation": self.elevation,
         })
         return res
 
@@ -478,7 +515,8 @@ class CanonicalRoof(PolygonElement):
             elevation_offset_m=parse_optional_float(data.get("elevation_offset_m")),
             pitch_deg=parse_optional_float(data.get("pitch_deg")),
             overhang_m=parse_optional_float(data.get("overhang_m")),
-            roof_type=str(data.get("roof_type", "FLAT")),
+            roof_type=str(data.get("roof_type", "UNKNOWN")),
+            elevation=parse_optional_float(data.get("elevation")),
         )
 
 
@@ -748,8 +786,106 @@ class CanonicalBuilding(CanonicalElement):
 
 
 @dataclass
+class CanonicalEvidenceObservation:
+    """
+    SECTION Y: Represents non-physical source evidence observations (e.g. elevation opening candidates,
+    roof pitch evidence, manual floor allowances, uncalibrated polygons).
+    Evidence observations MUST NOT create fake geometry, gain takeoff authority, or gain deduction authority.
+    """
+    id: str = field(default_factory=lambda: f"obs_{uuid.uuid4().hex[:8]}")
+    kind: str = "elevation_opening_candidate"
+    workspace_id: Optional[str] = None
+    document_id: Optional[str] = None
+    page_id: Optional[str] = None
+    page_no: Optional[int] = None
+    drawing_reference: Optional[str] = None
+    side: Optional[str] = None
+    level_name: Optional[str] = None
+    wall_ref: Optional[str] = None
+    source_coords: Optional[Dict[str, Any]] = None
+    coordinate_space: Optional[str] = None
+    width_m: Optional[float] = None
+    height_m: Optional[float] = None
+    producer: Optional[str] = None
+    producer_version: Optional[str] = None
+    confidence: Optional[float] = None
+    review_state: ReviewState = ReviewState.REVIEW_REQUIRED
+    reason_physical_unavailable: str = "Elevation evidence without plan host wall placement"
+    dimension_basis: str = "unknown"
+    deduction_authority: bool = False
+    no_instance_creation: bool = True
+    calibration_status: Optional[str] = None
+
+    def __post_init__(self):
+        self.deduction_authority = parse_strict_bool(self.deduction_authority)
+        self.no_instance_creation = parse_strict_bool(self.no_instance_creation)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "workspace_id": self.workspace_id,
+            "document_id": self.document_id,
+            "page_id": self.page_id,
+            "page_no": self.page_no,
+            "drawing_reference": self.drawing_reference,
+            "side": self.side,
+            "level_name": self.level_name,
+            "wall_ref": self.wall_ref,
+            "source_coords": self.source_coords,
+            "coordinate_space": self.coordinate_space,
+            "width_m": self.width_m,
+            "height_m": self.height_m,
+            "producer": self.producer,
+            "producer_version": self.producer_version,
+            "confidence": self.confidence,
+            "review_state": self.review_state.value if isinstance(self.review_state, ReviewState) else str(self.review_state),
+            "reason_physical_unavailable": self.reason_physical_unavailable,
+            "dimension_basis": self.dimension_basis,
+            "deduction_authority": parse_strict_bool(self.deduction_authority),
+            "no_instance_creation": parse_strict_bool(self.no_instance_creation),
+            "calibration_status": self.calibration_status,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CanonicalEvidenceObservation":
+        rev = data.get("review_state")
+        try:
+            rev_enum = ReviewState(rev) if rev in [r.value for r in ReviewState] else ReviewState.REVIEW_REQUIRED
+        except Exception:
+            rev_enum = ReviewState.REVIEW_REQUIRED
+
+        return cls(
+            id=str(data.get("id") or f"obs_{uuid.uuid4().hex[:8]}"),
+            kind=str(data.get("kind") or "elevation_opening_candidate"),
+            workspace_id=str(data.get("workspace_id")) if data.get("workspace_id") is not None else None,
+            document_id=str(data.get("document_id")) if data.get("document_id") is not None else None,
+            page_id=str(data.get("page_id")) if data.get("page_id") is not None else None,
+            page_no=int(data.get("page_no")) if data.get("page_no") is not None else None,
+            drawing_reference=str(data.get("drawing_reference")) if data.get("drawing_reference") is not None else None,
+            side=str(data.get("side")) if data.get("side") is not None else None,
+            level_name=str(data.get("level_name")) if data.get("level_name") is not None else None,
+            wall_ref=str(data.get("wall_ref")) if data.get("wall_ref") is not None else None,
+            source_coords=data.get("source_coords") if isinstance(data.get("source_coords"), dict) else None,
+            coordinate_space=str(data.get("coordinate_space")) if data.get("coordinate_space") is not None else None,
+            width_m=parse_optional_float(data.get("width_m")),
+            height_m=parse_optional_float(data.get("height_m")),
+            producer=str(data.get("producer")) if data.get("producer") is not None else None,
+            producer_version=str(data.get("producer_version")) if data.get("producer_version") is not None else None,
+            confidence=parse_optional_confidence(data.get("confidence")),
+            review_state=rev_enum,
+            reason_physical_unavailable=str(data.get("reason_physical_unavailable") or "Physical geometry unavailable"),
+            dimension_basis=str(data.get("dimension_basis", "unknown")),
+            deduction_authority=parse_strict_bool(data.get("deduction_authority")),
+            no_instance_creation=parse_strict_bool(data.get("no_instance_creation", True)),
+            calibration_status=str(data.get("calibration_status")) if data.get("calibration_status") is not None else None,
+        )
+
+
+@dataclass
 class CanonicalProject(CanonicalElement):
     buildings: List[CanonicalBuilding] = field(default_factory=list)
+    evidence_observations: List[CanonicalEvidenceObservation] = field(default_factory=list)
     is_synthetic_demo: bool = False
 
     def __post_init__(self):
@@ -761,6 +897,7 @@ class CanonicalProject(CanonicalElement):
         res = self.base_to_dict()
         res.update({
             "buildings": [b.to_dict() for b in self.buildings],
+            "evidence_observations": [obs.to_dict() for obs in self.evidence_observations],
             "is_synthetic_demo": parse_strict_bool(self.is_synthetic_demo),
         })
         return res
@@ -771,6 +908,7 @@ class CanonicalProject(CanonicalElement):
         return cls(
             **base_args,
             buildings=[CanonicalBuilding.from_dict(b) for b in data.get("buildings", []) or [] if isinstance(b, dict)],
+            evidence_observations=[CanonicalEvidenceObservation.from_dict(obs) for obs in data.get("evidence_observations", []) or [] if isinstance(obs, dict)],
             is_synthetic_demo=parse_strict_bool(data.get("is_synthetic_demo")),
         )
 
@@ -781,3 +919,4 @@ class CanonicalProject(CanonicalElement):
     def from_json(cls, json_str: str) -> "CanonicalProject":
         data = json.loads(json_str)
         return cls.from_dict(data)
+
