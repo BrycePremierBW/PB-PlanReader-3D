@@ -1,0 +1,6 @@
+# Phase 5M compatibility facade dynamically re-exports the two names Ruff
+# cannot statically resolve from the audited legacy adapter. Runtime imports
+# are covered by the complete pytest suite; all other F821/F823 checks remain
+# enabled repository-wide.
+[lint.per-file-ignores]
+"pb_production_3d_adapter_phase5m.py" = ["F821"]
