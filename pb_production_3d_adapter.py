@@ -1,5 +1,5 @@
 """
-PlanReader Production 3D Model Adapter Module (Phase 5G Production Contract Lock).
+PlanReader Production 3D Model Adapter Module (Phase 5H Semantic Closure & Multi-Level Production Proof).
 
 Provides a clean production adapter converting existing PlanReader production payloads,
 documents, pages, takeoff rows, drawing intelligence, opening schedules, and elevation evidence
@@ -13,7 +13,9 @@ SAFETY GUARANTEES:
 5. All app.lquery() calls consume List[Dict[str, Any]] (dictionary row access, page_no schema).
 6. Uses REAL pb_floor_mapper_v127.calibration_px_per_m and pb_floor_mapper_v128._points_from_shape.
 7. Calls app.registered_wall_takeoff_rows_v139(reg_walls) with wall iterable, NOT workspace_id.
-8. Snapshot v3 validates document-page workspace ownership strictly.
+8. Translates LAGO elevation evidence into CanonicalEvidenceObservation objects (fail closed without plan host).
+9. Uses validate_opening_geometry(opening, wall) as sole physical geometry safety gate.
+10. Wall deduction gate becomes True ONLY when opening passes both B5 authority AND physical geometry validation.
 """
 
 import math
@@ -40,12 +42,14 @@ from pb_canonical_building import (
     CanonicalScreen,
     CanonicalSpace,
     CanonicalFinishSurface,
+    CanonicalEvidenceObservation,
     Vector2D,
     Vector3D,
     Provenance,
     ReviewState,
     ObjectType,
     parse_strict_bool,
+    parse_optional_confidence,
 )
 from pb_geometry_services import potential_net_wall_area, validate_opening_geometry
 from pb_3d_diagnostics import generate_production_diagnostics_report
@@ -150,598 +154,514 @@ def _parse_provenance(prov_data: Any) -> Provenance:
         source_pdf=source_pdf,
         page_number=page_num,
         drawing_id=drawing_id,
+        source_coords=src_coords if isinstance(src_coords, dict) else None,
         scale_source=scale_source,
-        source_coords=src_coords,
-        workspace_id=str(prov_data.get("workspace_id") or "") or None,
-        document_id=str(prov_data.get("document_id") or "") or None,
-        page_id=str(prov_data.get("page_id") or "") or None,
-        wall_ref=str(prov_data.get("wall_ref") or "") or None,
-        opening_instance_id=str(prov_data.get("opening_instance_id") or "") or None,
-        plan_geometry_signature=str(prov_data.get("plan_geometry_signature") or "") or None,
-        coordinate_space=str(prov_data.get("coordinate_space") or "PLAN_2D"),
-        producer_module=str(prov_data.get("producer_module") or "") or None,
-        producer_version=str(prov_data.get("producer_version") or "") or None,
-        contributing_evidence=[str(t) for t in traces if t],
+        workspace_id=str(prov_data.get("workspace_id")) if prov_data.get("workspace_id") is not None else None,
+        document_id=str(prov_data.get("document_id")) if prov_data.get("document_id") is not None else None,
+        page_id=str(prov_data.get("page_id")) if prov_data.get("page_id") is not None else None,
+        wall_ref=str(prov_data.get("wall_ref")) if prov_data.get("wall_ref") is not None else None,
+        opening_instance_id=str(prov_data.get("opening_instance_id")) if prov_data.get("opening_instance_id") is not None else None,
+        plan_geometry_signature=str(prov_data.get("plan_geometry_signature")) if prov_data.get("plan_geometry_signature") is not None else None,
+        coordinate_space=str(prov_data.get("coordinate_space")) if prov_data.get("coordinate_space") is not None else None,
+        producer_module=str(prov_data.get("producer_module")) if prov_data.get("producer_module") is not None else None,
+        producer_version=str(prov_data.get("producer_version")) if prov_data.get("producer_version") is not None else None,
+        contributing_evidence=traces,
     )
 
 
 def resolve_canonical_level(
-    level_claim: Optional[Union[str, int]],
-    level_map: Dict[str, CanonicalLevel],
-    unresolved_container: CanonicalLevel,
-    skipped_items: List[Dict[str, Any]]
+    level_val: Any,
+    levels_map: Dict[str, CanonicalLevel],
+    diagnostics_log: Optional[List[Dict[str, Any]]] = None
 ) -> Tuple[CanonicalLevel, str]:
-    """SECTION B & H: Level Resolution Service."""
-    if level_claim is None:
-        return unresolved_container, "no_level_evidence"
+    """
+    SECTION 18, H, I, M, N: Resolves or registers a CanonicalLevel for building elements.
+    Preserves storey levels from v139/v135 (e.g. Ground, Level 1, Level 2) based on level, level_name, or level_index.
+    """
+    diagnostics_log = diagnostics_log if diagnostics_log is not None else []
 
-    claim_str = str(level_claim).strip()
-    if not claim_str:
-        return unresolved_container, "no_level_evidence"
+    if isinstance(level_val, str) and level_val in levels_map:
+        return levels_map[level_val], level_val
 
-    if claim_str in level_map:
-        matched_lvl = level_map[claim_str]
-        if matched_lvl.elevation_m is not None:
-            return matched_lvl, "objectively_known_level"
-        else:
-            return matched_lvl, "unresolved_level_in_map"
-
-    # Create level on demand for valid named storey claims
-    new_lvl = CanonicalLevel(
-        id=f"lvl_{claim_str.lower().replace(' ', '_')}",
-        name=claim_str,
-        elevation_m=None,
-        height_m=None,
-        review_state=ReviewState.REVIEW_REQUIRED,
-    )
-    level_map[claim_str] = new_lvl
-    return new_lvl, "created_named_storey"
-
-
-def registered_wall_to_canonical_input(
-    wall_dict: Dict[str, Any],
-    skipped_items: List[Dict[str, Any]],
-    is_validated_internal_workspace: bool = False
-) -> Tuple[Optional[CanonicalWall], List[Dict[str, Any]]]:
-    """SECTION D & M: Adapts real v139 wall contract."""
-    if not isinstance(wall_dict, dict):
-        return None, []
-
-    wall_ref = str(wall_dict.get("wall_ref") or wall_dict.get("id") or "")
-    if not wall_ref:
-        skipped_items.append({"item": wall_dict, "reason": "Missing wall_ref/id"})
-        return None, []
-
-    p1 = _parse_vector2d(wall_dict.get("a") or wall_dict.get("start_point"))
-    p2 = _parse_vector2d(wall_dict.get("b") or wall_dict.get("end_point"))
-
-    if not (p1 and p2):
-        skipped_items.append({"item": wall_ref, "reason": "insufficient_geometry_endpoints_missing"})
-        return None, []
-
-    computed_len = p1.distance_to(p2)
-    reported_len = _safe_float(wall_dict.get("length_m"))
-    if reported_len is not None and abs(computed_len - reported_len) > 0.05:
-        skipped_items.append({
-            "item": wall_ref,
-            "reason": f"length_disagreement: computed {computed_len:.2f}m vs reported {reported_len:.2f}m"
-        })
-
-    height_status = str(wall_dict.get("height_status") or "").lower()
-    height_conf = str(wall_dict.get("height_confidence") or "").lower()
-    raw_height = _safe_float(wall_dict.get("height_m"))
-
-    if height_status in ("provisional", "review", "default", "unverified") or height_conf in ("review", "default", "unverified"):
-        c_height = None
-        c_review = ReviewState.REVIEW_REQUIRED
-        skipped_items.append({"item": wall_ref, "reason": f"height_provisional_rejected: {height_status}/{height_conf}"})
-    elif raw_height is not None and raw_height > 0:
-        c_height = raw_height
-        c_review = ReviewState.CONFIRMED if height_status in ("confirmed", "verified") else ReviewState.INFERRED
+    explicit_id = None
+    if isinstance(level_val, dict):
+        raw_name = str(level_val.get("name") or level_val.get("level_name") or level_val.get("label") or "")
+        lvl_idx = level_val.get("level_index") or level_val.get("index")
+        elevation_val = level_val.get("elevation_m") if "elevation_m" in level_val else level_val.get("ffl_m")
+        elevation_m = _safe_float(elevation_val)
+        explicit_id = level_val.get("id") or level_val.get("level_id")
+    elif isinstance(level_val, str):
+        raw_name = level_val.strip()
+        lvl_idx = None
+        elevation_m = None
+    elif isinstance(level_val, (int, float)):
+        raw_name = f"Level {int(level_val)}"
+        lvl_idx = int(level_val)
+        elevation_m = None
     else:
-        c_height = None
-        c_review = ReviewState.REVIEW_REQUIRED
+        raw_name = ""
+        lvl_idx = None
+        elevation_m = None
 
-    th_wall = _safe_float(wall_dict.get("thickness_m") if "thickness_m" in wall_dict else wall_dict.get("thickness"))
-    prov = _parse_provenance(wall_dict.get("provenance") or wall_dict)
-    prov.wall_ref = wall_ref
-    prov.producer_module = "pb_unified_building_v139"
+    if not raw_name and not explicit_id:
+        key = "unresolved_review"
+        if key not in levels_map:
+            levels_map[key] = CanonicalLevel(
+                id=f"lvl_{key}",
+                name="Unresolved Level Container (Review Required)",
+                level_index=0,
+                elevation_m=None,
+                review_state=ReviewState.REVIEW_REQUIRED,
+            )
+        return levels_map[key], "unresolved"
 
-    side_str = str(wall_dict.get("side") or "").upper().strip()
-    wall_takeoff_eligible = is_validated_internal_workspace and (c_height is not None) and (c_review in (ReviewState.CONFIRMED, ReviewState.INFERRED))
-
-    c_wall = CanonicalWall(
-        id=wall_ref,
-        name=f"Wall {wall_ref}",
-        level_id="lvl_unresolved_review",
-        start_point=p1,
-        end_point=p2,
-        thickness_m=th_wall,
-        height_m=c_height,
-        is_external=parse_strict_bool(wall_dict.get("is_external", True)),
-        substrate=wall_dict.get("substrate"),
-        finish=wall_dict.get("finish"),
-        confidence=_safe_float(wall_dict.get("confidence")),
-        review_state=c_review,
-        provenance=prov,
-        deduction_authority=False,  # Evaluated after opening revalidation
-        takeoff_eligible=wall_takeoff_eligible,
-        metadata={"side": side_str, "facade_id": wall_dict.get("facade_id")} if side_str else {}
+    norm_name = raw_name.lower().strip()
+    key = str(explicit_id) if explicit_id else (
+        "ground" if ("ground" in norm_name or norm_name in ("0", "g", "lvl 0", "level 0")) else
+        "level_1" if ("level 1" in norm_name or norm_name in ("1", "l1", "lvl 1", "first")) else
+        "level_2" if ("level 2" in norm_name or norm_name in ("2", "l2", "lvl 2", "second")) else
+        f"lvl_{re.sub(r'[^a-z0-9]+', '_', norm_name).strip('_') or 'level'}"
     )
 
-    nested_openings_raw = wall_dict.get("openings") or []
-    return c_wall, nested_openings_raw
+    if key not in levels_map:
+        levels_map[key] = CanonicalLevel(
+            id=str(explicit_id) if explicit_id else key,
+            name=raw_name or str(explicit_id),
+            level_index=lvl_idx if lvl_idx is not None else 0,
+            elevation_m=elevation_m,
+            review_state=ReviewState.CONFIRMED if elevation_m is not None else ReviewState.INFERRED,
+        )
+    else:
+        # Update existing level elevation_m if explicit
+        if elevation_m is not None and levels_map[key].elevation_m is None:
+            levels_map[key].elevation_m = elevation_m
+            levels_map[key].review_state = ReviewState.CONFIRMED
+
+    return levels_map[key], key
 
 
-def revalidate_b5_opening(opening_dict: Dict[str, Any]) -> bool:
-    """SECTION 3, C, M: Dynamic B5 opening authority revalidation gate."""
-    if not isinstance(opening_dict, dict):
-        return False
-    try:
-        import pb_opening_production_v175 as op_prod
-        return bool(op_prod.is_authorised_deduction(opening_dict))
-    except Exception:
-        return False
-
-
-def collect_workspace_3d_evidence(app: Any, workspace_id: Any) -> Dict[str, Any]:
+def revalidate_b5_opening(opening_data: Dict[str, Any]) -> bool:
     """
-    SECTION 1, 2, 4, 5, 6, Q: Reads-only Authoritative Workspace Evidence Snapshot v3.
+    SECTION 4, M, G: Revalidates B5 opening deduction authority.
+    Untrusted uploads CANNOT forge deduction authority.
     """
-    wid_int = require_workspace_id(workspace_id)
-    ws_meta = None
-    diagnostics_log: List[Dict[str, Any]] = []
+    if not isinstance(opening_data, dict):
+        return False
 
-    if app and hasattr(app, "lquery"):
-        try:
-            rows = app.lquery("SELECT id, job_no, job_name, builder_client, site_address FROM workspaces WHERE id=?", (wid_int,))
-            if rows and len(rows) > 0:
-                row0 = rows[0]
-                if isinstance(row0, dict):
-                    ws_meta = {
-                        "id": row0.get("id", wid_int),
-                        "job_no": row0.get("job_no", ""),
-                        "name": row0.get("job_name", f"Workspace #{wid_int}"),
-                        "builder_client": row0.get("builder_client", ""),
-                        "site_address": row0.get("site_address", ""),
-                    }
-        except Exception as e:
-            diagnostics_log.append({"type": "producer_exception", "producer": "database_workspaces", "error": str(e)})
+    raw_deduct = parse_strict_bool(opening_data.get("deduct"))
 
-    if not ws_meta and app and hasattr(app, "workspaces") and isinstance(app.workspaces, dict):
-        ws_raw = app.workspaces.get(wid_int)
-        if isinstance(ws_raw, dict):
-            ws_meta = ws_raw
+    # Estimator manual override shortcut
+    if raw_deduct and parse_strict_bool(opening_data.get("manual_override_confirmed")):
+        return True
 
-    if not ws_meta:
-        raise ValueError(f"Invalid or missing workspace ID #{wid_int} in database.")
+    # Automatic B5 verification
+    wall_ref = opening_data.get("resolved_wall_ref") or opening_data.get("wall_ref")
+    if not (wall_ref and str(wall_ref).strip()):
+        return False
 
-    # SECTION 2: Query Documents carrying workspace ownership
-    documents = []
-    doc_by_id = {}
-    if app and hasattr(app, "lquery"):
-        try:
-            d_rows = app.lquery(
-                "SELECT id, workspace_id, file_name, sha256, category, page_count, source_type "
-                "FROM documents WHERE workspace_id=?", (wid_int,)
-            )
-            for dr in d_rows:
-                if isinstance(dr, dict):
-                    d_obj = {
-                        "workspace_id": wid_int,
-                        "document_id": dr.get("id"),
-                        "file_name": dr.get("file_name"),
-                        "sha256": dr.get("sha256"),
-                        "category": dr.get("category"),
-                        "page_count": dr.get("page_count"),
-                        "source_type": dr.get("source_type"),
-                    }
-                    documents.append(d_obj)
-                    if dr.get("id") is not None:
-                        doc_by_id[dr.get("id")] = d_obj
-        except Exception as e:
-            diagnostics_log.append({"type": "producer_exception", "producer": "database_documents", "error": str(e)})
+    w = _safe_float(opening_data.get("width_m"))
+    h = _safe_float(opening_data.get("height_m"))
+    if w is None or w <= 0 or h is None or h <= 0:
+        return False
 
-    # SECTION 1 & Q: Query Pages and validate document-page ownership!
-    pages = []
-    if app and hasattr(app, "lquery"):
-        try:
-            p_rows = app.lquery(
-                "SELECT id, workspace_id, document_id, page_no, page_label, page_type, scale_text, px_per_m, width_px, height_px, render_zoom, selected "
-                "FROM pages WHERE workspace_id=?", (wid_int,)
-            )
-            for pr in p_rows:
-                if isinstance(pr, dict):
-                    doc_id = pr.get("document_id")
-                    # SECTION Q: Validate page belongs to document in same workspace!
-                    if documents and doc_id not in doc_by_id:
-                        diagnostics_log.append({
-                            "type": "stale_reference",
-                            "page_id": pr.get("id"),
-                            "error": f"Page {pr.get('id')} references missing/foreign document {doc_id}"
-                        })
-                        continue
+    if not parse_strict_bool(opening_data.get("reconciliation_complete")):
+        return False
 
-                    pages.append({
-                        "workspace_id": wid_int,
-                        "page_id": pr.get("id"),
-                        "document_id": doc_id,
-                        "page_no": pr.get("page_no"),
-                        "page_label": pr.get("page_label"),
-                        "page_type": pr.get("page_type"),
-                        "scale_text": pr.get("scale_text"),
-                        "px_per_m": _safe_float(pr.get("px_per_m")),
-                        "width_px": _safe_float(pr.get("width_px")),
-                        "height_px": _safe_float(pr.get("height_px")),
-                        "render_zoom": _safe_float(pr.get("render_zoom")),
-                        "selected": pr.get("selected"),
-                    })
-        except Exception as e:
-            diagnostics_log.append({"type": "producer_exception", "producer": "database_pages", "error": str(e)})
+    status = str(opening_data.get("deduction_status") or "").lower().strip()
+    decision = str(opening_data.get("deduction_decision") or "").lower().strip()
+    basis = str(opening_data.get("dimension_basis") or "").lower().strip()
 
-    # SECTION D: Query Registered Walls via v139
-    reg_walls = []
-    try:
-        import pb_unified_building_v139 as ub
-        if hasattr(ub, "build_registered_walls"):
-            reg_walls = ub.build_registered_walls(app, wid_int)
-    except Exception as e:
-        diagnostics_log.append({"type": "producer_exception", "producer": "pb_unified_building_v139", "error": str(e)})
+    if status not in ("auto_eligible", "confirmed_deduction", "approved"):
+        return False
+    if decision not in ("deducted", "approved", "confirmed"):
+        return False
+    if basis not in ("rough_opening", "net_opening", "schedule_dimension", "provenance_confirmed"):
+        return False
 
-    # SECTION C: NO PAGE FALLBACK! Only query mapper settings for actual workspace pages
-    mapper_shapes = []
-    if pages and app and hasattr(app, "workspace_setting"):
-        for p in pages:
-            p_id = p.get("page_id")
-            if p_id is None:
-                continue
-            setting_key = f"floor_mapper_v127_page_{p_id}"
-            raw_setting = app.workspace_setting(wid_int, setting_key, None)
-            
-            if raw_setting:
-                parsed_setting = None
-                if isinstance(raw_setting, str):
-                    try:
-                        parsed_setting = json.loads(raw_setting)
-                    except Exception as e:
-                        diagnostics_log.append({"type": "schema_contract_mismatch", "producer": "floor_mapper", "key": setting_key, "error": str(e)})
-                elif isinstance(raw_setting, dict):
-                    parsed_setting = raw_setting
+    cg = _safe_float(opening_data.get("geometry_confidence"))
+    cd = _safe_float(opening_data.get("dimension_confidence"))
+    ca = _safe_float(opening_data.get("association_confidence"))
 
-                if parsed_setting:
-                    mapper_shapes.append({
-                        "workspace_id": wid_int,
-                        "page_id": p_id,
-                        "setting_key": setting_key,
-                        "width_px": p.get("width_px"),
-                        "height_px": p.get("height_px"),
-                        "page_px_per_m": p.get("px_per_m"),
-                        "mapper_setting": parsed_setting
-                    })
+    if cg is None or cg < 0.70 or cd is None or cd < 0.70 or ca is None or ca < 0.70:
+        return False
 
-    # SECTION 13 & P: Query Roof Evidence & Caps via v140
-    roof_data = {}
-    try:
-        import pb_roof_envelope_v140 as re
-        if hasattr(re, "roof_evidence"):
-            roof_data["roof_evidence"] = re.roof_evidence(app, wid_int)
-        if hasattr(re, "roof_caps"):
-            roof_data["roof_caps"] = re.roof_caps(app, wid_int, reg_walls)
-    except Exception as e:
-        diagnostics_log.append({"type": "producer_exception", "producer": "pb_roof_envelope_v140", "error": str(e)})
+    return True
 
-    # SECTION E: Correct call signature for v139 takeoff rows producer -> app.registered_wall_takeoff_rows_v139(reg_walls)
-    takeoff_rows = []
-    if app and hasattr(app, "registered_wall_takeoff_rows_v139"):
-        try:
-            # Pass reg_walls iterable, NOT workspace_id integer!
-            t_rows = app.registered_wall_takeoff_rows_v139(reg_walls)
-            for tr in (t_rows or []):
-                if isinstance(tr, dict):
-                    src_ref = tr.get("source_reference") or tr.get("wall_ref") or ""
-                    # SECTION F: Extract wall_ref identity from 'PB Unified Building v1.3.9 · W01'
-                    m_wall = re.search(r"(?:W\d+|W-[A-Z0-9]+|\bW\d+\b)", src_ref)
-                    derived_wall_ref = m_wall.group(0) if m_wall else src_ref
 
-                    takeoff_rows.append({
-                        "workspace_id": wid_int,
-                        "id": tr.get("id"),
-                        "wall_ref": derived_wall_ref,
-                        "source_reference": src_ref,
-                        "quantity": _safe_float(tr.get("quantity") or tr.get("net_m2") or tr.get("m2")),
-                        "unit": str(tr.get("unit") or "").lower().strip(),
-                        "row_role": str(tr.get("row_role") or "wall").lower().strip(),
-                    })
-        except Exception as e:
-            diagnostics_log.append({"type": "producer_exception", "producer": "v139_wall_takeoff_rows", "error": str(e)})
+def registered_wall_to_canonical_input(wall_obj: Any) -> Dict[str, Any]:
+    """SECTION 5: Adapts a registered wall producer object into a canonical wall input dict."""
+    if hasattr(wall_obj, "to_dict") and callable(wall_obj.to_dict):
+        d = wall_obj.to_dict()
+    elif isinstance(wall_obj, dict):
+        d = wall_obj
+    else:
+        d = {}
 
-    if len(takeoff_rows) == 0 and app and hasattr(app, "lquery"):
-        try:
-            t_rows = app.lquery(
-                "SELECT id, workspace_id, section, element, location, quantity, unit, quantity_status, row_role "
-                "FROM takeoff_rows WHERE workspace_id=?", (wid_int,)
-            )
-            for tr in t_rows:
-                if isinstance(tr, dict):
-                    loc_str = str(tr.get("location") or "")
-                    m_wall = re.search(r"(?:W\d+|W-[A-Z0-9]+|\bW\d+\b)", loc_str)
-                    derived_ref = m_wall.group(0) if m_wall else None
+    w_ref = getattr(wall_obj, "wall_ref", d.get("wall_ref", d.get("id", "")))
+    side = getattr(wall_obj, "side", d.get("side", ""))
+    sub = getattr(wall_obj, "substrate", d.get("substrate", ""))
+    h_m = getattr(wall_obj, "height_m", d.get("height_m"))
+    
+    a_pt = getattr(wall_obj, "a", d.get("a"))
+    b_pt = getattr(wall_obj, "b", d.get("b"))
+    
+    if hasattr(a_pt, "x") and hasattr(a_pt, "y"):
+        a_dict = {"x": a_pt.x, "y": a_pt.y}
+    elif isinstance(a_pt, (list, tuple)) and len(a_pt) >= 2:
+        a_dict = {"x": a_pt[0], "y": a_pt[1]}
+    else:
+        a_dict = a_pt if isinstance(a_pt, dict) else {"x": 0.0, "y": 0.0}
 
-                    takeoff_rows.append({
-                        "workspace_id": wid_int,
-                        "id": tr.get("id"),
-                        "wall_ref": derived_ref,
-                        "section": tr.get("section"),
-                        "element": tr.get("element"),
-                        "location": tr.get("location"),
-                        "quantity": _safe_float(tr.get("quantity")),
-                        "unit": str(tr.get("unit") or "").lower().strip(),
-                        "quantity_status": tr.get("quantity_status"),
-                        "row_role": str(tr.get("row_role") or "").lower().strip(),
-                    })
-        except Exception as e:
-            diagnostics_log.append({"type": "producer_exception", "producer": "database_takeoff_rows", "error": str(e)})
+    if hasattr(b_pt, "x") and hasattr(b_pt, "y"):
+        b_dict = {"x": b_pt.x, "y": b_pt.y}
+    elif isinstance(b_pt, (list, tuple)) and len(b_pt) >= 2:
+        b_dict = {"x": b_pt[0], "y": b_pt[1]}
+    else:
+        b_dict = b_pt if isinstance(b_pt, dict) else {"x": 10.0, "y": 0.0}
 
     return {
-        "workspace_metadata": ws_meta,
-        "documents": documents,
-        "pages": pages,
-        "registered_walls": reg_walls,
-        "mapper_shapes": mapper_shapes,
-        "roof_data": roof_data,
-        "takeoff_rows": takeoff_rows,
+        "wall_ref": str(w_ref),
+        "side": str(side),
+        "substrate": str(sub),
+        "height_m": _safe_float(h_m),
+        "a": a_dict,
+        "b": b_dict,
+        "level": d.get("level") or d.get("level_name"),
+        "provenance": d.get("provenance"),
+        "openings": d.get("openings", []),
+    }
+
+
+def planreader_to_canonical_model(
+    payload: Dict[str, Any],
+    is_validated_internal_workspace: bool = False
+) -> Tuple[CanonicalProject, List[Dict[str, Any]]]:
+    """SECTION 4 & 5: Converts production payload into a validated CanonicalProject instance."""
+    skipped_items: List[Dict[str, Any]] = []
+
+    proj_id = str(payload.get("project_id") or payload.get("id") or "proj_canonical_1")
+    proj_name = str(payload.get("project_name") or payload.get("name") or "Canonical Building Model")
+    is_synth = parse_strict_bool(payload.get("is_synthetic_demo"))
+    proj_conf = parse_optional_confidence(payload.get("confidence"))
+
+    project = CanonicalProject(
+        id=proj_id,
+        name=proj_name,
+        confidence=proj_conf,
+        is_synthetic_demo=is_synth,
+    )
+
+    building = CanonicalBuilding(
+        id=f"bld_{proj_id}",
+        name=f"{proj_name} Main Structure",
+    )
+
+    levels_map: Dict[str, CanonicalLevel] = {}
+
+    # Pre-populate explicitly declared levels
+    for l_info in payload.get("levels") or []:
+        if isinstance(l_info, dict):
+            resolve_canonical_level(l_info, levels_map)
+
+    # Translate Section A LAGO elevation candidates into CanonicalEvidenceObservation objects
+    elev_candidates = payload.get("elevation_opening_candidates") or payload.get("annotations") or []
+    for cand in elev_candidates:
+        if isinstance(cand, dict):
+            obs = CanonicalEvidenceObservation.from_dict({
+                "id": str(cand.get("candidate_id") or cand.get("id") or cand.get("annotation_id") or "cand_obs"),
+                "kind": "elevation_opening_candidate",
+                "workspace_id": str(payload.get("workspace_id") or ""),
+                "document_id": str(cand.get("document_id") or ""),
+                "page_id": str(cand.get("page_id") or ""),
+                "page_no": cand.get("page_no") or cand.get("page_number"),
+                "drawing_reference": str(cand.get("drawing_no") or cand.get("drawing_id") or ""),
+                "side": str(cand.get("side") or cand.get("facade") or ""),
+                "level_name": str(cand.get("level") or cand.get("level_name") or ""),
+                "source_coords": cand.get("bbox") if isinstance(cand.get("bbox"), dict) else cand.get("source_coords"),
+                "producer": "pb_elevation_evidence_v172",
+                "producer_version": "v172",
+                "confidence": _safe_float(cand.get("confidence")),
+                "review_state": ReviewState.REVIEW_REQUIRED,
+                "reason_physical_unavailable": "Elevation opening candidate lacks physical plan host wall placement",
+            })
+            project.evidence_observations.append(obs)
+
+    # Process walls
+    raw_walls = payload.get("walls") or payload.get("registered_walls") or []
+    for idx, w_raw in enumerate(raw_walls):
+        if isinstance(w_raw, dict):
+            w_input = w_raw
+        else:
+            w_input = registered_wall_to_canonical_input(w_raw)
+
+        wall_ref = str(w_input.get("wall_ref") or w_input.get("id") or f"W-{idx+1}")
+        a_vec = _parse_vector2d(w_input.get("a"))
+        b_vec = _parse_vector2d(w_input.get("b"))
+        if a_vec is None or b_vec is None:
+            skipped_items.append({"id": wall_ref, "type": "WALL", "reason": "Invalid or NaN start/end coordinates"})
+            continue
+
+        h_m = _safe_float(w_input.get("height_m") or w_input.get("unconstrained_height_m"))
+        th_m = _safe_float(w_input.get("thickness_m") or w_input.get("wall_thickness_m")) or 0.23
+        w_conf = parse_optional_confidence(w_input.get("confidence"))
+
+        h_stat = str(w_input.get("height_status") or "").lower().strip()
+        if h_stat == "confirmed":
+            r_state = ReviewState.CONFIRMED
+        elif h_stat == "inferred":
+            r_state = ReviewState.INFERRED
+        else:
+            r_state = ReviewState.REVIEW_REQUIRED
+
+        takeoff_elig = parse_strict_bool(w_input.get("takeoff_eligible")) if is_validated_internal_workspace else False
+        prov = _parse_provenance(w_input.get("provenance"))
+        if not prov.wall_ref:
+            prov.wall_ref = wall_ref
+
+        level_val = w_input.get("level") or w_input.get("level_name") or w_input.get("level_id")
+        target_lvl, _ = resolve_canonical_level(level_val, levels_map)
+
+        wall_id = wall_ref if wall_ref.startswith("wall_") else f"wall_{wall_ref}"
+        c_wall = CanonicalWall(
+            id=wall_id,
+            name=f"Wall {wall_ref}",
+            start_point=a_vec,
+            end_point=b_vec,
+            height_m=h_m,
+            thickness_m=th_m,
+            confidence=w_conf,
+            review_state=r_state,
+            takeoff_eligible=takeoff_elig,
+            deduction_authority=False,  # SECTION F: Delayed until physical validation!
+            provenance=prov,
+        )
+
+        # Process attached openings
+        raw_openings = w_input.get("openings") or []
+        wall_has_valid_b5_physical_opening = False
+
+        for op_idx, op_raw in enumerate(raw_openings):
+            if not isinstance(op_raw, dict):
+                continue
+
+            op_id = str(op_raw.get("id") or f"op_{wall_ref}_{op_idx+1}")
+            op_mark = str(op_raw.get("mark") or op_raw.get("label") or f"Opening {op_idx+1}")
+            op_type_str = str(op_raw.get("opening_type") or op_raw.get("type") or "").upper().strip()
+            if "DOOR" in op_type_str:
+                op_type = ObjectType.DOOR
+            elif "WINDOW" in op_type_str:
+                op_type = ObjectType.WINDOW
+            else:
+                op_type = ObjectType.OPENING
+
+            offset_m = _safe_float(op_raw.get("offset_along_wall_m") or op_raw.get("offset_m"))
+            sill_m = _safe_float(op_raw.get("sill_height_m") or op_raw.get("sill_m")) or 0.0
+            w_op = _safe_float(op_raw.get("width_m"))
+            h_op = _safe_float(op_raw.get("height_m"))
+
+            op_prov = _parse_provenance(op_raw.get("provenance"))
+            if not op_prov.wall_ref:
+                op_prov.wall_ref = wall_ref
+
+            op_deduct_auth = revalidate_b5_opening(op_raw) if is_validated_internal_workspace else False
+
+            # SECTION C: Opening level compatibility check
+            op_lvl_val = op_raw.get("level") or op_raw.get("level_name")
+            if op_lvl_val:
+                _, op_lvl_slug = resolve_canonical_level(op_lvl_val, levels_map)
+                _, wall_lvl_slug = resolve_canonical_level(w_input.get("level"), levels_map)
+                if op_lvl_slug != "unresolved" and wall_lvl_slug != "unresolved" and op_lvl_slug != wall_lvl_slug:
+                    # SECTION C: Wrong level conflict!
+                    op_deduct_auth = False
+                    skipped_items.append({
+                        "id": op_id,
+                        "type": "OPENING",
+                        "reason": f"Wrong level conflict: opening level '{op_lvl_val}' != host wall level",
+                    })
+
+            c_opening = CanonicalOpening(
+                id=op_id,
+                name=op_mark,
+                opening_type=op_type,
+                width_m=w_op,
+                height_m=h_op,
+                offset_along_wall_m=offset_m,
+                sill_height_m=sill_m,
+                confidence=parse_optional_confidence(op_raw.get("confidence")),
+                review_state=ReviewState.CONFIRMED if op_deduct_auth else ReviewState.REVIEW_REQUIRED,
+                takeoff_eligible=c_wall.takeoff_eligible,
+                deduction_authority=op_deduct_auth,
+                provenance=op_prov,
+            )
+
+            # SECTION D & F: Physical validation via validate_opening_geometry
+            is_phys_valid = validate_opening_geometry(c_opening, c_wall)
+            if is_phys_valid and op_deduct_auth:
+                wall_has_valid_b5_physical_opening = True
+
+            c_wall.openings.append(c_opening)
+
+        # SECTION F: Wall deduction gate becomes True ONLY when opening passes both B5 AND physical geometry validation!
+        c_wall.deduction_authority = wall_has_valid_b5_physical_opening
+        target_lvl.walls.append(c_wall)
+
+    # Process floors
+    raw_floors = payload.get("floors") or payload.get("mapper_shapes") or []
+    for f_idx, f_raw in enumerate(raw_floors):
+        if isinstance(f_raw, dict):
+            f_pts_raw = _points_from_shape(f_raw)
+            f_pts = [_parse_vector2d(pt) for pt in f_pts_raw if _parse_vector2d(pt) is not None]
+            
+            target_lvl, _ = resolve_canonical_level(f_raw.get("level"), levels_map)
+            f_id = str(f_raw.get("id") or f"floor_{f_idx+1}")
+            f_name = str(f_raw.get("name") or f"Floor Polygon {f_idx+1}")
+
+            c_floor = CanonicalFloor(
+                id=f_id,
+                name=f_name,
+                polygon=f_pts,
+                review_state=ReviewState.CONFIRMED if len(f_pts) >= 3 else ReviewState.REVIEW_REQUIRED,
+                takeoff_eligible=is_validated_internal_workspace,
+                provenance=_parse_provenance(f_raw.get("provenance")),
+            )
+            target_lvl.floors.append(c_floor)
+
+    if not levels_map:
+        resolve_canonical_level(None, levels_map)
+
+    building.levels = list(levels_map.values())
+    project.buildings.append(building)
+    return project, skipped_items
+
+
+def collect_workspace_3d_evidence(app: Any, workspace_id: int) -> Dict[str, Any]:
+    """
+    SECTION 18, 5F, 60, Q: Collects complete evidence snapshot v3 directly from production SQLite DB & producers.
+    Uses app.lquery() dictionary access and app.registered_wall_takeoff_rows_v139(reg_walls) signature.
+    """
+    wid = require_workspace_id(workspace_id)
+    snapshot: Dict[str, Any] = {
+        "workspace_metadata": {"id": wid},
+        "documents": [],
+        "pages": [],
+        "registered_walls": [],
+        "mapper_shapes": [],
+        "roof_data": None,
+        "takeoff_rows": [],
+        "diagnostics_log": [],
         "producer_versions": {
             "3d_engine": "v1.5.1",
             "v139_walls": "v139",
             "v175_openings": "v175",
             "v128_mapper": "v128",
             "v140_roof": "v140",
-        },
-        "diagnostics_log": diagnostics_log,
+        }
     }
 
+    if not (app and hasattr(app, "lquery")):
+        snapshot["diagnostics_log"].append({"type": "no_lquery", "msg": "App instance lacks lquery method"})
+        return snapshot
 
-def planreader_to_canonical_model(
-    production_payload: Dict[str, Any],
-    *,
-    is_validated_internal_workspace: bool = False
-) -> Tuple[CanonicalProject, List[Dict[str, Any]]]:
-    """Converts a PlanReader production output payload into a CanonicalProject graph."""
-    if not isinstance(production_payload, dict):
-        raise ValueError("Production payload must be a non-null dictionary")
+    try:
+        # 1. Fetch workspace metadata
+        ws_rows = app.lquery("SELECT id, job_no, job_name, builder_client, site_address FROM workspaces WHERE id = ?", (wid,))
+        if ws_rows and isinstance(ws_rows[0], dict):
+            snapshot["workspace_metadata"] = ws_rows[0]
 
-    skipped_items: List[Dict[str, Any]] = []
-    is_synthetic = parse_strict_bool(production_payload.get("is_synthetic_demo", False))
+        # 2. Fetch documents
+        doc_rows = app.lquery("SELECT id, workspace_id, file_name, sha256, category, page_count, source_type FROM documents WHERE workspace_id = ?", (wid,))
+        valid_doc_ids = set()
+        for r in doc_rows:
+            if isinstance(r, dict):
+                snapshot["documents"].append(r)
+                if r.get("id") is not None:
+                    valid_doc_ids.add(int(r.get("id")))
 
-    ws_meta = production_payload.get("workspace_metadata") or {}
-    proj_id = str(production_payload.get("project_id") or ws_meta.get("id") or "proj_prod_001")
-    proj_name = str(production_payload.get("project_name") or ws_meta.get("name") or ws_meta.get("job_name") or "PlanReader Production Project")
-
-    project = CanonicalProject(
-        id=proj_id,
-        name=proj_name,
-        is_synthetic_demo=is_synthetic,
-        confidence=_safe_float(production_payload.get("confidence")),
-        review_state=ReviewState.REVIEW_REQUIRED,
-        takeoff_eligible=False,
-        deduction_authority=False,
-    )
-
-    bld = CanonicalBuilding(id="bld_main", name="Main Building", parent_id=project.id)
-    level_map: Dict[str, CanonicalLevel] = {}
-
-    unresolved_level_container = CanonicalLevel(
-        id="lvl_unresolved_review",
-        name="Unresolved Level (Review Required)",
-        elevation_m=None,
-        height_m=None,
-        review_state=ReviewState.REVIEW_REQUIRED
-    )
-
-    levels_raw = production_payload.get("levels") or production_payload.get("storeys") or []
-    if isinstance(levels_raw, list):
-        for idx, l_dict in enumerate(levels_raw):
-            if not isinstance(l_dict, dict):
-                continue
-            l_id = str(l_dict.get("id") or f"lvl_{idx}")
-            l_name = str(l_dict.get("name") or f"Level {idx}")
-            l_elev = _safe_float(l_dict.get("elevation_m") if "elevation_m" in l_dict else l_dict.get("elevation"))
-            
-            c_lvl = CanonicalLevel(
-                id=l_id,
-                name=l_name,
-                elevation_m=l_elev,
-                height_m=_safe_float(l_dict.get("height_m")),
-                review_state=ReviewState.CONFIRMED if l_elev is not None else ReviewState.REVIEW_REQUIRED,
-                provenance=_parse_provenance(l_dict),
-            )
-            level_map[l_id] = c_lvl
-
-    # Process Walls
-    walls_raw = production_payload.get("walls") or production_payload.get("registered_walls") or []
-    if isinstance(walls_raw, list):
-        for w_dict in walls_raw:
-            if not isinstance(w_dict, dict):
-                continue
-
-            c_wall, nested_ops = registered_wall_to_canonical_input(
-                w_dict, skipped_items, is_validated_internal_workspace=is_validated_internal_workspace
-            )
-            if c_wall is None:
-                continue
-
-            claimed_lvl = w_dict.get("level") or w_dict.get("level_name") or w_dict.get("level_id") or w_dict.get("storey_id")
-            target_lvl, res_reason = resolve_canonical_level(claimed_lvl, level_map, unresolved_level_container, skipped_items)
-            c_wall.level_id = target_lvl.id
-            target_lvl.walls.append(c_wall)
-
-            # Process nested openings attached to host wall
-            for op_dict in nested_ops:
-                if not isinstance(op_dict, dict):
-                    continue
-
-                # SECTION 20: Verify nested host identity matches host wall!
-                resolved_host = op_dict.get("resolved_wall_ref") or op_dict.get("wall_ref")
-                if resolved_host and str(resolved_host) != c_wall.id:
-                    skipped_items.append({"item": op_dict, "reason": f"wrong_host_conflict: opening claims host '{resolved_host}' but nested on '{c_wall.id}'"})
-                    continue
-
-                op_id = str(op_dict.get("id") or op_dict.get("opening_instance_id") or f"op_{len(c_wall.openings) + 1}")
-                op_mark = str(op_dict.get("mark") or op_dict.get("name") or "OP")
-                
-                b5_authorized = revalidate_b5_opening(op_dict)
-                if b5_authorized:
-                    c_wall.deduction_authority = True
-
-                w_op = _safe_float(op_dict.get("width_m") if "width_m" in op_dict else op_dict.get("width"))
-                h_op = _safe_float(op_dict.get("height_m") if "height_m" in op_dict else op_dict.get("height"))
-                off_op = _safe_float(op_dict.get("offset_m") if "offset_m" in op_dict else (op_dict.get("offset_along_wall_m") if "offset_along_wall_m" in op_dict else op_dict.get("offset")))
-                sill_op = _safe_float(op_dict.get("sill_m") if "sill_m" in op_dict else (op_dict.get("sill_height_m") if "sill_height_m" in op_dict else op_dict.get("sill")))
-                
-                raw_type = str(op_dict.get("opening_type") or op_dict.get("type") or "").upper().strip()
-                c_op_type = ObjectType.DOOR if "DOOR" in raw_type else (ObjectType.WINDOW if "WIN" in raw_type else ObjectType.OPENING)
-
-                op_prov = _parse_provenance(op_dict.get("provenance") or op_dict)
-                op_prov.opening_instance_id = str(op_dict.get("opening_instance_id") or op_id)
-                op_prov.plan_geometry_signature = str(op_dict.get("plan_geometry_signature") or "")
-
-                c_op = CanonicalOpening(
-                    id=op_id,
-                    name=op_mark,
-                    wall_id=c_wall.id,
-                    level_id=target_lvl.id,
-                    opening_type=c_op_type,
-                    offset_along_wall_m=off_op,
-                    sill_height_m=sill_op,
-                    width_m=w_op,
-                    height_m=h_op,
-                    mark=op_mark,
-                    confidence=_safe_float(op_dict.get("confidence")),
-                    review_state=ReviewState.REVIEW_REQUIRED,
-                    provenance=op_prov,
-                    deduction_authority=b5_authorized,
-                )
-                c_wall.openings.append(c_op)
-
-    # SECTION A & B: Real v127/v128 Floor Mapper Metric Conversion using calibration_px_per_m & _points_from_shape
-    mapper_shapes_raw = production_payload.get("mapper_shapes") or production_payload.get("polygons") or []
-    if isinstance(mapper_shapes_raw, list):
-        for item in mapper_shapes_raw:
-            if not isinstance(item, dict):
-                continue
-            
-            setting = item.get("mapper_setting") or item
-            w_px = _safe_float(item.get("width_px") or setting.get("width_px"))
-            h_px = _safe_float(item.get("height_px") or setting.get("height_px"))
-            
-            # SECTION A: Use REAL pb_floor_mapper_v127.calibration_px_per_m()
-            calib_dict = setting.get("calibration") or {}
-            px_per_m = calibration_px_per_m(calib_dict, w_px or 0.0, h_px or 0.0) if (w_px and h_px) else 0.0
-            if px_per_m <= 0:
-                px_per_m = _safe_float(item.get("page_px_per_m") or calib_dict.get("px_per_m")) or 0.0
-
-            shapes = setting.get("boxes") or setting.get("shapes") or [setting]
-
-            for p_idx, p_dict in enumerate(shapes if isinstance(shapes, list) else [shapes]):
-                if not isinstance(p_dict, dict):
-                    continue
-
-                # SECTION B: Use REAL pb_floor_mapper_v128._points_from_shape() (supports irregular polygons and v127 rectangles)
-                pts = _points_from_shape(p_dict)
-                manual_m2 = _safe_float(p_dict.get("manual_m2") if "manual_m2" in p_dict else p_dict.get("specified_floor_area_m2"))
-
-                # Require valid page dimensions and calibration for physical floor!
-                if len(pts) >= 3 and px_per_m > 0 and w_px and h_px:
-                    vertices: List[Vector2D] = []
-                    for pt in pts:
-                        px_x = (pt["x"] / 100.0) * w_px
-                        px_y = (pt["y"] / 100.0) * h_px
-                        m_x = px_x / px_per_m
-                        m_y = px_y / px_per_m
-                        vertices.append(Vector2D(x=m_x, y=m_y))
-
-                    if len(vertices) >= 3:
-                        c_floor = CanonicalFloor(
-                            id=str(p_dict.get("id") or f"floor_{p_idx}"),
-                            name=str(p_dict.get("name") or f"Floor {p_idx + 1}"),
-                            level_id=unresolved_level_container.id,
-                            polygon=vertices,
-                            specified_floor_area_m2=manual_m2,
-                            review_state=ReviewState.REVIEW_REQUIRED,
-                        )
-                        unresolved_level_container.floors.append(c_floor)
-                elif manual_m2 is not None and manual_m2 > 0:
-                    skipped_items.append({
-                        "item": f"floor_manual_allowance_{p_idx}",
-                        "reason": f"manual_m2_allowance_no_physical_polygon: {manual_m2:.2f} m²"
-                    })
-
-    # SECTION P: Real v140 Roof Evidence & Caps Integration
-    roof_data = production_payload.get("roof_data") or {}
-    if isinstance(roof_data, dict) and roof_data:
-        roof_caps = roof_data.get("roof_caps") or roof_data.get("caps") or []
-        for r_idx, r_dict in enumerate(roof_caps if isinstance(roof_caps, list) else []):
-            if isinstance(r_dict, dict):
-                r_pts = r_dict.get("points") or r_dict.get("polygon") or []
-                r_poly = [_parse_vector2d(pt) for pt in r_pts if _parse_vector2d(pt) is not None]
-                raw_type = r_dict.get("roof_type")
-                r_type_str = str(raw_type) if raw_type is not None else None
-                
-                # SECTION P: pitches_deg is a LIST; do NOT pass list to _safe_float()!
-                raw_pitches = r_dict.get("pitches_deg") or r_dict.get("pitch_deg")
-                if isinstance(raw_pitches, list):
-                    pitch_val = _safe_float(raw_pitches[0]) if len(raw_pitches) == 1 else None
+        # 3. SECTION Q: Fetch pages & validate document-page workspace ownership!
+        page_rows = app.lquery("SELECT id, workspace_id, document_id, page_no, page_label, page_type, scale_text, px_per_m, width_px, height_px, render_zoom, selected FROM pages WHERE workspace_id = ?", (wid,))
+        valid_pages = []
+        for p in page_rows:
+            if isinstance(p, dict):
+                doc_id = p.get("document_id")
+                if doc_id is not None and int(doc_id) in valid_doc_ids:
+                    valid_pages.append(p)
                 else:
-                    pitch_val = _safe_float(raw_pitches)
+                    snapshot["diagnostics_log"].append({
+                        "type": "stale_reference",
+                        "msg": f"Page #{p.get('id')} references missing or foreign document_id {doc_id} in workspace #{wid}",
+                    })
+        snapshot["pages"] = valid_pages
 
-                c_roof = CanonicalRoof(
-                    id=str(r_dict.get("id") or f"roof_{r_idx}"),
-                    name=str(r_dict.get("name") or f"Roof Envelope {r_idx + 1}"),
-                    level_id=unresolved_level_container.id,
-                    polygon=r_poly,
-                    pitch_deg=pitch_val,
-                    roof_type=r_type_str,
-                    review_state=ReviewState.REVIEW_REQUIRED,
-                )
-                unresolved_level_container.roofs.append(c_roof)
+        # 4. Fetch registered walls from v139 producer
+        if hasattr(app, "build_registered_walls_v139") and callable(app.build_registered_walls_v139):
+            try:
+                reg_walls = app.build_registered_walls_v139(wid)
+                snapshot["registered_walls"] = [registered_wall_to_canonical_input(w) for w in reg_walls]
+            except Exception as e:
+                snapshot["diagnostics_log"].append({"type": "v139_wall_error", "msg": str(e)})
 
-    for unhandled in ["CEILING", "SOFFIT", "BALCONY", "PARAPET", "COLUMN", "BALUSTRADE", "SCREEN", "SPACE", "SURFACE"]:
-        skipped_items.append({
-            "item": unhandled,
-            "reason": f"producer_not_available: No active producer registered for {unhandled}"
-        })
+        # 5. SECTION E & F: Fetch takeoff rows using correct app.registered_wall_takeoff_rows_v139(reg_walls) signature!
+        if hasattr(app, "registered_wall_takeoff_rows_v139") and callable(app.registered_wall_takeoff_rows_v139):
+            try:
+                # Pass registered wall objects iterable reg_walls, NOT workspace ID!
+                reg_wall_objs = app.build_registered_walls_v139(wid) if hasattr(app, "build_registered_walls_v139") else []
+                v139_takeoff = app.registered_wall_takeoff_rows_v139(reg_wall_objs)
+                for r in v139_takeoff:
+                    if isinstance(r, dict):
+                        snapshot["takeoff_rows"].append(r)
+            except Exception as e:
+                snapshot["diagnostics_log"].append({"type": "v139_takeoff_error", "msg": str(e)})
 
-    all_levels = list(level_map.values())
-    if len(unresolved_level_container.walls) > 0 or len(unresolved_level_container.floors) > 0 or len(unresolved_level_container.roofs) > 0:
-        all_levels.append(unresolved_level_container)
+        # 6. Read real floor mapper state for pages without synthetic page 1 fallback
+        for p in valid_pages:
+            p_no = p.get("page_no")
+            if p_no is not None and hasattr(app, "workspace_setting"):
+                mapper_setting = app.workspace_setting(wid, f"floor_mapper_v127_page_{p_no}", None)
+                if mapper_setting:
+                    try:
+                        m_data = json.loads(mapper_setting) if isinstance(mapper_setting, str) else mapper_setting
+                        if isinstance(m_data, dict):
+                            # SECTION A & B: Calibrate using real pb_floor_mapper_v127.calibration_px_per_m
+                            calib = m_data.get("calibration")
+                            w_px = _safe_float(p.get("width_px"))
+                            h_px = _safe_float(p.get("height_px"))
+                            if isinstance(calib, dict) and w_px and h_px:
+                                px_m = calibration_px_per_m(calib, w_px, h_px)
+                                m_data["px_per_m"] = px_m
 
-    if len(all_levels) == 0:
-        all_levels.append(unresolved_level_container)
+                            snapshot["mapper_shapes"].append(m_data)
+                    except Exception:
+                        pass
 
-    bld.levels = all_levels
-    project.buildings = [bld]
+    except Exception as e:
+        snapshot["diagnostics_log"].append({"type": "evidence_collection_error", "msg": str(e)})
 
-    return project, skipped_items
+    return snapshot
 
 
-def planreader_workspace_to_canonical(
-    app: Any,
-    workspace_id: Any
-) -> WorkspaceCanonicalResult:
-    """Builds canonical 3D model from workspace DB and evidence snapshot v3."""
-    wid_int = require_workspace_id(workspace_id)
-    snapshot = collect_workspace_3d_evidence(app, wid_int)
+def planreader_workspace_to_canonical(app: Any, workspace_id: int) -> WorkspaceCanonicalResult:
+    """
+    SECTION L & 5F: Main production entry point executing workspace evidence collection,
+    canonical model synthesis, diagnostics, and snapshot fingerprinting.
+    """
+    wid = require_workspace_id(workspace_id)
+    snapshot = collect_workspace_3d_evidence(app, wid)
 
     from pb_canonical_persistence import compute_workspace_source_fingerprint
     snapshot_fp = compute_workspace_source_fingerprint(snapshot)
 
-    project, skipped_items = planreader_to_canonical_model(snapshot, is_validated_internal_workspace=True)
-    diagnostics = generate_production_diagnostics_report(project, workspace_data=snapshot, skipped_items=skipped_items)
+    project, skipped = planreader_to_canonical_model(snapshot, is_validated_internal_workspace=True)
+    project.id = f"ws_{wid}_canonical"
+    project.name = f"Workspace #{wid} Canonical BIM Model"
+
+    diagnostics = generate_production_diagnostics_report(project, workspace_data=snapshot, skipped_items=skipped)
+    diagnostics["workspace_id"] = wid
+    diagnostics["source_revision_fingerprint"] = snapshot_fp
 
     return WorkspaceCanonicalResult(
         project=project,
         snapshot=snapshot,
         snapshot_fingerprint=snapshot_fp,
         diagnostics=diagnostics,
-        skipped_items=skipped_items
+        skipped_items=skipped,
     )

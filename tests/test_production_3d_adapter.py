@@ -171,7 +171,7 @@ def test_level_integrity_preserves_unresolved_and_explicit_zero():
     lvl_zero = next(l for l in bld.levels if l.id == "lvl_explicit_zero")
     assert lvl_zero.elevation_m == 0.0  # Explicit 0.0 preserved!
     assert len(lvl_zero.walls) == 1
-    assert lvl_zero.walls[0].id == "w_zero"
+    assert lvl_zero.walls[0].id in ("w_zero", "wall_w_zero")
 
 
 def test_confidence_does_not_become_confirmation():

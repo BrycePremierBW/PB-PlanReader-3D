@@ -1,12 +1,12 @@
 """
-Unit and Integration test suite for Phase 5G Real Producer Contract Lock & Multi-Level Expansion
+Unit and Integration test suite for Phase 5H Semantic Closure & Multi-Level Production Proof
 (tests/test_production_workspace_adapter.py).
 
-Verifies Sections A through Y:
-1. Real v127 calibration_px_per_m & v128 _points_from_shape integration.
+Verifies Sections A through AP:
+1. Real LAGO evidence translation into CanonicalEvidenceObservation objects.
 2. Page fallback absent (no pages -> zero mapper setting reads).
 3. v139 takeoff_rows call signature requiring wall iterable (reg_walls), failing if integer workspace ID passed.
-4. v139 source_reference identity parsing ('PB Unified Building v1.3.9 · W01' -> 'W01').
+4. Robust v139 source_reference wall_ref identity parsing ('PB Unified Building v1.3.9 · W-E101' -> 'W-E101').
 5. Duplicate reconciliation candidate detection (status = 'ambiguous', no last-write-wins).
 6. Automatic B5 opening authority with manual_override_confirmed=False & field-by-field failure tests.
 7. Fingerprint ordered vs unordered semantics (polygon vertex order change alters hash).
@@ -14,13 +14,22 @@ Verifies Sections A through Y:
 9. Bounded session-state cache.
 10. Application wrapper idempotency (double apply does not double wrap).
 11. Real LAGO elevation evidence fail-closed integration test (0 physical openings).
+12. Wrong-level opening rejection (opening level != wall level -> wrong_level conflict, 0 deduction).
+13. Delayed wall deduction gate (wall deduction authority True ONLY when opening passes physical geometry validation).
 """
 
 import os
 import json
 import sqlite3
 import pytest
-from pb_canonical_building import CanonicalProject, CanonicalLevel, ReviewState, ObjectType, Vector2D
+from pb_canonical_building import (
+    CanonicalProject,
+    CanonicalLevel,
+    ReviewState,
+    ObjectType,
+    Vector2D,
+    CanonicalEvidenceObservation,
+)
 from pb_production_3d_adapter import (
     registered_wall_to_canonical_input,
     revalidate_b5_opening,
@@ -37,7 +46,7 @@ from pb_canonical_persistence import (
     PERSISTENCE_KEY,
 )
 from pb_3d_diagnostics import generate_production_diagnostics_report
-from pb_geometry_services import potential_net_wall_area
+from pb_geometry_services import potential_net_wall_area, validate_opening_geometry
 from pb_floor_mapper_v127 import calibration_px_per_m
 from pb_floor_mapper_v128 import _points_from_shape
 
@@ -241,7 +250,7 @@ def test_section_62_application_wrapper_idempotency():
 
 
 def test_section_n_real_lago_elevation_fail_closed_assertion():
-    """SECTION N: Test real LAGO elevation benchmark (0 plan host walls -> 0 physical 3D openings -> 0 deductions)."""
+    """SECTION N & A: Test real LAGO elevation benchmark (0 plan host walls -> 0 physical 3D openings -> 0 deductions)."""
     fpath = "tests/fixtures/lago_cd3001_east_elevation_v177.json"
     if not os.path.exists(fpath):
         pytest.skip("Fixture not found")
@@ -249,11 +258,10 @@ def test_section_n_real_lago_elevation_fail_closed_assertion():
     with open(fpath, "r", encoding="utf-8") as f:
         fixture_data = json.load(f)
 
-    src = fixture_data.get("source", {})
     lago_payload = {
-        "workspace_metadata": {"id": "lago_cd3001", "name": f"LAGO Elevation Benchmark {src.get('drawing_no')}"},
+        "workspace_metadata": {"id": "lago_cd3001"},
         "registered_walls": [],  # Zero plan host walls!
-        "elevation_opening_candidates": [
+        "elevation_opening_candidates": fixture_data.get("annotations") or [
             {"candidate_id": "c1", "width_m": 1.2, "height_m": 2.1}
         ]
     }
@@ -264,3 +272,41 @@ def test_section_n_real_lago_elevation_fail_closed_assertion():
 
     total_physical_openings = sum(len(w.openings) for l in bld.levels for w in l.walls)
     assert total_physical_openings == 0
+    assert len(project.evidence_observations) > 0  # SECTION A: Translated into evidence observations!
+
+
+def test_section_c_wrong_level_opening_rejection():
+    """SECTION C: Test opening assigned to Level 2 attached to Ground Floor wall causes wrong_level conflict and 0 deduction."""
+    payload = {
+        "walls": [
+            {
+                "wall_ref": "W-G01",
+                "level": "Ground",
+                "a": {"x": 0, "y": 0},
+                "b": {"x": 10, "y": 0},
+                "height_m": 3.0,
+                "openings": [
+                    {
+                        "id": "op_wrong_lvl",
+                        "opening_type": "DOOR",
+                        "level": "Level 2",  # WRONG LEVEL!
+                        "offset_along_wall_m": 2.0,
+                        "sill_height_m": 0.0,
+                        "width_m": 1.0,
+                        "height_m": 2.1,
+                        "deduct": True,
+                        "manual_override_confirmed": True,
+                    }
+                ]
+            }
+        ]
+    }
+
+    project, skipped = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
+    wall = project.buildings[0].levels[0].walls[0]
+    opening = wall.openings[0]
+
+    # Deduction authority MUST be set to False due to wrong level conflict!
+    assert opening.deduction_authority is False
+    assert wall.deduction_authority is False
+    assert any("Wrong level conflict" in str(s.get("reason", "")) for s in skipped)
