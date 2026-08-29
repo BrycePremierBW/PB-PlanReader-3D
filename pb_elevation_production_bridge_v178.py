@@ -1168,7 +1168,11 @@ def _validated_position_anchor(
     registration origins or directions likewise reject — same station in two
     different frames is not a shared position.  A record that conflicts with,
     or lacks, its OWN object's wall association also FAILS CLOSED: a well-formed
-    record frame alone cannot overrule mis-attached wall evidence.
+    record frame alone cannot overrule mis-attached wall evidence.  Finally,
+    the two sides must name the SAME wall at every level — object wall_refs,
+    and the records' wall_refs — so an internally inconsistent pair (each record
+    matching its own object, but the plan and elevation walls differing) can
+    never pass via a falsified frame.
     """
     plan_rec = _position_record(inst)
     elev_rec = _position_record(elev)
@@ -1189,6 +1193,13 @@ def _validated_position_anchor(
     if elev_rec["wall_ref"] != elev_wall:
         # The elevation record names a DIFFERENT wall than the elevation object
         # itself is associated with -> mis-attached evidence -> fail closed.
+        return False
+    if plan_rec["wall_ref"] != elev_rec["wall_ref"]:
+        # Even when each record matches its OWN object's wall, the two sides
+        # must name the SAME wall.  A record can still falsely supply a
+        # registered frame while its own wall_ref differs from the other side
+        # (the frame check does not compare wall_ref to the segment wall) -> an
+        # internally inconsistent pair fails closed.
         return False
     segment = _registered_wall_segment(
         facades, str(getattr(elev, "elevation_side", "") or "").strip(),
