@@ -13,6 +13,32 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
 
+import pytest
+
+
+# These three historical Phase 5 tests encode the now-rejected assumption that
+# an unregistered/missing "Ground" storey implicitly proves global elevation
+# Z=0. Phase 5M intentionally removes that assumption. Strict xfail is used so
+# the suite will fail if the unsafe legacy behaviour ever returns. Replacement
+# positive/negative roof-Z coverage lives in test_phase5m_roof_closure.py.
+_PHASE5M_SUPERSEDED_UNSAFE_ROOF_TESTS = {
+    "test_section_14_legacy_27m_roof_z_fencing",
+    "test_phase5j_roof_form_and_objective_z_proof",
+    "test_phase5k_roof_z_reproduction_verification",
+}
+
+
+def pytest_collection_modifyitems(items):
+    for item in items:
+        if item.name in _PHASE5M_SUPERSEDED_UNSAFE_ROOF_TESTS:
+            item.add_marker(pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "Superseded by Phase 5M zero-made-up-data contract: a Ground label "
+                    "without objective storey elevation cannot establish absolute roof Z"
+                ),
+            ))
+
 
 def make_temp_db() -> sqlite3.Connection:
     """Create an in-memory SQLite database with the PlanReader schema."""
