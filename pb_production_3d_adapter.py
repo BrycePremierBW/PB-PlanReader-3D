@@ -12,7 +12,6 @@ from typing import Any, Dict
 import pb_production_3d_adapter_phase5m as _phase5m
 from pb_production_3d_adapter_phase5m import *  # noqa: F401,F403
 
-from pb_canonical_building import CanonicalEvidenceObservation, ReviewState
 from pb_3d_diagnostics import generate_production_diagnostics_report
 
 require_workspace_id = _phase5m.require_workspace_id
@@ -51,58 +50,21 @@ def resolve_canonical_level(level_val: Any, levels_map: Dict[str, Any], diagnost
     return _BASE_RESOLVE_CANONICAL_LEVEL(level_val, levels_map, diagnostics_log)
 
 
-def _is_free_form_floor_level_claim(shape: Dict[str, Any]) -> bool:
-    weak = shape.get("_source_level")
-    if not isinstance(weak, str) or not weak.strip():
-        return False
-    for key in ("storey_id", "level_id", "level", "level_name"):
-        value = shape.get(key)
-        if value is not None and (not isinstance(value, str) or value.strip()):
-            return False
-    return True
-
-
 def planreader_to_canonical_model(payload: Dict[str, Any], is_validated_internal_workspace: bool = False):
     prepared = copy.deepcopy(payload if isinstance(payload, dict) else {})
-    rejected_weak_floors = []
-    shapes = prepared.get("mapper_shapes")
-    if isinstance(shapes, list):
-        kept = []
-        for shape in shapes:
-            if isinstance(shape, dict) and _is_free_form_floor_level_claim(shape):
-                rejected_weak_floors.append(shape)
-            else:
-                kept.append(shape)
-        prepared["mapper_shapes"] = kept
 
-    # Install the compatibility resolver into both module layers.  It delegates
+    # Install the compatibility resolver into both module layers. It delegates
     # to the captured immutable Phase 5M base resolver, so this does not recurse.
+    # Do not pre-filter mapper floors here: the Phase 5M preparation layer keeps
+    # calibrated metric XY geometry and assigns an unresolved/review storey when
+    # no trusted level identity exists. Weak sheet text is provenance, not storey
+    # authority, but it is also not a reason to discard valid XY geometry.
     _phase5m.resolve_canonical_level = resolve_canonical_level
     _phase5m._legacy.resolve_canonical_level = resolve_canonical_level
-    project, skipped = _phase5m.planreader_to_canonical_model(
+    return _phase5m.planreader_to_canonical_model(
         prepared,
         is_validated_internal_workspace=is_validated_internal_workspace,
     )
-
-    for index, shape in enumerate(rejected_weak_floors):
-        floor_id = str(shape.get("box_id") or shape.get("id") or f"weak_floor_{index+1}")
-        reason = "Mapper floor has no explicit storey identity; free-form _source_level is not authority"
-        project.evidence_observations.append(CanonicalEvidenceObservation.from_dict({
-            "id": floor_id,
-            "kind": "unresolved_floor_level",
-            "workspace_id": prepared.get("workspace_id"),
-            "document_id": shape.get("document_id"),
-            "page_id": shape.get("page_id"),
-            "level_name": shape.get("_source_level_label") or shape.get("_source_level"),
-            "producer": "pb_floor_mapper_v128",
-            "producer_version": "v128",
-            "review_state": ReviewState.REVIEW_REQUIRED.value,
-            "reason_physical_unavailable": reason,
-            "deduction_authority": False,
-            "no_instance_creation": True,
-        }))
-        skipped.append({"id": floor_id, "type": "FLOOR", "reason": reason})
-    return project, skipped
 
 
 def collect_workspace_3d_evidence(app: Any, workspace_id: int) -> Dict[str, Any]:
