@@ -605,12 +605,34 @@ def run_p5_native_payload(
     native: Dict[str, Any], *, page_no: int, page_id: int = 0,
     workspace_id: int = 0, scale_info: Dict[str, Any] | None = None,
     schedule_entries: Optional[Sequence[Any]] = None,
+    elevation_openings: Optional[Sequence[Any]] = None,
+    elevation_diagnostics: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
+    """Run the native payload through B1->B5 with optional elevation evidence.
+
+    Phase 2B controlled seam: ``elevation_openings`` may carry a
+    provenance-complete, dimensional list of ``ElevationOpening`` objects
+    produced by the fail-closed v1.7.8 production bridge.  They are threaded
+    into ``run_opening_pipeline(elevation_openings=...)`` whose reviewed B3
+    stage (correlate_elevation_to_plan) correlates them against B1 instances.
+
+    Safety guarantees preserved:
+      - Default is ``None``/empty -> identical to previous behaviour (no B3
+        stage, no elevation influence).
+      - Elevation evidence is CORROBORATION ONLY: B3 never creates instances
+        and never sets ``deduct=True``; generic elevation observations keep
+        ``dimension_basis="unknown"`` so the B5 rough-opening gate still
+        rejects them.
+      - Outcomes are persisted additively in ``elevation_openings`` and
+        ``elevation_diagnostics`` (never overwriting existing fields), so a
+        reviewer can see WHY every candidate was accepted/rejected and how it
+        correlated.
+    """
     segments = [_segment_from_native(row) for row in native.get("segments") or []]
     words = [_word_from_native(row, page_no) for row in native.get("words") or []]
     pipeline = run_opening_pipeline(
         segments=segments, words=words,
-        schedule_entries=schedule_entries, elevation_openings=None,
+        schedule_entries=schedule_entries, elevation_openings=elevation_openings,
         scale_info=scale_info or {}, page_no=int(page_no),
     )
     for inst in pipeline.get("instances") or []:
@@ -618,6 +640,20 @@ def run_p5_native_payload(
         inst.page_id = int(page_id) if page_id else None
     instances = [asdict(inst) for inst in pipeline.get("instances") or []]
     conflicts = [asdict(conflict) for conflict in pipeline.get("conflicts") or []]
+    elevation_openings_payload = [asdict(open) for open in (elevation_openings or [])]
+    elevation_diagnostics_payload = list(elevation_diagnostics or [])
+    # Persist the B3 correlation outcome so a reviewer can see the summary
+    # even though the correlations happen inside the pipeline stage.
+    b3_notes = [
+        str(note) for note in (pipeline.get("pipeline_notes") or [])
+        if str(note).startswith("B3:")
+    ]
+    if b3_notes:
+        elevation_diagnostics_payload.append({
+            "kind": "b3_correlation",
+            "note": b3_notes[0],
+            "source": "run_opening_pipeline.correlate_elevation_to_plan",
+        })
     return {
         "version": VERSION, "workspace_id": int(workspace_id), "page_id": int(page_id),
         "page_no": int(page_no), "instances": instances, "conflicts": conflicts,
@@ -626,11 +662,25 @@ def run_p5_native_payload(
         "candidate_count": len(instances),
         "deducted_count": sum(1 for row in instances if bool(row.get("deduct"))),
         "review_count": sum(1 for row in instances if str(row.get("deduction_status")) == "review"),
+        "elevation_openings": elevation_openings_payload,
+        "elevation_diagnostics": elevation_diagnostics_payload,
         "status": "ok", "error": "",
     }
 
 
-def analyse_stored_page_openings(app: Any, page_id: int, vector_result: Dict[str, Any]) -> Dict[str, Any]:
+def analyse_stored_page_openings(
+    app: Any, page_id: int, vector_result: Dict[str, Any], *,
+    elevation_openings: Optional[Sequence[Any]] = None,
+    elevation_diagnostics: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Analyse a stored page via the P5 native-vector path.
+
+    ``elevation_openings`` / ``elevation_diagnostics`` are the Phase 2B
+    controlled-elevation seam: a provenance-complete list of ElevationOpening
+    objects (plus diagnostics) is threaded into ``run_p5_native_payload`` and
+    from there into ``run_opening_pipeline(elevation_openings=...)``.  Defaults
+    keep pages without elevation evidence a no-op.
+    """
     rows = app.lquery(
         "SELECT p.*,d.path FROM pages p JOIN documents d ON d.id=p.document_id WHERE p.id=?",
         (int(page_id),),
@@ -655,6 +705,8 @@ def analyse_stored_page_openings(app: Any, page_id: int, vector_result: Dict[str
         workspace_id=int(row.get("workspace_id") or 0),
         scale_info={"px_per_m": px_per_m, "render_zoom": render_zoom},
         schedule_entries=schedule_entries,
+        elevation_openings=elevation_openings,
+        elevation_diagnostics=elevation_diagnostics,
     )
 
 
@@ -707,6 +759,21 @@ def install_native_vector_bridge(app: Any) -> None:
     app.is_authorised_opening_deduction_v175 = is_authorised_deduction
     app.merge_p5_authoritative_v175 = merge_b5_authoritative
     app.extract_p5_schedule_entries_v175 = extract_schedule_entries
+    # Phase 2B: expose the fail-closed elevation-evidence production bridge
+    # (additive; existing guard-required bindings are untouched).
+    try:
+        from pb_elevation_production_bridge_v178 import (
+            produce_elevation_openings,
+            raster_openings_from_candidates,
+            vector_openings_from_candidates,
+        )
+        app.extract_p5_elevation_openings_v178 = produce_elevation_openings
+        app.raster_to_p5_elevation_openings_v178 = raster_openings_from_candidates
+        app.vector_to_p5_elevation_openings_v178 = vector_openings_from_candidates
+    except Exception:
+        # Elevation evidence is an optional corroboration source; the core
+        # production integration must still install without it.
+        pass
     app._pb_opening_native_bridge_v175 = True
 
 
