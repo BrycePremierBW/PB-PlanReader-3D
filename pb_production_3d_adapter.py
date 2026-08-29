@@ -18,6 +18,12 @@ from pb_3d_diagnostics import generate_production_diagnostics_report
 require_workspace_id = _phase5m.require_workspace_id
 WorkspaceCanonicalResult = _phase5m.WorkspaceCanonicalResult
 
+# Capture the fail-closed Phase 5M resolver BEFORE this compatibility surface
+# is patched into the preserved legacy converter.  The wrapper below may be
+# installed as _phase5m.resolve_canonical_level for legacy call sites, so it
+# must never call that mutable module attribute or it would recurse into itself.
+_BASE_RESOLVE_CANONICAL_LEVEL = _phase5m.resolve_canonical_level
+
 
 def _norm_name(value: Any) -> str:
     return " ".join(str(value or "").strip().lower().split())
@@ -42,7 +48,7 @@ def resolve_canonical_level(level_val: Any, levels_map: Dict[str, Any], diagnost
             if len(matches) == 1:
                 key, level = matches[0]
                 return level, key
-    return _phase5m.resolve_canonical_level(level_val, levels_map, diagnostics_log)
+    return _BASE_RESOLVE_CANONICAL_LEVEL(level_val, levels_map, diagnostics_log)
 
 
 def _is_free_form_floor_level_claim(shape: Dict[str, Any]) -> bool:
@@ -69,8 +75,8 @@ def planreader_to_canonical_model(payload: Dict[str, Any], is_validated_internal
                 kept.append(shape)
         prepared["mapper_shapes"] = kept
 
-    # The underlying implementation patches its preserved legacy converter with
-    # whatever resolver is installed here at call time.
+    # Install the compatibility resolver into both module layers.  It delegates
+    # to the captured immutable Phase 5M base resolver, so this does not recurse.
     _phase5m.resolve_canonical_level = resolve_canonical_level
     _phase5m._legacy.resolve_canonical_level = resolve_canonical_level
     project, skipped = _phase5m.planreader_to_canonical_model(
