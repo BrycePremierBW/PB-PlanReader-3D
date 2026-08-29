@@ -607,6 +607,8 @@ def run_p5_native_payload(
     schedule_entries: Optional[Sequence[Any]] = None,
     elevation_openings: Optional[Sequence[Any]] = None,
     elevation_diagnostics: Optional[Sequence[Dict[str, Any]]] = None,
+    elevation_provenance: Optional[Sequence[Dict[str, Any]]] = None,
+    facade_registration: Any = None,
 ) -> Dict[str, Any]:
     """Run the native payload through B1->B5 with optional elevation evidence.
 
@@ -615,9 +617,26 @@ def run_p5_native_payload(
     produced by the fail-closed v1.7.8 production bridge.  They are correlated
     against the B1/B2 instances with the PRODUCTION strict B3 stage
     (``correlate_elevation_to_plan_production`` in the v1.7.8 bridge), which
-    requires a strong instance-specific identity anchor (exact opening mark /
-    validated position / proven unique signal) — generic "same elevation side +
-    compatible width" alone is never sufficient production identity.
+    requires a GENUINELY VALIDATED instance-specific identity anchor (exact
+    opening mark, or validated position backed by a registered facade
+    ``wall_ref``) — generic "same elevation side + compatible width" and
+    arbitrary caller-attached identifiers/positions are never sufficient.
+
+    ``elevation_provenance`` is index-aligned with ``elevation_openings``: it
+    carries the SAME resolved provenance (original source filename, page,
+    drawing ref/title, coordinate space, calibration source+state, elevation
+    side, level) as the matching accepted opening, so reviewers can trace each
+    persisted opening back to its source.  It is persisted additively as
+    ``elevation_provenance`` (never overwriting existing fields).
+
+    ``facade_registration`` (optional, shape of
+    ``pb_elevation_registration_v135.footprint_facades``) supplies the
+    drawing-derived facade coregistration used to validate GENUINE position
+    anchors: a validated-position anchor is only accepted when the elevation
+    opening's ``wall_ref`` is registered on its side AND the plan station lies
+    within that registered segment's extent.  When omitted, no position anchor
+    is genuine (positions fail closed), so only exact-mark anchors can
+    correlate — corroboration never relies on arbitrary caller-attached data.
 
     Because the strict B3 stage is owned by the production seam (and must not
     reuse v1.7.2's permissive side+width identity), elevation openings are NOT
@@ -635,10 +654,10 @@ def run_p5_native_payload(
         and never sets ``deduct=True``; generic elevation observations keep
         ``dimension_basis="unknown"`` so the B5 rough-opening gate still
         rejects them.
-      - Outcomes are persisted additively in ``elevation_openings`` and
-        ``elevation_diagnostics`` (never overwriting existing fields), so a
-        reviewer can see WHY every candidate was accepted/rejected and how it
-        correlated.
+      - Outcomes are persisted additively in ``elevation_openings``,
+        ``elevation_diagnostics`` and ``elevation_provenance`` (never
+        overwriting existing fields), so a reviewer can see WHY every candidate
+        was accepted/rejected, how it correlated, and trace it to its source.
     """
     segments = [_segment_from_native(row) for row in native.get("segments") or []]
     words = [_word_from_native(row, page_no) for row in native.get("words") or []]
@@ -654,6 +673,9 @@ def run_p5_native_payload(
 
     elevation_openings_payload = [asdict(open) for open in (elevation_openings or [])]
     elevation_diagnostics_payload = list(elevation_diagnostics or [])
+    # index-aligned provenance for each persisted opening (R1): same resolution
+    # as the matching accepted diagnostic, so persisting can never disagree.
+    elevation_provenance_payload = [dict(p) for p in (elevation_provenance or [])]
 
     # --- Production strict B3 correlation (C2) ------------------------------
     matched_openings = 0
@@ -665,6 +687,7 @@ def run_p5_native_payload(
             )
             correlated, unmatched = correlate_elevation_to_plan_production(
                 list(elevation_openings), pipeline_instances,
+                facades=facade_registration,
             )
             pipeline_instances = list(correlated)
             matched_openings = len(elevation_openings) - len(unmatched)
@@ -683,8 +706,9 @@ def run_p5_native_payload(
             ),
             "source": "pb_elevation_production_bridge_v178.correlate_elevation_to_plan_production",
             "identity_rule": (
-                "requires strong anchor (exact mark / validated position / "
-                "proven unique signal); side+width alone never identifies"
+                "requires GENUINELY validated anchor (exact mark / validated "
+                "position backed by registered wall_ref); side+width alone or "
+                "attached identity signals never identify"
             ),
             "matched_count": matched_openings,
             "unmatched_count": unmatched_openings,
@@ -705,6 +729,7 @@ def run_p5_native_payload(
         "review_count": sum(1 for row in instances if str(row.get("deduction_status")) == "review"),
         "elevation_openings": elevation_openings_payload,
         "elevation_diagnostics": elevation_diagnostics_payload,
+        "elevation_provenance": elevation_provenance_payload,
         "status": "ok", "error": "",
     }
 
@@ -713,6 +738,8 @@ def analyse_stored_page_openings(
     app: Any, page_id: int, vector_result: Dict[str, Any], *,
     elevation_openings: Optional[Sequence[Any]] = None,
     elevation_diagnostics: Optional[Sequence[Dict[str, Any]]] = None,
+    elevation_provenance: Optional[Sequence[Dict[str, Any]]] = None,
+    facade_registration: Any = None,
 ) -> Dict[str, Any]:
     """Analyse a stored page via the P5 native-vector path.
 
@@ -720,7 +747,10 @@ def analyse_stored_page_openings(
     controlled-elevation seam: a provenance-complete list of ElevationOpening
     objects (plus diagnostics) is threaded into ``run_p5_native_payload`` and
     from there into ``run_opening_pipeline(elevation_openings=...)``.  Defaults
-    keep pages without elevation evidence a no-op.
+    keep pages without elevation evidence a no-op.  ``elevation_provenance`` is
+    the index-aligned resolved provenance for each opening.
+    ``facade_registration`` is the footprint-derived facade coregistration used
+    to validate genuine position anchors (see ``run_p5_native_payload``).
     """
     rows = app.lquery(
         "SELECT p.*,d.path FROM pages p JOIN documents d ON d.id=p.document_id WHERE p.id=?",
@@ -748,6 +778,8 @@ def analyse_stored_page_openings(
         schedule_entries=schedule_entries,
         elevation_openings=elevation_openings,
         elevation_diagnostics=elevation_diagnostics,
+        elevation_provenance=elevation_provenance,
+        facade_registration=facade_registration,
     )
 
 

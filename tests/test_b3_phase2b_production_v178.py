@@ -139,6 +139,35 @@ def _mock_b1(candidates):
     return result
 
 
+def _register_facades():
+    """A footprint-derived facade coregistration (shape of ``footprint_facades``).
+
+    Registers one East facade with a single wall segment ``E01`` derived from
+    the calibrated building footprint, length 8 m (station interval 0..8).
+    Mirrors ``pb_elevation_registration_v135.footprint_facades``'s output shape
+    so the production bridge can extent-check genuine position anchors against
+    a drawing-derived registration.
+    """
+    return {
+        "North": {"side": "North", "segments": [], "projected_width_m": 10.0,
+                  "edge_length_m": 0.0, "levels": []},
+        "South": {"side": "South", "segments": [], "projected_width_m": 10.0,
+                  "edge_length_m": 0.0, "levels": []},
+        "East": {
+            "side": "East", "projected_width_m": 8.0, "edge_length_m": 8.0,
+            "levels": ["Ground / unregistered"],
+            "segments": [{
+                "wall_ref": "E01", "side": "East",
+                "a": [0.0, 0.0], "b": [8.0, 0.0], "length_m": 8.0,
+                "level_name": "Ground / unregistered", "level_index": 0,
+                "source_polygon": "fp-1", "confidence": "Measured plan geometry",
+            }],
+        },
+        "West": {"side": "West", "segments": [], "projected_width_m": 8.0,
+                 "edge_length_m": 0.0, "levels": []},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Fixture helpers (real evidence; expected geometry stated independently)
 # ---------------------------------------------------------------------------
@@ -260,11 +289,14 @@ def test_valid_elevation_reaches_production_evidence_pipeline():
         drawing_ref=fx["source"]["drawing_no"],
         drawing_title=fx["source"]["drawing_title"],
         level=None,
-        wall_ref="E1",
+        wall_ref="E01",
         calibration_source=cal.method,
     )
     assert len(result.openings) >= 1
     opening = result.openings[0]
+    # The produced opening must carry the registered wall_ref so the GENUINE
+    # position anchor can be extent-validated against the facade coregistration.
+    assert opening.wall_ref == "E01"
     assert opening.coord_space == COORD_SPACE_RENDER_PIXEL
     assert opening.width_m is not None and opening.height_m is not None
     # Independently-measured repeated facade cell ~2.96 x 1.57 m.
@@ -296,6 +328,8 @@ def test_valid_elevation_reaches_production_evidence_pipeline():
             native, page_no=1, scale_info={"px_per_m": cal.px_per_m},
             elevation_openings=result.openings,
             elevation_diagnostics=result.diagnostics,
+            elevation_provenance=result.opening_provenance,
+            facade_registration=_register_facades(),
         )
 
     assert payload["status"] == "ok"
@@ -652,9 +686,10 @@ def test_analyse_stored_page_openings_threads_elevation():
         source_filename=fx["source"]["local_source_alias"], source_page=86,
         drawing_ref=fx["source"]["drawing_no"],
         drawing_title=fx["source"]["drawing_title"],
-        level=None, wall_ref="E1", calibration_source=cal.method,
+        level=None, wall_ref="E01", calibration_source=cal.method,
     )
     opening = result.openings[0]
+    assert opening.wall_ref == "E01"
 
     plan = _b1_candidate(
         mark="", wall="E1", position=2.0, width=opening.width_m,
@@ -685,6 +720,8 @@ def test_analyse_stored_page_openings_threads_elevation():
                 app, 5, {"scale": {"px_per_m": cal.px_per_m}},
                 elevation_openings=result.openings,
                 elevation_diagnostics=result.diagnostics,
+                elevation_provenance=result.opening_provenance,
+                facade_registration=_register_facades(),
             )
         assert payload["status"] == "ok"
         inst = payload["instances"][0]
@@ -991,10 +1028,17 @@ def test_c2_exact_mark_plus_width_may_correlate():
     assert enriched[0].height_m == pytest.approx(2.1, abs=0.01)
 
 
-def test_c2_validated_position_plus_width_may_correlate():
-    """Validated position/location correspondence + width -> MAY correlate."""
+def test_c2_footprint_validated_position_plus_width_may_correlate():
+    """Footprint-registered wall/side + agreeing stations + width -> MAY correlate.
+
+    The position anchor is GENUINE: the elevation opening's ``wall_ref``/side
+    (E01/East) matches a facade segment registered from the calibrated
+    building-footprint index (``pb_elevation_registration_v135
+    .footprint_facades``), the plan station lies within that segment's
+    footprint-derived extent, and both stations agree within tolerance.
+    """
     plan = _b1_candidate(
-        mark="", wall="E1", position=2.0, width=1.0,
+        mark="", wall="E01", position=2.0, width=1.0,
         opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
     )
     plan.elevation_side = "East"
@@ -1002,21 +1046,124 @@ def test_c2_validated_position_plus_width_may_correlate():
         elevation_page_no=86, elevation_side="East",
         bbox_px=(100, 100, 200, 300), width_m=1.0, height_m=1.5,
         label="", confidence=0.7,
+        wall_ref="E01",
     )
-    # Explicit, validated wall position (m) agreeing with the plan station.
+    # E01/East is registered (length 8 m) and the agreed station is on extent.
     object.__setattr__(elev, "wall_position_m", plan.position_along_wall_m)
     enriched, unmatched = bridge.correlate_elevation_to_plan_production(
-        [elev], [plan],
+        [elev], [plan], facades=_register_facades(),
     )
     assert len(unmatched) == 0
     assert enriched[0].elevation_geometry is not None
 
-    # A position outside tolerance must NOT anchor (wrong location).
-    object.__setattr__(elev, "wall_position_m", plan.position_along_wall_m + 5.0)
+    # A position outside station tolerance must NOT anchor (wrong location).
+    out_tol = ElevationOpening(
+        elevation_page_no=86, elevation_side="East",
+        bbox_px=(100, 100, 200, 300), width_m=1.0, height_m=1.5,
+        label="", confidence=0.7,
+        wall_ref="E01",
+    )
+    object.__setattr__(out_tol, "wall_position_m", plan.position_along_wall_m + 5.0)
     enriched2, unmatched2 = bridge.correlate_elevation_to_plan_production(
-        [elev], [plan],
+        [out_tol], [plan], facades=_register_facades(),
     )
     assert len(unmatched2) == 1, "mismatched position must not correlate"
+
+    # A plan station OUTSIDE the registered facade extent must NOT anchor
+    # (the footprint-derived length limits where a position is valid).
+    far_elev = ElevationOpening(
+        elevation_page_no=86, elevation_side="East",
+        bbox_px=(100, 100, 200, 300), width_m=1.0, height_m=1.5,
+        label="", confidence=0.7,
+        wall_ref="E01",
+    )
+    far_plan = _b1_candidate(
+        mark="", wall="E01", position=12.0, width=1.0,
+        opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
+    )
+    far_plan.elevation_side = "East"
+    object.__setattr__(far_elev, "wall_position_m", far_plan.position_along_wall_m)
+    enriched3, unmatched3 = bridge.correlate_elevation_to_plan_production(
+        [far_elev], [far_plan], facades=_register_facades(),
+    )
+    assert len(unmatched3) == 1, "station off the registered extent must not correlate"
+
+
+def test_r2_bare_attached_anchors_are_not_enough():
+    """R2: arbitrary caller-attached identity/position attributes NEVER anchor.
+
+    A truthy ``identity_anchor`` or a bare ``wall_position_m`` — with no exact
+    mark and no footprint-registered wall_ref/side (and no registered facade
+    at all) — is NOT a genuinely validated anchor, so the pair must stay
+    unmatched/review (fail closed).
+    """
+    plan = _b1_candidate(
+        mark="", wall="E01", position=2.0, width=1.0,
+        opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
+    )
+    plan.elevation_side = "East"
+
+    # (1) Bare wall_position_m with NO registered facades at all -> no anchor.
+    bare_pos = ElevationOpening(
+        elevation_page_no=86, elevation_side="East",
+        bbox_px=(100, 100, 200, 300), width_m=1.0, height_m=1.5,
+        label="", confidence=0.7,
+    )
+    object.__setattr__(bare_pos, "wall_position_m", plan.position_along_wall_m)
+    enriched, unmatched = bridge.correlate_elevation_to_plan_production(
+        [bare_pos], [plan],
+    )
+    assert len(unmatched) == 1, "bare station without facades must not anchor"
+    assert enriched[0].elevation_geometry is None
+
+    # (2) Facades present but the wall_ref is UNREGISTERED (and no mark) ->
+    #     still no genuine position anchor.
+    unreg = ElevationOpening(
+        elevation_page_no=86, elevation_side="East",
+        bbox_px=(100, 100, 200, 300), width_m=1.0, height_m=1.5,
+        label="", confidence=0.7,
+        wall_ref="E99",
+    )
+    object.__setattr__(unreg, "wall_position_m", plan.position_along_wall_m)
+    enriched2, unmatched2 = bridge.correlate_elevation_to_plan_production(
+        [unreg], [plan], facades=_register_facades(),
+    )
+    assert len(unmatched2) == 1, "unregistered wall_ref must not anchor"
+    assert enriched2[0].elevation_geometry is None
+
+    # (3) Truthy identity_anchor ONLY (no mark, no registered position) -> the
+    #     permissive unique-signal free pass is removed in production.
+    unique_only = ElevationOpening(
+        elevation_page_no=86, elevation_side="East",
+        bbox_px=(100, 100, 200, 300), width_m=1.0, height_m=1.5,
+        label="", confidence=0.7,
+        wall_ref="E01",
+    )
+    object.__setattr__(unique_only, "identity_anchor", "schedule-LAGO-D01")
+    object.__setattr__(unique_only, "wall_position_m", 99.0)  # disagrees anyway
+    enriched3, unmatched3 = bridge.correlate_elevation_to_plan_production(
+        [unique_only], [plan], facades=_register_facades(),
+    )
+    assert len(unmatched3) == 1, "identity_anchor alone must not anchor"
+    assert enriched3[0].elevation_geometry is None
+
+    # (4) Sanity: the SAME evidence with a non-blank EXACT mark DOES correlate,
+    #     proving the gate rejects the bare attributes, not the pair itself.
+    marked = ElevationOpening(
+        elevation_page_no=86, elevation_side="East",
+        bbox_px=(100, 100, 200, 300), width_m=0.82, height_m=2.1,
+        label="D01", confidence=0.7,
+    )
+    plan2 = _b1_candidate(
+        mark="D01", wall="E01", position=2.0, width=0.82,
+        opening_type=OPENING_TYPE_DOOR, geom_conf=0.9, assoc_conf=0.85,
+    )
+    plan2.elevation_side = "East"
+    enriched4, unmatched4 = bridge.correlate_elevation_to_plan_production(
+        [marked], [plan2], facades=_register_facades(),
+    )
+    assert len(unmatched4) == 0
+    assert enriched4[0].elevation_geometry is not None
 
 
 def test_c2_wrong_mark_rejects():
@@ -1188,6 +1335,99 @@ def test_c3_provenance_traceability_persisted_in_payload():
         if s.get("kind") == "elevation_evidence_summary"
     ]
     assert summary and summary[0]["source_filename"] == src_filename
+
+
+def test_r1_opening_provenance_is_index_aligned_and_consistent():
+    """R1: persisted opening provenance is index-aligned with openings and
+    NEVER disagrees with the accepted candidate's diagnostic provenance.
+
+    Every accepted opening gets a provenance entry with the SAME resolved
+    source (filename, page, drawing ref/title, coordinate space, calibration
+    source+state, elevation side, level) as its accepted diagnostic — a single
+    authoritative resolver, so the openings and diagnostics can never diverge.
+    The production payload then persists ``elevation_provenance`` aligned with
+    ``elevation_openings`` so a reviewer can trace each persisted opening to its
+    original source.
+    """
+    cal, fx = _real_render_pixel_calibration()
+    cands = detect_raster_rect_candidates(
+        _load_real_crop(), cal,
+        source_filename=fx["source"]["local_source_alias"],
+        source_page=86,
+        drawing_ref=fx["source"]["drawing_no"],
+        elevation_side=fx["source"]["elevation_side"],
+        calibration_source=cal.method,
+    )
+    opening_cands = [c for c in cands if opening_sized(c.width_m, c.height_m)]
+    best = min(opening_cands, key=lambda c: abs(c.width_m - 2.96) + abs(c.height_m - 1.57))
+    result = bridge.raster_openings_from_candidates(
+        [best], cal,
+        elevation_page_no=86,
+        elevation_side=fx["source"]["elevation_side"],
+        source_filename=fx["source"]["local_source_alias"],
+        source_page=86,
+        drawing_ref=fx["source"]["drawing_no"],
+        drawing_title=fx["source"]["drawing_title"],
+        level=None,
+        wall_ref="E01",
+        calibration_source=cal.method,
+    )
+
+    assert result.openings, "need at least one accepted opening"
+    # Index-aligned: one provenance entry per opening.
+    assert len(result.opening_provenance) == len(result.openings)
+
+    accepted = [
+        d for d in result.diagnostics
+        if d.get("kind") == "elevation_candidate" and d.get("status") == "accepted"
+    ]
+    assert len(accepted) == len(result.openings)
+
+    for opening, prov, diag in zip(
+        result.openings, result.opening_provenance, accepted
+    ):
+        # The persisted provenance carries the real source traceability.
+        assert prov["source_filename"] == fx["source"]["local_source_alias"]
+        assert prov["source_page"] == 86
+        assert prov["drawing_ref"] == fx["source"]["drawing_no"]
+        assert prov["drawing_title"] == fx["source"]["drawing_title"]
+        assert prov["coord_space"] == COORD_SPACE_RENDER_PIXEL
+        assert prov["elevation_side"] == fx["source"]["elevation_side"]
+        assert prov["calibration_source"]
+        assert prov["calibration_state"]["method"] == cal.method
+        # SINGLE authoritative resolver: the diagnostic's provenance is the
+        # SAME as the persisted provenance for that opening.
+        for key in ("source_filename", "source_page", "drawing_ref",
+                    "drawing_title", "elevation_side", "coord_space",
+                    "calibration_source"):
+            assert prov[key] == diag[key], f"provenance mismatch on {key}"
+
+    # --- Production payload persists elevation_provenance aligned ------------
+    plan = _b1_candidate(
+        mark="", wall="E01", position=2.0, width=result.openings[0].width_m,
+        opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
+    )
+    plan.elevation_side = "East"
+    object.__setattr__(result.openings[0], "wall_position_m", plan.position_along_wall_m)
+    with patch(
+        "pb_plan_opening_detection_v171.plan_opening_candidates",
+        return_value=_mock_b1([plan]),
+    ):
+        payload = prod.run_p5_native_payload(
+            {"segments": [], "words": []}, page_no=1,
+            scale_info={"px_per_m": cal.px_per_m},
+            elevation_openings=result.openings,
+            elevation_diagnostics=result.diagnostics,
+            elevation_provenance=result.opening_provenance,
+            facade_registration=_register_facades(),
+        )
+
+    assert payload["status"] == "ok"
+    persisted = payload["elevation_provenance"]
+    assert persisted, "elevation_provenance must be persisted in the payload"
+    assert len(persisted) == len(payload["elevation_openings"])
+    assert persisted[0]["source_filename"] == fx["source"]["local_source_alias"]
+    assert persisted[0]["source_page"] == 86
 
 
 def test_c3_bridge_level_source_filename_survives_when_candidate_has_none():

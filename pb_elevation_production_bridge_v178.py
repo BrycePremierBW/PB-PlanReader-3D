@@ -26,7 +26,7 @@ production entry points (``run_p5_native_payload`` /
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from pb_elevation_calibration_v177 import (
@@ -65,6 +65,11 @@ REASON_NOT_OPENING_SIZED = "not_opening_sized"                # outside the open
 REASON_BACKEND_UNAVAILABLE = "backend_unavailable"            # cv2/numpy not available
 REASON_NO_EVIDENCE = "no_elevation_evidence_supplied"
 
+# Explicit marker when a provenance field has neither candidate-own evidence
+# nor bridge-supplied context.  Provenance is NEVER invented; unresolved
+# fields are flagged "unknown" (strings) or None (page/level).
+PROVENANCE_UNKNOWN = "unknown"
+
 # ---------------------------------------------------------------------------
 # Production B3 correlation identity (C2)
 # ---------------------------------------------------------------------------
@@ -84,14 +89,23 @@ class ElevationBridgeResult:
     record the accept/reject decision and provenance for every candidate so a
     reviewer can see WHY each candidate did or did not qualify (and that
     qualified candidates remain deduction review-only).
+
+    ``opening_provenance`` is index-aligned with ``openings``: element i carries
+    the SAME resolved provenance as the matching accepted opening, so a reviewer
+    can trace each persisted opening back to its original source filename, page,
+    drawing ref/title, coordinate space, calibration source+state, elevation
+    side, and level.  Provenance is resolved through a SINGLE authoritative
+    helper so the openings and their diagnostics can never disagree.
     """
     openings: List[ElevationOpening]
     diagnostics: List[Dict[str, Any]]
+    opening_provenance: List[Dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "openings": [asdict(o) for o in self.openings],
             "diagnostics": list(self.diagnostics),
+            "opening_provenance": [dict(p) for p in self.opening_provenance],
         }
 
 
@@ -130,6 +144,70 @@ def calibration_state(calibration: Optional[Calibration]) -> Dict[str, Any]:
     }
 
 
+def _resolve_provenance(
+    cand: Any,
+    *,
+    source_filename: str = "",
+    source_page: Optional[int] = None,
+    drawing_ref: str = "",
+    drawing_title: str = "",
+    elevation_side: str = "",
+    level: Optional[str] = None,
+    wall_ref: str = "",
+    calibration: Optional[Calibration] = None,
+    calibration_source: str = "",
+) -> Dict[str, Any]:
+    """SINGLE authoritative provenance resolution for elevation evidence.
+
+    Order of precedence (candidate-own evidence first, then the bridge-supplied
+    page/elevation context, else an explicit ``PROVENANCE_UNKNOWN``/``None``):
+      - source filename: candidate's own ``source_filename``, else bridge arg
+      - source page / drawing ref / drawing title / level / wall_ref: own, else
+        bridge arg
+      - elevation side / coordinate space: candidate's own, else bridge arg
+      - calibration source: candidate's own ``calibration_source``, else the
+        calibration's ``method``
+    No provenance is ever invented: unresolved fields are "unknown" or None.
+    """
+    own_filename = str(getattr(cand, "source_filename", None) or "").strip()
+    bridge_filename = str(source_filename or "").strip()
+    resolved_filename = own_filename or bridge_filename
+
+    own_page = getattr(cand, "source_page", None)
+    resolved_page = own_page if own_page is not None else source_page
+
+    own_ref = str(getattr(cand, "drawing_ref", None) or "").strip()
+    resolved_ref = own_ref or str(drawing_ref or "").strip()
+
+    own_side = str(getattr(cand, "elevation_side", None) or "").strip()
+    resolved_side = own_side or str(elevation_side or "").strip()
+
+    own_wall = str(getattr(cand, "wall_ref", None) or "").strip()
+    resolved_wall = own_wall or str(wall_ref or "").strip()
+
+    cal_method = ""
+    cal_state: Dict[str, Any] = {}
+    if calibration is not None:
+        cal_state = calibration_state(calibration)
+        cal_method = str(calibration.method or "").strip()
+    own_cal_src = str(getattr(cand, "calibration_source", None) or "").strip()
+    resolved_cal_source = own_cal_src or str(calibration_source or "").strip() or cal_method
+
+    return {
+        "source_filename": resolved_filename or PROVENANCE_UNKNOWN,
+        "source_page": resolved_page,
+        "drawing_ref": resolved_ref or PROVENANCE_UNKNOWN,
+        "drawing_title": str(drawing_title or "").strip() or PROVENANCE_UNKNOWN,
+        "elevation_side": resolved_side or PROVENANCE_UNKNOWN,
+        "coord_space": str(getattr(cand, "coord_space", None) or "").strip()
+                        or PROVENANCE_UNKNOWN,
+        "level": level,
+        "wall_ref": resolved_wall,
+        "calibration_source": resolved_cal_source or PROVENANCE_UNKNOWN,
+        "calibration_state": cal_state,
+    }
+
+
 def _candidate_diag(
     index: int,
     cand: Any,
@@ -141,32 +219,48 @@ def _candidate_diag(
     level: Optional[str] = None,
     calibration: Optional[Calibration] = None,
     source_filename: str = "",
+    calibration_source: str = "",
+    wall_ref: str = "",
 ) -> Dict[str, Any]:
     """Per-candidate diagnostic carrying full reviewer traceability (C3).
 
     Traces an accepted/rejected elevation candidate back to: original source
     filename, source page, drawing ref/title, coordinate space, calibration
-    source+state, elevation side, and level (when known).
+    source+state, elevation side, and level (when known).  Provenance is
+    resolved through the single ``_resolve_provenance`` helper so diagnostics
+    and the persisted openings can never disagree.
     """
+    prov = _resolve_provenance(
+        cand,
+        source_filename=source_filename,
+        source_page=getattr(cand, "source_page", None) or None,
+        drawing_ref=str(getattr(cand, "drawing_ref", None) or ""),
+        drawing_title=drawing_title,
+        elevation_side=str(getattr(cand, "elevation_side", None) or ""),
+        level=level,
+        wall_ref=wall_ref,
+        calibration=calibration,
+        calibration_source=calibration_source,
+    )
     diag: Dict[str, Any] = {
         "kind": "elevation_candidate",
         "candidate_index": index,
         "source": cand.extraction_method,
         "status": status,
         "reason": reason,
-        "source_filename": str(
-            getattr(cand, "source_filename", None) or source_filename
-        ),
-        "source_page": getattr(cand, "source_page", None),
-        "coord_space": cand.coord_space,
+        "source_filename": prov["source_filename"],
+        "source_page": prov["source_page"],
+        "coord_space": prov["coord_space"],
         "bbox": list(cand.bbox),
         "width_m": cand.width_m,
         "height_m": cand.height_m,
         "review_status": cand.review_status,
-        "drawing_ref": cand.drawing_ref,
-        "drawing_title": drawing_title,
-        "elevation_side": cand.elevation_side,
-        "level": level,
+        "drawing_ref": prov["drawing_ref"],
+        "drawing_title": prov["drawing_title"],
+        "elevation_side": prov["elevation_side"],
+        "level": prov["level"],
+        "wall_ref": prov["wall_ref"],
+        "calibration_source": prov["calibration_source"],
         "extraction_method": cand.extraction_method,
     }
     if calibration is not None:
@@ -428,6 +522,7 @@ def raster_openings_from_candidates(
 
     diagnostics: List[Dict[str, Any]] = []
     rects: List[Dict[str, Any]] = []
+    accepted_provenance: List[Dict[str, Any]] = []
     rejected = 0
 
     for i, cand in enumerate(candidates or []):
@@ -435,11 +530,24 @@ def raster_openings_from_candidates(
             diagnostics.append(_candidate_diag(
                 i, cand, STATUS_REJECTED, REASON_BACKEND_UNAVAILABLE, cand.notes,
                 drawing_title=drawing_title, level=level,
-                calibration=calib, source_filename=source_filename))
+                calibration=calib, source_filename=source_filename,
+                calibration_source=calibration_source, wall_ref=wall_ref))
             rejected += 1
             continue
         if _is_qualified(cand, calib):
             rects.append(_raster_rect_dict(cand, calibration_source, wall_ref))
+            accepted_provenance.append(_resolve_provenance(
+                cand,
+                source_filename=source_filename,
+                source_page=source_page,
+                drawing_ref=drawing_ref,
+                drawing_title=drawing_title,
+                elevation_side=elevation_side,
+                level=level,
+                wall_ref=wall_ref,
+                calibration=calib,
+                calibration_source=calibration_source,
+            ))
             diagnostics.append(_candidate_diag(
                 i, cand, STATUS_ACCEPTED, "",
                 notes=[
@@ -447,14 +555,16 @@ def raster_openings_from_candidates(
                     "deduction review-only (B5 requires rough_opening basis)",
                 ],
                 drawing_title=drawing_title, level=level,
-                calibration=calib, source_filename=source_filename))
+                calibration=calib, source_filename=source_filename,
+                calibration_source=calibration_source, wall_ref=wall_ref))
         else:
             rejected += 1
             diagnostics.append(_candidate_diag(
                 i, cand, STATUS_REJECTED,
                 _reject_reason(cand, calib, calib_dimensional, calib_space),
                 drawing_title=drawing_title, level=level,
-                calibration=calib, source_filename=source_filename))
+                calibration=calib, source_filename=source_filename,
+                calibration_source=calibration_source, wall_ref=wall_ref))
 
     openings: List[ElevationOpening] = []
     if rects and calib_dimensional:
@@ -475,6 +585,10 @@ def raster_openings_from_candidates(
             calibration=calib.as_dict(),
         )
 
+    # opening_provenance is index-aligned with openings: guard the per-accepted-
+    # rect provenance to exactly len(openings) so alignment is never violated.
+    opening_provenance = accepted_provenance[:len(openings)]
+
     diagnostics.append(_evidence_summary(
         calibration=calib,
         elevation_page_no=elevation_page_no,
@@ -488,7 +602,11 @@ def raster_openings_from_candidates(
         rejected=rejected,
     ))
 
-    return ElevationBridgeResult(openings=list(openings), diagnostics=diagnostics)
+    return ElevationBridgeResult(
+        openings=list(openings),
+        diagnostics=diagnostics,
+        opening_provenance=opening_provenance,
+    )
 
 
 def extract_raster_elevation_openings(
@@ -585,6 +703,7 @@ def vector_openings_from_candidates(
 
     diagnostics: List[Dict[str, Any]] = []
     rects: List[Dict[str, Any]] = []
+    accepted_provenance: List[Dict[str, Any]] = []
     rejected = 0
 
     for i, cand in enumerate(candidates or []):
@@ -592,11 +711,23 @@ def vector_openings_from_candidates(
             diagnostics.append(_candidate_diag(
                 i, cand, STATUS_REJECTED, REASON_BACKEND_UNAVAILABLE, cand.notes,
                 drawing_title=drawing_title, level=level,
-                calibration=calib, source_filename=source_filename))
+                calibration=calib, source_filename=source_filename,
+                wall_ref=wall_ref))
             rejected += 1
             continue
         if _is_qualified(cand, calib):
             rects.append(_vector_rect_dict(cand, wall_ref))
+            accepted_provenance.append(_resolve_provenance(
+                cand,
+                source_filename=source_filename,
+                source_page=source_page,
+                drawing_ref=drawing_ref,
+                drawing_title=drawing_title,
+                elevation_side=elevation_side,
+                level=level,
+                wall_ref=wall_ref,
+                calibration=calib,
+            ))
             diagnostics.append(_candidate_diag(
                 i, cand, STATUS_ACCEPTED, "",
                 notes=[
@@ -604,14 +735,16 @@ def vector_openings_from_candidates(
                     "deduction review-only (B5 requires rough_opening basis)",
                 ],
                 drawing_title=drawing_title, level=level,
-                calibration=calib, source_filename=source_filename))
+                calibration=calib, source_filename=source_filename,
+                wall_ref=wall_ref))
         else:
             rejected += 1
             diagnostics.append(_candidate_diag(
                 i, cand, STATUS_REJECTED,
                 _reject_reason(cand, calib, calib_dimensional, calib_space),
                 drawing_title=drawing_title, level=level,
-                calibration=calib, source_filename=source_filename))
+                calibration=calib, source_filename=source_filename,
+                wall_ref=wall_ref))
 
     openings: List[ElevationOpening] = []
     if rects and calib_dimensional:
@@ -632,6 +765,8 @@ def vector_openings_from_candidates(
             calibration=calib.as_dict(),
         )
 
+    opening_provenance = accepted_provenance[:len(openings)]
+
     diagnostics.append(_evidence_summary(
         calibration=calib,
         elevation_page_no=elevation_page_no,
@@ -645,7 +780,11 @@ def vector_openings_from_candidates(
         rejected=rejected,
     ))
 
-    return ElevationBridgeResult(openings=list(openings), diagnostics=diagnostics)
+    return ElevationBridgeResult(
+        openings=list(openings),
+        diagnostics=diagnostics,
+        opening_provenance=opening_provenance,
+    )
 
 
 def extract_vector_elevation_openings(
@@ -741,6 +880,7 @@ def produce_elevation_openings(
     reviewed B3 correlation resolves them (ties fail closed to review).
     """
     openings: List[ElevationOpening] = []
+    opening_provenance: List[Dict[str, Any]] = []
     diagnostics: List[Dict[str, Any]] = []
     ran = False
 
@@ -766,6 +906,7 @@ def produce_elevation_openings(
             calibration_source=calibration_source,
         )
         openings.extend(r.openings)
+        opening_provenance.extend(r.opening_provenance)
         diagnostics.extend(r.diagnostics)
 
     if segments:
@@ -788,6 +929,7 @@ def produce_elevation_openings(
             max_cells=max_cells,
         )
         openings.extend(v.openings)
+        opening_provenance.extend(v.opening_provenance)
         diagnostics.extend(v.diagnostics)
 
     if not ran:
@@ -811,7 +953,11 @@ def produce_elevation_openings(
             "calibration": calibration_state(calibration),
         })
 
-    return ElevationBridgeResult(openings=openings, diagnostics=diagnostics)
+    return ElevationBridgeResult(
+        openings=openings,
+        diagnostics=diagnostics,
+        opening_provenance=opening_provenance,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -840,58 +986,112 @@ def _exact_mark_anchor(inst: Any, elev: ElevationOpening) -> bool:
     return bool(inst_mark and elev_mark and inst_mark.upper() == elev_mark.upper())
 
 
-def _validated_position_anchor(inst: Any, elev: ElevationOpening) -> bool:
-    """Strong anchor (b): validated position/location correspondence.
+def _registered_wall_extent(
+    facades: Any, side: str, wall_ref: str
+) -> Optional[Tuple[float, float]]:
+    """Return (station_min, station_max) for a registered facade wall segment.
 
-    A production elevation opening may carry an explicit, independently
-    validated wall position in metres (``wall_position_m``) that must agree
+    ``facades`` is the shape produced by ``footprint_facades`` (keyed by
+    cardinal side, each with a ``segments`` list of ``{wall_ref, a, b,
+    length_m, side, ...}``) — i.e. wall segments derived from the CALIBRATED
+    building footprint.  Returns the station interval along the segment
+    (0..length_m, station measured from the segment start) when the ``wall_ref``
+    is genuinely registered on that side; None otherwise (including when no
+    facade coregistration is supplied at all — a caller-attached string can
+    never be a genuine anchor).
+    """
+    if not facades:
+        return None
+    for seg in (facades.get(side) or {}).get("segments") or []:
+        if str(seg.get("wall_ref") or "").strip() == wall_ref:
+            length = _num(seg.get("length_m"), None)
+            if length is None or length <= 0.0:
+                return None
+            return (0.0, length)
+    return None
+
+
+def _validated_position_anchor(
+    inst: Any, elev: ElevationOpening, facades: Any = None
+) -> bool:
+    """Strong anchor (b): GENUINELY validated position/location correspondence.
+
+    A production elevation opening may carry an explicit, INDEPENDENTLY
+    VALIDATED wall position in metres (``wall_position_m``) that must agree
     with the plan instance's ``position_along_wall_m`` within tolerance.
     Position is instance-specific (two same-width windows on one elevation sit
     at different stations along the wall).
+
+    To be a GENUINE anchor — not an arbitrary caller-attached number — the
+    opening must ALSO be associated with a facade wall segment REGISTERED from
+    the calibrated building footprint (``facades`` from ``footprint_facades``),
+    and the plan station must fall within that registered segment's extent.  A
+    bare numeric position, an unregistered ``wall_ref``, or a station off the
+    registered extent is NOT sufficient to independently identify a physical
+    opening (it fails closed to ambiguity/review).
     """
     inst_pos = _num(getattr(inst, "position_along_wall_m", None), float("nan"))
     elev_pos = _num(getattr(elev, "wall_position_m", None), float("nan"))
-    if inst_pos != inst_pos or elev_pos != elev_pos:
+    elev_wall_ref = str(getattr(elev, "wall_ref", None) or "").strip()
+    if (inst_pos != inst_pos) or (elev_pos != elev_pos):
         return False  # either position unknown -> no validated correspondence
+    if not elev_wall_ref:
+        # A numeric position without a registered facade wall_ref is not an
+        # independently-validated identity anchor.
+        return False
+    extent = _registered_wall_extent(
+        facades, str(getattr(elev, "elevation_side", "") or "").strip(), elev_wall_ref
+    )
+    if extent is None:
+        # The wall/side is not registered from the footprint (or no facades
+        # supplied) -> the position cannot be independently validated.
+        return False
+    lo, hi = extent
+    if inst_pos < lo or inst_pos > hi:
+        # Plan station falls outside the registered extent -> wrong location.
+        return False
     return abs(inst_pos - elev_pos) <= PROD_POSITION_TOLERANCE_M
 
 
 def _proven_unique_anchor(elev: ElevationOpening) -> bool:
-    """Strong anchor (c): another independently-proven unique identity signal.
+    """Strong anchor (c): an independently-proven UNIQUE identity signal.
 
-    An elevation opening may declare an explicit identity anchor (e.g. a
-    proven unique opening reference / owner-verified correspondence) via the
-    ``identity_anchor`` attribute.  A truthy, non-blank value counts as a
-    strong, independently-proven unique identity signal; side/width do NOT.
+    A truthy, caller-attached ``identity_anchor`` attribute is NOT accepted as
+    an anchor: it is not independently validated and would let generic side +
+    width evidence masquerade as a unique match.  Production relies on the
+    genuine exact-mark anchor (a) and the genuine validated-position anchor (b)
+    instead.  This predicate is therefore always False — kept as an explicit
+    statement that arbitrary attached identity signals are never sufficient.
     """
-    anchor = getattr(elev, "identity_anchor", None)
-    if anchor is None:
-        return False
-    if isinstance(anchor, (dict, list)):
-        return bool(anchor)
-    return bool(str(anchor).strip())
+    return False
 
 
-def _has_production_identity_anchor(inst: Any, elev: ElevationOpening) -> bool:
+def _has_production_identity_anchor(
+    inst: Any, elev: ElevationOpening, facades: Any = None
+) -> bool:
     """Return True when a (plan, elevation) pair shares a strong anchor.
 
-    Production matching REQUIRES at least one of:
-      (a) an exact compatible opening mark, OR
-      (b) validated position/location correspondence, OR
-      (c) another independently-proven unique identity signal.
+    Production matching REQUIRES at least one GENUINELY VALIDATED anchor:
+      (a) an exact compatible opening mark (non-blank both sides, equal), OR
+      (b) a validated position/location correspondence backed by a
+          footprint-registered facade wall_ref (extent-checked against
+          ``facades``).
 
     Side and width SUPPORT a match but never independently identify a physical
-    opening, so a pair that only agrees on side+width has NO strong anchor and
-    may not correlate (fail-closed ambiguity → review).
+    opening, and arbitrary caller-attached identifiers/positions are never
+    sufficient.  A pair that only agrees on side+width (or only on an attached
+    ``identity_anchor``/bare position) has NO strong anchor and may not
+    correlate (fail-closed ambiguity → review).
     """
     return (
         _exact_mark_anchor(inst, elev)
-        or _validated_position_anchor(inst, elev)
-        or _proven_unique_anchor(elev)
+        or _validated_position_anchor(inst, elev, facades)
     )
 
 
-def _production_correlation_score(inst: Any, elev: ElevationOpening) -> float:
+def _production_correlation_score(
+    inst: Any, elev: ElevationOpening, facades: Any = None
+) -> float:
     """Production B3 score: v172 compatibility, plus the strong-anchor gate.
 
     The reviewed v1.7.2 ``_correlation_score`` already enforces the hard
@@ -909,7 +1109,7 @@ def _production_correlation_score(inst: Any, elev: ElevationOpening) -> float:
     base = _correlation_score(inst, elev)
     if base <= 0.0:
         return 0.0
-    if not _has_production_identity_anchor(inst, elev):
+    if not _has_production_identity_anchor(inst, elev, facades):
         # Side + width agreement alone is insufficient production identity.
         return 0.0
     return base
@@ -918,14 +1118,20 @@ def _production_correlation_score(inst: Any, elev: ElevationOpening) -> float:
 def correlate_elevation_to_plan_production(
     elevation_openings: Sequence[ElevationOpening],
     plan_instances: Sequence[Any],
+    facades: Any = None,
 ) -> Tuple[List[Any], List[ElevationOpening]]:
     """Strict production B3 correlation: (enriched, unmatched).
 
     Same ambiguity-safe unique-best assignment and enrichment as the reviewed
     v1.7.2 B3 stage, but with the production identity gate: only pairs sharing
-    a strong instance anchor (exact mark / validated position / proven unique
-    signal) may correlate.  Pairs without a strong anchor are NEVER matched —
-    they fail closed to unmatched/review, exactly like a tie.
+    a GENUINELY VALIDATED strong instance anchor may correlate.  Genuine anchors
+    are (a) an exact compatible opening mark, or (b) a validated position backed
+    by a facade wall segment REGISTERED from the calibrated building footprint
+    (``facades`` from ``footprint_facades``), extent-checked so a station off
+    the registered wall can never anchor.  Pairs without such an anchor —
+    including side+width-only agreement and arbitrary caller-attached
+    identifiers/positions — are NEVER matched; they fail closed to
+    unmatched/review, exactly like a tie.
 
     Returns ``(enriched_instances, unmatched_elevations)`` mirroring
     ``pb_elevation_evidence_v172.correlate_elevation_to_plan``'s contract, so
@@ -937,7 +1143,7 @@ def correlate_elevation_to_plan_production(
     pairs: List[Tuple[float, int, int]] = []
     for p_idx, inst in enumerate(plan_instances):
         for e_idx, elev in enumerate(elevation_openings):
-            sc = _production_correlation_score(inst, elev)
+            sc = _production_correlation_score(inst, elev, facades)
             if sc > 0.0:
                 pairs.append((sc, p_idx, e_idx))
 
