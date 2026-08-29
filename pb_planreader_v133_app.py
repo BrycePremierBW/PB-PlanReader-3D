@@ -53,7 +53,8 @@ verify_opening_production_v175(app)
 apply_3d_canonical_integration(app)
 # Phase 6A is presentation/read-only and wraps the shared workspace hero only.
 apply_commercial_workspace_v160(app)
-app.APP_VERSION = "1.6.0"
+# Preserve the production compatibility contract; Phase 6A has its own module VERSION.
+app.APP_VERSION = "1.5.1"
 
 if __name__ == "__main__":
     app.main()
