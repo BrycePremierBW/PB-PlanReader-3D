@@ -6,8 +6,8 @@ for generated CanonicalProject models tied to PlanReader workspaces.
 
 SAFETY GUARANTEES:
 1. Versioned schema contract (PERSISTENCE_KEY = "canonical_3d_model_v1").
-2. Fingerprints underlying PlanReader workspace evidence sources (document revision, mapper, walls, B5 openings).
-3. Saved timestamp does NOT contaminate the source revision fingerprint.
+2. Real production set_workspace_setting API string serialization (json.dumps / json.loads).
+3. Fingerprints underlying Workspace Evidence Snapshot (excluding generation_timestamp).
 4. Detects stale persisted models when workspace evidence changes.
 5. Provides 'Refresh model from source evidence' flow.
 6. Refuses to persist synthetic demo data to production workspace stores.
@@ -23,25 +23,27 @@ PERSISTENCE_KEY = "canonical_3d_model_v1"
 SCHEMA_VERSION = "1.0.0"
 
 
-def compute_workspace_source_fingerprint(workspace_data: Dict[str, Any]) -> str:
+def compute_workspace_source_fingerprint(snapshot: Dict[str, Any]) -> str:
     """
-    SECTION 8: Computes a deterministic SHA-256 fingerprint representing the current
-    revision of underlying PlanReader workspace evidence sources (pages, mapper, walls, B5 openings).
+    SECTION K: Computes a deterministic SHA-256 fingerprint representing the current
+    revision of the Workspace Evidence Snapshot (metadata, pages, walls, openings, mapper, roof).
     
-    GUARANTEE: saved_timestamp is EXCLUDED so it never affects the source fingerprint!
+    GUARANTEE: Excludes generation_timestamp, UI toggles, and viewer camera.
     """
-    if not isinstance(workspace_data, dict):
-        return "empty_workspace_fingerprint"
+    if not isinstance(snapshot, dict):
+        return "empty_snapshot_fingerprint"
 
-    source_sources = {
-        "workspace_id": workspace_data.get("id") or workspace_data.get("workspace_id"),
-        "pages_revision": workspace_data.get("pages") or workspace_data.get("document_pages"),
-        "takeoff_rows": workspace_data.get("takeoff_rows") or workspace_data.get("walls"),
-        "openings_b5": workspace_data.get("openings") or workspace_data.get("opening_schedule"),
-        "mapper_shapes": workspace_data.get("floor_mapper_v128_shapes") or workspace_data.get("polygons"),
+    # Filter snapshot fields for deterministic hashing
+    clean_sources = {
+        "workspace_metadata": snapshot.get("workspace_metadata"),
+        "pages": snapshot.get("pages"),
+        "registered_walls": snapshot.get("registered_walls"),
+        "mapper_shapes": snapshot.get("mapper_shapes"),
+        "roof_data": snapshot.get("roof_data"),
+        "takeoff_rows": snapshot.get("takeoff_rows"),
     }
 
-    serialized = json.dumps(source_sources, sort_keys=True, default=str)
+    serialized = json.dumps(clean_sources, sort_keys=True, default=str)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
 
 
@@ -49,15 +51,17 @@ def save_workspace_canonical_model(
     app: Any,
     workspace_id: int,
     project: CanonicalProject,
+    snapshot: Optional[Dict[str, Any]] = None,
     workspace_data: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    SECTION 8: Saves canonical model to workspace settings / local store.
+    SECTION I & J: Saves canonical model to workspace settings using deterministic JSON string storage.
     """
     if project.is_synthetic_demo:
         raise ValueError("Cannot persist synthetic demonstration data to production workspace storage.")
 
-    fingerprint = compute_workspace_source_fingerprint(workspace_data) if workspace_data else "untracked_revision"
+    effective_snapshot = snapshot or workspace_data
+    fingerprint = compute_workspace_source_fingerprint(effective_snapshot) if effective_snapshot else "untracked_revision"
 
     persistence_payload = {
         "schema_version": SCHEMA_VERSION,
@@ -74,8 +78,11 @@ def save_workspace_canonical_model(
         "model_data": project.to_dict(),
     }
 
+    # SECTION I: Real production set_workspace_setting converts values to strings!
+    json_str = json.dumps(persistence_payload, sort_keys=True, indent=2)
+
     if app and hasattr(app, "set_workspace_setting"):
-        app.set_workspace_setting(int(workspace_id), PERSISTENCE_KEY, persistence_payload)
+        app.set_workspace_setting(int(workspace_id), PERSISTENCE_KEY, json_str)
 
     return persistence_payload
 
@@ -83,31 +90,49 @@ def save_workspace_canonical_model(
 def load_workspace_canonical_model(
     app: Any,
     workspace_id: int,
+    current_snapshot: Optional[Dict[str, Any]] = None,
     current_workspace_data: Optional[Dict[str, Any]] = None
 ) -> Tuple[bool, Optional[CanonicalProject], str, Optional[Dict[str, Any]]]:
     """
-    SECTION 8: Loads persisted canonical model and checks for staleness.
+    SECTION I & J: Loads persisted canonical model and checks for staleness.
+    Handles string JSON decoding from real set_workspace_setting API.
     Returns (is_valid_and_fresh, project, status_msg, saved_payload).
     """
     if not (app and hasattr(app, "workspace_setting")):
         return False, None, "No workspace settings interface available", None
 
-    saved_payload = app.workspace_setting(int(workspace_id), PERSISTENCE_KEY, None)
-    if not isinstance(saved_payload, dict):
+    raw_setting = app.workspace_setting(int(workspace_id), PERSISTENCE_KEY, None)
+    if raw_setting is None:
         return False, None, "No persisted canonical model found in workspace", None
+
+    # SECTION I: Handle string JSON or dict payload
+    if isinstance(raw_setting, str):
+        try:
+            saved_payload = json.loads(raw_setting)
+        except Exception as e:
+            return False, None, f"Corrupted JSON in persistence setting: {e}", None
+    elif isinstance(raw_setting, dict):
+        saved_payload = raw_setting
+    else:
+        return False, None, "Invalid persistence payload format", None
 
     if saved_payload.get("persistence_key") != PERSISTENCE_KEY:
         return False, None, f"Invalid persistence key: {saved_payload.get('persistence_key')}", None
 
+    saved_wid = saved_payload.get("workspace_id")
+    if saved_wid is not None and int(saved_wid) != int(workspace_id):
+        return False, None, f"Workspace ID mismatch: expected {workspace_id}, got {saved_wid}", None
+
     proj_dict = saved_payload.get("model_data")
     if not isinstance(proj_dict, dict):
-        return False, None, "Corrupted model data", None
+        return False, None, "Missing or invalid model_data in payload", None
 
     project = CanonicalProject.from_dict(proj_dict)
 
-    if current_workspace_data:
+    effective_snapshot = current_snapshot or current_workspace_data
+    if effective_snapshot:
         saved_fp = saved_payload.get("source_revision_fingerprint")
-        current_fp = compute_workspace_source_fingerprint(current_workspace_data)
+        current_fp = compute_workspace_source_fingerprint(effective_snapshot)
         if saved_fp != current_fp:
             return False, project, f"⚠️ Stale saved model detected (Saved FP: {saved_fp}, Current FP: {current_fp})", saved_payload
 

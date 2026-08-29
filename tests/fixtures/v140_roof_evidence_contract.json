@@ -1,0 +1,16 @@
+{
+  "roof_caps": [
+    {
+      "id": "roof_cap_01",
+      "name": "Main Building Roof Envelope",
+      "polygon": [
+        {"x": 0.0, "y": 0.0},
+        {"x": 18.5, "y": 0.0},
+        {"x": 18.5, "y": 12.0},
+        {"x": 0.0, "y": 12.0}
+      ],
+      "pitch_deg": 22.5,
+      "roof_type": "GABLE"
+    }
+  ]
+}
