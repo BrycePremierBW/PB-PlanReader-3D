@@ -612,9 +612,21 @@ def run_p5_native_payload(
 
     Phase 2B controlled seam: ``elevation_openings`` may carry a
     provenance-complete, dimensional list of ``ElevationOpening`` objects
-    produced by the fail-closed v1.7.8 production bridge.  They are threaded
-    into ``run_opening_pipeline(elevation_openings=...)`` whose reviewed B3
-    stage (correlate_elevation_to_plan) correlates them against B1 instances.
+    produced by the fail-closed v1.7.8 production bridge.  They are correlated
+    against the B1/B2 instances with the PRODUCTION strict B3 stage
+    (``correlate_elevation_to_plan_production`` in the v1.7.8 bridge), which
+    requires a strong instance-specific identity anchor (exact opening mark /
+    validated position / proven unique signal) — generic "same elevation side +
+    compatible width" alone is never sufficient production identity.
+
+    Because the strict B3 stage is owned by the production seam (and must not
+    reuse v1.7.2's permissive side+width identity), elevation openings are NOT
+    threaded into ``run_opening_pipeline``'s shared weak B3 stage; instead the
+    pipeline runs B1->B2 (and B4/B5) and production applies the strict
+    elevation correlation afterwards.  This ordering is SAFE for all safety
+    guarantees: elevation is CORROBORATION ONLY — it never creates instances,
+    never sets ``deduct=True``, and always keeps ``dimension_basis="unknown"``
+    — so running it after B4/B5 cannot change any deduction outcome.
 
     Safety guarantees preserved:
       - Default is ``None``/empty -> identical to previous behaviour (no B3
@@ -630,30 +642,59 @@ def run_p5_native_payload(
     """
     segments = [_segment_from_native(row) for row in native.get("segments") or []]
     words = [_word_from_native(row, page_no) for row in native.get("words") or []]
+    # Elevation is NOT passed to the shared weak pipeline B3 stage (v1.7.2
+    # treats side+width as sufficient identity).  Production correlation uses
+    # the strict gated stage below instead.
     pipeline = run_opening_pipeline(
         segments=segments, words=words,
-        schedule_entries=schedule_entries, elevation_openings=elevation_openings,
+        schedule_entries=schedule_entries, elevation_openings=None,
         scale_info=scale_info or {}, page_no=int(page_no),
     )
-    for inst in pipeline.get("instances") or []:
-        inst.workspace_id = int(workspace_id)
-        inst.page_id = int(page_id) if page_id else None
-    instances = [asdict(inst) for inst in pipeline.get("instances") or []]
-    conflicts = [asdict(conflict) for conflict in pipeline.get("conflicts") or []]
+    pipeline_instances = list(pipeline.get("instances") or [])
+
     elevation_openings_payload = [asdict(open) for open in (elevation_openings or [])]
     elevation_diagnostics_payload = list(elevation_diagnostics or [])
-    # Persist the B3 correlation outcome so a reviewer can see the summary
-    # even though the correlations happen inside the pipeline stage.
-    b3_notes = [
-        str(note) for note in (pipeline.get("pipeline_notes") or [])
-        if str(note).startswith("B3:")
-    ]
-    if b3_notes:
+
+    # --- Production strict B3 correlation (C2) ------------------------------
+    matched_openings = 0
+    unmatched_openings = len(elevation_openings or [])
+    if (elevation_openings or []) and pipeline_instances:
+        try:
+            from pb_elevation_production_bridge_v178 import (
+                correlate_elevation_to_plan_production,
+            )
+            correlated, unmatched = correlate_elevation_to_plan_production(
+                list(elevation_openings), pipeline_instances,
+            )
+            pipeline_instances = list(correlated)
+            matched_openings = len(elevation_openings) - len(unmatched)
+            unmatched_openings = len(unmatched)
+        except Exception:
+            # If the strict seam is unavailable, elevation never influences the
+            # result (fail closed to the no-elevation path).
+            matched_openings = 0
+            unmatched_openings = len(elevation_openings or [])
+    if (elevation_openings or []):
         elevation_diagnostics_payload.append({
             "kind": "b3_correlation",
-            "note": b3_notes[0],
-            "source": "run_opening_pipeline.correlate_elevation_to_plan",
+            "note": (
+                f"B3 strict production correlation: {matched_openings} correlated, "
+                f"{unmatched_openings} unmatched/review"
+            ),
+            "source": "pb_elevation_production_bridge_v178.correlate_elevation_to_plan_production",
+            "identity_rule": (
+                "requires strong anchor (exact mark / validated position / "
+                "proven unique signal); side+width alone never identifies"
+            ),
+            "matched_count": matched_openings,
+            "unmatched_count": unmatched_openings,
         })
+
+    for inst in pipeline_instances:
+        inst.workspace_id = int(workspace_id)
+        inst.page_id = int(page_id) if page_id else None
+    instances = [asdict(inst) for inst in pipeline_instances]
+    conflicts = [asdict(conflict) for conflict in pipeline.get("conflicts") or []]
     return {
         "version": VERSION, "workspace_id": int(workspace_id), "page_id": int(page_id),
         "page_no": int(page_no), "instances": instances, "conflicts": conflicts,
