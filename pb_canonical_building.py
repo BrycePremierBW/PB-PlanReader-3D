@@ -11,7 +11,8 @@ Fail-Closed & Zero-Made-Up-Data Rules:
 - Default takeoff_eligible = False (Strict boolean required)
 - Default deduction_authority = False (Strict boolean required)
 - Physical dimensions default to None (No invented fallback heights or thicknesses)
-- Strict boolean parsing: ONLY actual JSON boolean true grants authority. Strings like "true"/"yes"/"1" return False.
+- Strict boolean parsing: ONLY actual JSON/Python boolean True grants authority.
+  Direct Python construction with "false", "true", "yes", 1, 0 fails closed to False.
 """
 
 from dataclasses import dataclass, field
@@ -26,7 +27,7 @@ def parse_strict_bool(value: Any) -> bool:
     """
     Strict boolean parser.
     ONLY actual Python bool True grants authority.
-    Strings such as "true", "false", "yes", "1" fail-closed to False.
+    Strings such as "true", "false", "yes", "1", "0" and integers return False.
     """
     if isinstance(value, bool):
         return value
@@ -212,6 +213,12 @@ class CanonicalElement:
     takeoff_eligible: bool = False  # Fail-closed default: False
     deduction_authority: bool = False  # Fail-closed default: False
 
+    def __post_init__(self):
+        """Enforces strict boolean normalization on direct Python object construction."""
+        self.takeoff_eligible = parse_strict_bool(self.takeoff_eligible)
+        self.deduction_authority = parse_strict_bool(self.deduction_authority)
+        self.confidence = parse_optional_confidence(self.confidence)
+
     def base_to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
@@ -226,8 +233,8 @@ class CanonicalElement:
             "substrate": self.substrate,
             "finish": self.finish,
             "metadata": dict(self.metadata),
-            "takeoff_eligible": bool(self.takeoff_eligible),
-            "deduction_authority": bool(self.deduction_authority),
+            "takeoff_eligible": parse_strict_bool(self.takeoff_eligible),
+            "deduction_authority": parse_strict_bool(self.deduction_authority),
         }
 
     @classmethod
@@ -282,6 +289,7 @@ class CanonicalOpening(CanonicalElement):
     mark: Optional[str] = None
 
     def __post_init__(self):
+        super().__post_init__()
         if self.opening_type.upper() == "DOOR":
             self.object_type = ObjectType.DOOR
         elif self.opening_type.upper() == "WINDOW":
@@ -327,7 +335,9 @@ class CanonicalWall(CanonicalElement):
     openings: List[CanonicalOpening] = field(default_factory=list)
 
     def __post_init__(self):
+        super().__post_init__()
         self.object_type = ObjectType.WALL
+        self.is_external = parse_strict_bool(self.is_external)
 
     def to_dict(self) -> Dict[str, Any]:
         res = self.base_to_dict()
@@ -336,7 +346,7 @@ class CanonicalWall(CanonicalElement):
             "end_point": self.end_point.to_dict(),
             "thickness_m": self.thickness_m,
             "height_m": self.height_m,
-            "is_external": bool(self.is_external),
+            "is_external": parse_strict_bool(self.is_external),
             "openings": [op.to_dict() for op in self.openings],
         })
         return res
@@ -366,6 +376,7 @@ class CanonicalSpace(CanonicalElement):
     room_number: Optional[str] = None
 
     def __post_init__(self):
+        super().__post_init__()
         self.object_type = ObjectType.SPACE
 
     def to_dict(self) -> Dict[str, Any]:
@@ -425,12 +436,14 @@ class PolygonElement(CanonicalElement):
 @dataclass
 class CanonicalFloor(PolygonElement):
     def __post_init__(self):
+        super().__post_init__()
         self.object_type = ObjectType.FLOOR
 
 
 @dataclass
 class CanonicalCeiling(PolygonElement):
     def __post_init__(self):
+        super().__post_init__()
         self.object_type = ObjectType.CEILING
 
 
@@ -441,6 +454,7 @@ class CanonicalRoof(PolygonElement):
     roof_type: str = "FLAT"
 
     def __post_init__(self):
+        super().__post_init__()
         self.object_type = ObjectType.ROOF
 
     def to_dict(self) -> Dict[str, Any]:
@@ -471,6 +485,7 @@ class CanonicalRoof(PolygonElement):
 @dataclass
 class CanonicalSoffit(PolygonElement):
     def __post_init__(self):
+        super().__post_init__()
         self.object_type = ObjectType.SOFFIT
 
 
@@ -479,6 +494,7 @@ class CanonicalBalcony(PolygonElement):
     balustrade_ids: List[str] = field(default_factory=list)
 
     def __post_init__(self):
+        super().__post_init__()
         self.object_type = ObjectType.BALCONY
 
     def to_dict(self) -> Dict[str, Any]:
@@ -508,6 +524,7 @@ class CanonicalParapet(CanonicalElement):
     thickness_m: Optional[float] = None
 
     def __post_init__(self):
+        super().__post_init__()
         self.object_type = ObjectType.PARAPET
 
     def to_dict(self) -> Dict[str, Any]:
@@ -540,6 +557,7 @@ class CanonicalColumn(CanonicalElement):
     height_m: Optional[float] = None
 
     def __post_init__(self):
+        super().__post_init__()
         self.object_type = ObjectType.COLUMN
 
     def to_dict(self) -> Dict[str, Any]:
@@ -593,12 +611,14 @@ class CanonicalLinearElement(CanonicalElement):
 @dataclass
 class CanonicalBalustrade(CanonicalLinearElement):
     def __post_init__(self):
+        super().__post_init__()
         self.object_type = ObjectType.BALUSTRADE
 
 
 @dataclass
 class CanonicalScreen(CanonicalLinearElement):
     def __post_init__(self):
+        super().__post_init__()
         self.object_type = ObjectType.SCREEN
 
 
@@ -609,6 +629,7 @@ class CanonicalFinishSurface(CanonicalElement):
     orientation: str = "UNKNOWN"
 
     def __post_init__(self):
+        super().__post_init__()
         self.object_type = ObjectType.SURFACE
 
     def to_dict(self) -> Dict[str, Any]:
@@ -650,6 +671,7 @@ class CanonicalLevel(CanonicalElement):
     surfaces: List[CanonicalFinishSurface] = field(default_factory=list)
 
     def __post_init__(self):
+        super().__post_init__()
         self.object_type = ObjectType.LEVEL
 
     def to_dict(self) -> Dict[str, Any]:
@@ -702,6 +724,7 @@ class CanonicalBuilding(CanonicalElement):
     building_bounds: Optional[BoundingBox3D] = None
 
     def __post_init__(self):
+        super().__post_init__()
         self.object_type = ObjectType.BUILDING
 
     def to_dict(self) -> Dict[str, Any]:
@@ -730,13 +753,15 @@ class CanonicalProject(CanonicalElement):
     is_synthetic_demo: bool = False
 
     def __post_init__(self):
+        super().__post_init__()
         self.object_type = ObjectType.PROJECT
+        self.is_synthetic_demo = parse_strict_bool(self.is_synthetic_demo)
 
     def to_dict(self) -> Dict[str, Any]:
         res = self.base_to_dict()
         res.update({
             "buildings": [b.to_dict() for b in self.buildings],
-            "is_synthetic_demo": bool(self.is_synthetic_demo),
+            "is_synthetic_demo": parse_strict_bool(self.is_synthetic_demo),
         })
         return res
 

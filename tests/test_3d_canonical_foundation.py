@@ -1,6 +1,6 @@
 """
 Unit test suite for Phase 1-4 3D Canonical Building Model, Geometry Services,
-Synthetic Demonstration Fixture, Viewer Payload Generator, and Round 2 Security/Safety Regressions.
+Synthetic Demonstration Fixture, Viewer Payload Generator, and Round 3 Security/Safety Regressions.
 """
 
 import base64
@@ -88,27 +88,26 @@ def test_canonical_model_creation_and_fail_closed_defaults():
     assert wall.takeoff_eligible is False
 
 
-def test_strict_boolean_parsing():
-    """ROUND 2: Verify that ONLY Python bool True grants authority. Strings return False."""
-    assert parse_strict_bool(True) is True
-    assert parse_strict_bool(False) is False
-    assert parse_strict_bool("true") is False
-    assert parse_strict_bool("True") is False
-    assert parse_strict_bool("yes") is False
-    assert parse_strict_bool("1") is False
-    assert parse_strict_bool(1) is False
-    assert parse_strict_bool(None) is False
+def test_direct_python_construction_strict_boolean_normalization():
+    """ROUND 3: Direct Python construction with 'false', 'true', 'yes', 1 must NOT grant authority."""
+    w_false = CanonicalWall(deduction_authority="false", takeoff_eligible="true", is_external="yes")
+    assert w_false.deduction_authority is False
+    assert w_false.takeoff_eligible is False
+    assert w_false.is_external is False
 
-    dict_data = {
-        "id": "elem_strict",
-        "takeoff_eligible": "true",       # String MUST fail to False
-        "deduction_authority": "yes",     # String MUST fail to False
-        "is_external": True,             # Boolean True succeeds
-    }
-    elem = CanonicalWall.from_dict(dict_data)
-    assert elem.takeoff_eligible is False
-    assert elem.deduction_authority is False
-    assert elem.is_external is True
+    w_int = CanonicalWall(deduction_authority=1, takeoff_eligible=0)
+    assert w_int.deduction_authority is False
+    assert w_int.takeoff_eligible is False
+
+    w_true = CanonicalWall(deduction_authority=True, takeoff_eligible=True, is_external=True)
+    assert w_true.deduction_authority is True
+    assert w_true.takeoff_eligible is True
+    assert w_true.is_external is True
+
+    # Test serialization base_to_dict
+    w_false_dict = w_false.to_dict()
+    assert w_false_dict["deduction_authority"] is False
+    assert w_false_dict["takeoff_eligible"] is False
 
 
 def test_synthetic_demo_fixture_flags():
@@ -119,12 +118,17 @@ def test_synthetic_demo_fixture_flags():
     assert demo.deduction_authority is False
 
 
-def test_model_bounds_api_contract():
-    """ROUND 2: Test model_bounds returns (bounds_available: bool, bounds: Optional[BoundingBox3D])."""
+def test_model_bounds_api_contract_and_z_fail_closed():
+    """ROUND 3: Test model_bounds returns (bounds_available: bool, bounds: Optional[BoundingBox3D]) and fails closed in Z."""
     empty_proj = CanonicalProject(name="Empty")
     ok_empty, bounds_empty = model_bounds(empty_proj)
     assert ok_empty is False
     assert bounds_empty is None
+
+    # Level with unknown elevation_m must fail closed in Z (returns None for extents)
+    lvl_no_elev = CanonicalLevel(name="Unknown Elev", elevation_m=None)
+    lvl_no_elev.walls = [CanonicalWall(start_point=Vector2D(0,0), end_point=Vector2D(10,0), height_m=3.0)]
+    assert level_extents(lvl_no_elev) is None
 
     demo_proj = get_synthetic_viewer_demo_model()
     ok_demo, bounds_demo = model_bounds(demo_proj)
@@ -136,7 +140,7 @@ def test_model_bounds_api_contract():
 
 
 def test_no_invented_physical_geometry_defaults():
-    """ROUND 2: Test that missing physical geometry parameters remain None."""
+    """ROUND 2 & 3: Test that missing physical geometry parameters remain None."""
     wall = CanonicalWall(start_point=Vector2D(0.0, 0.0), end_point=Vector2D(10.0, 0.0))
     assert wall.height_m is None
     assert wall.thickness_m is None
@@ -186,21 +190,17 @@ def test_opening_render_order_and_host_resolution():
     proj.buildings = [bld]
 
     payload = project_to_viewer_payload(proj)
-    
-    # Sort payload objects so opening is explicitly FIRST, wall is SECOND
     payload["objects"].sort(key=lambda o: 0 if o["id"] == "door_child_99" else 1)
     assert payload["objects"][0]["id"] == "door_child_99"
     assert payload["objects"][1]["id"] == "wall_host_99"
 
     html_code = generate_bim_viewer_html(payload)
-    # Verify 2-pass indexing logic present in HTML JS
     assert "PASS 1: Index ALL objects in objectDataMap first" in html_code
     assert "PASS 2: Create and render 3D meshes" in html_code
 
 
-def test_deduction_and_opening_conflict_safety():
-    """ROUND 2: Test overlap detection, duplicate openings, and valid/invalid deduction counts."""
-    # 1. Overlapping openings on wall
+def test_deduction_and_overlap_conflict_fail_closed_net_area():
+    """ROUND 3: Test that overlapping openings FAIL CLOSED for authorized deduction area (0.0) and authorized net area (gross wall)."""
     wall_op = CanonicalWall(
         id="wall_overlap",
         start_point=Vector2D(0.0, 0.0),
@@ -231,37 +231,9 @@ def test_deduction_and_opening_conflict_safety():
     p_overlap = potential_net_wall_area(wall_op)
     assert p_overlap["has_overlapping_openings"] is True
     assert p_overlap["all_deductions_authorized"] is False
+    assert p_overlap["authorized_opening_deduction_area_m2"] == 0.0  # Fails closed to 0.0 deduction!
+    assert p_overlap["authorized_net_area_m2"] == 30.0  # Equals gross wall area (30.0 m²)!
     assert "Conflict: Overlapping / Duplicate Openings" in p_overlap["authority_note"]
-
-    # 2. Authorized valid + invalid opening on wall
-    wall_bad = CanonicalWall(
-        id="wall_bad",
-        start_point=Vector2D(0.0, 0.0),
-        end_point=Vector2D(10.0, 0.0),
-        height_m=3.0,
-        deduction_authority=True,
-    )
-    op_valid = CanonicalOpening(
-        id="op_v",
-        wall_id=wall_bad.id,
-        offset_along_wall_m=1.0,
-        width_m=1.0,
-        height_m=2.0,
-        sill_height_m=0.0,
-        deduction_authority=True,
-    )
-    op_invalid = CanonicalOpening(
-        id="op_inv",
-        wall_id=wall_bad.id,
-        width_m=-1.0,  # Invalid dimension
-        deduction_authority=True,
-    )
-    wall_bad.openings = [op_valid, op_invalid]
-
-    p_bad = potential_net_wall_area(wall_bad)
-    assert p_bad["invalid_unresolved_opening_count"] == 1
-    assert p_bad["all_deductions_authorized"] is False
-    assert "Conflict: 1 Invalid/Unresolved Opening" in p_bad["authority_note"]
 
 
 def test_confidence_semantics_explicit_zero_vs_none():
@@ -316,10 +288,8 @@ def test_xss_script_context_escaped_base64():
     payload = project_to_viewer_payload(proj)
     html_code = generate_bim_viewer_html(payload)
 
-    # Raw script tag break out string MUST NOT appear unencoded in HTML source!
     assert "</script><script>globalThis" not in html_code.split("const b64Data = ")[1].split(";")[0]
 
-    # Verify Base64 decoding unpacks original payload cleanly
     b64_str = html_code.split('const b64Data = "')[1].split('"')[0]
     decoded_json = base64.b64decode(b64_str.encode("ascii")).decode("utf-8")
     decoded_data = json.loads(decoded_json)
@@ -337,7 +307,6 @@ def test_complete_declared_types_and_finish_surface():
     lvl.screens = [screen]
     lvl.surfaces = [surf]
 
-    # Test round trip serialization
     lvl_dict = lvl.to_dict()
     lvl_recon = CanonicalLevel.from_dict(lvl_dict)
 

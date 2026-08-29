@@ -8,7 +8,10 @@ IMPORTANT GUARANTEES:
 2. Does NOT create a duplicate PDF measurement/extraction engine.
 3. Does NOT automatically grant deduction authority for calculated net wall areas.
 4. Separates authorized vs unauthorized opening deduction areas cleanly (no blanket authorization).
-5. Detects overlapping/duplicate openings and invalid/unresolved geometry to fail-closed on deduction authority.
+5. Detects overlapping/duplicate openings and invalid/unresolved geometry:
+   - If a conflict exists (overlapping, duplicate, or invalid openings), authorized deduction area FAILS CLOSED to 0.0,
+     and authorized net area equals gross wall area (no deductions applied!).
+6. level_extents / model_bounds fail closed in Z when level elevation is unknown (no ground level 0.0 assumption).
 """
 
 import math
@@ -26,6 +29,7 @@ from pb_canonical_building import (
     Vector3D,
     BoundingBox3D,
     ReviewState,
+    parse_strict_bool,
 )
 
 
@@ -199,11 +203,14 @@ def potential_net_wall_area(wall: CanonicalWall) -> Dict[str, Any]:
     Calculates wall gross area, observed opening areas, authorized vs unauthorized opening deductions,
     and potential net area.
 
-    STRICT DEDUCTION SAFETY & OVERLAP DETECTION:
-    1. Tracks valid, invalid/unresolved, authorized, and unauthorized opening counts.
-    2. Overlapping or duplicate openings trigger overlap conflicts and fail closed.
-    3. all_deductions_authorized is False if ANY opening is invalid, unresolved, unauthorized, or overlapping.
+    FAIL-CLOSED DEDUCTION RULE (ROUND 3):
+    1. Strict boolean check on deduction authority.
+    2. Overlapping, duplicate, invalid, or unresolved openings trigger a conflict.
+    3. IF ANY CONFLICT EXISTS, authorized deduction area FAILS CLOSED to 0.0,
+       and authorized_net_area_m2 equals gross_wall_area_m2 (zero deductions applied!).
     """
+    wall_deduction_auth = parse_strict_bool(wall.deduction_authority)
+
     valid_w, msg_w = validate_wall_geometry(wall)
     if not valid_w:
         return {
@@ -227,7 +234,7 @@ def potential_net_wall_area(wall: CanonicalWall) -> Dict[str, Any]:
 
     gross = wall_gross_area(wall)
     observed_opening_area = 0.0
-    authorized_deduction_area = 0.0
+    raw_authorized_deduction_area = 0.0
 
     valid_count = 0
     invalid_count = 0
@@ -244,37 +251,46 @@ def potential_net_wall_area(wall: CanonicalWall) -> Dict[str, Any]:
         op_area = gross_opening_area(op)
         observed_opening_area += op_area
 
-        if wall.deduction_authority and op.deduction_authority:
-            authorized_deduction_area += op_area
+        op_deduction_auth = parse_strict_bool(op.deduction_authority)
+        if wall_deduction_auth and op_deduction_auth:
+            raw_authorized_deduction_area += op_area
             auth_count += 1
         else:
             unauth_count += 1
 
     has_overlaps, overlap_pairs = detect_opening_overlaps(wall.openings)
-
     potential_net = max(0.0, gross - observed_opening_area)
-    authorized_net = max(0.0, gross - authorized_deduction_area)
-    unauthorized_opening_area = max(0.0, observed_opening_area - authorized_deduction_area)
 
-    all_authorized = (
-        valid_count > 0 and
-        invalid_count == 0 and
-        unauth_count == 0 and
-        not has_overlaps and
-        wall.deduction_authority and
-        abs(observed_opening_area - authorized_deduction_area) <= 1e-4
-    )
+    # FAIL-CLOSED FOR AUTHORIZED NET AREA ON CONFLICT:
+    # If overlapping, duplicate, or invalid openings exist, DO NOT grant authorized deductions!
+    has_conflict = has_overlaps or (invalid_count > 0) or not wall_deduction_auth
 
-    if has_overlaps:
-        note = f"Conflict: Overlapping / Duplicate Openings Detected on Wall ({len(overlap_pairs)} pair(s))"
-    elif invalid_count > 0:
-        note = f"Conflict: {invalid_count} Invalid/Unresolved Opening(s) Detected on Wall"
-    elif all_authorized:
-        note = "All Opening Deductions Authorized by Evidence"
-    elif authorized_deduction_area > 0:
-        note = f"Partial Deduction Authorized ({authorized_deduction_area:.2f} m² authorized, {unauthorized_opening_area:.2f} m² unauthorized)"
+    if has_conflict:
+        authorized_deduction_area = 0.0
+        authorized_net = gross  # Fail closed to gross wall area (no deductions applied)
+        effective_auth_count = 0
+        all_authorized = False
+
+        if has_overlaps:
+            note = f"Conflict: Overlapping / Duplicate Openings ({len(overlap_pairs)} pair(s)) — Authorized Net Fails Closed to Gross Wall"
+        elif invalid_count > 0:
+            note = f"Conflict: {invalid_count} Invalid/Unresolved Opening(s) — Authorized Net Fails Closed to Gross Wall"
+        else:
+            note = "Deduction NOT Authorized — Potential Net Geometry Only"
     else:
-        note = "Deduction NOT Authorized — Potential Net Geometry Only"
+        authorized_deduction_area = raw_authorized_deduction_area
+        authorized_net = max(0.0, gross - authorized_deduction_area)
+        effective_auth_count = auth_count
+        all_authorized = (valid_count > 0 and unauth_count == 0)
+        
+        if all_authorized:
+            note = "All Opening Deductions Authorized by Evidence"
+        elif authorized_deduction_area > 0:
+            note = f"Partial Deduction Authorized ({authorized_deduction_area:.2f} m² authorized)"
+        else:
+            note = "Deduction NOT Authorized — Potential Net Geometry Only"
+
+    unauthorized_opening_area = max(0.0, observed_opening_area - authorized_deduction_area)
 
     return {
         "wall_id": wall.id,
@@ -287,7 +303,7 @@ def potential_net_wall_area(wall: CanonicalWall) -> Dict[str, Any]:
         "unauthorized_opening_area_m2": unauthorized_opening_area,
         "valid_opening_count": valid_count,
         "invalid_unresolved_opening_count": invalid_count,
-        "authorized_opening_count": auth_count,
+        "authorized_opening_count": effective_auth_count,
         "unauthorized_opening_count": unauth_count,
         "has_overlapping_openings": has_overlaps,
         "all_deductions_authorized": all_authorized,
@@ -315,11 +331,17 @@ def space_floor_area(space: CanonicalSpace) -> float:
 
 
 def level_extents(level: CanonicalLevel) -> Optional[BoundingBox3D]:
-    """Calculates total 3D bounding box for all elements on a specific level."""
+    """
+    Calculates total 3D bounding box for all elements on a specific level.
+    ROUND 3 FAIL CLOSED: Returns None if level.elevation_m is unknown (no ground level 0.0 assumption).
+    """
+    if not _is_valid_float(level.elevation_m):
+        return None
+
     min_x, max_x = float("inf"), float("-inf")
     min_y, max_y = float("inf"), float("-inf")
 
-    z_min = level.elevation_m if _is_valid_float(level.elevation_m) else 0.0
+    z_min = float(level.elevation_m)
     h = level.height_m if _is_valid_float(level.height_m) else 0.0
     z_max = z_min + max(0.0, h)
 
@@ -403,7 +425,7 @@ def surface_metadata(element: CanonicalElement) -> Dict[str, Any]:
         "review_state": element.review_state.value if isinstance(element.review_state, Enum) else str(element.review_state),
         "provenance": prov,
         "has_explicit_provenance": has_explicit_provenance,
-        "takeoff_eligible": element.takeoff_eligible,
-        "deduction_authority": element.deduction_authority,
+        "takeoff_eligible": parse_strict_bool(element.takeoff_eligible),
+        "deduction_authority": parse_strict_bool(element.deduction_authority),
         "metadata": element.metadata,
     }

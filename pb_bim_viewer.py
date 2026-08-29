@@ -10,14 +10,17 @@ Features:
 - 2-Pass scene building resolving opening host walls regardless of payload order
 - Complete declared type support (CEILING, SCREEN, SURFACE, BALUSTRADE, PARAPET, etc.)
 - Review state visual styling across ALL geometry types (CONFIRMED, INFERRED, REVIEW_REQUIRED)
-- Zero made-up data for unknown confidence, review state, evidence, or empty bounds
+- Zero invented physical fallbacks:
+  - Unknown level elevation is NOT treated as ground level 0.0
+  - Missing thickness renders as 2D flat planar/line geometry, NOT arbitrary 5cm or 15cm blocks
+  - Missing column center/dimensions are excluded, NOT placed at (0,0)
 """
 
 import base64
 import json
 import math
 from typing import Dict, Any, Optional
-from pb_canonical_building import CanonicalProject, ObjectType, ReviewState
+from pb_canonical_building import CanonicalProject, ObjectType, ReviewState, parse_strict_bool
 from pb_geometry_services import (
     wall_length,
     wall_gross_area,
@@ -88,10 +91,10 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
                         "gross_area_m2": op_gross,
                         "substrate": op.substrate,
                         "finish": op.finish,
-                        "confidence": op.confidence,  # Preserve explicit 0.0 vs None
+                        "confidence": op.confidence,
                         "review_state": op_rev,
                         "provenance": op.provenance.to_dict() if op.provenance else {},
-                        "deduction_authorized": op.deduction_authority,
+                        "deduction_authorized": parse_strict_bool(op.deduction_authority),
                     }
                     openings_data.append(op_data)
                     objects_payload.append(op_data)
@@ -119,10 +122,10 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
                     "has_overlapping_openings": p_net["has_overlapping_openings"],
                     "all_deductions_authorized": p_net["all_deductions_authorized"],
                     "authority_note": p_net["authority_note"],
-                    "is_external": w.is_external,
+                    "is_external": parse_strict_bool(w.is_external),
                     "substrate": w.substrate,
                     "finish": w.finish,
-                    "confidence": w.confidence,  # Preserve explicit 0.0 vs None
+                    "confidence": w.confidence,
                     "review_state": w_rev,
                     "provenance": w.provenance.to_dict() if w.provenance else {},
                     "openings": openings_data,
@@ -196,7 +199,7 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
                     "name": col.name,
                     "type": ObjectType.COLUMN.value,
                     "level_id": lvl.id,
-                    "center": col.center.to_dict() if col.center else {},
+                    "center": col.center.to_dict() if (col.center and col.center.is_valid()) else None,
                     "width_m": col.width_m,
                     "depth_m": col.depth_m,
                     "height_m": col.height_m,
@@ -258,7 +261,7 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
     return {
         "project_id": project.id,
         "project_name": project.name,
-        "is_synthetic_demo": bool(getattr(project, "is_synthetic_demo", False)),
+        "is_synthetic_demo": parse_strict_bool(getattr(project, "is_synthetic_demo", False)),
         "bounds_available": bounds_ok,
         "bounds": bounds.to_dict() if bounds_ok and bounds else None,
         "levels": levels_payload,
@@ -270,9 +273,8 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
     """
     Generates an HTML/JS document featuring an interactive Three.js 3D WebGL viewer
     with Base64 UTF-8 JSON script encoding (XSS-safe), 2-pass scene building,
-    and genuine physical wall cut-outs.
+    genuine physical wall cut-outs, and ZERO invented physical fallbacks.
     """
-    # BLOCKER 6 FIX: Base64-encode JSON payload to prevent </script> XSS breakage
     json_bytes = json.dumps(payload).encode("utf-8")
     b64_payload = base64.b64encode(json_bytes).decode("ascii")
 
@@ -411,7 +413,6 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
     </div>
 
     <script>
-        // BLOCKER 6 FIX: Safe Base64 UTF-8 JSON decoding preventing script-context XSS
         const b64Data = "{b64_payload}";
         const jsonText = new TextDecoder().decode(Uint8Array.from(atob(b64Data), c => c.charCodeAt(0)));
         const modelData = JSON.parse(jsonText);
@@ -534,7 +535,7 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             animate();
         }}
 
-        // BLOCKER 4 FIX: 2-Pass scene building so openings can resolves host walls deterministically
+        // 2-Pass Scene Building: NO INVENTED PHYSICAL FALLBACKS
         function buildScene() {{
             if (!modelData.objects || modelData.objects.length === 0) return;
 
@@ -549,7 +550,11 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             // PASS 2: Create and render 3D meshes
             modelData.objects.forEach(obj => {{
                 const lvl = levelMap.get(obj.level_id);
-                const zElev = (lvl && lvl.elevation_m !== null && !isNaN(lvl.elevation_m)) ? lvl.elevation_m : 0.0;
+                // ROUND 3 FIX: Unknown level elevation is NOT treated as ground level 0.0!
+                if (!lvl || lvl.elevation_m === null || lvl.elevation_m === undefined || isNaN(lvl.elevation_m)) {{
+                    return;
+                }}
+                const zElev = lvl.elevation_m;
 
                 let mat = getMaterialForObject(obj);
                 let mesh = null;
@@ -576,7 +581,7 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             }});
         }}
 
-        // BLOCKER 3 & 5 FIX: Subtractive 3D Shape holes for doors (sill=0) and windows
+        // ZERO INVENTED PHYSICAL FALLBACKS FOR WALL THICKNESS / HEIGHT
         function createWallMeshWithHoles(wall, zElev, mat) {{
             const p1 = wall.start_point;
             const p2 = wall.end_point;
@@ -587,8 +592,8 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             const len = Math.hypot(dx, dy);
             if (isNaN(len) || len < 0.001) return null;
 
-            // Zero invented physical defaults! If height_m is missing, render baseline schematic wireframe
             if (wall.height_m === null || wall.height_m === undefined || isNaN(wall.height_m) || wall.height_m <= 0) {{
+                // Missing wall height: render as 2D baseline wireframe
                 const lineGeom = new THREE.BufferGeometry().setFromPoints([
                     new THREE.Vector3(p1.x, zElev, -p1.y),
                     new THREE.Vector3(p2.x, zElev, -p2.y)
@@ -600,8 +605,20 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             }}
 
             const hWall = wall.height_m;
-            const th = (wall.thickness_m !== null && wall.thickness_m > 0) ? wall.thickness_m : 0.05;
 
+            // ROUND 3 FIX: Missing wall thickness is rendered as 2D flat planar ribbon, NOT a 5cm block!
+            if (wall.thickness_m === null || wall.thickness_m === undefined || isNaN(wall.thickness_m) || wall.thickness_m <= 0) {{
+                const planeGeom = new THREE.PlaneGeometry(len, hWall);
+                const mesh = new THREE.Mesh(planeGeom, mat);
+                const angle = Math.atan2(dy, dx);
+                mesh.rotation.y = -angle;
+                const midX = (p1.x + p2.x) / 2;
+                const midY = (p1.y + p2.y) / 2;
+                mesh.position.set(midX, zElev + hWall / 2, -midY);
+                return mesh;
+            }}
+
+            const th = wall.thickness_m;
             const shape = new THREE.Shape();
             shape.moveTo(0, 0);
             shape.lineTo(len, 0);
@@ -614,7 +631,7 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
                     const off = op.offset_along_wall_m;
                     const wOp = op.width_m;
                     const hOp = op.height_m;
-                    const sill = (op.sill_height_m !== null) ? op.sill_height_m : 0.0;
+                    const sill = (op.sill_height_m !== null && op.sill_height_m !== undefined) ? op.sill_height_m : 0.0;
 
                     if (off !== null && wOp !== null && hOp !== null && wOp > 0 && hOp > 0 && off >= 0 && (off + wOp) <= (len + 0.05) && (sill + hOp) <= (hWall + 0.05)) {{
                         const hole = new THREE.Path();
@@ -646,8 +663,8 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             if (op.width_m === null || op.height_m === null || op.width_m <= 0 || op.height_m <= 0) return null;
             const wWidth = op.width_m;
             const wHeight = op.height_m;
-            const sill = (op.sill_height_m !== null) ? op.sill_height_m : 0.0;
-            const off = (op.offset_along_wall_m !== null) ? op.offset_along_wall_m : 0.0;
+            const sill = (op.sill_height_m !== null && op.sill_height_m !== undefined) ? op.sill_height_m : 0.0;
+            const off = (op.offset_along_wall_m !== null && op.offset_along_wall_m !== undefined) ? op.offset_along_wall_m : 0.0;
 
             const geom = new THREE.BoxGeometry(wWidth, wHeight, 0.06);
             const mesh = new THREE.Mesh(geom, mat);
@@ -675,6 +692,7 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             return mesh;
         }}
 
+        // ROUND 3 FIX: Missing polygon thickness renders 2D flat planar polygon, NOT 15cm block!
         function createPolygonMesh(polyObj, zElev, mat) {{
             if (!polyObj.polygon || polyObj.polygon.length < 3) return null;
             const shape = new THREE.Shape();
@@ -685,13 +703,24 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
                 }}
             }});
 
-            const th = (polyObj.thickness_m !== null && polyObj.thickness_m > 0) ? polyObj.thickness_m : 0.15;
+            const elevOff = (polyObj.elevation_offset_m !== null && polyObj.elevation_offset_m !== undefined) ? polyObj.elevation_offset_m : 0.0;
+
+            if (polyObj.thickness_m === null || polyObj.thickness_m === undefined || isNaN(polyObj.thickness_m) || polyObj.thickness_m <= 0) {{
+                const geom = new THREE.ShapeGeometry(shape);
+                geom.rotateX(Math.PI / 2);
+                const mesh = new THREE.Mesh(geom, mat);
+                mesh.position.y = zElev + elevOff;
+                mesh.receiveShadow = true;
+                return mesh;
+            }}
+
+            const th = polyObj.thickness_m;
             const extrudeSettings = {{ steps: 1, depth: th, bevelEnabled: false }};
             const geom = new THREE.ExtrudeGeometry(shape, extrudeSettings);
             geom.rotateX(Math.PI / 2);
 
             const mesh = new THREE.Mesh(geom, mat);
-            mesh.position.y = zElev + ((polyObj.elevation_offset_m !== null) ? polyObj.elevation_offset_m : 0.0);
+            mesh.position.y = zElev + elevOff;
             mesh.receiveShadow = true;
             return mesh;
         }}
@@ -699,35 +728,45 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
         function createParapetMesh(p, zElev, mat) {{
             if (p.height_m === null || p.height_m <= 0) return null;
             const len = p.length_m || 1.0;
-            const th = (p.thickness_m !== null && p.thickness_m > 0) ? p.thickness_m : 0.15;
-            const geom = new THREE.BoxGeometry(len, p.height_m, th);
-            const mesh = new THREE.Mesh(geom, mat);
-            mesh.castShadow = true;
 
             const dx = p.end_point.x - p.start_point.x;
             const dy = p.end_point.y - p.start_point.y;
             const angle = Math.atan2(dy, dx);
-            mesh.rotation.y = -angle;
-
             const midX = (p.start_point.x + p.end_point.x) / 2;
             const midY = (p.start_point.y + p.end_point.y) / 2;
+
+            if (p.thickness_m === null || p.thickness_m === undefined || isNaN(p.thickness_m) || p.thickness_m <= 0) {{
+                const geom = new THREE.PlaneGeometry(len, p.height_m);
+                const mesh = new THREE.Mesh(geom, mat);
+                mesh.rotation.y = -angle;
+                mesh.position.set(midX, zElev + p.height_m / 2, -midY);
+                return mesh;
+            }}
+
+            const geom = new THREE.BoxGeometry(len, p.height_m, p.thickness_m);
+            const mesh = new THREE.Mesh(geom, mat);
+            mesh.castShadow = true;
+            mesh.rotation.y = -angle;
             mesh.position.set(midX, zElev + p.height_m / 2, -midY);
             return mesh;
         }}
 
+        // ROUND 3 FIX: Missing column center/dimensions excluded, NOT placed at (0,0)!
         function createColumnMesh(col, zElev, mat) {{
-            if (col.width_m === null || col.depth_m === null || col.height_m === null) return null;
+            if (!col.center || col.center.x === null || col.center.y === null || col.width_m === null || col.depth_m === null || col.height_m === null) {{
+                return null;
+            }}
             const geom = new THREE.BoxGeometry(col.width_m, col.height_m, col.depth_m);
             const mesh = new THREE.Mesh(geom, mat);
             mesh.castShadow = true;
-            mesh.position.set(col.center.x || 0, zElev + col.height_m / 2, -(col.center.y || 0));
+            mesh.position.set(col.center.x, zElev + col.height_m / 2, -col.center.y);
             return mesh;
         }}
 
         function createLinearMesh(lin, zElev, mat) {{
             if (lin.height_m === null || lin.height_m <= 0) return null;
             const len = lin.length_m || 1.0;
-            const geom = new THREE.BoxGeometry(len, lin.height_m, 0.05);
+            const geom = new THREE.PlaneGeometry(len, lin.height_m);
             const mesh = new THREE.Mesh(geom, mat);
             mesh.castShadow = true;
 
@@ -918,8 +957,7 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
         }}
 
         function addSectionTitle(container, titleText) {{
-            const title = document.createElement('div');
-            title.className = 'info-section-title';
+            const title = document.className = 'info-section-title';
             title.textContent = titleText;
             container.appendChild(title);
         }}
@@ -960,7 +998,6 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
                 addInfoRow(container, 'Object ID', obj.id);
                 addInfoRow(container, 'Parent ID', obj.parent_id || 'None');
                 
-                // BLOCKER 5 FIX: Preserve explicit 0.0 vs null/undefined confidence
                 let confText = 'Not Recorded';
                 if (obj.confidence !== undefined && obj.confidence !== null && !isNaN(obj.confidence)) {{
                     confText = (obj.confidence * 100).toFixed(0) + '%';
