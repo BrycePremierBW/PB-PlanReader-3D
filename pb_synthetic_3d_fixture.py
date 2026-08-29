@@ -43,6 +43,10 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
     project = CanonicalProject(
         id="proj_synth_001",
         name="SYNTHETIC VIEWER DEMONSTRATION — NOT BENCHMARK TRUTH",
+        is_synthetic_demo=True,
+        confidence=1.0,
+        review_state=ReviewState.CONFIRMED,
+        takeoff_eligible=True,
         metadata={
             "disclaimer": "SYNTHETIC VIEWER DEMONSTRATION — NOT BENCHMARK TRUTH",
             "purpose": "Architecture & 3D Viewer Verification Only",

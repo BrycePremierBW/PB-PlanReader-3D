@@ -5,11 +5,15 @@ Defines the single-source-of-truth object graph representing physical building g
 Project -> Building -> Level -> Space/Room -> Wall -> Opening (Door/Window) ->
 Floor -> Ceiling -> Roof -> Soffit -> Balcony -> Parapet -> Column -> Balustrade -> Screen -> FinishSurface.
 
-Every element supports provenance, confidence, review state, metric dimensions,
-and strict deduction authority flags.
+Fail-Closed Security & Provenance Guarantees:
+- Default review_state = REVIEW_REQUIRED
+- Default confidence = 0.0 (unproven)
+- Default takeoff_eligible = False
+- Default deduction_authority = False
+- Strict 0.0..1.0 confidence clamping; malformed values fail-closed to 0.0
 """
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from enum import Enum
 import math
 import uuid
@@ -49,7 +53,7 @@ class Provenance:
     """Retains origin traces for evidence-based drawing reconciliation."""
     source_pdf: Optional[str] = None
     page_number: Optional[int] = None
-    drawing_id: Optional[str] = None  # e.g., "A101", "EL-02", "SEC-01"
+    drawing_id: Optional[str] = None
     source_coords: Optional[Dict[str, Any]] = None
     scale_source: Optional[str] = None
     contributing_evidence: List[str] = field(default_factory=list)
@@ -66,54 +70,74 @@ class Provenance:
 
     @classmethod
     def from_dict(cls, data: Optional[Dict[str, Any]]) -> "Provenance":
-        if not data:
+        if not isinstance(data, dict):
             return cls()
         return cls(
             source_pdf=data.get("source_pdf"),
             page_number=data.get("page_number"),
             drawing_id=data.get("drawing_id"),
-            source_coords=data.get("source_coords"),
+            source_coords=data.get("source_coords") if isinstance(data.get("source_coords"), dict) else None,
             scale_source=data.get("scale_source"),
-            contributing_evidence=data.get("contributing_evidence", []) or [],
+            contributing_evidence=list(data.get("contributing_evidence", []) or []) if isinstance(data.get("contributing_evidence"), list) else [],
         )
 
 
 @dataclass
 class Vector2D:
-    x: float
-    y: float
+    x: float = 0.0
+    y: float = 0.0
 
     def to_dict(self) -> Dict[str, float]:
         return {"x": float(self.x), "y": float(self.y)}
 
     @classmethod
     def from_dict(cls, data: Union[Dict[str, Any], List[float], Tuple[float, float]]) -> "Vector2D":
-        if isinstance(data, dict):
-            return cls(x=float(data.get("x", 0.0)), y=float(data.get("y", 0.0)))
-        elif isinstance(data, (list, tuple)) and len(data) >= 2:
-            return cls(x=float(data[0]), y=float(data[1]))
+        try:
+            if isinstance(data, dict):
+                vx = float(data.get("x", 0.0))
+                vy = float(data.get("y", 0.0))
+                if math.isnan(vx) or math.isinf(vx): vx = 0.0
+                if math.isnan(vy) or math.isinf(vy): vy = 0.0
+                return cls(x=vx, y=vy)
+            elif isinstance(data, (list, tuple)) and len(data) >= 2:
+                vx = float(data[0])
+                vy = float(data[1])
+                if math.isnan(vx) or math.isinf(vx): vx = 0.0
+                if math.isnan(vy) or math.isinf(vy): vy = 0.0
+                return cls(x=vx, y=vy)
+        except (ValueError, TypeError):
+            pass
         return cls(x=0.0, y=0.0)
 
 
 @dataclass
 class Vector3D:
-    x: float
-    y: float
-    z: float
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 0.0
 
     def to_dict(self) -> Dict[str, float]:
         return {"x": float(self.x), "y": float(self.y), "z": float(self.z)}
 
     @classmethod
     def from_dict(cls, data: Union[Dict[str, Any], List[float], Tuple[float, float, float]]) -> "Vector3D":
-        if isinstance(data, dict):
-            return cls(
-                x=float(data.get("x", 0.0)),
-                y=float(data.get("y", 0.0)),
-                z=float(data.get("z", 0.0)),
-            )
-        elif isinstance(data, (list, tuple)) and len(data) >= 3:
-            return cls(x=float(data[0]), y=float(data[1]), z=float(data[2]))
+        try:
+            if isinstance(data, dict):
+                vx = float(data.get("x", 0.0))
+                vy = float(data.get("y", 0.0))
+                vz = float(data.get("z", 0.0))
+                if math.isnan(vx) or math.isinf(vx): vx = 0.0
+                if math.isnan(vy) or math.isinf(vy): vy = 0.0
+                if math.isnan(vz) or math.isinf(vz): vz = 0.0
+                return cls(x=vx, y=vy, z=vz)
+            elif isinstance(data, (list, tuple)) and len(data) >= 3:
+                vx, vy, vz = float(data[0]), float(data[1]), float(data[2])
+                if math.isnan(vx) or math.isinf(vx): vx = 0.0
+                if math.isnan(vy) or math.isinf(vy): vy = 0.0
+                if math.isnan(vz) or math.isinf(vz): vz = 0.0
+                return cls(x=vx, y=vy, z=vz)
+        except (ValueError, TypeError):
+            pass
         return cls(x=0.0, y=0.0, z=0.0)
 
 
@@ -130,31 +154,31 @@ class BoundingBox3D:
 
     @classmethod
     def from_dict(cls, data: Optional[Dict[str, Any]]) -> "BoundingBox3D":
-        if not data:
+        if not isinstance(data, dict):
             return cls(min_point=Vector3D(0, 0, 0), max_point=Vector3D(0, 0, 0))
         return cls(
-            min_point=Vector3D.from_dict(data.get("min_point", {})),
-            max_point=Vector3D.from_dict(data.get("max_point", {})),
+            min_point=Vector3D.from_dict(data.get("min_point")),
+            max_point=Vector3D.from_dict(data.get("max_point")),
         )
 
 
 @dataclass
 class CanonicalElement:
-    """Base class for all canonical building elements."""
+    """Base class for all canonical building elements. Fails closed by default."""
     id: str = field(default_factory=lambda: f"elem_{uuid.uuid4().hex[:8]}")
     name: str = "Unnamed Element"
     object_type: ObjectType = ObjectType.SURFACE
     level_id: Optional[str] = None
     parent_id: Optional[str] = None
     children_ids: List[str] = field(default_factory=list)
-    confidence: float = 1.0  # 0.0 to 1.0
-    review_state: ReviewState = ReviewState.CONFIRMED
+    confidence: float = 0.0  # Fail-closed default: 0.0 (unproven)
+    review_state: ReviewState = ReviewState.REVIEW_REQUIRED  # Fail-closed default
     provenance: Provenance = field(default_factory=Provenance)
     substrate: Optional[str] = None
     finish: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
-    takeoff_eligible: bool = True
-    deduction_authority: bool = False  # CRITICAL: rendering geometry does NOT automatically imply deduction authority
+    takeoff_eligible: bool = False  # Fail-closed default: False
+    deduction_authority: bool = False  # Fail-closed default: False
 
     def base_to_dict(self) -> Dict[str, Any]:
         return {
@@ -176,13 +200,20 @@ class CanonicalElement:
 
     @classmethod
     def base_from_dict_args(cls, data: Dict[str, Any]) -> Dict[str, Any]:
-        rev_state = data.get("review_state", ReviewState.CONFIRMED.value)
+        if not isinstance(data, dict):
+            data = {}
+
+        # Fail-closed review_state deserialization
+        rev_state = data.get("review_state")
         if isinstance(rev_state, str):
             try:
                 rev_state = ReviewState(rev_state)
             except ValueError:
                 rev_state = ReviewState.REVIEW_REQUIRED
+        else:
+            rev_state = ReviewState.REVIEW_REQUIRED
 
+        # Object type deserialization
         obj_type = data.get("object_type", ObjectType.SURFACE.value)
         if isinstance(obj_type, str):
             try:
@@ -190,11 +221,19 @@ class CanonicalElement:
             except ValueError:
                 obj_type = ObjectType.SURFACE
 
-        raw_conf = data.get("confidence", 1.0)
+        # Fail-closed confidence deserialization (clamped to 0.0..1.0)
+        raw_conf = data.get("confidence")
         try:
-            conf_val = float(raw_conf)
+            if raw_conf is not None:
+                conf_val = float(raw_conf)
+                if math.isnan(conf_val) or math.isinf(conf_val):
+                    conf_val = 0.0
+                else:
+                    conf_val = max(0.0, min(1.0, conf_val))
+            else:
+                conf_val = 0.0
         except (ValueError, TypeError):
-            conf_val = 1.0
+            conf_val = 0.0
 
         return {
             "id": str(data.get("id", f"elem_{uuid.uuid4().hex[:8]}")),
@@ -209,7 +248,7 @@ class CanonicalElement:
             "substrate": data.get("substrate"),
             "finish": data.get("finish"),
             "metadata": dict(data.get("metadata", {}) or {}) if isinstance(data.get("metadata"), dict) else {},
-            "takeoff_eligible": bool(data.get("takeoff_eligible", True)),
+            "takeoff_eligible": bool(data.get("takeoff_eligible", False)),
             "deduction_authority": bool(data.get("deduction_authority", False)),
         }
 
@@ -217,7 +256,7 @@ class CanonicalElement:
 @dataclass
 class CanonicalOpening(CanonicalElement):
     wall_id: Optional[str] = None
-    opening_type: str = "GENERIC"  # "DOOR", "WINDOW", "GENERIC"
+    opening_type: str = "GENERIC"
     offset_along_wall_m: float = 0.0
     sill_height_m: float = 0.0
     width_m: float = 0.0
@@ -248,14 +287,22 @@ class CanonicalOpening(CanonicalElement):
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "CanonicalOpening":
         base_args = cls.base_from_dict_args(data)
+        
+        def safe_float(val, default=0.0):
+            try:
+                f = float(val)
+                return default if math.isnan(f) or math.isinf(f) else f
+            except (ValueError, TypeError):
+                return default
+
         return cls(
             **base_args,
             wall_id=data.get("wall_id"),
-            opening_type=data.get("opening_type", "GENERIC"),
-            offset_along_wall_m=float(data.get("offset_along_wall_m", 0.0)),
-            sill_height_m=float(data.get("sill_height_m", 0.0)),
-            width_m=float(data.get("width_m", 0.0)),
-            height_m=float(data.get("height_m", 0.0)),
+            opening_type=str(data.get("opening_type", "GENERIC")),
+            offset_along_wall_m=safe_float(data.get("offset_along_wall_m")),
+            sill_height_m=safe_float(data.get("sill_height_m")),
+            width_m=safe_float(data.get("width_m")),
+            height_m=safe_float(data.get("height_m")),
             mark=data.get("mark"),
         )
 
@@ -289,12 +336,20 @@ class CanonicalWall(CanonicalElement):
         base_args = cls.base_from_dict_args(data)
         openings_raw = data.get("openings", []) or []
         openings = [CanonicalOpening.from_dict(op) for op in openings_raw if isinstance(op, dict)]
+        
+        def safe_float(val, default=0.0):
+            try:
+                f = float(val)
+                return default if math.isnan(f) or math.isinf(f) else f
+            except (ValueError, TypeError):
+                return default
+
         return cls(
             **base_args,
-            start_point=Vector2D.from_dict(data.get("start_point", {})),
-            end_point=Vector2D.from_dict(data.get("end_point", {})),
-            thickness_m=float(data.get("thickness_m", 0.15)),
-            height_m=float(data.get("height_m", 2.7)),
+            start_point=Vector2D.from_dict(data.get("start_point")),
+            end_point=Vector2D.from_dict(data.get("end_point")),
+            thickness_m=safe_float(data.get("thickness_m"), 0.15),
+            height_m=safe_float(data.get("height_m"), 2.7),
             is_external=bool(data.get("is_external", False)),
             openings=openings,
         )
@@ -324,19 +379,28 @@ class CanonicalSpace(CanonicalElement):
     def from_dict(cls, data: Dict[str, Any]) -> "CanonicalSpace":
         base_args = cls.base_from_dict_args(data)
         poly_raw = data.get("boundary_polygon", []) or []
-        poly = [Vector2D.from_dict(pt) for pt in poly_raw]
+        poly = [Vector2D.from_dict(pt) for pt in poly_raw if pt]
+        
+        spec_area = data.get("specified_floor_area_m2")
+        try:
+            if spec_area is not None:
+                spec_area = float(spec_area)
+                if math.isnan(spec_area) or math.isinf(spec_area): spec_area = None
+        except (ValueError, TypeError):
+            spec_area = None
+
         return cls(
             **base_args,
             boundary_polygon=poly,
             height_m=float(data.get("height_m", 2.7)),
-            specified_floor_area_m2=data.get("specified_floor_area_m2"),
+            specified_floor_area_m2=spec_area,
             room_number=data.get("room_number"),
         )
 
 
 @dataclass
 class PolygonElement(CanonicalElement):
-    """Generic base class for horizontal polygonal elements (Floors, Ceilings, Roofs, Soffits, Balconies)."""
+    """Generic base class for horizontal polygonal elements."""
     polygon: List[Vector2D] = field(default_factory=list)
     thickness_m: float = 0.2
     elevation_offset_m: float = 0.0
@@ -354,7 +418,7 @@ class PolygonElement(CanonicalElement):
     def from_dict(cls, data: Dict[str, Any]) -> "PolygonElement":
         base_args = cls.base_from_dict_args(data)
         poly_raw = data.get("polygon", []) or []
-        poly = [Vector2D.from_dict(pt) for pt in poly_raw]
+        poly = [Vector2D.from_dict(pt) for pt in poly_raw if pt]
         return cls(
             **base_args,
             polygon=poly,
@@ -379,7 +443,7 @@ class CanonicalCeiling(PolygonElement):
 class CanonicalRoof(PolygonElement):
     pitch_deg: float = 0.0
     overhang_m: float = 0.6
-    roof_type: str = "FLAT"  # "FLAT", "GABLE", "HIP"
+    roof_type: str = "FLAT"
 
     def __post_init__(self):
         self.object_type = ObjectType.ROOF
@@ -397,7 +461,7 @@ class CanonicalRoof(PolygonElement):
     def from_dict(cls, data: Dict[str, Any]) -> "CanonicalRoof":
         base_args = cls.base_from_dict_args(data)
         poly_raw = data.get("polygon", []) or []
-        poly = [Vector2D.from_dict(pt) for pt in poly_raw]
+        poly = [Vector2D.from_dict(pt) for pt in poly_raw if pt]
         return cls(
             **base_args,
             polygon=poly,
@@ -431,7 +495,7 @@ class CanonicalBalcony(PolygonElement):
     def from_dict(cls, data: Dict[str, Any]) -> "CanonicalBalcony":
         base_args = cls.base_from_dict_args(data)
         poly_raw = data.get("polygon", []) or []
-        poly = [Vector2D.from_dict(pt) for pt in poly_raw]
+        poly = [Vector2D.from_dict(pt) for pt in poly_raw if pt]
         return cls(
             **base_args,
             polygon=poly,
@@ -466,8 +530,8 @@ class CanonicalParapet(CanonicalElement):
         base_args = cls.base_from_dict_args(data)
         return cls(
             **base_args,
-            start_point=Vector2D.from_dict(data.get("start_point", {})),
-            end_point=Vector2D.from_dict(data.get("end_point", {})),
+            start_point=Vector2D.from_dict(data.get("start_point")),
+            end_point=Vector2D.from_dict(data.get("end_point")),
             height_m=float(data.get("height_m", 1.0)),
             thickness_m=float(data.get("thickness_m", 0.2)),
         )
@@ -498,7 +562,7 @@ class CanonicalColumn(CanonicalElement):
         base_args = cls.base_from_dict_args(data)
         return cls(
             **base_args,
-            center=Vector2D.from_dict(data.get("center", {})),
+            center=Vector2D.from_dict(data.get("center")),
             width_m=float(data.get("width_m", 0.4)),
             depth_m=float(data.get("depth_m", 0.4)),
             height_m=float(data.get("height_m", 2.7)),
@@ -507,7 +571,6 @@ class CanonicalColumn(CanonicalElement):
 
 @dataclass
 class CanonicalLinearElement(CanonicalElement):
-    """Generic base class for linear edge elements (Balustrades, Screens)."""
     start_point: Vector2D = field(default_factory=lambda: Vector2D(0.0, 0.0))
     end_point: Vector2D = field(default_factory=lambda: Vector2D(0.0, 0.0))
     height_m: float = 1.0
@@ -526,8 +589,8 @@ class CanonicalLinearElement(CanonicalElement):
         base_args = cls.base_from_dict_args(data)
         return cls(
             **base_args,
-            start_point=Vector2D.from_dict(data.get("start_point", {})),
-            end_point=Vector2D.from_dict(data.get("end_point", {})),
+            start_point=Vector2D.from_dict(data.get("start_point")),
+            end_point=Vector2D.from_dict(data.get("end_point")),
             height_m=float(data.get("height_m", 1.0)),
         )
 
@@ -548,7 +611,7 @@ class CanonicalScreen(CanonicalLinearElement):
 class CanonicalFinishSurface(CanonicalElement):
     parent_element_id: Optional[str] = None
     surface_area_m2: float = 0.0
-    orientation: str = "UNKNOWN"  # e.g., "NORTH", "SOUTH", "INTERNAL", "CEILING"
+    orientation: str = "UNKNOWN"
 
     def __post_init__(self):
         self.object_type = ObjectType.SURFACE
@@ -569,14 +632,14 @@ class CanonicalFinishSurface(CanonicalElement):
             **base_args,
             parent_element_id=data.get("parent_element_id"),
             surface_area_m2=float(data.get("surface_area_m2", 0.0)),
-            orientation=data.get("orientation", "UNKNOWN"),
+            orientation=str(data.get("orientation", "UNKNOWN")),
         )
 
 
 @dataclass
 class CanonicalLevel(CanonicalElement):
-    elevation_m: float = 0.0  # Height above project datum (ground)
-    height_m: float = 2.7     # Floor-to-floor height
+    elevation_m: float = 0.0
+    height_m: float = 2.7
     level_index: int = 0
     walls: List[CanonicalWall] = field(default_factory=list)
     spaces: List[CanonicalSpace] = field(default_factory=list)
@@ -621,17 +684,17 @@ class CanonicalLevel(CanonicalElement):
             elevation_m=float(data.get("elevation_m", 0.0)),
             height_m=float(data.get("height_m", 2.7)),
             level_index=int(data.get("level_index", 0)),
-            walls=[CanonicalWall.from_dict(w) for w in data.get("walls", []) or []],
-            spaces=[CanonicalSpace.from_dict(sp) for sp in data.get("spaces", []) or []],
-            floors=[CanonicalFloor.from_dict(fl) for fl in data.get("floors", []) or []],
-            ceilings=[CanonicalCeiling.from_dict(c) for c in data.get("ceilings", []) or []],
-            roofs=[CanonicalRoof.from_dict(r) for r in data.get("roofs", []) or []],
-            soffits=[CanonicalSoffit.from_dict(s) for s in data.get("soffits", []) or []],
-            balconies=[CanonicalBalcony.from_dict(b) for b in data.get("balconies", []) or []],
-            parapets=[CanonicalParapet.from_dict(p) for p in data.get("parapets", []) or []],
-            columns=[CanonicalColumn.from_dict(col) for col in data.get("columns", []) or []],
-            balustrades=[CanonicalBalustrade.from_dict(bal) for bal in data.get("balustrades", []) or []],
-            screens=[CanonicalScreen.from_dict(scr) for scr in data.get("screens", []) or []],
+            walls=[CanonicalWall.from_dict(w) for w in data.get("walls", []) or [] if isinstance(w, dict)],
+            spaces=[CanonicalSpace.from_dict(sp) for sp in data.get("spaces", []) or [] if isinstance(sp, dict)],
+            floors=[CanonicalFloor.from_dict(fl) for fl in data.get("floors", []) or [] if isinstance(fl, dict)],
+            ceilings=[CanonicalCeiling.from_dict(c) for c in data.get("ceilings", []) or [] if isinstance(c, dict)],
+            roofs=[CanonicalRoof.from_dict(r) for r in data.get("roofs", []) or [] if isinstance(r, dict)],
+            soffits=[CanonicalSoffit.from_dict(s) for s in data.get("soffits", []) or [] if isinstance(s, dict)],
+            balconies=[CanonicalBalcony.from_dict(b) for b in data.get("balconies", []) or [] if isinstance(b, dict)],
+            parapets=[CanonicalParapet.from_dict(p) for p in data.get("parapets", []) or [] if isinstance(p, dict)],
+            columns=[CanonicalColumn.from_dict(col) for col in data.get("columns", []) or [] if isinstance(col, dict)],
+            balustrades=[CanonicalBalustrade.from_dict(bal) for bal in data.get("balustrades", []) or [] if isinstance(bal, dict)],
+            screens=[CanonicalScreen.from_dict(scr) for scr in data.get("screens", []) or [] if isinstance(scr, dict)],
         )
 
 
@@ -655,10 +718,10 @@ class CanonicalBuilding(CanonicalElement):
     def from_dict(cls, data: Dict[str, Any]) -> "CanonicalBuilding":
         base_args = cls.base_from_dict_args(data)
         bounds_raw = data.get("building_bounds")
-        bounds = BoundingBox3D.from_dict(bounds_raw) if bounds_raw else None
+        bounds = BoundingBox3D.from_dict(bounds_raw) if isinstance(bounds_raw, dict) else None
         return cls(
             **base_args,
-            levels=[CanonicalLevel.from_dict(lvl) for lvl in data.get("levels", []) or []],
+            levels=[CanonicalLevel.from_dict(lvl) for lvl in data.get("levels", []) or [] if isinstance(lvl, dict)],
             building_bounds=bounds,
         )
 
@@ -666,6 +729,7 @@ class CanonicalBuilding(CanonicalElement):
 @dataclass
 class CanonicalProject(CanonicalElement):
     buildings: List[CanonicalBuilding] = field(default_factory=list)
+    is_synthetic_demo: bool = False  # Explicit flag for demo vs user canonical models
 
     def __post_init__(self):
         self.object_type = ObjectType.PROJECT
@@ -674,6 +738,7 @@ class CanonicalProject(CanonicalElement):
         res = self.base_to_dict()
         res.update({
             "buildings": [b.to_dict() for b in self.buildings],
+            "is_synthetic_demo": bool(self.is_synthetic_demo),
         })
         return res
 
@@ -682,7 +747,8 @@ class CanonicalProject(CanonicalElement):
         base_args = cls.base_from_dict_args(data)
         return cls(
             **base_args,
-            buildings=[CanonicalBuilding.from_dict(b) for b in data.get("buildings", []) or []],
+            buildings=[CanonicalBuilding.from_dict(b) for b in data.get("buildings", []) or [] if isinstance(b, dict)],
+            is_synthetic_demo=bool(data.get("is_synthetic_demo", False)),
         )
 
     def to_json(self, indent: Optional[int] = 2) -> str:
