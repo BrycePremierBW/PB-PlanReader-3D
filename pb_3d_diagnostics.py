@@ -3,17 +3,19 @@ PlanReader 3D Canonical Model Reconciliation & Diagnostics Module.
 
 Generates production diagnostic reports summarizing canonical model completeness,
 level resolution, opening host attachment, provenance coverage, deduction authority,
-stale model detection, and quantity reconciliation against PlanReader takeoff totals.
+stale model detection, and per-wall quantity reconciliation against PlanReader takeoff rows.
 
 SAFETY GUARANTEES:
 1. Does NOT alter tender/takeoff quantity authority (read-only diagnostic).
-2. Reports variances explicitly without forcing dimension matching.
-3. Exposes unresolved levels, missing heights, and review-required items clearly.
+2. Performs PER-WALL quantity reconciliation using strong wall_ref identity only.
+3. Filters production takeoff units strictly to m². Excludes lm, No., item, L, allowances.
+4. If strong identity is missing, status = 'unresolved' (no misleading whole-table variances).
+5. Reports explicit skip diagnostics for elements without registered physical producers.
 """
 
 from typing import Dict, Any, List, Optional
 from pb_canonical_building import CanonicalProject, ObjectType, ReviewState, parse_strict_bool
-from pb_geometry_services import potential_net_wall_area, wall_gross_area
+from pb_geometry_services import potential_net_wall_area
 
 
 def generate_production_diagnostics_report(
@@ -44,10 +46,19 @@ def generate_production_diagnostics_report(
     unresolved_heights_count = 0
     missing_provenance_count = 0
 
-    gross_wall_area_m2 = 0.0
-    observed_opening_area_m2 = 0.0
-    authorized_deduction_area_m2 = 0.0
-    authorized_net_area_m2 = 0.0
+    per_wall_reconciliation: List[Dict[str, Any]] = []
+
+    # Map production takeoff rows by strong identity (wall_ref / id)
+    takeoff_rows_by_ref: Dict[str, Dict[str, Any]] = {}
+    if workspace_data and isinstance(workspace_data, dict):
+        raw_rows = workspace_data.get("takeoff_rows") or workspace_data.get("walls") or []
+        for r in raw_rows:
+            if isinstance(r, dict):
+                ref = str(r.get("wall_ref") or r.get("id") or "")
+                unit = str(r.get("unit") or "m2").lower().strip()
+                # SECTION 9: Filter units strictly to m²! Exclude lm, No., item, L, allowances
+                if ref and unit in ("m2", "m²", "sqm", "sq m"):
+                    takeoff_rows_by_ref[ref] = r
 
     for bld in project.buildings:
         for lvl in bld.levels:
@@ -71,14 +82,58 @@ def generate_production_diagnostics_report(
                     authorized_deduction_count += 1
 
                 prov = w.provenance
-                if not (prov and (prov.source_pdf or prov.drawing_id)):
+                if not (prov and (prov.source_pdf or prov.drawing_id or prov.wall_ref)):
                     missing_provenance_count += 1
 
                 p_net = potential_net_wall_area(w)
-                gross_wall_area_m2 += p_net["gross_wall_area_m2"]
-                observed_opening_area_m2 += p_net["observed_opening_area_m2"]
-                authorized_deduction_area_m2 += p_net["authorized_opening_deduction_area_m2"]
-                authorized_net_area_m2 += p_net["authorized_net_area_m2"]
+                c_gross = p_net["gross_wall_area_m2"]
+                c_obs = p_net["observed_opening_area_m2"]
+                c_ded = p_net["authorized_opening_deduction_area_m2"]
+                c_net = p_net["authorized_net_area_m2"]
+
+                # SECTION 9: Per-Wall Reconciliation using strong identity
+                ref_key = str(prov.wall_ref or w.id)
+                matched_row = takeoff_rows_by_ref.get(ref_key)
+
+                if matched_row:
+                    prod_qty = float(matched_row.get("quantity") or matched_row.get("m2") or matched_row.get("net_m2") or 0.0)
+                    variance = c_net - prod_qty
+                    if abs(variance) <= 1e-2:
+                        rec_status = "matched"
+                        rec_exp = "Canonical net area matches production takeoff quantity exactly."
+                    else:
+                        rec_status = "variance_detected"
+                        rec_exp = f"Area variance of {variance:+.2f} m² between 3D model and production row."
+
+                    per_wall_reconciliation.append({
+                        "canonical_wall_id": w.id,
+                        "wall_ref": ref_key,
+                        "canonical_gross_m2": c_gross,
+                        "observed_opening_m2": c_obs,
+                        "authorized_deduction_m2": c_ded,
+                        "authorized_net_m2": c_net,
+                        "matched_production_row_id": str(matched_row.get("id") or ref_key),
+                        "production_quantity": prod_qty,
+                        "unit": "m²",
+                        "variance_m2": variance,
+                        "reconciliation_status": rec_status,
+                        "explanation": rec_exp,
+                    })
+                else:
+                    per_wall_reconciliation.append({
+                        "canonical_wall_id": w.id,
+                        "wall_ref": ref_key,
+                        "canonical_gross_m2": c_gross,
+                        "observed_opening_m2": c_obs,
+                        "authorized_deduction_m2": c_ded,
+                        "authorized_net_m2": c_net,
+                        "matched_production_row_id": None,
+                        "production_quantity": None,
+                        "unit": None,
+                        "variance_m2": None,
+                        "reconciliation_status": "unresolved",
+                        "explanation": "No matching production takeoff row with strong identity found.",
+                    })
 
                 for op in w.openings:
                     total_openings += 1
@@ -100,26 +155,6 @@ def generate_production_diagnostics_report(
                 total_roofs += 1
 
     total_canonical_objects = total_walls + total_openings + total_floors + total_ceilings + total_roofs + total_other
-
-    # Quantity Reconciliation against production workspace takeoff rows (if present)
-    production_takeoff_gross_m2 = 0.0
-    reconciliation_notes = []
-
-    if workspace_data and isinstance(workspace_data, dict):
-        takeoff_rows = workspace_data.get("takeoff_rows") or workspace_data.get("lines") or []
-        for r in takeoff_rows:
-            if isinstance(r, dict):
-                qty = r.get("quantity") or r.get("m2") or r.get("area_m2") or 0.0
-                try:
-                    production_takeoff_gross_m2 += float(qty)
-                except (ValueError, TypeError):
-                    pass
-
-    area_variance_m2 = gross_wall_area_m2 - production_takeoff_gross_m2
-    if abs(area_variance_m2) > 1e-2:
-        reconciliation_notes.append(f"Wall Area Variance: Canonical ({gross_wall_area_m2:.2f} m²) vs Production Takeoff ({production_takeoff_gross_m2:.2f} m²), Diff = {area_variance_m2:+.2f} m²")
-    else:
-        reconciliation_notes.append("Canonical Wall Area matches Production Takeoff Totals cleanly.")
 
     return {
         "project_id": project.id,
@@ -150,13 +185,5 @@ def generate_production_diagnostics_report(
             "skipped_items_count": len(skipped_items),
             "skipped_items": skipped_items,
         },
-        "quantity_reconciliation": {
-            "canonical_gross_wall_area_m2": gross_wall_area_m2,
-            "canonical_observed_opening_area_m2": observed_opening_area_m2,
-            "canonical_authorized_deduction_area_m2": authorized_deduction_area_m2,
-            "canonical_authorized_net_area_m2": authorized_net_area_m2,
-            "production_takeoff_gross_m2": production_takeoff_gross_m2,
-            "area_variance_m2": area_variance_m2,
-            "notes": reconciliation_notes,
-        },
+        "per_wall_quantity_reconciliation": per_wall_reconciliation,
     }

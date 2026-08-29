@@ -31,6 +31,7 @@ from pb_takeoff_colours_v153 import apply as apply_takeoff_colours_v153
 from pb_editor_ux_v154 import install as install_editor_ux_v154
 from pb_opening_production_v175 import apply as apply_opening_production_v175
 from pb_opening_production_guard_v175 import verify as verify_opening_production_v175
+from pb_3d_workspace_integration import apply as apply_3d_canonical_integration
 
 install_editor_ux_v154()
 
@@ -48,6 +49,8 @@ apply_opening_production_v175(app)
 # This is a safety-critical integration: refuse startup if later import-order
 # changes leave any known legacy automatic-deduction alias live.
 verify_opening_production_v175(app)
+# Install Phase 5 3D Canonical WebGL Viewer extension hook
+apply_3d_canonical_integration(app)
 app.APP_VERSION = "1.5.1"
 
 if __name__ == "__main__":

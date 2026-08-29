@@ -99,6 +99,15 @@ class Provenance:
     drawing_id: Optional[str] = None
     source_coords: Optional[Dict[str, Any]] = None
     scale_source: Optional[str] = None
+    workspace_id: Optional[str] = None
+    document_id: Optional[str] = None
+    page_id: Optional[str] = None
+    wall_ref: Optional[str] = None
+    opening_instance_id: Optional[str] = None
+    plan_geometry_signature: Optional[str] = None
+    coordinate_space: Optional[str] = None
+    producer_module: Optional[str] = None
+    producer_version: Optional[str] = None
     contributing_evidence: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -108,6 +117,15 @@ class Provenance:
             "drawing_id": self.drawing_id,
             "source_coords": self.source_coords,
             "scale_source": self.scale_source,
+            "workspace_id": self.workspace_id,
+            "document_id": self.document_id,
+            "page_id": self.page_id,
+            "wall_ref": self.wall_ref,
+            "opening_instance_id": self.opening_instance_id,
+            "plan_geometry_signature": self.plan_geometry_signature,
+            "coordinate_space": self.coordinate_space,
+            "producer_module": self.producer_module,
+            "producer_version": self.producer_version,
             "contributing_evidence": list(self.contributing_evidence),
         }
 
@@ -121,6 +139,15 @@ class Provenance:
             drawing_id=data.get("drawing_id"),
             source_coords=data.get("source_coords") if isinstance(data.get("source_coords"), dict) else None,
             scale_source=data.get("scale_source"),
+            workspace_id=data.get("workspace_id"),
+            document_id=data.get("document_id"),
+            page_id=data.get("page_id"),
+            wall_ref=data.get("wall_ref"),
+            opening_instance_id=data.get("opening_instance_id"),
+            plan_geometry_signature=data.get("plan_geometry_signature"),
+            coordinate_space=data.get("coordinate_space"),
+            producer_module=data.get("producer_module"),
+            producer_version=data.get("producer_version"),
             contributing_evidence=list(data.get("contributing_evidence", []) or []) if isinstance(data.get("contributing_evidence"), list) else [],
         )
 
@@ -132,6 +159,11 @@ class Vector2D:
 
     def is_valid(self) -> bool:
         return self.x is not None and self.y is not None
+
+    def distance_to(self, other: "Vector2D") -> float:
+        if not (self.is_valid() and other and other.is_valid()):
+            return 0.0
+        return math.hypot(other.x - self.x, other.y - self.y)
 
     def to_dict(self) -> Dict[str, Optional[float]]:
         return {"x": self.x, "y": self.y}
@@ -410,6 +442,7 @@ class PolygonElement(CanonicalElement):
     polygon: List[Vector2D] = field(default_factory=list)
     thickness_m: Optional[float] = None
     elevation_offset_m: Optional[float] = None
+    specified_floor_area_m2: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         res = self.base_to_dict()
@@ -417,6 +450,7 @@ class PolygonElement(CanonicalElement):
             "polygon": [pt.to_dict() for pt in self.polygon],
             "thickness_m": self.thickness_m,
             "elevation_offset_m": self.elevation_offset_m,
+            "specified_floor_area_m2": self.specified_floor_area_m2,
         })
         return res
 
@@ -430,6 +464,7 @@ class PolygonElement(CanonicalElement):
             polygon=poly,
             thickness_m=parse_optional_float(data.get("thickness_m")),
             elevation_offset_m=parse_optional_float(data.get("elevation_offset_m")),
+            specified_floor_area_m2=parse_optional_float(data.get("specified_floor_area_m2")),
         )
 
 
