@@ -1,5 +1,5 @@
 """
-PlanReader Production 3D Model Adapter Module (Phase 5F Final Production Contract).
+PlanReader Production 3D Model Adapter Module (Phase 5G Production Contract Lock).
 
 Provides a clean production adapter converting existing PlanReader production payloads,
 documents, pages, takeoff rows, drawing intelligence, opening schedules, and elevation evidence
@@ -11,17 +11,16 @@ SAFETY GUARANTEES:
 3. Untrusted/uploaded JSON CANNOT forge deduction_authority or takeoff_eligible.
 4. Fails closed if workspace ID is missing or invalid in database (require_workspace_id).
 5. All app.lquery() calls consume List[Dict[str, Any]] (dictionary row access, page_no schema).
-6. Snapshot v3 collects documents, pages, registered walls, mapper settings, roof evidence, takeoff rows.
-7. Level resolution creates explicit unresolved containers (elevation_m=None) if level is unknown.
-8. Re-validates every opening through is_authorised_deduction(op). Stale deduction booleans are rejected.
-9. Rejects legacy 2.7m wall height fallbacks as physical truth.
-10. Calibrated floor mapper geometry percentage-to-metric conversion via px_per_m.
+6. Uses REAL pb_floor_mapper_v127.calibration_px_per_m and pb_floor_mapper_v128._points_from_shape.
+7. Calls app.registered_wall_takeoff_rows_v139(reg_walls) with wall iterable, NOT workspace_id.
+8. Snapshot v3 validates document-page workspace ownership strictly.
 """
 
 import math
 import sqlite3
 import json
 import hashlib
+import re
 from typing import Dict, Any, List, Optional, Tuple, Union, NamedTuple
 
 from pb_canonical_building import (
@@ -48,11 +47,14 @@ from pb_canonical_building import (
     ObjectType,
     parse_strict_bool,
 )
+from pb_geometry_services import potential_net_wall_area, validate_opening_geometry
 from pb_3d_diagnostics import generate_production_diagnostics_report
+from pb_floor_mapper_v127 import calibration_px_per_m
+from pb_floor_mapper_v128 import _points_from_shape
 
 
 class WorkspaceCanonicalResult(NamedTuple):
-    """SECTION H: Encapsulates the complete authoritative workspace conversion result."""
+    """Encapsulates the complete authoritative workspace conversion result."""
     project: CanonicalProject
     snapshot: Dict[str, Any]
     snapshot_fingerprint: str
@@ -63,15 +65,11 @@ class WorkspaceCanonicalResult(NamedTuple):
 def require_workspace_id(workspace_id: Any) -> int:
     """
     SECTION 3 & C: Validates workspace identity strictly.
-    
-    Accepts ONLY a valid positive integer (or integer string) belonging to the selected workspace.
     Rejects booleans, zero, negative numbers, non-integral floats (e.g. 101.5), malformed strings, or invalid types.
-    GUARANTEE: No implicit workspace fallbacks!
     """
     if workspace_id is None or isinstance(workspace_id, bool):
         raise ValueError(f"Invalid workspace ID: {workspace_id} (must be a positive integer)")
 
-    # Reject non-integral floats such as 101.5
     if isinstance(workspace_id, float):
         if not workspace_id.is_integer():
             raise ValueError(f"Invalid workspace ID: {workspace_id} (non-integral float rejected)")
@@ -173,10 +171,7 @@ def resolve_canonical_level(
     unresolved_container: CanonicalLevel,
     skipped_items: List[Dict[str, Any]]
 ) -> Tuple[CanonicalLevel, str]:
-    """
-    SECTION B: Level Resolution Service.
-    Preserves 5 explicit level states.
-    """
+    """SECTION B & H: Level Resolution Service."""
     if level_claim is None:
         return unresolved_container, "no_level_evidence"
 
@@ -191,11 +186,16 @@ def resolve_canonical_level(
         else:
             return matched_lvl, "unresolved_level_in_map"
 
-    skipped_items.append({
-        "item": f"level_claim_{claim_str}",
-        "reason": f"wrong_known_level_conflict: level '{claim_str}' not found in known storeys"
-    })
-    return unresolved_container, "wrong_known_level_conflict"
+    # Create level on demand for valid named storey claims
+    new_lvl = CanonicalLevel(
+        id=f"lvl_{claim_str.lower().replace(' ', '_')}",
+        name=claim_str,
+        elevation_m=None,
+        height_m=None,
+        review_state=ReviewState.REVIEW_REQUIRED,
+    )
+    level_map[claim_str] = new_lvl
+    return new_lvl, "created_named_storey"
 
 
 def registered_wall_to_canonical_input(
@@ -203,10 +203,7 @@ def registered_wall_to_canonical_input(
     skipped_items: List[Dict[str, Any]],
     is_validated_internal_workspace: bool = False
 ) -> Tuple[Optional[CanonicalWall], List[Dict[str, Any]]]:
-    """
-    SECTION 2 & D & M: Adapts the EXACT real v139 wall contract.
-    Preserves facade/side identity and wall_ref as strong ID.
-    """
+    """SECTION D & M: Adapts real v139 wall contract."""
     if not isinstance(wall_dict, dict):
         return None, []
 
@@ -251,7 +248,6 @@ def registered_wall_to_canonical_input(
     prov.producer_module = "pb_unified_building_v139"
 
     side_str = str(wall_dict.get("side") or "").upper().strip()
-
     wall_takeoff_eligible = is_validated_internal_workspace and (c_height is not None) and (c_review in (ReviewState.CONFIRMED, ReviewState.INFERRED))
 
     c_wall = CanonicalWall(
@@ -278,10 +274,7 @@ def registered_wall_to_canonical_input(
 
 
 def revalidate_b5_opening(opening_dict: Dict[str, Any]) -> bool:
-    """
-    SECTION 3 & C: Dynamic B5 opening authority revalidation gate.
-    Re-runs pb_opening_production_v175.is_authorised_deduction(opening_dict).
-    """
+    """SECTION 3, C, M: Dynamic B5 opening authority revalidation gate."""
     if not isinstance(opening_dict, dict):
         return False
     try:
@@ -293,19 +286,12 @@ def revalidate_b5_opening(opening_dict: Dict[str, Any]) -> bool:
 
 def collect_workspace_3d_evidence(app: Any, workspace_id: Any) -> Dict[str, Any]:
     """
-    SECTION 1, 2, 4, 5, 6: Reads-only Authoritative Workspace Evidence Snapshot v3.
-    
-    GUARANTEES:
-    1. Obey require_workspace_id() (no fallback to workspace 1 or 101).
-    2. All app.lquery() interactions consume List[Dict[str, Any]] (dictionary row access, page_no schema).
-    3. Snapshot documents & pages carrying workspace ownership.
-    4. Categorized producer diagnostics log (no silent passes).
+    SECTION 1, 2, 4, 5, 6, Q: Reads-only Authoritative Workspace Evidence Snapshot v3.
     """
     wid_int = require_workspace_id(workspace_id)
     ws_meta = None
     diagnostics_log: List[Dict[str, Any]] = []
 
-    # SECTION 1: Production app.lquery() returns List[Dict[str, Any]]
     if app and hasattr(app, "lquery"):
         try:
             rows = app.lquery("SELECT id, job_no, job_name, builder_client, site_address FROM workspaces WHERE id=?", (wid_int,))
@@ -319,8 +305,6 @@ def collect_workspace_3d_evidence(app: Any, workspace_id: Any) -> Dict[str, Any]
                         "builder_client": row0.get("builder_client", ""),
                         "site_address": row0.get("site_address", ""),
                     }
-                else:
-                    diagnostics_log.append({"type": "schema_contract_mismatch", "error": "lquery returned non-dict row"})
         except Exception as e:
             diagnostics_log.append({"type": "producer_exception", "producer": "database_workspaces", "error": str(e)})
 
@@ -334,6 +318,7 @@ def collect_workspace_3d_evidence(app: Any, workspace_id: Any) -> Dict[str, Any]
 
     # SECTION 2: Query Documents carrying workspace ownership
     documents = []
+    doc_by_id = {}
     if app and hasattr(app, "lquery"):
         try:
             d_rows = app.lquery(
@@ -342,7 +327,7 @@ def collect_workspace_3d_evidence(app: Any, workspace_id: Any) -> Dict[str, Any]
             )
             for dr in d_rows:
                 if isinstance(dr, dict):
-                    documents.append({
+                    d_obj = {
                         "workspace_id": wid_int,
                         "document_id": dr.get("id"),
                         "file_name": dr.get("file_name"),
@@ -350,11 +335,14 @@ def collect_workspace_3d_evidence(app: Any, workspace_id: Any) -> Dict[str, Any]
                         "category": dr.get("category"),
                         "page_count": dr.get("page_count"),
                         "source_type": dr.get("source_type"),
-                    })
+                    }
+                    documents.append(d_obj)
+                    if dr.get("id") is not None:
+                        doc_by_id[dr.get("id")] = d_obj
         except Exception as e:
             diagnostics_log.append({"type": "producer_exception", "producer": "database_documents", "error": str(e)})
 
-    # SECTION 1: Query Pages carrying workspace ownership using REAL schema (page_no, NOT page_number!)
+    # SECTION 1 & Q: Query Pages and validate document-page ownership!
     pages = []
     if app and hasattr(app, "lquery"):
         try:
@@ -364,10 +352,20 @@ def collect_workspace_3d_evidence(app: Any, workspace_id: Any) -> Dict[str, Any]
             )
             for pr in p_rows:
                 if isinstance(pr, dict):
+                    doc_id = pr.get("document_id")
+                    # SECTION Q: Validate page belongs to document in same workspace!
+                    if documents and doc_id not in doc_by_id:
+                        diagnostics_log.append({
+                            "type": "stale_reference",
+                            "page_id": pr.get("id"),
+                            "error": f"Page {pr.get('id')} references missing/foreign document {doc_id}"
+                        })
+                        continue
+
                     pages.append({
                         "workspace_id": wid_int,
                         "page_id": pr.get("id"),
-                        "document_id": pr.get("document_id"),
+                        "document_id": doc_id,
                         "page_no": pr.get("page_no"),
                         "page_label": pr.get("page_label"),
                         "page_type": pr.get("page_type"),
@@ -390,12 +388,13 @@ def collect_workspace_3d_evidence(app: Any, workspace_id: Any) -> Dict[str, Any]
     except Exception as e:
         diagnostics_log.append({"type": "producer_exception", "producer": "pb_unified_building_v139", "error": str(e)})
 
-    # SECTION 7: Query page-scoped floor mapper saved state (v127/v128)
+    # SECTION C: NO PAGE FALLBACK! Only query mapper settings for actual workspace pages
     mapper_shapes = []
-    if app and hasattr(app, "workspace_setting"):
-        target_pages = pages if pages else [{"page_id": 1}]
-        for p in target_pages:
-            p_id = p.get("page_id") or p.get("id", 1)
+    if pages and app and hasattr(app, "workspace_setting"):
+        for p in pages:
+            p_id = p.get("page_id")
+            if p_id is None:
+                continue
             setting_key = f"floor_mapper_v127_page_{p_id}"
             raw_setting = app.workspace_setting(wid_int, setting_key, None)
             
@@ -416,10 +415,11 @@ def collect_workspace_3d_evidence(app: Any, workspace_id: Any) -> Dict[str, Any]
                         "setting_key": setting_key,
                         "width_px": p.get("width_px"),
                         "height_px": p.get("height_px"),
+                        "page_px_per_m": p.get("px_per_m"),
                         "mapper_setting": parsed_setting
                     })
 
-    # SECTION 13: Query Roof Evidence & Caps via v140 as two separate contracts
+    # SECTION 13 & P: Query Roof Evidence & Caps via v140
     roof_data = {}
     try:
         import pb_roof_envelope_v140 as re
@@ -430,18 +430,25 @@ def collect_workspace_3d_evidence(app: Any, workspace_id: Any) -> Dict[str, Any]
     except Exception as e:
         diagnostics_log.append({"type": "producer_exception", "producer": "pb_roof_envelope_v140", "error": str(e)})
 
-    # SECTION 24: Query Takeoff Rows using app.registered_wall_takeoff_rows_v139 or database
+    # SECTION E: Correct call signature for v139 takeoff rows producer -> app.registered_wall_takeoff_rows_v139(reg_walls)
     takeoff_rows = []
     if app and hasattr(app, "registered_wall_takeoff_rows_v139"):
         try:
-            t_rows = app.registered_wall_takeoff_rows_v139(wid_int)
+            # Pass reg_walls iterable, NOT workspace_id integer!
+            t_rows = app.registered_wall_takeoff_rows_v139(reg_walls)
             for tr in (t_rows or []):
                 if isinstance(tr, dict):
+                    src_ref = tr.get("source_reference") or tr.get("wall_ref") or ""
+                    # SECTION F: Extract wall_ref identity from 'PB Unified Building v1.3.9 · W01'
+                    m_wall = re.search(r"(?:W\d+|W-[A-Z0-9]+|\bW\d+\b)", src_ref)
+                    derived_wall_ref = m_wall.group(0) if m_wall else src_ref
+
                     takeoff_rows.append({
                         "workspace_id": wid_int,
                         "id": tr.get("id"),
-                        "wall_ref": tr.get("source_reference") or tr.get("wall_ref"),
-                        "quantity": _safe_float(tr.get("quantity") or tr.get("m2")),
+                        "wall_ref": derived_wall_ref,
+                        "source_reference": src_ref,
+                        "quantity": _safe_float(tr.get("quantity") or tr.get("net_m2") or tr.get("m2")),
                         "unit": str(tr.get("unit") or "").lower().strip(),
                         "row_role": str(tr.get("row_role") or "wall").lower().strip(),
                     })
@@ -456,9 +463,14 @@ def collect_workspace_3d_evidence(app: Any, workspace_id: Any) -> Dict[str, Any]
             )
             for tr in t_rows:
                 if isinstance(tr, dict):
+                    loc_str = str(tr.get("location") or "")
+                    m_wall = re.search(r"(?:W\d+|W-[A-Z0-9]+|\bW\d+\b)", loc_str)
+                    derived_ref = m_wall.group(0) if m_wall else None
+
                     takeoff_rows.append({
                         "workspace_id": wid_int,
                         "id": tr.get("id"),
+                        "wall_ref": derived_ref,
                         "section": tr.get("section"),
                         "element": tr.get("element"),
                         "location": tr.get("location"),
@@ -494,10 +506,7 @@ def planreader_to_canonical_model(
     *,
     is_validated_internal_workspace: bool = False
 ) -> Tuple[CanonicalProject, List[Dict[str, Any]]]:
-    """
-    Converts a PlanReader production output payload into a CanonicalProject graph.
-    Returns (canonical_project, skipped_items_diagnostics).
-    """
+    """Converts a PlanReader production output payload into a CanonicalProject graph."""
     if not isinstance(production_payload, dict):
         raise ValueError("Production payload must be a non-null dictionary")
 
@@ -561,7 +570,7 @@ def planreader_to_canonical_model(
             if c_wall is None:
                 continue
 
-            claimed_lvl = w_dict.get("level_id") or w_dict.get("storey_id")
+            claimed_lvl = w_dict.get("level") or w_dict.get("level_name") or w_dict.get("level_id") or w_dict.get("storey_id")
             target_lvl, res_reason = resolve_canonical_level(claimed_lvl, level_map, unresolved_level_container, skipped_items)
             c_wall.level_id = target_lvl.id
             target_lvl.walls.append(c_wall)
@@ -581,8 +590,6 @@ def planreader_to_canonical_model(
                 op_mark = str(op_dict.get("mark") or op_dict.get("name") or "OP")
                 
                 b5_authorized = revalidate_b5_opening(op_dict)
-                
-                # SECTION 18: If opening is B5 authorized, grant wall deduction gate!
                 if b5_authorized:
                     c_wall.deduction_authority = True
 
@@ -616,90 +623,85 @@ def planreader_to_canonical_model(
                 )
                 c_wall.openings.append(c_op)
 
-    # SECTION 7, 8, 9, 10, 11: Real v127/v128 Floor Mapper Metric Conversion
+    # SECTION A & B: Real v127/v128 Floor Mapper Metric Conversion using calibration_px_per_m & _points_from_shape
     mapper_shapes_raw = production_payload.get("mapper_shapes") or production_payload.get("polygons") or []
     if isinstance(mapper_shapes_raw, list):
         for item in mapper_shapes_raw:
             if not isinstance(item, dict):
                 continue
             
-            item_wid = item.get("workspace_id")
-            if item_wid and str(item_wid) != str(proj_id):
-                skipped_items.append({"item": item, "reason": "foreign_workspace_evidence_rejected"})
-                continue
-
             setting = item.get("mapper_setting") or item
-            shapes = setting.get("boxes") or setting.get("shapes") or [setting]
-            
-            # SECTION 7: Calculate px_per_m from calibration line
-            calib_dict = setting.get("calibration") or {}
             w_px = _safe_float(item.get("width_px") or setting.get("width_px"))
             h_px = _safe_float(item.get("height_px") or setting.get("height_px"))
             
-            # SECTION 9: Delete 1000x1000 page dimension fallbacks! If missing, attempt calculation or skip
-            px_per_m = _safe_float(calib_dict.get("px_per_m"))
-            if not px_per_m and calib_dict.get("len_m") and calib_dict.get("x1") is not None:
-                dx = float(calib_dict["x2"]) - float(calib_dict["x1"])
-                dy = float(calib_dict["y2"]) - float(calib_dict["y1"])
-                dist_px = math.hypot(dx, dy)
-                if dist_px > 0 and float(calib_dict["len_m"]) > 0:
-                    px_per_m = dist_px / float(calib_dict["len_m"])
+            # SECTION A: Use REAL pb_floor_mapper_v127.calibration_px_per_m()
+            calib_dict = setting.get("calibration") or {}
+            px_per_m = calibration_px_per_m(calib_dict, w_px or 0.0, h_px or 0.0) if (w_px and h_px) else 0.0
+            if px_per_m <= 0:
+                px_per_m = _safe_float(item.get("page_px_per_m") or calib_dict.get("px_per_m")) or 0.0
+
+            shapes = setting.get("boxes") or setting.get("shapes") or [setting]
 
             for p_idx, p_dict in enumerate(shapes if isinstance(shapes, list) else [shapes]):
                 if not isinstance(p_dict, dict):
                     continue
 
-                pts = p_dict.get("polygon") or p_dict.get("points") or []
-                area_m2 = _safe_float(p_dict.get("specified_floor_area_m2") or p_dict.get("area_m2") or p_dict.get("area"))
+                # SECTION B: Use REAL pb_floor_mapper_v128._points_from_shape() (supports irregular polygons and v127 rectangles)
+                pts = _points_from_shape(p_dict)
+                manual_m2 = _safe_float(p_dict.get("manual_m2") if "manual_m2" in p_dict else p_dict.get("specified_floor_area_m2"))
 
-                # SECTION 8 & 9: Requires valid page dimensions and calibration!
-                if isinstance(pts, list) and len(pts) >= 3 and px_per_m and px_per_m > 0 and w_px and h_px:
+                # Require valid page dimensions and calibration for physical floor!
+                if len(pts) >= 3 and px_per_m > 0 and w_px and h_px:
                     vertices: List[Vector2D] = []
                     for pt in pts:
-                        p_vec = _parse_vector2d(pt)
-                        if p_vec:
-                            # SECTION 8: Percentage coordinates 0-100 to page pixels -> plan metres
-                            px_x = (p_vec.x / 100.0) * w_px
-                            px_y = (p_vec.y / 100.0) * h_px
-                            m_x = px_x / px_per_m
-                            m_y = px_y / px_per_m
-                            vertices.append(Vector2D(x=m_x, y=m_y))
+                        px_x = (pt["x"] / 100.0) * w_px
+                        px_y = (pt["y"] / 100.0) * h_px
+                        m_x = px_x / px_per_m
+                        m_y = px_y / px_per_m
+                        vertices.append(Vector2D(x=m_x, y=m_y))
 
                     if len(vertices) >= 3:
-                        # SECTION 11: Floor on unresolved level stays REVIEW_REQUIRED
                         c_floor = CanonicalFloor(
                             id=str(p_dict.get("id") or f"floor_{p_idx}"),
                             name=str(p_dict.get("name") or f"Floor {p_idx + 1}"),
                             level_id=unresolved_level_container.id,
                             polygon=vertices,
-                            specified_floor_area_m2=area_m2,
-                            review_state=ReviewState.REVIEW_REQUIRED,  # SECTION 11
+                            specified_floor_area_m2=manual_m2,
+                            review_state=ReviewState.REVIEW_REQUIRED,
                         )
                         unresolved_level_container.floors.append(c_floor)
-                elif area_m2 is not None and area_m2 > 0:
+                elif manual_m2 is not None and manual_m2 > 0:
                     skipped_items.append({
                         "item": f"floor_manual_allowance_{p_idx}",
-                        "reason": f"manual_m2_allowance_no_physical_polygon: {area_m2:.2f} m²"
+                        "reason": f"manual_m2_allowance_no_physical_polygon: {manual_m2:.2f} m²"
                     })
 
-    # SECTION 13, 14, 15, 16: Exact v140 Roof Evidence & Caps Integration
+    # SECTION P: Real v140 Roof Evidence & Caps Integration
     roof_data = production_payload.get("roof_data") or {}
     if isinstance(roof_data, dict) and roof_data:
         roof_caps = roof_data.get("roof_caps") or roof_data.get("caps") or []
         for r_idx, r_dict in enumerate(roof_caps if isinstance(roof_caps, list) else []):
             if isinstance(r_dict, dict):
-                r_poly = [_parse_vector2d(pt) for pt in (r_dict.get("polygon") or r_dict.get("points") or []) if _parse_vector2d(pt) is not None]
+                r_pts = r_dict.get("points") or r_dict.get("polygon") or []
+                r_poly = [_parse_vector2d(pt) for pt in r_pts if _parse_vector2d(pt) is not None]
                 raw_type = r_dict.get("roof_type")
                 r_type_str = str(raw_type) if raw_type is not None else None
                 
+                # SECTION P: pitches_deg is a LIST; do NOT pass list to _safe_float()!
+                raw_pitches = r_dict.get("pitches_deg") or r_dict.get("pitch_deg")
+                if isinstance(raw_pitches, list):
+                    pitch_val = _safe_float(raw_pitches[0]) if len(raw_pitches) == 1 else None
+                else:
+                    pitch_val = _safe_float(raw_pitches)
+
                 c_roof = CanonicalRoof(
                     id=str(r_dict.get("id") or f"roof_{r_idx}"),
                     name=str(r_dict.get("name") or f"Roof Envelope {r_idx + 1}"),
                     level_id=unresolved_level_container.id,
                     polygon=r_poly,
-                    pitch_deg=_safe_float(r_dict.get("pitch_deg") if "pitch_deg" in r_dict else r_dict.get("pitches_deg")),
-                    roof_type=r_type_str,  # SECTION 16: Unknown stays None (never fallback to FLAT)
-                    review_state=ReviewState.REVIEW_REQUIRED,  # SECTION 15: Fences legacy 2.7m fallbacks
+                    pitch_deg=pitch_val,
+                    roof_type=r_type_str,
+                    review_state=ReviewState.REVIEW_REQUIRED,
                 )
                 unresolved_level_container.roofs.append(c_roof)
 
@@ -726,21 +728,13 @@ def planreader_workspace_to_canonical(
     app: Any,
     workspace_id: Any
 ) -> WorkspaceCanonicalResult:
-    """
-    SECTION A, C, E, H: Builds canonical 3D model from workspace DB and evidence snapshot v3.
-    Returns WorkspaceCanonicalResult namedtuple.
-    Fails closed if workspace ID is invalid or missing in database!
-    """
+    """Builds canonical 3D model from workspace DB and evidence snapshot v3."""
     wid_int = require_workspace_id(workspace_id)
-
-    # SECTION D: Collect authoritative workspace evidence snapshot v3
     snapshot = collect_workspace_3d_evidence(app, wid_int)
 
-    # Compute deterministic fingerprint
     from pb_canonical_persistence import compute_workspace_source_fingerprint
     snapshot_fp = compute_workspace_source_fingerprint(snapshot)
 
-    # Convert snapshot into Canonical Project
     project, skipped_items = planreader_to_canonical_model(snapshot, is_validated_internal_workspace=True)
     diagnostics = generate_production_diagnostics_report(project, workspace_data=snapshot, skipped_items=skipped_items)
 

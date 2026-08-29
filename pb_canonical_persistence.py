@@ -8,9 +8,8 @@ SAFETY GUARANTEES:
 1. Versioned schema contract (PERSISTENCE_KEY = "canonical_3d_model_v1", SCHEMA_VERSION = "1.0.0").
 2. Real production set_workspace_setting API string serialization (json.dumps / json.loads).
 3. Fingerprints underlying Workspace Evidence Snapshot using deterministic collection canonicalization.
-4. Detects stale persisted models when workspace evidence changes.
-5. Provides 'Refresh model from source evidence' flow.
-6. Refuses to persist synthetic demo data to production workspace stores.
+4. Preserves ordered geometry (polygon vertices) so vertex order changes alter fingerprint.
+5. Sorts unordered collections (documents, pages, walls, takeoff_rows) by stable item identity.
 """
 
 import hashlib
@@ -35,42 +34,51 @@ def _sort_item_key(item: Any) -> str:
 
 def canonicalize_evidence_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     """
-    SECTION 37, 38, 39: Canonicalizes unordered evidence snapshot collections by strong stable identities.
-    Ensures that identical semantic evidence in different list order produces the EXACT same fingerprint.
+    SECTION R: Canonicalizes evidence snapshot.
+    Sorts UNORDERED collections (documents, pages, registered_walls, takeoff_rows) by stable identity.
+    PRESERVES ORDERED GEOMETRY (polygon vertices, wall endpoints, triangles) so geometric vertex order changes alter fingerprint!
     """
     if not isinstance(snapshot, dict):
         return {}
 
-    def _canonicalize_obj(obj: Any) -> Any:
+    def _canonicalize_unordered_list(lst: list) -> list:
+        try:
+            return sorted([_canonicalize_obj(x) for x in lst], key=_sort_item_key)
+        except Exception:
+            return [_canonicalize_obj(x) for x in lst]
+
+    def _canonicalize_obj(obj: Any, is_ordered_geometry: bool = False) -> Any:
         if isinstance(obj, dict):
-            return {k: _canonicalize_obj(v) for k, v in sorted(obj.items())}
+            # Check if this object represents ordered geometry (e.g. polygon, points, triangles)
+            keys = set(obj.keys())
+            is_geom = bool(keys & {"polygon", "points", "triangles", "vertices", "a", "b"})
+            return {k: _canonicalize_obj(v, is_ordered_geometry=is_geom or is_ordered_geometry) for k, v in sorted(obj.items())}
         elif isinstance(obj, list):
-            canonicalized_list = [_canonicalize_obj(x) for x in obj]
-            try:
-                return sorted(canonicalized_list, key=_sort_item_key)
-            except Exception:
-                return canonicalized_list
+            if is_ordered_geometry:
+                # PRESERVE ORDER for ordered geometry!
+                return [_canonicalize_obj(x, is_ordered_geometry=True) for x in obj]
+            else:
+                return _canonicalize_unordered_list(obj)
         return obj
 
     clean_snapshot = {
         "workspace_metadata": snapshot.get("workspace_metadata"),
-        "documents": snapshot.get("documents"),
-        "pages": snapshot.get("pages"),
-        "registered_walls": snapshot.get("registered_walls"),
-        "mapper_shapes": snapshot.get("mapper_shapes"),
+        "documents": _canonicalize_unordered_list(snapshot.get("documents") or []),
+        "pages": _canonicalize_unordered_list(snapshot.get("pages") or []),
+        "registered_walls": _canonicalize_unordered_list(snapshot.get("registered_walls") or []),
+        "mapper_shapes": _canonicalize_unordered_list(snapshot.get("mapper_shapes") or []),
         "roof_data": snapshot.get("roof_data"),
-        "takeoff_rows": snapshot.get("takeoff_rows"),
+        "takeoff_rows": _canonicalize_unordered_list(snapshot.get("takeoff_rows") or []),
+        "producer_versions": snapshot.get("producer_versions"),
     }
 
-    return _canonicalize_obj(clean_snapshot)
+    return clean_snapshot
 
 
 def compute_workspace_source_fingerprint(snapshot: Dict[str, Any]) -> str:
     """
-    SECTION 37, 40: Computes a deterministic SHA-256 fingerprint representing the current
+    SECTION R: Computes a deterministic SHA-256 fingerprint representing the current
     revision of the Workspace Evidence Snapshot after collection canonicalization.
-    
-    GUARANTEE: Excludes generation_timestamp, UI toggles, and viewer camera.
     """
     canonical_dict = canonicalize_evidence_snapshot(snapshot)
     serialized = json.dumps(canonical_dict, sort_keys=True, default=str)
@@ -84,10 +92,7 @@ def save_workspace_canonical_model(
     snapshot: Optional[Dict[str, Any]] = None,
     workspace_data: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    """
-    SECTION 41: Saves canonical model to workspace settings using deterministic JSON string storage.
-    Initial production save MUST compute a real tracked fingerprint!
-    """
+    """SECTION S: Saves canonical model to workspace settings with strict type checking."""
     if project.is_synthetic_demo:
         raise ValueError("Cannot persist synthetic demonstration data to production workspace storage.")
 
@@ -126,10 +131,7 @@ def load_workspace_canonical_model(
     current_snapshot: Optional[Dict[str, Any]] = None,
     current_workspace_data: Optional[Dict[str, Any]] = None
 ) -> Tuple[bool, Optional[CanonicalProject], str, Optional[Dict[str, Any]]]:
-    """
-    SECTION 42 & 43: Loads persisted canonical model and checks for staleness.
-    Returns (is_valid_and_fresh, project, status_msg, saved_payload).
-    """
+    """SECTION S: Loads persisted canonical model and checks for staleness."""
     if not (app and hasattr(app, "workspace_setting")):
         return False, None, "No workspace settings interface available", None
 
