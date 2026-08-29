@@ -64,7 +64,10 @@ def canonicalize_evidence_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
             }
         elif isinstance(obj, list):
             if is_ordered_geometry:
-                return [_canonicalize_obj(x, is_ordered_geometry=False) for x in obj]
+                # Preserve every nested list in a geometry value.  This keeps
+                # [x, y] coordinate order and [i, j, k] triangle winding as
+                # well as the outer polygon/point/triangle sequence.
+                return [_canonicalize_obj(x, is_ordered_geometry=True) for x in obj]
             return _canonicalize_unordered_list(obj)
         return obj
 

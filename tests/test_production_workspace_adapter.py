@@ -21,6 +21,9 @@ Verifies Sections A through AP:
 import os
 import json
 import sqlite3
+from pathlib import Path
+
+import cv2
 import pytest
 from pb_canonical_building import (
     CanonicalProject,
@@ -54,6 +57,48 @@ from pb_3d_diagnostics import generate_production_diagnostics_report
 from pb_geometry_services import potential_net_wall_area, validate_opening_geometry
 from pb_floor_mapper_v127 import calibration_px_per_m
 from pb_floor_mapper_v128 import _points_from_shape
+from pb_elevation_calibration_v177 import (
+    COORD_SPACE_RENDER_PIXEL,
+    calibration_from_scale_bar_positions,
+)
+from pb_elevation_raster_extract_v177 import detect_raster_rect_candidates
+
+
+_FIXTURES = Path(__file__).resolve().parent / "fixtures"
+_LAGO_FIXTURE = _FIXTURES / "lago_cd3001_east_elevation_v177.json"
+_LAGO_POSITIVE_CROP = _FIXTURES / "lago_cd3001_p86_e1east_glazed_open_group_150dpi.png"
+
+
+def _real_lago_raster_candidates():
+    """Run the committed page-86 crop through the real v177 raster producer."""
+    with _LAGO_FIXTURE.open(encoding="utf-8") as fh:
+        fixture = json.load(fh)
+    image = cv2.imread(str(_LAGO_POSITIVE_CROP), cv2.IMREAD_GRAYSCALE)
+    assert image is not None, f"real LAGO crop not readable: {_LAGO_POSITIVE_CROP}"
+    dpi = float(fixture["render"]["dpi"])
+    px_per_m = float(fixture["calibration"]["scale_pt_per_m"]) * dpi / 72.0
+    calibration = calibration_from_scale_bar_positions(
+        [0.0, px_per_m, 2.0 * px_per_m, 3.0 * px_per_m],
+        1.0,
+        coord_space=COORD_SPACE_RENDER_PIXEL,
+        render_dpi=dpi,
+    )
+    source = fixture["source"]
+    detected = detect_raster_rect_candidates(
+        image,
+        calibration,
+        source_filename=source["local_source_alias"],
+        source_page=source["page_1_based"],
+        drawing_ref=source["drawing_no"],
+        elevation_side=source["elevation_side"],
+        calibration_source="page-86-cd3001-e1-east",
+    )
+    candidates = []
+    for index, candidate in enumerate(detected, 1):
+        candidate_payload = candidate.as_dict()
+        candidate_payload["candidate_id"] = f"page86-raster-{index}"
+        candidates.append(candidate_payload)
+    return fixture, detected, candidates
 
 
 class MockAppDB:
@@ -248,6 +293,9 @@ def test_section_f_e2e_automatic_b5_canonical_deduction_and_field_failure():
     assert parse_strict_bool(wall.deduction_authority) is True
     assert parse_strict_bool(op.deduction_authority) is True
     assert op.review_state == ReviewState.CONFIRMED
+    assert op.wall_id == wall.id
+    assert op.parent_id == wall.id
+    assert op.level_id == wall.level_id
 
     p_net = potential_net_wall_area(wall)
     gross = p_net["gross_wall_area_m2"]
@@ -260,6 +308,8 @@ def test_section_f_e2e_automatic_b5_canonical_deduction_and_field_failure():
     #    (opening authority, wall gate, reduced net) fails closed.
     required_field_mutations = {
         "missing wall_ref":              {"resolved_wall_ref": None},
+        "wrong nonblank wall_ref":       {"resolved_wall_ref": "W-OTHER"},
+        "deduct disabled":               {"deduct": False},
         "missing width":                 {"width_m": None},
         "non-positive height":           {"height_m": 0},
         "reconciliation incomplete":     {"reconciliation_complete": False},
@@ -306,6 +356,40 @@ def test_section_r_fingerprint_ordered_vs_unordered_semantics():
     assert fp1 != fp2  # Geometric order change MUST alter fingerprint!
 
 
+def test_fingerprint_preserves_only_actual_geometry_order():
+    """Blocker #7: unordered rows stay stable; coordinates and winding do not."""
+    base = {
+        "workspace_metadata": {"id": 101},
+        "registered_walls": [{
+            "wall_ref": "W-1",
+            "a": {"x": 0, "y": 0},
+            "b": {"x": 10, "y": 0},
+            "openings": [
+                {"id": "op-a", "width_m": 1.0},
+                {"id": "op-b", "width_m": 2.0},
+            ],
+        }],
+        "roof_data": {
+            "caps": [{
+                "id": "roof-1",
+                "points": [[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]],
+                "triangles": [[0, 1, 2]],
+            }],
+        },
+    }
+    openings_reordered = json.loads(json.dumps(base))
+    openings_reordered["registered_walls"][0]["openings"].reverse()
+    assert compute_workspace_source_fingerprint(base) == compute_workspace_source_fingerprint(openings_reordered)
+
+    coordinate_reversed = json.loads(json.dumps(base))
+    coordinate_reversed["roof_data"]["caps"][0]["points"][0] = [1.0, 0.0]
+    assert compute_workspace_source_fingerprint(base) != compute_workspace_source_fingerprint(coordinate_reversed)
+
+    winding_reversed = json.loads(json.dumps(base))
+    winding_reversed["roof_data"]["caps"][0]["triangles"][0] = [0, 2, 1]
+    assert compute_workspace_source_fingerprint(base) != compute_workspace_source_fingerprint(winding_reversed)
+
+
 def test_section_q_document_page_workspace_ownership(tmp_path):
     """SECTION Q: Test page referencing missing or foreign document ID is rejected."""
     db_file = tmp_path / "planreader.db"
@@ -349,41 +433,14 @@ def test_section_62_application_wrapper_idempotency():
 def test_section_n_real_lago_elevation_fail_closed_assertion():
     """SECTION N & A: Test real LAGO elevation benchmark (0 plan host walls -> 0 physical 3D openings -> 0 deductions).
 
-    Blocker #1: The elevation candidates MUST be derived from the REAL producer output
-    (positive_benchmark.independent_annotation.true_positive_openings + the REAL measured
-    scale_pt_per_m calibration), never from a fabricated fallback candidate. Zero plan host
-    walls STILL fail closed to 0 physical 3D openings.
+    Blocker #1: candidates come from detect_raster_rect_candidates() operating on
+    the committed real page-86 crop with its measured calibration. Independent
+    benchmark truth is never re-labelled as detector output. Zero plan host walls
+    still fails closed to zero physical instances and deductions.
     """
-    fpath = "tests/fixtures/lago_cd3001_east_elevation_v177.json"
-    if not os.path.exists(fpath):
-        pytest.skip("Fixture not found")
-
-    with open(fpath, "r", encoding="utf-8") as f:
-        fixture_data = json.load(f)
-
-    # Blocker #1: map the 9 REAL true-positive openings -> candidates using the REAL
-    # measured calibration (scale_pt_per_m) and opening_height_m from the producer.
-    benchmark = fixture_data.get("positive_benchmark") or {}
-    independent = benchmark.get("independent_annotation") or {}
-    true_pos = independent.get("true_positive_openings") or []
-    calibration = fixture_data.get("calibration") or {}
-    scale_pt_per_m = calibration.get("scale_pt_per_m")
-    opening_height_m = independent.get("opening_height_m")
-
-    real_candidates = []
-    if scale_pt_per_m and opening_height_m:
-        for tp in true_pos:
-            w_pt = float(tp.get("x1_pt") or 0.0) - float(tp.get("x0_pt") or 0.0)
-            real_candidates.append({
-                "candidate_id": str(tp.get("id") or "tp"),
-                "width_m": round(w_pt / scale_pt_per_m, 3) if w_pt > 0 else 0.0,
-                "height_m": float(opening_height_m),
-                "side": "East",
-                "level": "Ground",
-            })
-
-    assert len(real_candidates) == 9  # Blocker #1: ALL 9 real openings translated, none fabricated
-    assert all(c["width_m"] > 0 and c["height_m"] > 0 for c in real_candidates)
+    fixture_data, detected, real_candidates = _real_lago_raster_candidates()
+    assert len(detected) > 0
+    assert len(real_candidates) == len(detected)
 
     lago_payload = {
         "workspace_metadata": {"id": "lago_cd3001"},
@@ -397,7 +454,16 @@ def test_section_n_real_lago_elevation_fail_closed_assertion():
 
     total_physical_openings = sum(len(w.openings) for l in bld.levels for w in l.walls)
     assert total_physical_openings == 0
-    assert len(project.evidence_observations) > 0  # SECTION A: Translated into evidence observations!
+    observations = project.evidence_observations
+    assert len(observations) == len(detected)
+    assert all(obs.producer_version == "v177" for obs in observations)
+    assert all(obs.page_no == fixture_data["source"]["page_1_based"] for obs in observations)
+    assert all(obs.drawing_reference == fixture_data["source"]["drawing_no"] for obs in observations)
+    assert all(obs.side == fixture_data["source"]["elevation_side"] for obs in observations)
+    assert all(obs.level_name is None for obs in observations)  # no fabricated Ground assignment
+    assert all(obs.source_coords["source_filename"] == fixture_data["source"]["local_source_alias"] for obs in observations)
+    assert all(obs.source_coords["coord_space"] == COORD_SPACE_RENDER_PIXEL for obs in observations)
+    assert all(obs.source_coords["calibration_source"] == "page-86-cd3001-e1-east" for obs in observations)
 
 
 def test_section_c_wrong_level_opening_rejection():
@@ -434,7 +500,101 @@ def test_section_c_wrong_level_opening_rejection():
     # Deduction authority MUST be set to False due to wrong level conflict!
     assert opening.deduction_authority is False
     assert wall.deduction_authority is False
+    assert opening.metadata["physical_state"] == "wrong_level"
+    assert opening.wall_id == wall.id
+    assert opening.level_id != wall.level_id  # contradictory evidence is not rewritten onto the host
     assert any("Wrong level conflict" in str(s.get("reason", "")) for s in skipped)
+
+
+def test_all_opening_level_identities_must_agree_and_numeric_zero_is_preserved():
+    base_opening = {
+        "id": "op_level_identity",
+        "opening_type": "DOOR",
+        "offset_along_wall_m": 2.0,
+        "sill_height_m": 0.0,
+        "width_m": 1.0,
+        "height_m": 2.1,
+        "deduct": True,
+        "manual_override_confirmed": True,
+        "resolved_wall_ref": "W-G01",
+    }
+
+    conflicting = {
+        "walls": [{
+            "wall_ref": "W-G01",
+            "level": "Ground",
+            "a": {"x": 0, "y": 0},
+            "b": {"x": 10, "y": 0},
+            "height_m": 3.0,
+            "openings": [{**base_opening, "level": "Ground", "level_id": "Level 2"}],
+        }]
+    }
+    project, _ = planreader_to_canonical_model(conflicting, is_validated_internal_workspace=True)
+    wall = next(level.walls[0] for level in project.buildings[0].levels if level.walls)
+    opening = wall.openings[0]
+    assert opening.metadata["physical_state"] == "wrong_level"
+    assert opening.deduction_authority is False
+    assert opening.level_id is None
+
+    numeric_zero = {
+        "levels": [{"id": "level_zero", "name": "Ground", "elevation_m": 0.0}],
+        "walls": [{
+            "wall_ref": "W-0",
+            "level": 0,
+            "a": {"x": 0, "y": 0},
+            "b": {"x": 10, "y": 0},
+            "height_m": 3.0,
+            "openings": [{**base_opening, "resolved_wall_ref": "W-0", "level": 0}],
+        }],
+    }
+    project_zero, _ = planreader_to_canonical_model(numeric_zero, is_validated_internal_workspace=True)
+    wall_zero = next(level.walls[0] for level in project_zero.buildings[0].levels if level.walls)
+    opening_zero = wall_zero.openings[0]
+    assert opening_zero.metadata["physical_state"] == "physical_b5_authorised"
+    assert opening_zero.level_id == wall_zero.level_id
+
+
+def test_wrong_nonblank_host_reference_fails_closed_before_b5_deduction():
+    payload = _e2e_b5_payload(resolved_wall_ref="W-OTHER")
+    project, skipped = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
+    wall = next(level.walls[0] for level in project.buildings[0].levels if level.walls)
+    opening = wall.openings[0]
+    assert opening.metadata["physical_state"] == "wrong_host"
+    assert opening.wall_id is None
+    assert opening.parent_id is None
+    assert opening.deduction_authority is False
+    assert wall.deduction_authority is False
+    areas = potential_net_wall_area(wall)
+    assert areas["authorized_net_area_m2"] == areas["gross_wall_area_m2"]
+    assert any("Wrong host conflict" in str(item.get("reason", "")) for item in skipped)
+
+
+def test_physical_non_authorised_opening_remains_physical_in_diagnostics():
+    payload = {
+        "walls": [{
+            "wall_ref": "W-QA",
+            "level": "Ground",
+            "a": {"x": 0, "y": 0},
+            "b": {"x": 8, "y": 0},
+            "height_m": 3.0,
+            "openings": [{
+                "id": "op_observed",
+                "resolved_wall_ref": "W-QA",
+                "offset_along_wall_m": 1.0,
+                "sill_height_m": 0.9,
+                "width_m": 1.2,
+                "height_m": 1.2,
+                "deduct": False,
+            }],
+        }],
+    }
+    project, skipped = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
+    report = generate_production_diagnostics_report(project, skipped_items=skipped)
+    qa = report["estimator_qa_summary"]
+    assert qa["physical_openings"] == 1
+    assert qa["evidence_only_openings"] == 0
+    assert qa["authorised_b5_deductions"] == 0
+    assert qa["opening_state_counts"]["physical_not_authorised"] == 1
 
 
 class RuntimeProducerMockApp:
@@ -482,6 +642,62 @@ class RuntimeProducerMockApp:
 
     def roof_caps_v140(self, wid, walls):
         return []
+
+
+def test_v140_fixture_matches_live_roof_producer_contract():
+    """Blocker #8: the committed contract is generated by the real v140 producers."""
+    from pb_roof_envelope_v140 import roof_caps, roof_evidence
+
+    class RoofProducerApp:
+        def lquery(self, query, params=()):
+            return [{
+                "page_label": "Roof Plan",
+                "page_type": "Roof Plan",
+                "extracted_text": "ROOF PITCH 22.5 DEG",
+            }]
+
+        def build_precision_prisms(self, workspace_id):
+            return [{
+                "points": [[0.0, 0.0], [18.5, 0.0], [18.5, 12.0], [0.0, 12.0]],
+                "triangles": [[3, 0, 1], [1, 2, 3]],
+                "level_name": "Ground",
+            }]
+
+    app = RoofProducerApp()
+    walls = [{"wall_ref": "W-G", "height_m": 3.2}]
+    live = {
+        "producer": "v140",
+        "evidence": roof_evidence(app, 101),
+        "caps": roof_caps(app, 101, walls),
+    }
+    with (_FIXTURES / "v140_roof_evidence_contract.json").open(encoding="utf-8") as fh:
+        expected = json.load(fh)
+    expected.pop("_comment", None)
+    assert live == expected
+
+
+def test_v140_evidence_without_caps_is_explicitly_evidence_only():
+    payload = {
+        "workspace_id": 101,
+        "roof_data": {
+            "producer": "v140",
+            "evidence": {
+                "pitches_deg": [],
+                "parapet": True,
+                "flat": True,
+                "status": "Flat/parapet roof evidence identified",
+                "confidence": "High",
+            },
+            "caps": [],
+        },
+    }
+    project, skipped = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
+    assert sum(len(level.roofs) for level in project.buildings[0].levels) == 0
+    report = generate_production_diagnostics_report(project, workspace_data=payload, skipped_items=skipped)
+    qa = report["estimator_qa_summary"]
+    assert qa["roof_geometry_rendered"] == 0
+    assert qa["roof_evidence_observations"] == 1
+    assert qa["roof_evidence_only"] == 1
 
 
 def test_section_x_runtime_production_pipeline_evidence():
@@ -541,6 +757,76 @@ def test_section_x_runtime_production_pipeline_evidence():
     rec = result.diagnostics.get("per_wall_quantity_reconciliation") or []
     assert any(r.get("wall_ref") == "W-E101" for r in rec)
 
+    conn.close()
+
+
+def test_runtime_collector_keeps_three_mapper_storeys_isolated():
+    """Blocker #5: runtime pages resolve only through registered storey authority."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE workspaces (id INTEGER PRIMARY KEY, job_no TEXT, job_name TEXT, builder_client TEXT, site_address TEXT)")
+    conn.execute("CREATE TABLE documents (id INTEGER PRIMARY KEY, workspace_id INTEGER, file_name TEXT, sha256 TEXT, category TEXT, page_count INTEGER, source_type TEXT)")
+    conn.execute("CREATE TABLE pages (id INTEGER PRIMARY KEY, workspace_id INTEGER, document_id INTEGER, page_no INTEGER, page_label TEXT, page_type TEXT, scale_text TEXT, px_per_m REAL, width_px REAL, height_px REAL, render_zoom REAL, selected INTEGER)")
+    conn.execute("INSERT INTO workspaces (id, job_no, job_name) VALUES (301, 'JOB-3L', 'Three Storey Runtime')")
+    conn.execute("INSERT INTO documents (id, workspace_id, file_name) VALUES (60, 301, 'three-level.pdf')")
+    for page_id, page_no, page_label in ((11, 1, "Ground"), (12, 2, "Level 1"), (13, 3, "Level 2")):
+        conn.execute(
+            "INSERT INTO pages (id, workspace_id, document_id, page_no, page_label, page_type, width_px, height_px, selected) VALUES (?, 301, 60, ?, ?, 'Floor Plan', 1000.0, 1000.0, 1)",
+            (page_id, page_no, page_label),
+        )
+    conn.commit()
+
+    class ThreeLevelApp(RuntimeProducerMockApp):
+        def build_registered_walls_v139(self, wid):
+            class Wall:
+                def __init__(self, ref, level, y):
+                    self.data = {
+                        "wall_ref": ref,
+                        "level": level,
+                        "a": {"x": 0.0, "y": y},
+                        "b": {"x": 10.0, "y": y},
+                        "height_m": 3.0,
+                        "height_status": "confirmed",
+                        "openings": [],
+                    }
+
+                def to_dict(self):
+                    return dict(self.data)
+
+            return [
+                Wall("W-G", "Ground", 0.0),
+                Wall("W-L1", "Level 1", 10.0),
+                Wall("W-L2", "Level 2", 20.0),
+            ]
+
+        def registered_wall_takeoff_rows_v139(self, walls):
+            return []
+
+    app = ThreeLevelApp(conn)
+    for page_id in (11, 12, 13):
+        app.set_workspace_setting(301, f"floor_mapper_v127_page_{page_id}", json.dumps({
+            "boxes": [{"id": f"floor-{page_id}", "x": 10.0, "y": 10.0, "w": 20.0, "h": 20.0}],
+            "calibration": {"x1": 10.0, "y1": 10.0, "x2": 60.0, "y2": 10.0, "len_m": 10.0},
+        }))
+
+    result = planreader_workspace_to_canonical(app, 301)
+    assert [shape["_source_level"]["id"] for shape in result.snapshot["mapper_shapes"]] == [
+        "ground", "level_1", "level_2"
+    ]
+    floors_by_level = {
+        level.id: [floor.id for floor in level.floors]
+        for level in result.project.buildings[0].levels
+        if level.floors
+    }
+    assert floors_by_level == {
+        "ground": ["floor-11"],
+        "level_1": ["floor-12"],
+        "level_2": ["floor-13"],
+    }
+    assert all(
+        floor.takeoff_eligible
+        for level in result.project.buildings[0].levels
+        for floor in level.floors
+    )
     conn.close()
 
 
@@ -641,13 +927,21 @@ def test_section_6_7_8_mapper_conversion_and_manual_m2():
                 "page_height_px": 1000.0,
                 "px_per_m": 50.0,
                 "raw_box": {"x": 10.0, "y": 10.0, "w": 40.0, "h": 30.0},
-                "_source_level": "Ground",
+                "_source_level": {
+                    "id": "ground",
+                    "name": "Ground",
+                    "derivation_source": "mapper_explicit_storey",
+                },
             },
             {
                 "box_id": "box_manual_1",
                 "manual_m2": 45.0,
                 "raw_box": {"manual_m2": 45.0},
-                "_source_level": "Ground",
+                "_source_level": {
+                    "id": "ground",
+                    "name": "Ground",
+                    "derivation_source": "mapper_explicit_storey",
+                },
             }
         ]
     }
@@ -669,43 +963,103 @@ def test_section_6_7_8_mapper_conversion_and_manual_m2():
     assert "45.0" in manual_obs[0].reason_physical_unavailable
 
 
-def test_section_10_real_lago_9_true_positive_openings_translation():
-    """SECTION 10: Test real LAGO fixture translates exactly 9 true-positive openings from positive_benchmark into evidence observations."""
-    fpath = "tests/fixtures/lago_cd3001_east_elevation_v177.json"
-    if not os.path.exists(fpath):
-        pytest.skip("Fixture not found")
+@pytest.mark.parametrize(
+    "points",
+    [
+        # Bow-tie proper crossing.
+        [{"x": 0, "y": 0}, {"x": 100, "y": 100}, {"x": 0, "y": 100}, {"x": 100, "y": 0}],
+        # Non-adjacent repeated/touching vertex.
+        [{"x": 0, "y": 0}, {"x": 100, "y": 0}, {"x": 50, "y": 50}, {"x": 100, "y": 100}, {"x": 50, "y": 50}, {"x": 0, "y": 100}],
+        # Non-adjacent collinear overlap along the bottom edge.
+        [{"x": 0, "y": 0}, {"x": 100, "y": 0}, {"x": 100, "y": 100}, {"x": 25, "y": 0}, {"x": 75, "y": 0}, {"x": 0, "y": 100}],
+    ],
+)
+def test_invalid_mapper_polygons_are_evidence_only_and_never_takeoff_eligible(points):
+    payload = {
+        "workspace_id": 101,
+        "mapper_shapes": [{
+            "box_id": "invalid-floor",
+            "page_width_px": 1000.0,
+            "page_height_px": 1000.0,
+            "px_per_m": 50.0,
+            "raw_box": {"points": points},
+            "_source_level": {
+                "id": "ground",
+                "name": "Ground",
+                "derivation_source": "mapper_explicit_storey",
+            },
+        }],
+    }
+    project, skipped = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
+    assert sum(len(level.floors) for level in project.buildings[0].levels) == 0
+    assert any(obs.kind == "rejected_floor_polygon" for obs in project.evidence_observations)
+    assert any(item.get("type") == "FLOOR" for item in skipped)
 
-    with open(fpath, "r", encoding="utf-8") as f:
-        fixture_data = json.load(f)
 
-    independent = fixture_data["positive_benchmark"]["independent_annotation"]
-    true_positives = independent["true_positive_openings"]
-    assert len(true_positives) == 9
+def test_free_form_page_level_is_not_floor_storey_authority():
+    payload = {
+        "workspace_id": 101,
+        "mapper_shapes": [{
+            "box_id": "weak-level-floor",
+            "page_width_px": 1000.0,
+            "page_height_px": 1000.0,
+            "px_per_m": 50.0,
+            "raw_box": {"x": 10, "y": 10, "w": 20, "h": 20},
+            "_source_level": "Ground Floor",
+            "_source_level_label": "Ground Floor",
+        }],
+    }
+    project, skipped = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
+    assert sum(len(level.floors) for level in project.buildings[0].levels) == 0
+    assert any(obs.kind == "unresolved_floor_level" for obs in project.evidence_observations)
+    assert any("no explicit storey identity" in str(item.get("reason", "")) for item in skipped)
 
-    expected_ids = {tp["id"] for tp in true_positives}
-    assert "bay1-light1" in expected_ids
-    assert "bay3-light3" in expected_ids
 
-    candidates = [
-        {
-            "candidate_id": tp["id"],
-            "x0_pt": tp["x0_pt"],
-            "x1_pt": tp["x1_pt"],
-            "width_m": independent["light_width_m"],
-            "height_m": independent["opening_height_m"],
-            "side": "East",
-            "level": "Ground",
-        }
-        for tp in true_positives
+def test_three_storey_mapper_floors_remain_isolated_by_structured_level_identity():
+    level_specs = [
+        ("ground", "Ground"),
+        ("level_1", "Level 1"),
+        ("level_2", "Level 2"),
     ]
+    payload = {
+        "workspace_id": 101,
+        "levels": [
+            {"id": level_id, "name": name, "elevation_m": index * 3.2}
+            for index, (level_id, name) in enumerate(level_specs)
+        ],
+        "mapper_shapes": [
+            {
+                "box_id": f"floor-{level_id}",
+                "page_width_px": 1000.0,
+                "page_height_px": 1000.0,
+                "px_per_m": 50.0,
+                "raw_box": {"x": 10, "y": 10, "w": 20, "h": 20},
+                "_source_level": {
+                    "id": level_id,
+                    "name": name,
+                    "derivation_source": "mapper_explicit_storey",
+                },
+            }
+            for level_id, name in level_specs
+        ],
+    }
+    project, _ = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
+    levels = {level.id: level for level in project.buildings[0].levels}
+    for level_id, _ in level_specs:
+        assert len(levels[level_id].floors) == 1
+        assert levels[level_id].floors[0].level_id == level_id
+        assert levels[level_id].floors[0].takeoff_eligible is True
 
+
+def test_section_10_real_lago_9_true_positive_openings_translation():
+    """SECTION 10: The adapter translates every real live detector candidate as evidence only."""
+    _, detected, candidates = _real_lago_raster_candidates()
     payload = {"workspace_id": "lago_101", "elevation_opening_candidates": candidates, "walls": []}
     project, _ = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
 
     obs = project.evidence_observations
-    assert len(obs) == 9
-    obs_ids = {o.id for o in obs}
-    assert obs_ids == expected_ids
+    assert len(obs) == len(detected) > 0
+    assert {o.id for o in obs} == {f"page86-raster-{i}" for i in range(1, len(detected) + 1)}
     total_physical_openings = sum(len(w.openings) for l in project.buildings[0].levels for w in l.walls)
     assert total_physical_openings == 0
 
@@ -714,31 +1068,56 @@ def test_section_14_legacy_27m_roof_z_fencing():
     """SECTION 14: Test roof cap Z is accepted ONLY when supporting wall height is confirmed; fallback 2.7m is fenced."""
     unconfirmed_payload = {
         "walls": [
-            {"wall_ref": "W1", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 2.7, "height_status": "inferred"}
+            {"wall_ref": "W1", "level": "Ground", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 2.7, "height_status": "inferred"}
         ],
         "roof_data": {
             "evidence": {"pitches_deg": [22.5], "flat": False},
-            "caps": [{"id": "r1", "points": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}], "z": 2.7}],
+            "caps": [{"id": "r1", "level": "Ground", "points": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}], "z": 2.7}],
         }
     }
     proj_unconf, _ = planreader_to_canonical_model(unconfirmed_payload, is_validated_internal_workspace=True)
     roof_unconf = proj_unconf.buildings[0].levels[0].roofs[0]
     assert roof_unconf.metadata["z"] is None  # Fenced!
     assert roof_unconf.review_state == ReviewState.REVIEW_REQUIRED
+    assert roof_unconf.takeoff_eligible is False
 
     confirmed_payload = {
         "walls": [
-            {"wall_ref": "W1", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 3.2, "height_status": "confirmed"}
+            {"wall_ref": "W1", "level": "Ground", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 3.2, "height_status": "confirmed"}
         ],
         "roof_data": {
             "evidence": {"pitches_deg": [22.5], "flat": False},
-            "caps": [{"id": "r2", "points": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}], "z": 3.2}],
+            "caps": [{"id": "r2", "level": "Ground", "points": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}], "z": 3.2}],
         }
     }
     proj_conf, _ = planreader_to_canonical_model(confirmed_payload, is_validated_internal_workspace=True)
     roof_conf = proj_conf.buildings[0].levels[0].roofs[0]
     assert roof_conf.metadata["z"] == 3.2  # Accepted!
     assert roof_conf.review_state == ReviewState.CONFIRMED
+    assert roof_conf.takeoff_eligible is True
+
+
+def test_invalid_v140_roof_cap_is_evidence_only_and_not_materialised():
+    payload = {
+        "workspace_id": 101,
+        "walls": [{
+            "wall_ref": "W1", "level": "Ground",
+            "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0},
+            "height_m": 3.2, "height_status": "confirmed",
+        }],
+        "roof_data": {
+            "evidence": {"pitches_deg": [22.5], "flat": False, "status": "pitch evidence"},
+            "caps": [{
+                "id": "roof-bowtie", "level": "Ground", "z": 3.2,
+                "points": [[0, 0], [10, 10], [0, 10], [10, 0]],
+                "triangles": [[0, 1, 2], [0, 2, 3]],
+            }],
+        },
+    }
+    project, skipped = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
+    assert sum(len(level.roofs) for level in project.buildings[0].levels) == 0
+    assert any(obs.kind == "rejected_roof_cap" for obs in project.evidence_observations)
+    assert any(item.get("id") == "roof-bowtie" for item in skipped)
 
 
 def test_section_15_registered_wall_missing_endpoints_fail_closed():
@@ -1379,5 +1758,3 @@ def test_phase5l_v140_producer_version():
     from pb_production_3d_adapter import get_producer_versions
     v_map = get_producer_versions()
     assert v_map.get("v140_roof") == "1.4.0"
-
-

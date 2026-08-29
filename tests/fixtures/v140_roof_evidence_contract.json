@@ -10,18 +10,16 @@
   },
   "caps": [
     {
-      "id": "roof_cap_01",
-      "name": "Main Building Roof Envelope",
       "points": [
-        {"x": 0.0, "y": 0.0},
-        {"x": 18.5, "y": 0.0},
-        {"x": 18.5, "y": 12.0},
-        {"x": 0.0, "y": 12.0}
+        [0.0, 0.0],
+        [18.5, 0.0],
+        [18.5, 12.0],
+        [0.0, 12.0]
       ],
-      "triangles": [],
-      "z": 2.7,
+      "triangles": [[3, 0, 1], [1, 2, 3]],
+      "z": 3.2,
       "level": "Ground",
-      "pitches_deg": 22.5,
+      "pitches_deg": [22.5],
       "parapet": false,
       "flat": false,
       "status": "Roof pitch identified; ridge direction still requires roof-plan evidence",

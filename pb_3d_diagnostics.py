@@ -77,6 +77,10 @@ def generate_production_diagnostics_report(
 
     total_roofs = 0
     roof_geometry_rendered = 0
+    roof_evidence_observations = len([
+        obs for obs in project.evidence_observations
+        if obs.kind in {"roof_profile_evidence", "rejected_roof_cap"}
+    ])
 
     confirmed_count = 0
     inferred_count = 0
@@ -307,14 +311,19 @@ def generate_production_diagnostics_report(
                         else:
                             phys_state = "evidence_only"
 
-                    # SECTION L: Count authorised OPENING INSTANCES!
-                    if b5_auth:
-                        authorised_b5_opening_instances += 1
-
                     if phys_state == "physical_b5_authorised":
                         physical_openings += 1
                         opening_state_counts["physical_b5_authorised"] += 1
-                    elif phys_state in ("physical_not_authorised", "invalid_geometry", "wrong_level",
+                        if b5_auth:
+                            authorised_b5_opening_instances += 1
+                    elif phys_state == "physical_not_authorised":
+                        # Physical placement and deduction authority are
+                        # independent facts.  A valid, non-deducting opening
+                        # remains a physical opening in QA.
+                        physical_openings += 1
+                        opening_state_counts["physical_not_authorised"] += 1
+                        rejected_deduction_claims += 1
+                    elif phys_state in ("invalid_geometry", "wrong_level",
                                         "conflict_overlap", "manual_exclusion", "wrong_host"):
                         evidence_only_openings += 1
                         opening_state_counts.setdefault(phys_state, 0)
@@ -356,6 +365,8 @@ def generate_production_diagnostics_report(
         "elevation_opening_candidates_observed": len(elevation_opening_candidates),  # SECTION N
         "opening_state_counts": opening_state_counts,
         "roof_geometry_rendered": roof_geometry_rendered,
+        "roof_evidence_observations": roof_evidence_observations,
+        "roof_evidence_only": roof_evidence_observations if roof_geometry_rendered == 0 else 0,
         "provenance_gaps": missing_provenance_count,
         "matched_reconciliations": len([r for r in per_wall_reconciliation if r["reconciliation_status"] == "matched"]),
         "unresolved_reconciliations": len([r for r in per_wall_reconciliation if r["reconciliation_status"] == "unresolved"]),
