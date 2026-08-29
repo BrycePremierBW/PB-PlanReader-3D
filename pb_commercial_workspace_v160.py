@@ -7,6 +7,7 @@ or estimator-confirmed data.
 """
 from __future__ import annotations
 
+import html
 import json
 import math
 from dataclasses import asdict, dataclass
@@ -45,17 +46,12 @@ def _rows(frame: Any) -> List[Dict[str, Any]]:
         return []
     if isinstance(frame, list):
         return [dict(row) for row in frame if isinstance(row, dict)]
-    try:
-        return [dict(row) for row in frame.to_dict("records")]
-    except Exception:
-        return []
+    return [dict(row) for row in frame.to_dict("records")]
 
 
 def _query(app: Any, sql: str, params: tuple) -> List[Dict[str, Any]]:
-    try:
-        return _rows(app.ldf(sql, params))
-    except Exception:
-        return []
+    """Read status evidence; caller decides how to degrade if storage is unavailable."""
+    return _rows(app.ldf(sql, params))
 
 
 def _positive(value: Any) -> bool:
@@ -200,6 +196,8 @@ def derive_workspace_status(app: Any, workspace: Dict[str, Any]) -> CommercialWo
         try:
             scale_review = len(app.scale_gate_issues(workspace_id) or [])
         except Exception:
+            # Optional scale diagnostics being unavailable must not hide the rest
+            # of the commercial status shell.
             scale_review = 0
 
     # This is a count of independent review signals from existing sources, not a
@@ -284,9 +282,11 @@ def render_commercial_workspace_shell(app: Any, workspace: Dict[str, Any]) -> Co
         unsafe_allow_html=True,
     )
 
-    job_no = str(workspace.get("job_no") or "").strip()
-    job_name = str(workspace.get("job_name") or "Untitled project").strip()
-    drawing_issue = str(workspace.get("drawing_issue") or "").strip()
+    # Workspace values can originate outside this module (including JobHub), so
+    # escape them before interpolating into unsafe HTML.
+    job_no = html.escape(str(workspace.get("job_no") or "").strip())
+    job_name = html.escape(str(workspace.get("job_name") or "Untitled project").strip())
+    drawing_issue = html.escape(str(workspace.get("drawing_issue") or "").strip())
     issue_text = f" · Issue {drawing_issue}" if drawing_issue else ""
 
     steps_html = "".join(
@@ -324,7 +324,16 @@ def apply(app: Any) -> None:
     def commercial_hero(workspace=None, *args, **kwargs):
         result = original_hero(workspace, *args, **kwargs)
         if isinstance(workspace, dict) and workspace.get("id") is not None:
-            render_commercial_workspace_shell(app, workspace)
+            try:
+                render_commercial_workspace_shell(app, workspace)
+            except Exception:
+                # Commercial status is presentation-only: an unavailable status
+                # query must never take down the underlying estimator page, and it
+                # must never be misrepresented as an empty/new workspace.
+                try:
+                    app.st.caption("Project workflow status unavailable. Estimator tools remain available.")
+                except Exception:
+                    pass
         return result
 
     app.hero = commercial_hero
