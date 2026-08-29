@@ -4,6 +4,7 @@ from pb_commercial_workspace_v160 import (
     WORKFLOW_STEPS,
     apply,
     derive_workspace_status,
+    render_commercial_workspace_shell,
     workflow_step_states,
 )
 
@@ -41,6 +42,30 @@ class FakeApp:
     def workspace_setting(self, workspace_id, key, default=None):
         assert key == "canonical_3d_model_v1"
         return self._model if self._model is not None else default
+
+
+class _MetricColumn:
+    def __init__(self, sink):
+        self.sink = sink
+
+    def metric(self, *args, **kwargs):
+        self.sink.append((args, kwargs))
+
+
+class FakeStreamlit:
+    def __init__(self):
+        self.markdowns = []
+        self.metrics = []
+        self.captions = []
+
+    def markdown(self, text, **kwargs):
+        self.markdowns.append(text)
+
+    def columns(self, count):
+        return [_MetricColumn(self.metrics) for _ in range(count)]
+
+    def caption(self, text):
+        self.captions.append(text)
 
 
 WORKSPACE = {"id": 101, "job_no": "PB-101", "job_name": "Commercial Test"}
@@ -202,6 +227,39 @@ def test_workflow_step_states_are_fixed_order_and_review_signals_are_visible():
     review = next(step for step in steps if step["label"] == "Review")
     assert review["state"] == "review"
     assert review["detail"] == "1 signal"
+
+
+def test_workspace_text_is_html_escaped_before_unsafe_markup():
+    app = FakeApp()
+    app.st = FakeStreamlit()
+    render_commercial_workspace_shell(
+        app,
+        {"id": 101, "job_no": "PB<101>", "job_name": "<script>alert(1)</script>", "drawing_issue": "A&B"},
+    )
+    rendered = "\n".join(app.st.markdowns)
+    assert "<script>alert(1)</script>" not in rendered
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in rendered
+    assert "PB&lt;101&gt;" in rendered
+    assert "A&amp;B" in rendered
+
+
+def test_status_query_failure_does_not_break_underlying_estimator_page_or_look_new():
+    class BrokenApp(FakeApp):
+        def __init__(self):
+            super().__init__()
+            self.st = FakeStreamlit()
+
+        def ldf(self, sql, params):
+            raise RuntimeError("database unavailable")
+
+    app = BrokenApp()
+    apply(app)
+    result = app.hero(WORKSPACE)
+    assert result == WORKSPACE
+    assert app.hero_calls == 1
+    assert app.st.captions == ["Project workflow status unavailable. Estimator tools remain available."]
+    # No zero-valued/new-workspace commercial cards were rendered after the failure.
+    assert app.st.metrics == []
 
 
 def test_apply_is_idempotent_and_only_wraps_existing_hero_once():
