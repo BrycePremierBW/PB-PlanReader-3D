@@ -310,7 +310,7 @@ def test_valid_elevation_reaches_production_evidence_pipeline():
 
     # Plan instance that shares the geometry (same width, known East side).
     plan = _b1_candidate(
-        mark="", wall="E1", position=2.0, width=opening.width_m,
+        mark="", wall="E01", position=2.0, width=opening.width_m,
         opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
     )
     plan.elevation_side = "East"
@@ -692,7 +692,7 @@ def test_analyse_stored_page_openings_threads_elevation():
     assert opening.wall_ref == "E01"
 
     plan = _b1_candidate(
-        mark="", wall="E1", position=2.0, width=opening.width_m,
+        mark="", wall="E01", position=2.0, width=opening.width_m,
         opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
     )
     plan.elevation_side = "East"
@@ -1166,6 +1166,99 @@ def test_r2_bare_attached_anchors_are_not_enough():
     assert enriched4[0].elevation_geometry is not None
 
 
+def test_r2_wrong_wall_never_anchors():
+    """R2: MISMATCHED plan/elevation wall references never anchor — even when
+    the attached ``wall_position_m`` numerically lies within a registered extent.
+
+    The elevation opening sits on registered East wall ``E01`` (extent 0..8)
+    with an in-extent station, but the PLAN instance is on a DIFFERENT wall
+    (``W02``).  Without a MATCHING plan wall_ref, the position cannot be a
+    registration-derived anchor: same stations on different walls are two
+    different physical openings, so the pair fails closed to review.
+    """
+    # Plan on West wall W02; elevation on East wall E01 (registered, extent 0..8).
+    plan = _b1_candidate(
+        mark="", wall="W02", position=2.0, width=1.0,
+        opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
+    )
+    plan.elevation_side = "West"
+    elev = ElevationOpening(
+        elevation_page_no=86, elevation_side="East",
+        bbox_px=(100, 100, 200, 300), width_m=1.0, height_m=1.5,
+        label="", confidence=0.7,
+        wall_ref="E01",
+    )
+    # The attached station (2.0) is well WITHIN E01's registered extent — but
+    # the plan is on a different wall, so this must NOT qualify by itself.
+    object.__setattr__(elev, "wall_position_m", 2.0)
+    enriched, unmatched = bridge.correlate_elevation_to_plan_production(
+        [elev], [plan], facades=_register_facades(),
+    )
+    assert len(unmatched) == 1, "wrong wall must never anchor (wrong-wall regression)"
+    assert enriched[0].elevation_geometry is None
+
+
+def test_r2_unproven_position_never_anchors():
+    """R2: an attached in-extent ``wall_position_m`` does NOT qualify BY ITSELF —
+    it also needs a REGISTRATION-DERIVED plan station on the same segment.
+
+    Plan and elevation share registered East wall ``E01`` and the attached
+    station (2.0) is inside the 0..8 extent — but the plan carries NO
+    ``position_along_wall_m`` (its position is UNPROVEN).  There is no derived
+    plan station to agree with, so the opening's own number is just an
+    arbitrary caller-attached scalar and must fail closed to ambiguity/review.
+    """
+    plan = _b1_candidate(
+        mark="", wall="E01", width=1.0,
+        opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
+    )
+    plan.elevation_side = "East"
+    # Deliberately drop the plan's position: it is NOT registration-derived.
+    plan.position_along_wall_m = None
+    elev = ElevationOpening(
+        elevation_page_no=86, elevation_side="East",
+        bbox_px=(100, 100, 200, 300), width_m=1.0, height_m=1.5,
+        label="", confidence=0.7,
+        wall_ref="E01",
+    )
+    object.__setattr__(elev, "wall_position_m", 2.0)  # in E01 extent 0..8
+    enriched, unmatched = bridge.correlate_elevation_to_plan_production(
+        [elev], [plan], facades=_register_facades(),
+    )
+    assert len(unmatched) == 1, (
+        "attached in-extent position must not qualify without a derived plan station"
+    )
+    assert enriched[0].elevation_geometry is None
+
+
+def test_r2_registration_derived_position_still_correlates():
+    """R2 sanity: a genuinely registration-derived position DOES anchor.
+
+    Matching plan/elevation wall_ref (E01), a registered E01/East segment
+    (origin 0 + direction toward 8), a registration-derived plan station
+    (2.0, on extent) and an agreeing elevation station (2.0) -> a genuine
+    production identity anchor, so the pair correlates.  This is the positive
+    counterpart to the wrong-wall / unproven-position regressions above.
+    """
+    plan = _b1_candidate(
+        mark="", wall="E01", position=2.0, width=1.0,
+        opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
+    )
+    plan.elevation_side = "East"
+    elev = ElevationOpening(
+        elevation_page_no=86, elevation_side="East",
+        bbox_px=(100, 100, 200, 300), width_m=1.0, height_m=1.5,
+        label="", confidence=0.7,
+        wall_ref="E01",
+    )
+    object.__setattr__(elev, "wall_position_m", plan.position_along_wall_m)
+    enriched, unmatched = bridge.correlate_elevation_to_plan_production(
+        [elev], [plan], facades=_register_facades(),
+    )
+    assert len(unmatched) == 0
+    assert enriched[0].elevation_geometry is not None
+
+
 def test_c2_wrong_mark_rejects():
     """Wrong opening mark -> reject (no correlation even with width/side)."""
     plan = _b1_candidate(
@@ -1275,7 +1368,7 @@ def test_c3_provenance_traceability_persisted_in_payload():
     assert opening.level == "L2"
 
     plan = _b1_candidate(
-        mark="", wall="E1", position=2.0, width=opening.width_m,
+        mark="", wall="E01", position=2.0, width=opening.width_m,
         opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
     )
     plan.elevation_side = "East"
@@ -1470,3 +1563,82 @@ def test_c3_bridge_level_source_filename_survives_when_candidate_has_none():
         s for s in result.diagnostics if s.get("kind") == "elevation_evidence_summary"
     ]
     assert summary and summary[0]["source_filename"] == "my_source_drawing.pdf"
+
+
+def test_r1_objective_level_beats_caller_level():
+    """R1 precedence: the CANDIDATE-OBJECTIVE level wins over a conflicting
+    bridge-supplied ``level``.
+
+    The candidate objectively resolved level ``L1`` (via ``level_band``); the
+    caller passes ``L2``.  Provenance resolution is candidate-objective ->
+    bridge-context -> unknown, so the opening AND its diagnostic must both
+    carry ``L1`` — never ``L2`` — and the identical record is reused for both
+    (single authoritative resolve).
+    """
+    cal, _ = _real_render_pixel_calibration()
+    cand = _raster_candidate(width_m=0.82, height_m=2.1, level_band="L1")
+    result = bridge.raster_openings_from_candidates(
+        [cand], cal,
+        elevation_page_no=86, elevation_side="East",
+        source_filename="synthetic.pdf", source_page=86,
+        drawing_ref="CD3001",
+        drawing_title="E1 EAST ELEVATION",
+        level="L2",           # conflicting caller level
+        wall_ref="E1",
+        calibration_source=cal.method,
+    )
+    assert len(result.openings) == 1
+    accepted = [
+        d for d in result.diagnostics
+        if d.get("kind") == "elevation_candidate" and d.get("status") == "accepted"
+    ]
+    assert len(accepted) == 1
+
+    # Candidate-objective level beats the caller context.
+    prov = result.opening_provenance[0]
+    assert prov["level"] == "L1", "candidate-objective level must beat caller L2"
+    # The diagnostic reuses the IDENTICAL resolved record (R1 single resolve).
+    assert prov["level"] == accepted[0]["level"]
+    assert result.openings[0].level == "L1"
+
+
+def test_r1_blank_candidate_falls_back_to_caller_context():
+    """R1 precedence: a BLANK candidate falls back to the bridge-supplied
+    context (candidate-objective -> BRIDGE-CONTEXT -> unknown).
+
+    The candidate carries NO own level / source_filename; the caller's ``L2``
+    and filename flow through to the opening and its diagnostic — proving the
+    bridge-context tier of the precedence chain.
+    """
+    cal, _ = _real_render_pixel_calibration()
+    cand = _raster_candidate(
+        width_m=0.82, height_m=2.1,
+        source_filename="", level_band=None,   # blank candidate-objective tier
+    )
+    result = bridge.raster_openings_from_candidates(
+        [cand], cal,
+        elevation_page_no=86, elevation_side="East",
+        source_filename="BRIDGE_SOURCE.pdf",
+        source_page=86,
+        drawing_ref="CD3001",
+        drawing_title="BRIDGE TITLE",
+        level="L2",
+        wall_ref="E1",
+        calibration_source=cal.method,
+    )
+    assert len(result.openings) == 1
+    prov = result.opening_provenance[0]
+    # Bridge context fills the blank candidate slots (candidate-objective empty
+    # -> bridge-context -> unknown).
+    assert prov["level"] == "L2", "blank candidate level falls back to caller L2"
+    assert prov["drawing_title"] == "BRIDGE TITLE"
+    assert prov["source_filename"] == "BRIDGE_SOURCE.pdf"
+    assert result.openings[0].level == "L2"
+    accepted = [
+        d for d in result.diagnostics
+        if d.get("kind") == "elevation_candidate" and d.get("status") == "accepted"
+    ]
+    assert len(accepted) == 1
+    assert prov["level"] == accepted[0]["level"]
+    assert prov["drawing_title"] == accepted[0]["drawing_title"]
+    assert prov["source_filename"] == accepted[0]["source_filename"]
