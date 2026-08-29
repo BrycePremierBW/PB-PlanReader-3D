@@ -60,8 +60,15 @@ _LABEL_SEARCH_RADIUS_M = 0.5
 # Minimum strong signal score for a match to qualify
 _MIN_STRONG_SIGNAL = 0.3
 
-# Mark label pattern
-_MARK_RE = re.compile(r"\b([DW]0?\d{1,2})\b", re.IGNORECASE)
+# Mark label patterns — align with approved B1 families:
+#   doors:   D, ED, ID  followed by 1-3 digits
+#   windows: W, EW, IW  followed by 1-3 digits
+# Full-token matching (word boundaries) rejects junk suffixes such as
+# ``ED01XYZ`` or Roman-numeral-like ``I``/``II``; prefixes are matched
+# longest-first so ``ED01`` is not misread as ``D01``.
+_MARK_RE = re.compile(
+    r"\b((?:ED|ID|EW|IW|D|W)\d{1,3})\b", re.IGNORECASE
+)
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +92,16 @@ class ElevationOpening:
     label: str = ""           # nearby mark text (D01, W01) if detected
     confidence: float = 0.5
     extraction_method: str = "elevation_rect"
+    # --- Phase 2A provenance / coordinate-space (ADDITIVE, defaulted) ---
+    coord_space: str = "render_pixel"   # explicit: "pdf_point" | "render_pixel"
+    render_dpi: Optional[float] = None  # when coord_space == "render_pixel"
+    source_page_id: Optional[int] = None  # workspace page id if known
+    source_page_no: Optional[int] = None  # 1-based source page number
+    drawing_ref: str = ""                 # e.g. "CD3001"
+    drawing_title: str = ""               # e.g. "E1 EAST ELEVATION"
+    level: Optional[str] = None           # level band when objectively derived
+    wall_ref: str = ""                    # candidate wall association
+    calibration: Dict[str, Any] = field(default_factory=dict)  # calibration provenance
 
 
 # ---------------------------------------------------------------------------
@@ -99,17 +116,54 @@ def _is_opening_sized(width_m: float, height_m: float) -> bool:
     return True
 
 
+def _word_position(word: Dict[str, Any]) -> Tuple[Optional[str], Optional[float], Optional[float]]:
+    """Normalize a word record to (text, center_x, center_y).
+
+    Accepts the current native word format ``{"text": ..., "bbox": [x0,y0,x1,y1]}``
+    (v130) AND the legacy numeric-key format ``{0,1,2,3,4}``.  Returns
+    (None, None, None) for an unrecognized record.
+    """
+    bbox = word.get("bbox")
+    text = str(word.get("text") or word.get("4", "")).strip()
+    if bbox and isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+        try:
+            x0, y0, x1, y1 = map(float, bbox[:4])
+            return (text, (x0 + x1) / 2.0, (y0 + y1) / 2.0)
+        except (TypeError, ValueError):
+            return (text, None, None)
+    if not text and "0" not in word and "1" not in word:
+        return (None, None, None)
+    try:
+        wx = (float(word.get("0", 0)) + float(word.get("2", 0))) / 2.0
+        wy = (float(word.get("1", 0)) + float(word.get("3", 0))) / 2.0
+    except (TypeError, ValueError, IndexError):
+        return (text, None, None)
+    return (text, wx, wy)
+
+
+def _is_approved_door_mark(mark: str) -> bool:
+    return mark in ("D", "ED", "ID") or re.fullmatch(r"(?:D|ED|ID)\d{1,3}", mark) is not None
+
+
+def _is_approved_window_mark(mark: str) -> bool:
+    return mark in ("W", "EW", "IW") or re.fullmatch(r"(?:W|EW|IW)\d{1,3}", mark) is not None
+
+
 def _extract_label_near_rect(
     words: Sequence[Dict[str, Any]],
     rect_bbox: Tuple[float, float, float, float],
     max_distance_px: float = 120.0,
 ) -> str:
-    """Find a D/W mark label near (or inside) an elevation rectangle.
+    """Find a door/window mark label near (or inside) an elevation rectangle.
 
     Searches words within max_distance_px of the rectangle boundary.
     Distance is measured from the word center to the nearest edge of the
     rectangle (not center), since labels typically sit above/below the
-    opening.  Returns the first valid mark found, or empty string.
+    opening.  Returns the closest valid approved mark found, or empty string.
+
+    Word records may use the current native ``{"text","bbox"}`` format or the
+    legacy numeric-key format.  Marks must be an approved door/window family
+    (D/ED/ID for doors; W/EW/IW for windows); junk tokens are rejected.
     """
     rx0, ry0, rx1, ry1 = rect_bbox
     r_left, r_right = min(rx0, rx1), max(rx0, rx1)
@@ -118,20 +172,17 @@ def _extract_label_near_rect(
     best_dist = max_distance_px + 1.0
 
     for word in words:
-        text = str(word.get("text") or word.get("4", "")).strip()
+        text, wx, wy = _word_position(word)
         if not text:
             continue
         m = _MARK_RE.search(text)
         if not m:
             continue
         mark = m.group(1).upper()
-        if not (mark[0] in ("D", "W")):
+        # Must be an approved door or window family (not junk / not I / II).
+        if not (_is_approved_door_mark(mark) or _is_approved_window_mark(mark)):
             continue
-        # Word center
-        try:
-            wx = (float(word.get("0", 0)) + float(word.get("2", 0))) / 2.0
-            wy = (float(word.get("1", 0)) + float(word.get("3", 0))) / 2.0
-        except (TypeError, ValueError, IndexError):
+        if wx is None or wy is None:
             continue
         # Distance from word center to nearest edge of rectangle
         dx = max(r_left - wx, 0, wx - r_right)
@@ -149,17 +200,48 @@ def detect_elevation_openings(
     elevation_side: str,
     rects: Sequence[Dict[str, Any]],
     words: Sequence[Dict[str, Any]],
-    scale_px_per_m: float,
+    units_per_m: float,
+    *,
+    coord_space: str = "render_pixel",
+    render_dpi: Optional[float] = None,
+    source_page_id: Optional[int] = None,
+    source_page_no: Optional[int] = None,
+    drawing_ref: str = "",
+    drawing_title: str = "",
+    level: Optional[str] = None,
+    wall_ref: str = "",
+    calibration: Optional[Dict[str, Any]] = None,
 ) -> List[ElevationOpening]:
     """Detect opening-sized rectangular regions on an elevation drawing.
 
     Args:
         elevation_page_no: Page number of the elevation drawing.
         elevation_side: Cardinal side ("North", "South", etc.).
-        rects: Rectangle dicts with keys "bbox" → [x0, y0, x1, y1] in
-               page pixel coordinates.  May also have "confidence".
+        rects: Rectangle dicts with keys "bbox" → [x0, y0, x1, y1] in the
+               calibration's coordinate units.  May also have "confidence",
+               and provenance keys ("coord_space", "level", "wall_ref",
+               "drawing_ref", "calibration", ...).
         words: Word dicts from PDF extraction (positioned text).
-        scale_px_per_m: Calibration factor (pixels per metre).
+        units_per_m: Measured calibration factor (units per metre) expressed
+            in ``coord_space`` units — render pixels when coord_space is
+            "render_pixel", PDF points when coord_space is "pdf_point".
+            This value is NEVER described as pixels-per-metre unless
+            coord_space == "render_pixel" (see Calibration.pt_per_m /
+            Calibration.px_per_m for the typed accessors).
+        coord_space: The explicit coordinate space of BOTH the calibration
+            factor above AND the rect bboxes: "render_pixel" or "pdf_point".
+        render_dpi: Render DPI when coord_space == "render_pixel".
+        source_page_id / source_page_no / drawing_ref / drawing_title /
+        level / wall_ref / calibration: Provenance carried onto every
+            candidate.
+
+    Coordinate-space compatibility (HARD GUARD):
+        Dimensioned candidates are only produced when the rect's declared
+        coordinate space is PROVEN identical to the calibration's space
+        (``coord_space``).  Any rect that declares a different space than the
+        calibration (e.g. a pdf_point rect against a render-pixel calibration,
+        or vice versa) FAILS CLOSED — it produces NO dimensional candidate and
+        is skipped.  Coordinate spaces are never mixed.
 
     Returns:
         List of ElevationOpening candidates.  These are NOT confirmed
@@ -167,11 +249,11 @@ def detect_elevation_openings(
 
     Sill/head are None until an elevation datum/baseline is registered.
     """
-    if scale_px_per_m <= 0:
+    if units_per_m <= 0:
         return []
 
-    # Convert physical label search radius to pixels
-    label_radius_px = _LABEL_SEARCH_RADIUS_M * scale_px_per_m
+    # Convert physical label search radius to calibration units
+    label_radius_units = _LABEL_SEARCH_RADIUS_M * units_per_m
 
     candidates: List[ElevationOpening] = []
     for rect in rects:
@@ -180,18 +262,28 @@ def detect_elevation_openings(
             continue
         x0, y0, x1, y1 = [float(v) for v in bbox[:4]]
 
-        # Measure in metres
-        width_px = abs(x1 - x0)
-        height_px = abs(y1 - y0)
-        width_m = width_px / scale_px_per_m
-        height_m = height_px / scale_px_per_m
+        # Hard coordinate-space guard: the rect MUST be in the same proven
+        # coordinate space as the calibration before any dimension is
+        # calculated.  A rect declaring a different space fails closed — it
+        # contributes no dimensional candidate (spaces are never mixed).
+        r_coord = rect.get("coord_space", coord_space)
+        if r_coord != coord_space:
+            # Dimensionally incommensurable with the calibration space:
+            # fail closed, do NOT emit a candidate with invented metres.
+            continue
+
+        # Measure in metres (space is known equal to the calibration space)
+        width_units = abs(x1 - x0)
+        height_units = abs(y1 - y0)
+        width_m = width_units / units_per_m
+        height_m = height_units / units_per_m
 
         if not _is_opening_sized(width_m, height_m):
             continue
 
         # Look for a mark label near this rectangle (scale-aware radius)
         label = _extract_label_near_rect(
-            words, (x0, y0, x1, y1), max_distance_px=label_radius_px
+            words, (x0, y0, x1, y1), max_distance_px=label_radius_units
         )
 
         # Confidence: higher for clearly opening-sized, lower for borderline
@@ -202,6 +294,14 @@ def detect_elevation_openings(
             conf += 0.1  # label boost
         conf = min(conf, 0.85)
 
+        # Per-rect provenance, falling back to the function-level args so
+        # rects produced by the extraction layer carry their own metadata.
+        r_render = rect.get("render_dpi", render_dpi) if rect.get("render_dpi") is not None else render_dpi
+        r_level = rect.get("level", level)
+        r_wall = rect.get("wall_ref", wall_ref)
+        r_draw = rect.get("drawing_ref", drawing_ref)
+        r_calib = rect.get("calibration", calibration) or calibration or {}
+
         candidates.append(ElevationOpening(
             elevation_page_no=elevation_page_no,
             elevation_side=elevation_side,
@@ -210,6 +310,15 @@ def detect_elevation_openings(
             height_m=round(height_m, 4),
             label=label,
             confidence=round(conf, 2),
+            coord_space=r_coord,
+            render_dpi=r_render,
+            source_page_id=source_page_id,
+            source_page_no=source_page_no or elevation_page_no,
+            drawing_ref=r_draw,
+            drawing_title=drawing_title,
+            level=r_level,
+            wall_ref=r_wall,
+            calibration=dict(r_calib),
         ))
 
     return candidates
@@ -232,11 +341,32 @@ def _mark_compatible(mark1: str, mark2: str) -> bool:
     return mark1.upper() == mark2.upper()
 
 
-def _mark_type(mark: str) -> str:
-    """Return the type prefix of a mark: 'D', 'W', or ''."""
-    if mark and mark[0].upper() in ("D", "W"):
-        return mark[0].upper()
+def _mark_family_prefix(mark: str) -> str:
+    """Return 'D' or 'W' for an approved door/window mark family.
+
+    Uses the approved mark-family classifier, NEVER the first character:
+        D / ED / ID (+ digits)  => 'D'  (door)
+        W / EW / IW (+ digits)  => 'W'  (window)
+    Anything else (junk, lone I/II, etc.) => ''.
+
+    Rationale: ``ED01`` must classify as a DOOR (family 'D'), not as an
+    unknown 'E'; ``IW03`` must classify as a WINDOW ('W').  Using ``mark[0]``
+    would misclassify every ED/ID/EW/IW mark.
+    """
+    if mark and _is_approved_door_mark(mark):
+        return "D"
+    if mark and _is_approved_window_mark(mark):
+        return "W"
     return ""
+
+
+def _mark_type(mark: str) -> str:
+    """Return the type prefix of a mark: 'D', 'W', or ``''``.
+
+    Uses the approved mark-family classifier (_mark_family_prefix), so
+    ED01/ID01 are 'D' (door) and EW01/IW01 are 'W' (window).
+    """
+    return _mark_family_prefix(mark)
 
 
 def _marks_conflict(inst_mark: str, elev_label: str) -> bool:
@@ -259,7 +389,7 @@ def _opening_type_conflicts(inst: OpeningEvidence, elev_label: str) -> bool:
     """
     if not elev_label:
         return False
-    elev_type = elev_label[0].upper()
+    elev_type = _mark_family_prefix(elev_label)
     if inst.opening_type == OPENING_TYPE_WINDOW and elev_type == "D":
         return True
     if inst.opening_type == OPENING_TYPE_DOOR and elev_type == "W":
@@ -299,6 +429,15 @@ def _correlation_score(
     if inst.elevation_side and elev.elevation_side:
         if inst.elevation_side != elev.elevation_side:
             return 0.0
+
+    # --- Hard reject: different known levels ---
+    # When BOTH sources carry a reliable level, different levels hard-reject
+    # the association.  An unknown level is NEUTRAL: it never becomes a
+    # positive match signal and never rejects.
+    inst_level = str(inst.level or "").strip()
+    elev_level = str(elev.level or "").strip()
+    if inst_level and elev_level and inst_level.upper() != elev_level.upper():
+        return 0.0
 
     # --- Side match: contextual evidence (not sufficient alone) ---
     side_match = False
@@ -482,10 +621,16 @@ def _enrich_from_elevation(
         elevation_side=elev.elevation_side,
         elevation_geometry={
             "bbox_px": list(elev.bbox_px),
+            "coord_space": elev.coord_space,
             "sill_m": elev.sill_m,
             "head_m": elev.head_m,
             "confidence": elev.confidence,
             "extraction_method": elev.extraction_method,
+            "level": elev.level,
+            "wall_ref": elev.wall_ref,
+            "drawing_ref": elev.drawing_ref,
+            "source_page_no": elev.source_page_no,
+            "calibration": dict(elev.calibration),
         },
         geometry_confidence=elev.confidence,
         evidence=[f"elevation_rect page={elev.elevation_page_no} "
@@ -503,6 +648,10 @@ def _enrich_from_elevation(
         "dimension_confidence": ELEVATION_HEIGHT_CONFIDENCE,
         "type_mark": elev.label or "",  # preserve elevation's own label
         "page_no": elev.elevation_page_no,
+        "level": elev.level,
+        "wall_ref": elev.wall_ref,
+        "drawing_ref": elev.drawing_ref,
+        "coord_space": elev.coord_space,
         "accepted": False,  # updated after merge
     }
 
