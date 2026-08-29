@@ -27,6 +27,16 @@ _PHASE5M_SUPERSEDED_UNSAFE_ROOF_TESTS = {
     "test_phase5k_roof_z_reproduction_verification",
 }
 
+# This historical regression expected a calibrated floor carrying only weak
+# sheet text such as "Ground Floor" to be discarded completely. The final
+# contract retains valid metric XY under the unresolved/review storey while
+# withholding takeoff authority. A strict xfail makes the suite fail if the old
+# drop-on-unknown-storey behaviour returns. Replacement coverage lives in
+# test_phase5m_unresolved_floor_retention.py.
+_PHASE5M_SUPERSEDED_FLOOR_DROP_TESTS = {
+    "test_free_form_page_level_is_not_floor_storey_authority",
+}
+
 
 def pytest_collection_modifyitems(items):
     for item in items:
@@ -36,6 +46,15 @@ def pytest_collection_modifyitems(items):
                 reason=(
                     "Superseded by Phase 5M zero-made-up-data contract: a Ground label "
                     "without objective storey elevation cannot establish absolute roof Z"
+                ),
+            ))
+        elif item.name in _PHASE5M_SUPERSEDED_FLOOR_DROP_TESTS:
+            item.add_marker(pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "Superseded by Phase 5M unresolved-storey contract: valid calibrated XY "
+                    "is retained under the unresolved review level, never discarded merely "
+                    "because free-form sheet text is not storey authority"
                 ),
             ))
 
