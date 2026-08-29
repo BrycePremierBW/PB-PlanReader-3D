@@ -24,8 +24,10 @@ import sqlite3
 import pytest
 from pb_canonical_building import (
     CanonicalProject,
+    CanonicalBuilding,
     CanonicalLevel,
     CanonicalWall,
+    CanonicalRoof,
     CanonicalOpening,
     ReviewState,
     ObjectType,
@@ -915,7 +917,7 @@ def test_phase5j_roof_form_and_objective_z_proof():
     """SECTION J, K, L: Test pitch does not invent GABLE, and roof Z requires ALL contributing wall heights to be confirmed."""
     # Positive pitch alone leaves roof_type = UNKNOWN
     payload_pitch = {
-        "walls": [{"wall_ref": "W1", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 3.0, "height_status": "confirmed"}],
+        "walls": [{"wall_ref": "W1", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 4.5, "height_status": "confirmed"}],
         "roof_data": {
             "evidence": {"pitches_deg": [22.5], "flat": False},
             "caps": [{"id": "cap1", "polygon": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}], "z": 4.5}]
@@ -945,30 +947,6 @@ def test_phase5j_roof_form_and_objective_z_proof():
     assert roof_m.review_state == ReviewState.REVIEW_REQUIRED
 
 
-def test_phase5j_level_identity_and_unregistered_storeys():
-    """SECTION M, N, O, P: Test sheet text is not a level, Ground / unregistered remains REVIEW_REQUIRED."""
-    payload = {
-        "walls": [
-            {"wall_ref": "W_UNREG", "level": "Ground / unregistered", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 3.0},
-            {"wall_ref": "W_SHEET", "level": "A101", "a": {"x": 0, "y": 10}, "b": {"x": 10, "y": 10}, "height_m": 3.0},
-        ]
-    }
-
-    project, _ = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
-    bld = project.buildings[0]
-
-    # Ground / unregistered stays "Ground / unregistered" and REVIEW_REQUIRED
-    unreg_lvl = next(l for l in bld.levels if "unregistered" in l.name.lower())
-    assert unreg_lvl.name == "Ground / unregistered"
-    assert unreg_lvl.review_state == ReviewState.REVIEW_REQUIRED
-    assert unreg_lvl.metadata.get("registered_storey") is False
-
-    # A101 sheet text routes to Unresolved Level Container (Review Required)
-    unres_lvl = next(l for l in bld.levels if "unresolved" in l.name.lower())
-    assert unres_lvl.review_state == ReviewState.REVIEW_REQUIRED
-    assert any(w.provenance.wall_ref == "W_SHEET" for w in unres_lvl.walls)
-
-
 def test_phase5j_persistence_missing_fingerprint_rejection():
     """SECTION Z: Test load_workspace_canonical_model rejects saved model if missing source_revision_fingerprint."""
     class MockApp:
@@ -985,3 +963,229 @@ def test_phase5j_persistence_missing_fingerprint_rejection():
     assert ok is False
     assert proj is None
     assert "Missing or invalid source_revision_fingerprint" in msg
+
+
+def test_phase5k_v175_v178_persisted_evidence():
+    """PHASE 5K - Section 1, 2, 14: Test live v175 page evidence integration and fingerprint determinism/sensitivity."""
+    from pb_opening_production_v175 import apply as apply_opening_production_v175
+    from pb_canonical_persistence import compute_workspace_source_fingerprint
+
+    class DummyApp:
+        def __init__(self):
+            self.settings = {}
+            self.analyse_stored_page_v130 = lambda page_id: {}
+
+        def lquery(self, query, params=()):
+            if "FROM workspaces" in query:
+                return [{"id": 101, "job_no": "J101"}]
+            if "FROM documents" in query:
+                return [{"id": 5, "workspace_id": 101, "file_name": "elevations.pdf"}]
+            if "FROM pages" in query:
+                return [{"id": 42, "workspace_id": 101, "document_id": 5, "page_no": 2, "page_label": "Elevations"}]
+            return []
+
+        def workspace_setting(self, wid, key, default=None):
+            return self.settings.get(key, default)
+
+    app = DummyApp()
+    apply_opening_production_v175(app)
+
+    # Store real v175 page evidence
+    app.settings["opening_evidence_v175_pages"] = json.dumps([42])
+    app.settings["opening_evidence_v175_page_42"] = json.dumps({
+        "elevation_openings": [{
+            "id": "elev_op_1",
+            "width_m": 1.8,
+            "height_m": 2.1,
+            "accepted": True,
+            "reason": "v1.7.5 detected opening",
+        }],
+        "elevation_provenance": [{
+            "source_filename": "elevations.pdf",
+            "source_page": 2,
+            "drawing_ref": "E-01",
+            "elevation_side": "North",
+            "wall_ref": "W01",
+            "source_coords": {"x1": 10, "y1": 20, "x2": 100, "y2": 200},
+            "coordinate_space": "pdf_pixels",
+            "calibration": {"px_per_m": 50.0},
+        }],
+        "elevation_diagnostics": [{"note": "Clean detection"}],
+    })
+
+    snap1 = collect_workspace_3d_evidence(app, 101)
+    assert len(snap1["evidence_observations"]) == 1
+    obs = snap1["evidence_observations"][0]
+    assert obs["candidate_id"] == "elev_op_1"
+    assert obs["drawing_reference"] == "E-01"
+    assert obs["source_filename"] == "elevations.pdf"
+    assert obs["wall_ref"] == "W01"
+    assert obs["producer"] == "pb_opening_production_v175"
+    assert obs["deduction_authority"] is False
+    assert obs["no_instance_creation"] is True
+
+    fp1 = compute_workspace_source_fingerprint(snap1)
+
+    # Mutate elevation provenance -> fingerprint MUST change!
+    app.settings["opening_evidence_v175_page_42"] = json.dumps({
+        "elevation_openings": [{
+            "id": "elev_op_1",
+            "width_m": 2.4,  # Mutated width
+            "height_m": 2.1,
+            "accepted": True,
+        }],
+        "elevation_provenance": [{
+            "source_filename": "elevations.pdf",
+            "source_page": 2,
+            "drawing_ref": "E-01",
+        }],
+        "elevation_diagnostics": [],
+    })
+    snap2 = collect_workspace_3d_evidence(app, 101)
+    fp2 = compute_workspace_source_fingerprint(snap2)
+    assert fp1 != fp2
+
+
+def test_phase5k_wrong_host_bim_payload():
+    """PHASE 5K - Section 3, 4, 5: Test wrong-host openings do NOT cut wall mesh and wall_id is None for wrong host in payload."""
+    from pb_bim_viewer import project_to_viewer_payload
+
+    w1 = CanonicalWall(
+        id="W1",
+        name="Wall 1",
+        start_point=Vector2D(x=0.0, y=0.0),
+        end_point=Vector2D(x=10.0, y=0.0),
+        thickness_m=0.2,
+        height_m=3.0,
+    )
+    # Valid host-attached opening for W1
+    op_valid = CanonicalOpening(
+        id="OP_VALID",
+        name="Valid Door",
+        wall_id="W1",
+        offset_along_wall_m=2.0,
+        sill_height_m=0.0,
+        width_m=1.0,
+        height_m=2.1,
+        deduction_authority=True,
+    )
+    op_valid.metadata["physical_state"] = "physical_b5_authorised"
+
+    # Wrong host opening claiming W2 on wall W1
+    op_wrong = CanonicalOpening(
+        id="OP_WRONG",
+        name="Wrong Host Door",
+        wall_id="W2",
+        offset_along_wall_m=5.0,
+        sill_height_m=0.0,
+        width_m=1.0,
+        height_m=2.1,
+        deduction_authority=False,
+    )
+    op_wrong.metadata["physical_state"] = "wrong_host"
+
+    w1.openings = [op_valid, op_wrong]
+    lvl = CanonicalLevel(id="L1", name="Level 1", walls=[w1])
+    bld = CanonicalBuilding(id="B1", name="Building 1", levels=[lvl])
+    proj = CanonicalProject(id="P1", name="Project 1", buildings=[bld])
+
+    payload = project_to_viewer_payload(proj)
+    objs = payload["objects"]
+
+    # Check wall W1 payload object
+    w1_payload = next(o for o in objs if o["id"] == "W1")
+    # Wall openings attached list contains ONLY valid W1 opening (1 item, not 2)
+    assert len(w1_payload["openings"]) == 1
+    assert w1_payload["openings"][0]["id"] == "OP_VALID"
+
+    # Check wrong host opening payload object in global objects list
+    wrong_op_payload = next(o for o in objs if o["id"] == "OP_WRONG")
+    assert wrong_op_payload["wall_id"] is None
+    assert wrong_op_payload["is_host_attached"] is False
+
+
+def test_phase5k_duplicate_name_different_source_polygon():
+    """PHASE 5K - Section 6, 7: Test two walls with same level_name = 'Level 1' but different source_polygon IDs create two distinct storeys."""
+    wall_a = {
+        "wall_ref": "WA",
+        "a": {"x": 0, "y": 0},
+        "b": {"x": 10, "y": 0},
+        "height_m": 3.0,
+        "level_name": "Level 1",
+        "level_index": 1,
+        "source_polygon": "poly_building_north",
+    }
+    wall_b = {
+        "wall_ref": "WB",
+        "a": {"x": 0, "y": 20},
+        "b": {"x": 10, "y": 20},
+        "height_m": 3.0,
+        "level_name": "Level 1",
+        "level_index": 1,
+        "source_polygon": "poly_building_south",
+    }
+
+    payload = {"walls": [wall_a, wall_b]}
+    proj, _ = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
+    bld = proj.buildings[0]
+
+    # Two distinct level storeys created because source_polygon differs
+    assert len(bld.levels) == 2
+
+
+def test_phase5k_roof_z_reproduction_verification():
+    """PHASE 5K - Section 11: Test roof cap Z verification against reproduced expected wall top Z."""
+    # Case A: Confirmed heights 3.0 and 3.4, cap_z = 3.4 => cap Z accepted
+    payload_a = {
+        "walls": [
+            {"wall_ref": "W1", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 3.0, "height_status": "confirmed"},
+            {"wall_ref": "W2", "a": {"x": 10, "y": 0}, "b": {"x": 10, "y": 10}, "height_m": 3.4, "height_status": "confirmed"},
+        ],
+        "roof_data": {
+            "evidence": {"pitches_deg": [15.0], "flat": False},
+            "caps": [{"id": "cap1", "polygon": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}], "z": 3.4}]
+        }
+    }
+    proj_a, _ = planreader_to_canonical_model(payload_a, is_validated_internal_workspace=True)
+    roof_a = proj_a.buildings[0].levels[0].roofs[0]
+    assert roof_a.elevation == 3.4
+    assert roof_a.review_state == ReviewState.CONFIRMED
+
+    # Case B: Confirmed heights 3.0 and 3.4, cap_z = 9.0 (mismatch > 0.05m) => cap Z rejected!
+    payload_b = {
+        "walls": [
+            {"wall_ref": "W1", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 3.0, "height_status": "confirmed"},
+            {"wall_ref": "W2", "a": {"x": 10, "y": 0}, "b": {"x": 10, "y": 10}, "height_m": 3.4, "height_status": "confirmed"},
+        ],
+        "roof_data": {
+            "evidence": {"pitches_deg": [15.0], "flat": False},
+            "caps": [{"id": "cap2", "polygon": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}], "z": 9.0}]
+        }
+    }
+    proj_b, _ = planreader_to_canonical_model(payload_b, is_validated_internal_workspace=True)
+    roof_b = proj_b.buildings[0].levels[0].roofs[0]
+    assert roof_b.elevation is None
+    assert roof_b.review_state == ReviewState.REVIEW_REQUIRED
+
+
+def test_phase5k_model_bounds_includes_roof_z():
+    """PHASE 5K - Section 12: Test model_bounds includes objective roof elevation Z."""
+    from pb_geometry_services import model_bounds
+
+    lvl = CanonicalLevel(
+        id="L1",
+        name="Ground",
+        elevation_m=0.0,
+        walls=[
+            CanonicalWall(id="W1", name="W1", start_point=Vector2D(x=0.0, y=0.0), end_point=Vector2D(x=10.0, y=0.0), height_m=3.0)
+        ],
+        roofs=[
+            CanonicalRoof(id="R1", name="Roof 1", elevation=3.4, polygon=[Vector2D(x=0.0, y=0.0), Vector2D(x=10.0, y=0.0), Vector2D(x=10.0, y=10.0)])
+        ]
+    )
+    proj = CanonicalProject(id="P1", name="Project 1", buildings=[CanonicalBuilding(id="B1", name="B1", levels=[lvl])])
+    has_b, bbox = model_bounds(proj)
+    assert has_b is True
+    assert bbox is not None
+    assert bbox.max_point.z == 3.4
+

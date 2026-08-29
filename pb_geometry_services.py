@@ -354,9 +354,10 @@ def level_extents(level: CanonicalLevel) -> Optional[BoundingBox3D]:
         for col in level.columns:
             if _is_valid_float(col.height_m):
                 max_elem_h = max(max_elem_h, col.height_m)
-        for p in level.parapets:
-            if _is_valid_float(p.height_m):
-                max_elem_h = max(max_elem_h, p.height_m)
+    for r in level.roofs:
+        if _is_valid_float(r.elevation):
+            max_elem_h = max(max_elem_h, r.elevation - z_min)
+            z_min = min(z_min, r.elevation)
 
     z_max = z_min + max_elem_h
 
@@ -395,6 +396,7 @@ def level_extents(level: CanonicalLevel) -> Optional[BoundingBox3D]:
 def model_bounds(project: CanonicalProject) -> Tuple[bool, Optional[BoundingBox3D]]:
     """
     Calculates global 3D bounding box across all buildings and levels in a project.
+    SECTION 12: Includes objective roof elevation in bounds calculation.
     Fails closed: Returns (False, None) if project is empty or bounds cannot be derived.
     """
     min_x, max_x = float("inf"), float("-inf")
@@ -414,6 +416,12 @@ def model_bounds(project: CanonicalProject) -> Tuple[bool, Optional[BoundingBox3
                 max_y = max(max_y, l_bounds.max_point.y)
                 min_z = min(min_z, l_bounds.min_point.z)
                 max_z = max(max_z, l_bounds.max_point.z)
+
+            for r in lvl.roofs:
+                if _is_valid_float(r.elevation):
+                    found_elements = True
+                    max_z = max(max_z, r.elevation)
+                    min_z = min(min_z, r.elevation)
 
     if not found_elements:
         return False, None

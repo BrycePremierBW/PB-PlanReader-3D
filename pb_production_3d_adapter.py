@@ -375,7 +375,7 @@ def revalidate_b5_opening(opening_data: Dict[str, Any]) -> bool:
 
 
 def registered_wall_to_canonical_input(wall_obj: Any) -> Dict[str, Any]:
-    """SECTION 15: Adapts a registered wall producer object into a canonical wall input dict (fail-closed if missing A/B)."""
+    """SECTION 15 & 6: Adapts a registered wall producer object into a canonical wall input dict (fail-closed if missing A/B). Preserves v135 level_index, source_polygon, level_id/storey_id."""
     if hasattr(wall_obj, "to_dict") and callable(wall_obj.to_dict):
         d = wall_obj.to_dict()
     elif isinstance(wall_obj, dict):
@@ -406,6 +406,21 @@ def registered_wall_to_canonical_input(wall_obj: Any) -> Dict[str, Any]:
     else:
         b_dict = b_pt if isinstance(b_pt, dict) else None
 
+    lvl_val = getattr(wall_obj, "level", d.get("level"))
+    lvl_name = getattr(wall_obj, "level_name", d.get("level_name"))
+    lvl_idx = getattr(wall_obj, "level_index", d.get("level_index"))
+    src_poly = getattr(wall_obj, "source_polygon", d.get("source_polygon", d.get("prism_id")))
+    lvl_id = getattr(wall_obj, "level_id", d.get("level_id", d.get("storey_id")))
+
+    # SECTION 6 & 7: Structurally retain all level identity attributes without collapsing
+    level_struct = {
+        "level": lvl_val,
+        "level_name": lvl_name or lvl_val,
+        "level_index": lvl_idx,
+        "source_polygon": src_poly,
+        "level_id": lvl_id,
+    }
+
     return {
         "wall_ref": str(w_ref),
         "side": str(side),
@@ -414,7 +429,11 @@ def registered_wall_to_canonical_input(wall_obj: Any) -> Dict[str, Any]:
         "height_status": str(h_stat),
         "a": a_dict,
         "b": b_dict,
-        "level": d.get("level") or d.get("level_name") or d.get("level_id"),
+        "level": level_struct if (isinstance(lvl_val, dict) or lvl_name or lvl_idx is not None or src_poly or lvl_id) else lvl_val,
+        "level_name": lvl_name,
+        "level_index": lvl_idx,
+        "source_polygon": src_poly,
+        "level_id": lvl_id,
         "provenance": d.get("provenance"),
         "openings": d.get("openings", []),
     }
@@ -523,8 +542,27 @@ def planreader_to_canonical_model(
         if not prov.wall_ref:
             prov.wall_ref = wall_ref
 
-        level_val = w_input.get("level") or w_input.get("level_name") or w_input.get("level_id")
-        target_lvl, _ = resolve_canonical_level(level_val, levels_map)
+        if isinstance(w_input.get("level"), dict):
+            level_val = w_input.get("level")
+        elif (
+            w_input.get("level_name")
+            or w_input.get("level_index") is not None
+            or w_input.get("source_polygon")
+            or w_input.get("prism_id")
+            or w_input.get("level_id")
+            or w_input.get("storey_id")
+        ):
+            level_val = {
+                "level": w_input.get("level"),
+                "level_name": w_input.get("level_name") or w_input.get("level"),
+                "level_index": w_input.get("level_index"),
+                "source_polygon": w_input.get("source_polygon") or w_input.get("prism_id"),
+                "level_id": w_input.get("level_id") or w_input.get("storey_id"),
+            }
+        else:
+            level_val = w_input.get("level") or w_input.get("level_name") or w_input.get("level_id")
+
+        target_lvl, wall_lvl_slug = resolve_canonical_level(level_val, levels_map)
 
         wall_id = wall_ref if wall_ref.startswith("wall_") else f"wall_{wall_ref}"
         c_wall = CanonicalWall(
@@ -544,7 +582,6 @@ def planreader_to_canonical_model(
         # Process attached openings
         raw_openings = w_input.get("openings") or []
         wall_has_valid_b5_physical_opening = False
-        _, wall_lvl_slug = resolve_canonical_level(w_input.get("level") or w_input.get("level_name") or w_input.get("level_id"), levels_map)
 
         for op_idx, op_raw in enumerate(raw_openings):
             if not isinstance(op_raw, dict):
@@ -821,12 +858,26 @@ def planreader_to_canonical_model(
         cap_pitch = first_pitch
         cap_type = roof_type
 
-        # Section K & L: Objective Roof Z proof
+        # Section 11: Objective Roof Z proof & reproduction verification
         cap_z = _safe_float(cap.get("z"))
-        if not all_contributing_walls_confirmed:
+        reproduced_expected_z = max(
+            [_safe_float(w.get("height_m")) for w in raw_walls if isinstance(w, dict) and _safe_float(w.get("height_m")) is not None]
+        ) if (raw_walls and any(_safe_float(w.get("height_m")) is not None for w in raw_walls if isinstance(w, dict))) else None
+
+        cap_z_matches_reproduced = (
+            all_contributing_walls_confirmed and
+            cap_z is not None and
+            reproduced_expected_z is not None and
+            abs(cap_z - reproduced_expected_z) <= 0.05
+        )
+
+        if not (all_contributing_walls_confirmed and cap_z_matches_reproduced):
             c_roof_z = None
             roof_r_state = ReviewState.REVIEW_REQUIRED
-            z_msg = "Roof cap height Z rejected: one or more contributing wall heights are unconfirmed or defaulted"
+            if not all_contributing_walls_confirmed:
+                z_msg = "Roof cap height Z rejected: one or more contributing wall heights are unconfirmed or defaulted"
+            else:
+                z_msg = f"Roof cap Z rejected: cap_z ({cap_z}m) disagrees with reproduced expected wall top Z ({reproduced_expected_z}m)"
         else:
             c_roof_z = cap_z
             roof_r_state = ReviewState.CONFIRMED if roof_valid else ReviewState.REVIEW_REQUIRED
@@ -860,10 +911,61 @@ def planreader_to_canonical_model(
     return project, skipped_items
 
 
+def get_producer_versions() -> Dict[str, str]:
+    """SECTION 13: Derive consumed producer versions from real module VERSION constants."""
+    versions = {
+        "3d_engine": "v1.5.1",
+        "v127_mapper": "v127",
+        "v128_mapper": "v128",
+        "v135_levels": "v135",
+        "v139_walls": "v139",
+        "v140_roof": "v140",
+        "v175_openings": "v1.7.5",
+        "v178_elevation_bridge": "v1.7.8",
+        "v172_elevation_evidence": "v1.7.2",
+    }
+    try:
+        from pb_opening_production_v175 import VERSION as v175_v
+        versions["v175_openings"] = str(v175_v)
+    except Exception:
+        pass
+    try:
+        from pb_elevation_production_bridge_v178 import VERSION as v178_v
+        versions["v178_elevation_bridge"] = str(v178_v)
+    except Exception:
+        pass
+    try:
+        from pb_elevation_evidence_v172 import VERSION as v172_v
+        versions["v172_elevation_evidence"] = str(v172_v)
+    except Exception:
+        pass
+    try:
+        from pb_unified_building_v139 import VERSION as v139_v
+        versions["v139_walls"] = str(v139_v)
+    except Exception:
+        pass
+    try:
+        from pb_floor_mapper_v127 import VERSION as v127_v
+        versions["v127_mapper"] = str(v127_v)
+    except Exception:
+        pass
+    try:
+        from pb_floor_mapper_v128 import VERSION as v128_v
+        versions["v128_mapper"] = str(v128_v)
+    except Exception:
+        pass
+    try:
+        from pb_elevation_registration_v135 import VERSION as v135_v
+        versions["v135_levels"] = str(v135_v)
+    except Exception:
+        pass
+    return versions
+
+
 def collect_workspace_3d_evidence(app: Any, workspace_id: int) -> Dict[str, Any]:
     """
-    SECTION 18, 5F, 60, Q: Collects complete evidence snapshot v3 directly from production SQLite DB & producers.
-    Uses app.lquery() dictionary access and app.registered_wall_takeoff_rows_v139(reg_walls) signature.
+    SECTION 18, 5F, 60, Q, 1, 2: Collects complete evidence snapshot v3 directly from production SQLite DB & producers.
+    Reads persisted v175 page evidence settings (opening_evidence_v175_pages / opening_evidence_v175_page_<id>).
     """
     wid = require_workspace_id(workspace_id)
     snapshot: Dict[str, Any] = {
@@ -877,17 +979,7 @@ def collect_workspace_3d_evidence(app: Any, workspace_id: int) -> Dict[str, Any]
         "roof_data": None,
         "takeoff_rows": [],
         "diagnostics_log": [],
-        "producer_versions": {
-            "3d_engine": "v1.5.1",
-            "v127_mapper": "v127",
-            "v128_mapper": "v128",
-            "v135_levels": "v135",
-            "v139_walls": "v139",
-            "v140_roof": "v140",
-            "v175_openings": "v175",
-            "v178_elevation_bridge": "v178",
-            "v172_elevation_evidence": "v172",
-        }
+        "producer_versions": get_producer_versions()
     }
 
     if not (app and hasattr(app, "lquery")):
@@ -1011,46 +1103,72 @@ def collect_workspace_3d_evidence(app: Any, workspace_id: int) -> Dict[str, Any]
             snapshot["diagnostics_log"].append({"type": "v140_roof_error", "msg": str(e)})
         snapshot["roof_data"] = roof_snapshot
 
-        # 8. SECTION F & G: Collect live elevation evidence from B3 bridge (v178) or v172 producer
+        # 8. SECTION 1, 2, 14: Collect persisted v175 page evidence (elevation openings, diagnostics, provenance)
         try:
-            elev_bridge_res = None
-            if hasattr(app, "build_elevation_bridge_v178") and callable(app.build_elevation_bridge_v178):
-                reg_walls_v139 = app.build_registered_walls_v139(wid) if hasattr(app, "build_registered_walls_v139") else []
-                elev_bridge_res = app.build_elevation_bridge_v178(wid, reg_walls_v139)
-            elif hasattr(app, "elevation_bridge_v178") and callable(app.elevation_bridge_v178):
-                reg_walls_v139 = app.build_registered_walls_v139(wid) if hasattr(app, "build_registered_walls_v139") else []
-                elev_bridge_res = app.elevation_bridge_v178(wid, reg_walls_v139)
+            p5_pages_setting = app.workspace_setting(wid, "opening_evidence_v175_pages", "[]") if hasattr(app, "workspace_setting") else None
+            p5_page_ids = json.loads(str(p5_pages_setting or "[]")) if p5_pages_setting else []
+            if not isinstance(p5_page_ids, list):
+                p5_page_ids = []
 
-            if elev_bridge_res:
-                openings_cand = getattr(elev_bridge_res, "openings", None) or getattr(elev_bridge_res, "candidates", None) or []
-                if isinstance(openings_cand, list):
-                    for cand in openings_cand:
-                        if isinstance(cand, dict):
-                            snapshot["elevation_opening_candidates"].append(cand)
-                            snapshot["evidence_observations"].append({
-                                "candidate_id": str(cand.get("candidate_id") or cand.get("id") or "cand_live"),
-                                "kind": "elevation_opening_candidate",
-                                "workspace_id": str(wid),
-                                "document_id": str(cand.get("document_id")) if cand.get("document_id") is not None else None,
-                                "page_id": str(cand.get("page_id")) if cand.get("page_id") is not None else None,
-                                "page_no": int(cand["page_no"]) if cand.get("page_no") is not None else None,
-                                "drawing_reference": str(cand.get("drawing_no") or cand.get("drawing_id")) if (cand.get("drawing_no") or cand.get("drawing_id")) else None,
-                                "side": str(cand.get("side") or cand.get("facade")) if (cand.get("side") or cand.get("facade")) else None,
-                                "level_name": str(cand.get("level") or cand.get("level_name")) if (cand.get("level") or cand.get("level_name")) else None,
-                                "wall_ref": str(cand.get("wall_ref")) if cand.get("wall_ref") is not None else None,
-                                "source_coords": cand.get("source_coords") or cand.get("bbox"),
-                                "coordinate_space": str(cand.get("coordinate_space")) if cand.get("coordinate_space") is not None else None,
-                                "width_m": _safe_float(cand.get("width_m")),
-                                "height_m": _safe_float(cand.get("height_m")),
-                                "producer": str(cand.get("producer") or "pb_elevation_production_bridge_v178"),
-                                "producer_version": str(cand.get("producer_version") or "v178"),
-                                "confidence": _safe_float(cand.get("confidence")),
-                                "dimension_basis": str(cand.get("dimension_basis", "unknown")),
-                                "deduction_authority": False,
-                                "no_instance_creation": True,
-                            })
+            for p_id in p5_page_ids:
+                try:
+                    p_id_int = int(p_id)
+                except (ValueError, TypeError):
+                    continue
+
+                matching_page = next((p for p in valid_pages if p.get("id") == p_id_int), None)
+                if not matching_page:
+                    continue
+
+                page_setting = app.workspace_setting(wid, f"opening_evidence_v175_page_{p_id_int}", "{}")
+                p5_data = json.loads(str(page_setting or "{}")) if page_setting else {}
+                if not isinstance(p5_data, dict):
+                    continue
+
+                elev_ops = p5_data.get("elevation_openings") or []
+                elev_provs = p5_data.get("elevation_provenance") or []
+                elev_diags = p5_data.get("elevation_diagnostics") or []
+
+                for idx, item in enumerate(elev_ops):
+                    if isinstance(item, dict):
+                        snapshot["elevation_opening_candidates"].append(item)
+                        
+                        prov = elev_provs[idx] if (isinstance(elev_provs, list) and idx < len(elev_provs) and isinstance(elev_provs[idx], dict)) else {}
+                        diag = elev_diags[idx] if (isinstance(elev_diags, list) and idx < len(elev_diags) and isinstance(elev_diags[idx], dict)) else {}
+
+                        obs_id = str(item.get("id") or item.get("candidate_id") or f"obs_v175_p{p_id_int}_{idx+1}")
+                        dwg_ref = str(prov.get("drawing_ref") or prov.get("drawing_id") or item.get("drawing_reference") or "") or None
+                        dwg_title = str(prov.get("drawing_title") or item.get("drawing_title") or "") or None
+
+                        snapshot["evidence_observations"].append({
+                            "candidate_id": obs_id,
+                            "kind": "elevation_opening_candidate",
+                            "workspace_id": str(wid),
+                            "document_id": str(matching_page.get("document_id")) if matching_page.get("document_id") is not None else None,
+                            "page_id": str(p_id_int),
+                            "page_no": matching_page.get("page_no"),
+                            "source_filename": str(prov.get("source_filename") or prov.get("source_pdf") or ""),
+                            "source_page": prov.get("source_page") or matching_page.get("page_no"),
+                            "drawing_reference": dwg_ref,
+                            "drawing_title": dwg_title,
+                            "side": str(prov.get("elevation_side") or item.get("side") or item.get("facade") or "") or None,
+                            "level_name": str(prov.get("level") or item.get("level") or "") or None,
+                            "wall_ref": str(prov.get("wall_ref") or item.get("wall_ref") or "") or None,
+                            "source_coords": prov.get("source_coords") or item.get("source_coords") or item.get("bbox"),
+                            "coordinate_space": str(prov.get("coordinate_space") or item.get("coordinate_space") or "") or None,
+                            "calibration": prov.get("calibration") or item.get("calibration"),
+                            "width_m": _safe_float(item.get("width_m")),
+                            "height_m": _safe_float(item.get("height_m")),
+                            "accepted_state": bool(item.get("accepted", False)),
+                            "rejected_state": not bool(item.get("accepted", False)),
+                            "reason": str(item.get("reason") or diag.get("note") or "v1.7.5/v1.7.8 elevation evidence candidate"),
+                            "producer": "pb_opening_production_v175",
+                            "producer_version": snapshot["producer_versions"].get("v175_openings", "v1.7.5"),
+                            "deduction_authority": False,
+                            "no_instance_creation": True,
+                        })
         except Exception as e:
-            snapshot["diagnostics_log"].append({"type": "v178_bridge_error", "msg": str(e)})
+            snapshot["diagnostics_log"].append({"type": "v175_persisted_evidence_error", "msg": str(e)})
 
     except Exception as e:
         snapshot["diagnostics_log"].append({"type": "evidence_collection_error", "msg": str(e)})
