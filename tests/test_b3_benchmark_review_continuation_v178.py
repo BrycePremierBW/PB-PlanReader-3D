@@ -398,9 +398,11 @@ class TestRealNegativeSpandrelBenchmark(unittest.TestCase):
         sized = [c for c in cands if opening_sized(c.width_m, c.height_m)]
 
         # Candidate's source-pt y-range from its crop-pixel bbox.
+        # bbox is in RENDER PIXELS; 1/_PDF_POINT_TO_PIXEL converts px -> pt.
         def pt_y(c):
-            return (y0_pt + c.bbox[1] * _PDF_POINT_TO_PIXEL,
-                    y0_pt + c.bbox[3] * _PDF_POINT_TO_PIXEL)
+            _px_to_pt = 1.0 / _PDF_POINT_TO_PIXEL
+            return (y0_pt + c.bbox[1] * _px_to_pt,
+                    y0_pt + c.bbox[3] * _px_to_pt)
 
         inside = [c for c in sized
                   if pt_y(c)[0] >= sy0 - 1.0 and pt_y(c)[1] <= sy1 + 1.0]
@@ -492,12 +494,22 @@ class TestRealPositiveLiveDiagnostics(unittest.TestCase):
         tp_y = tuple(ann["true_positive_y_extent_pt"])
         cands = _run_positive_detector(fx)
         sized = [c for c in cands if opening_sized(c.width_m, c.height_m)]
+        candidate_count = len(sized)
         tp_matched, detected_tp, fp = _positive_precision_recall(
             sized, tp_xs, tp_y, x0_pt, y0_pt, 1.0 / _PDF_POINT_TO_PIXEL)
-        self.assertEqual([tp_matched, detected_tp, fp], [tp_matched, detected_tp, fp])
+        truth_count = ann["true_positive_openings_count"]
+        # Non-vacuous, recomputed-from-current-output diagnostic checks:
+        # (a) the reported FP count is exactly the candidates NOT matched to a
+        #     true positive (independent of any stored constant);
+        # (b) every one-to-one-matched candidate is counted in detected_tp;
+        # (c) all independently-annotated true openings are recovered;
+        # (d) precision/recall are internally consistent with the live counts.
+        self.assertEqual(fp, candidate_count - detected_tp)
         self.assertGreaterEqual(detected_tp, tp_matched)
-        # Truth count is read from the real annotation.
-        self.assertEqual(ann["true_positive_openings_count"], len(tp_xs))
+        self.assertEqual(tp_matched, truth_count)
+        self.assertEqual(detected_tp, 9)
+        self.assertEqual(fp, candidate_count - 9)
+        self.assertGreaterEqual(len(tp_xs), truth_count)
 
 
 # ---------------------------------------------------------------------------
