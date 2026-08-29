@@ -1,17 +1,13 @@
 """
-PlanReader 3D Foundation Streamlit Web Application.
+PlanReader 3D Development & Inspection Harness (Untrusted Mode).
 
-Provides a live interactive WebGL 3D BIM Viewer interface supporting both
-real production project payloads (via pb_production_3d_adapter) and the synthetic
+Provides a standalone development inspection interface supporting both
+untrusted production JSON uploads (via pb_production_3d_adapter) and the synthetic
 demonstration fixture (for visual testing).
 
-Features:
-- Real PlanReader Production Project Upload & Workspace Processing
-- Empty State Handling ("No production project loaded")
-- Fail-Closed Synthetic Demo Fixture Warning Badge
-- Interactive WebGL 3D BIM Viewer (Three.js)
-- End-to-End Drawing Provenance & Evidence Trace Panels
-- Level Extents & Deductions Diagnostic Breakdown
+SAFETY GUARANTEE:
+Uploaded JSON in this harness is permanently UNTRUSTED (is_validated_internal_workspace=False).
+It CANNOT grant deduction_authority or takeoff_eligible.
 """
 
 import json
@@ -24,18 +20,19 @@ from pb_bim_viewer import project_to_viewer_payload, generate_bim_viewer_html
 from pb_geometry_services import model_bounds
 
 st.set_page_config(
-    page_title="PlanReader 3D BIM Viewer",
+    page_title="PlanReader 3D Inspection Harness",
     page_icon="🏗️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.sidebar.title("PlanReader 3D Controls")
+st.title("PlanReader 3D Development & Inspection Harness (Untrusted Mode)")
+st.sidebar.title("Inspection Harness Controls")
 st.sidebar.markdown("---")
 
 data_source = st.sidebar.radio(
     "Data Source Selection",
-    ["Real Production Project (Upload / Payload)", "Synthetic Demo Fixture (Testing Only)"],
+    ["Untrusted Production JSON Upload", "Synthetic Demo Fixture (Testing Only)"],
     index=0,
 )
 
@@ -45,32 +42,30 @@ if data_source == "Synthetic Demo Fixture (Testing Only)":
     current_project = get_synthetic_viewer_demo_model()
     st.sidebar.info("Using Synthetic Viewer Demo Fixture. Takeoff eligibility is disabled.")
 else:
-    st.sidebar.subheader("Production Project Upload")
+    st.sidebar.subheader("Production JSON Upload")
     uploaded_file = st.sidebar.file_uploader("Upload PlanReader Production JSON Output", type=["json"])
     
     if uploaded_file is not None:
         try:
             prod_payload = json.load(uploaded_file)
-            current_project = planreader_to_canonical_model(prod_payload, trusted_source=False)
-            st.sidebar.success(f"Loaded Production Project: {current_project.name}")
+            # SECTION M: Unpack (project, skipped_items) and enforce is_validated_internal_workspace=False
+            current_project, skipped = planreader_to_canonical_model(prod_payload, is_validated_internal_workspace=False)
+            st.sidebar.success(f"Loaded Untrusted Project: {current_project.name}")
         except Exception as e:
             st.sidebar.error(f"Error parsing production JSON: {e}")
 
-# SECTION I: Remove fake production examples!
 if current_project is None:
-    st.title("PlanReader 3D BIM Viewer")
     st.info("ℹ️ No production project loaded.")
     st.markdown("""
-    ### Getting Started
-    - **To view a real project**: Upload an authoritative PlanReader JSON production payload using the file uploader in the sidebar, or select an active workspace.
+    ### Development Harness Notice
+    - **To inspect a production JSON file**: Upload a JSON file in the sidebar. Note: Uploaded JSON is treated as **Untrusted** and cannot grant deduction authority.
     - **For visual interface testing**: Switch to **Synthetic Demo Fixture (Testing Only)** in the sidebar mode selector.
     """)
 else:
-    # Banner Warning: Synthetic Demo Fixture Warning
     if current_project.is_synthetic_demo:
         st.warning("⚠️ SYNTHETIC VIEWER DEMONSTRATION FIXTURE — NOT BENCHMARK TRUTH / NOT TAKEOFF AUTHORITATIVE")
 
-    st.title(f"3D Model: {current_project.name}")
+    st.subheader(f"3D Model: {current_project.name}")
 
     bounds_ok, bounds = model_bounds(current_project)
     if bounds_ok and bounds is not None:

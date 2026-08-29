@@ -3,14 +3,15 @@ PlanReader 3D Canonical Model Reconciliation & Diagnostics Module.
 
 Generates production diagnostic reports summarizing canonical model completeness,
 level resolution, opening host attachment, provenance coverage, deduction authority,
-stale model detection, and per-wall quantity reconciliation against PlanReader takeoff rows.
+stale model detection, estimator QA summary, and per-wall quantity reconciliation.
 
 SAFETY GUARANTEES:
 1. Does NOT alter tender/takeoff quantity authority (read-only diagnostic).
-2. Performs PER-WALL quantity reconciliation using strong wall_ref identity only.
-3. Filters production takeoff units strictly to m². Excludes lm, No., item, L, allowances.
-4. If strong identity is missing, status = 'unresolved' (no misleading whole-table variances).
-5. Reports explicit skip diagnostics for elements without registered physical producers.
+2. Provides concise Estimator QA Summary panel for non-technical users.
+3. Performs PER-WALL quantity reconciliation using strong wall_ref identity only.
+4. Filters production takeoff units strictly to m². Excludes lm, No., item, L, allowances.
+5. If strong identity is missing, status = 'unresolved' (no misleading whole-table variances).
+6. Reports explicit skip diagnostics for elements without registered physical producers.
 """
 
 from typing import Dict, Any, List, Optional
@@ -24,16 +25,24 @@ def generate_production_diagnostics_report(
     skipped_items: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
     """
-    Generates a production diagnostic report for a CanonicalProject instance.
+    Generates a production diagnostic report and Estimator QA summary for a CanonicalProject instance.
     """
     skipped_items = skipped_items or []
     
     total_walls = 0
+    physical_walls_rendered = 0
+    baseline_only_walls = 0
+    walls_missing_heights = 0
+
     total_openings = 0
+    physical_openings = 0
+    evidence_only_openings = 0
+
     total_floors = 0
-    total_ceilings = 0
+    calibrated_floors = 0
+
     total_roofs = 0
-    total_other = 0
+    roof_geometry_rendered = 0
 
     confirmed_count = 0
     inferred_count = 0
@@ -41,9 +50,10 @@ def generate_production_diagnostics_report(
 
     takeoff_eligible_count = 0
     authorized_deduction_count = 0
+    rejected_deduction_claims = 0
 
+    known_levels_count = 0
     unresolved_levels_count = 0
-    unresolved_heights_count = 0
     missing_provenance_count = 0
 
     per_wall_reconciliation: List[Dict[str, Any]] = []
@@ -51,12 +61,12 @@ def generate_production_diagnostics_report(
     # Map production takeoff rows by strong identity (wall_ref / id)
     takeoff_rows_by_ref: Dict[str, Dict[str, Any]] = {}
     if workspace_data and isinstance(workspace_data, dict):
-        raw_rows = workspace_data.get("takeoff_rows") or workspace_data.get("walls") or []
+        raw_rows = workspace_data.get("takeoff_rows") or []
         for r in raw_rows:
             if isinstance(r, dict):
                 ref = str(r.get("wall_ref") or r.get("id") or "")
                 unit = str(r.get("unit") or "m2").lower().strip()
-                # SECTION 9: Filter units strictly to m²! Exclude lm, No., item, L, allowances
+                # SECTION 9 & N: Filter units strictly to m²!
                 if ref and unit in ("m2", "m²", "sqm", "sq m"):
                     takeoff_rows_by_ref[ref] = r
 
@@ -64,11 +74,17 @@ def generate_production_diagnostics_report(
         for lvl in bld.levels:
             if lvl.elevation_m is None:
                 unresolved_levels_count += 1
-            if lvl.height_m is None:
-                unresolved_heights_count += 1
+            else:
+                known_levels_count += 1
 
             for w in lvl.walls:
                 total_walls += 1
+                if w.height_m is not None and w.height_m > 0:
+                    physical_walls_rendered += 1
+                else:
+                    baseline_only_walls += 1
+                    walls_missing_heights += 1
+
                 if w.review_state == ReviewState.CONFIRMED:
                     confirmed_count += 1
                 elif w.review_state == ReviewState.INFERRED:
@@ -91,7 +107,7 @@ def generate_production_diagnostics_report(
                 c_ded = p_net["authorized_opening_deduction_area_m2"]
                 c_net = p_net["authorized_net_area_m2"]
 
-                # SECTION 9: Per-Wall Reconciliation using strong identity
+                # SECTION 9 & N: Per-Wall Reconciliation using strong identity
                 ref_key = str(prov.wall_ref or w.id)
                 matched_row = takeoff_rows_by_ref.get(ref_key)
 
@@ -137,50 +153,68 @@ def generate_production_diagnostics_report(
 
                 for op in w.openings:
                     total_openings += 1
-                    if op.review_state == ReviewState.CONFIRMED:
-                        confirmed_count += 1
-                    elif op.review_state == ReviewState.INFERRED:
-                        inferred_count += 1
+                    if op.offset_along_wall_m is not None and op.width_m is not None and op.height_m is not None:
+                        physical_openings += 1
                     else:
-                        review_required_count += 1
+                        evidence_only_openings += 1
 
                     if parse_strict_bool(op.deduction_authority):
                         authorized_deduction_count += 1
+                    else:
+                        rejected_deduction_claims += 1
 
             for f in lvl.floors:
                 total_floors += 1
-            for c in lvl.ceilings:
-                total_ceilings += 1
+                if len(f.polygon) >= 3:
+                    calibrated_floors += 1
+
             for r in lvl.roofs:
                 total_roofs += 1
+                if len(r.polygon) >= 3:
+                    roof_geometry_rendered += 1
 
-    total_canonical_objects = total_walls + total_openings + total_floors + total_ceilings + total_roofs + total_other
+    total_canonical_objects = total_walls + total_openings + total_floors + total_roofs
+
+    # SECTION O: Estimator QA Summary Breakdown
+    estimator_qa_summary = {
+        "physical_walls_rendered": physical_walls_rendered,
+        "baseline_only_walls": baseline_only_walls,
+        "walls_missing_heights": walls_missing_heights,
+        "known_levels": known_levels_count,
+        "unresolved_levels": unresolved_levels_count,
+        "calibrated_floors": calibrated_floors,
+        "manual_floor_allowances": len([s for s in skipped_items if "manual_m2_allowance" in str(s.get("reason", ""))]),
+        "physical_openings": physical_openings,
+        "evidence_only_openings": evidence_only_openings,
+        "authorised_b5_deductions": authorized_deduction_count,
+        "rejected_deduction_claims": rejected_deduction_claims,
+        "roof_geometry_rendered": roof_geometry_rendered,
+        "provenance_gaps": missing_provenance_count,
+        "matched_reconciliations": len([r for r in per_wall_reconciliation if r["reconciliation_status"] == "matched"]),
+        "unresolved_reconciliations": len([r for r in per_wall_reconciliation if r["reconciliation_status"] == "unresolved"]),
+        "variances_detected": len([r for r in per_wall_reconciliation if r["reconciliation_status"] == "variance_detected"]),
+    }
 
     return {
         "project_id": project.id,
         "project_name": project.name,
         "is_synthetic_demo": project.is_synthetic_demo,
         "total_canonical_objects": total_canonical_objects,
+        "estimator_qa_summary": estimator_qa_summary,
         "object_breakdown": {
             "walls": total_walls,
             "openings": total_openings,
             "floors": total_floors,
-            "ceilings": total_ceilings,
             "roofs": total_roofs,
-            "other": total_other,
         },
         "review_state_summary": {
             "confirmed": confirmed_count,
             "inferred": inferred_count,
             "review_required": review_required_count,
         },
-        "authority_summary": {
-            "takeoff_eligible_elements": takeoff_eligible_count,
-            "authorized_deduction_elements": authorized_deduction_count,
-        },
         "integrity_checks": {
             "unresolved_levels": unresolved_levels_count,
-            "unresolved_heights": unresolved_heights_count,
+            "unresolved_heights": walls_missing_heights,
             "missing_provenance": missing_provenance_count,
             "skipped_items_count": len(skipped_items),
             "skipped_items": skipped_items,
