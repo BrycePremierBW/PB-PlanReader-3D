@@ -1,0 +1,238 @@
+{
+  "fixture_version": 3,
+  "geometry": {
+    "segments": [
+      {
+        "drawing_index": 1,
+        "x1": 0.0,
+        "x2": 1200.0,
+        "y1": 100.0,
+        "y2": 100.0
+      },
+      {
+        "drawing_index": 2,
+        "x1": 280.0,
+        "x2": 280.0,
+        "y1": 85.0,
+        "y2": 115.0
+      },
+      {
+        "drawing_index": 3,
+        "x1": 320.0,
+        "x2": 320.0,
+        "y1": 85.0,
+        "y2": 115.0
+      },
+      {
+        "drawing_index": 4,
+        "x1": 580.0,
+        "x2": 580.0,
+        "y1": 85.0,
+        "y2": 115.0
+      },
+      {
+        "drawing_index": 5,
+        "x1": 620.0,
+        "x2": 620.0,
+        "y1": 85.0,
+        "y2": 115.0
+      },
+      {
+        "drawing_index": 6,
+        "x1": 880.0,
+        "x2": 880.0,
+        "y1": 85.0,
+        "y2": 115.0
+      },
+      {
+        "drawing_index": 7,
+        "x1": 920.0,
+        "x2": 920.0,
+        "y1": 85.0,
+        "y2": 115.0
+      },
+      {
+        "drawing_index": 8,
+        "x1": 0.0,
+        "x2": 800.0,
+        "y1": 400.0,
+        "y2": 400.0
+      },
+      {
+        "drawing_index": 9,
+        "x1": 140.0,
+        "x2": 140.0,
+        "y1": 385.0,
+        "y2": 415.0
+      },
+      {
+        "drawing_index": 10,
+        "x1": 160.0,
+        "x2": 160.0,
+        "y1": 385.0,
+        "y2": 415.0
+      },
+      {
+        "drawing_index": 11,
+        "x1": 190.0,
+        "x2": 190.0,
+        "y1": 385.0,
+        "y2": 415.0
+      },
+      {
+        "drawing_index": 12,
+        "x1": 210.0,
+        "x2": 210.0,
+        "y1": 385.0,
+        "y2": 415.0
+      },
+      {
+        "drawing_index": 13,
+        "x1": 240.0,
+        "x2": 240.0,
+        "y1": 385.0,
+        "y2": 415.0
+      },
+      {
+        "drawing_index": 14,
+        "x1": 260.0,
+        "x2": 260.0,
+        "y1": 385.0,
+        "y2": 415.0
+      },
+      {
+        "drawing_index": 15,
+        "x1": 290.0,
+        "x2": 290.0,
+        "y1": 385.0,
+        "y2": 415.0
+      },
+      {
+        "drawing_index": 16,
+        "x1": 310.0,
+        "x2": 310.0,
+        "y1": 385.0,
+        "y2": 415.0
+      },
+      {
+        "drawing_index": 17,
+        "x1": 340.0,
+        "x2": 340.0,
+        "y1": 385.0,
+        "y2": 415.0
+      },
+      {
+        "drawing_index": 18,
+        "x1": 360.0,
+        "x2": 360.0,
+        "y1": 385.0,
+        "y2": 415.0
+      }
+    ],
+    "wall_lines": [
+      {
+        "wall_ref": "W-MW1",
+        "x1": 0.0,
+        "x2": 1200.0,
+        "y1": 100.0,
+        "y2": 100.0
+      },
+      {
+        "wall_ref": "W-MW2",
+        "x1": 0.0,
+        "x2": 800.0,
+        "y1": 400.0,
+        "y2": 400.0
+      }
+    ],
+    "words": [
+      {
+        "page_no": 2,
+        "text": "W01",
+        "x0": 290.0,
+        "x1": 310.0,
+        "y0": 60.0,
+        "y1": 70.0
+      },
+      {
+        "page_no": 2,
+        "text": "W02",
+        "x0": 590.0,
+        "x1": 610.0,
+        "y0": 60.0,
+        "y1": 70.0
+      },
+      {
+        "page_no": 2,
+        "text": "W03",
+        "x0": 890.0,
+        "x1": 910.0,
+        "y0": 60.0,
+        "y1": 70.0
+      }
+    ]
+  },
+  "source": {
+    "drawing_ref": "BMK/MW/02",
+    "drawing_title": "Multi-Window Wall Plan",
+    "extraction": "deterministic synthetic geometry (50 pt/m)",
+    "generation": "benchmark_fixtures.py",
+    "pdf": "synthetic-benchmark-plans.pdf",
+    "pdf_page_0based": 1,
+    "pdf_page_1based": 2,
+    "scale_a1": "1:100",
+    "scale_pt_per_m": 50.0
+  },
+  "truth": {
+    "authority": "committed independent plan truth (synthesised); detector output never defines truth",
+    "deduct_must_be_false": true,
+    "dimension_basis": "unknown",
+    "doors": [],
+    "expected_candidate_counts": {
+      "door": 0,
+      "gap": 0,
+      "window": 3
+    },
+    "gaps": [],
+    "rejected_regions": [
+      {
+        "description": "hatch-like batten repetition \u2014 must be conservatively rejected, never a false positive",
+        "expected_candidates": 0,
+        "wall_ref": "W-MW2"
+      }
+    ],
+    "safety_note": "Three independently-tagged windows must each resolve without tie-ambiguity; the batten region must never produce an opening or a deduction.",
+    "windows": [
+      {
+        "height_m": null,
+        "mark": "W01",
+        "opening_type": "window",
+        "position_along_wall_m": 6.0,
+        "wall_ref": "W-MW1",
+        "width_m": 0.8
+      },
+      {
+        "height_m": null,
+        "mark": "W02",
+        "opening_type": "window",
+        "position_along_wall_m": 12.0,
+        "wall_ref": "W-MW1",
+        "width_m": 0.8
+      },
+      {
+        "height_m": null,
+        "mark": "W03",
+        "opening_type": "window",
+        "position_along_wall_m": 18.0,
+        "wall_ref": "W-MW1",
+        "width_m": 0.8
+      }
+    ]
+  },
+  "workspace": {
+    "id": "bench_multi_window_wall",
+    "page_no": 2,
+    "scale_pt_per_m": 50.0,
+    "title": "Benchmark Multi-Window Wall + Hatch Rejection"
+  }
+}
