@@ -8,7 +8,7 @@ containing external walls, internal walls, doors, windows, balconies, soffits,
 parapets, columns, roofs, and varied substrate/finish assignments across
 CONFIRMED, INFERRED, and REVIEW_REQUIRED review states.
 
-FOR ARCHITECTURE AND RENDERING TESTING ONLY. NOT PDF EXTRACTION TRUTH.
+FOR ARCHITECTURE AND RENDERING TESTING ONLY. NOT TAKEOFF AUTHORITATIVE.
 """
 
 from pb_canonical_building import (
@@ -35,7 +35,7 @@ from pb_canonical_building import (
 
 def get_synthetic_viewer_demo_model() -> CanonicalProject:
     """
-    Constructs a rich synthetic 3-level building model fixture for testing
+    Constructs a synthetic 3-level building model fixture for testing
     rendering fidelity, level isolation, object selection, and evidence panels.
 
     Fixture Identifier: SYNTHETIC VIEWER DEMONSTRATION — NOT BENCHMARK TRUTH
@@ -46,7 +46,8 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
         is_synthetic_demo=True,
         confidence=1.0,
         review_state=ReviewState.CONFIRMED,
-        takeoff_eligible=True,
+        takeoff_eligible=False,      # Demo fixture is NOT takeoff authoritative
+        deduction_authority=False,   # Demo fixture is NOT takeoff authoritative
         metadata={
             "disclaimer": "SYNTHETIC VIEWER DEMONSTRATION — NOT BENCHMARK TRUTH",
             "purpose": "Architecture & 3D Viewer Verification Only",
@@ -81,8 +82,6 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
         ),
     )
 
-    # Level 0 Outer Footprint (L-Shaped 12m x 8m with inset)
-    # External Walls: Plaster/Rendered Brickwork, CONFIRMED
     prov_lvl0_ext = Provenance(source_pdf="Architectural_Set_RevB.pdf", page_number=3, drawing_id="A101")
     
     wall_g1 = CanonicalWall(
@@ -100,7 +99,6 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
         review_state=ReviewState.CONFIRMED,
         provenance=prov_lvl0_ext,
     )
-    # Add Entrance Door D01 and Window W01 to South Wall
     d01 = CanonicalOpening(
         id="door_d01",
         name="Main Entry Door (D01)",
@@ -221,7 +219,6 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
         provenance=prov_lvl0_ext,
     )
 
-    # Internal Walls Level 0 (Plasterboard Partition, CONFIRMED)
     wall_g_int1 = CanonicalWall(
         id="wall_g_int_hall",
         name="Ground Entry Hallway Spine Wall",
@@ -256,7 +253,6 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
     )
     wall_g_int1.openings = [d03]
 
-    # Ground Floor Slab & Spaces
     floor_g = CanonicalFloor(
         id="floor_g0",
         name="Ground Concrete Floor Slab",
@@ -284,21 +280,6 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
         review_state=ReviewState.CONFIRMED,
     )
 
-    space_entry = CanonicalSpace(
-        id="space_entry_g",
-        name="Ground Entrance & Foyer",
-        level_id=lvl0.id,
-        room_number="G02",
-        boundary_polygon=[Vector2D(0, 0), Vector2D(4.5, 0), Vector2D(4.5, 5.5), Vector2D(0, 5.5)],
-        height_m=2.7,
-        specified_floor_area_m2=24.75,
-        substrate="Tiles on Screed",
-        finish="Porcelain Tile Finish",
-        confidence=0.95,
-        review_state=ReviewState.CONFIRMED,
-    )
-
-    # Porch Entrance Column
     col_porch = CanonicalColumn(
         id="col_porch_01",
         name="Front Porch Feature Pillar",
@@ -315,12 +296,11 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
 
     lvl0.walls = [wall_g1, wall_g2, wall_g3, wall_g4, wall_g_int1]
     lvl0.floors = [floor_g]
-    lvl0.spaces = [space_living, space_entry]
+    lvl0.spaces = [space_living]
     lvl0.columns = [col_porch]
 
     # ----------------------------------------------------
     # LEVEL 1: FIRST FLOOR (FFL 3.0m, height 2.8m)
-    # Includes Balcony, Balcony Soffit, Balustrade, INFERRED features
     # ----------------------------------------------------
     lvl1 = CanonicalLevel(
         id="lvl_1",
@@ -438,7 +418,6 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
         provenance=prov_lvl1,
     )
 
-    # Level 1 Floor Slab
     floor_l1 = CanonicalFloor(
         id="floor_l1_slab",
         name="Level 1 Timber Floor Joist Structure",
@@ -451,7 +430,6 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
         review_state=ReviewState.INFERRED,
     )
 
-    # Level 1 Balcony extending over front entrance (Overhang: 0.0 -> 4.5m x, -1.8 -> 0.0m y)
     balcony_l1 = CanonicalBalcony(
         id="balcony_l1_front",
         name="Master Bedroom Cantilevered Balcony",
@@ -466,7 +444,6 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
         provenance=prov_lvl1,
     )
 
-    # Balcony Soffit underneath Level 1 balcony
     soffit_balcony = CanonicalSoffit(
         id="soffit_l1_balcony",
         name="Level 1 Balcony Underside Exterior Soffit",
@@ -482,7 +459,6 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
         provenance=prov_lvl1,
     )
 
-    # Balustrade around Balcony (3 sides)
     balustrade_front = CanonicalBalustrade(
         id="balustrade_b1",
         name="Front Balcony Toughened Glass Balustrade",
@@ -521,7 +497,6 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
 
     # ----------------------------------------------------
     # LEVEL 2: ROOF LEVEL & PARAPET (FFL 5.8m, height 1.2m)
-    # Includes REVIEW_REQUIRED unproven geometry
     # ----------------------------------------------------
     lvl2 = CanonicalLevel(
         id="lvl_roof",
@@ -547,7 +522,6 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
         contributing_evidence=["Elevation section height unverified; required manual review"],
     )
 
-    # Perimeter Parapet Wall (REVIEW_REQUIRED)
     parapet_south = CanonicalParapet(
         id="parapet_south_roof",
         name="Roof Perimeter Parapet Wall - South",
@@ -563,22 +537,6 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
         provenance=prov_lvl2_rev,
     )
 
-    parapet_north = CanonicalParapet(
-        id="parapet_north_roof",
-        name="Roof Perimeter Parapet Wall - North",
-        level_id=lvl2.id,
-        start_point=Vector2D(12.0, 8.0),
-        end_point=Vector2D(0.0, 8.0),
-        height_m=1.1,
-        thickness_m=0.20,
-        substrate="Rendered Masonry Capped",
-        finish="Taubmans Weatherbeater Acrylic - Monument",
-        confidence=0.45,
-        review_state=ReviewState.REVIEW_REQUIRED,
-        provenance=prov_lvl2_rev,
-    )
-
-    # Main Roof Slab / Form
     roof_main = CanonicalRoof(
         id="roof_main_envelope",
         name="Main Metal Deck Low Pitch Roof Envelope",
@@ -595,10 +553,9 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
         provenance=prov_lvl2_rev,
     )
 
-    lvl2.parapets = [parapet_south, parapet_north]
+    lvl2.parapets = [parapet_south]
     lvl2.roofs = [roof_main]
 
-    # Build Project Structure
     building.levels = [lvl0, lvl1, lvl2]
     project.buildings = [building]
 

@@ -8,6 +8,7 @@ IMPORTANT GUARANTEES:
 2. Does NOT create a duplicate PDF measurement/extraction engine.
 3. Does NOT automatically grant deduction authority for calculated net wall areas.
 4. Separates authorized vs unauthorized opening deduction areas cleanly (no blanket authorization).
+5. Detects overlapping/duplicate openings and invalid/unresolved geometry to fail-closed on deduction authority.
 """
 
 import math
@@ -29,6 +30,8 @@ from pb_canonical_building import (
 
 
 def _is_valid_float(val: Any) -> bool:
+    if val is None:
+        return False
     try:
         f = float(val)
         return not (math.isnan(f) or math.isinf(f))
@@ -38,13 +41,13 @@ def _is_valid_float(val: Any) -> bool:
 
 def validate_wall_geometry(wall: CanonicalWall) -> Tuple[bool, str]:
     """Validates wall baseline, height, and thickness parameters."""
-    if not (_is_valid_float(wall.start_point.x) and _is_valid_float(wall.start_point.y)):
-        return False, "Invalid wall start_point coordinates"
-    if not (_is_valid_float(wall.end_point.x) and _is_valid_float(wall.end_point.y)):
-        return False, "Invalid wall end_point coordinates"
+    if not (wall.start_point and wall.start_point.is_valid()):
+        return False, "Invalid or missing wall start_point coordinates"
+    if not (wall.end_point and wall.end_point.is_valid()):
+        return False, "Invalid or missing wall end_point coordinates"
     if not _is_valid_float(wall.height_m) or wall.height_m <= 1e-4:
-        return False, f"Invalid or non-positive wall height_m: {wall.height_m}"
-    if not _is_valid_float(wall.thickness_m) or wall.thickness_m < 0.0:
+        return False, f"Invalid or missing wall height_m: {wall.height_m}"
+    if wall.thickness_m is not None and (not _is_valid_float(wall.thickness_m) or wall.thickness_m < 0.0):
         return False, f"Invalid wall thickness_m: {wall.thickness_m}"
 
     w_len = wall_length(wall)
@@ -56,14 +59,14 @@ def validate_wall_geometry(wall: CanonicalWall) -> Tuple[bool, str]:
 
 def validate_opening_geometry(opening: CanonicalOpening, wall: Optional[CanonicalWall] = None) -> Tuple[bool, str]:
     """Validates opening dimensions, sill height, offset, and wall bounds."""
-    if not _is_valid_float(opening.width_m) or opening.width_m < 0.0:
-        return False, f"Invalid opening width_m: {opening.width_m}"
-    if not _is_valid_float(opening.height_m) or opening.height_m < 0.0:
-        return False, f"Invalid opening height_m: {opening.height_m}"
+    if not _is_valid_float(opening.width_m) or opening.width_m <= 0.0:
+        return False, f"Invalid or missing opening width_m: {opening.width_m}"
+    if not _is_valid_float(opening.height_m) or opening.height_m <= 0.0:
+        return False, f"Invalid or missing opening height_m: {opening.height_m}"
     if not _is_valid_float(opening.offset_along_wall_m) or opening.offset_along_wall_m < 0.0:
-        return False, f"Invalid opening offset_along_wall_m: {opening.offset_along_wall_m}"
+        return False, f"Invalid or missing opening offset_along_wall_m: {opening.offset_along_wall_m}"
     if not _is_valid_float(opening.sill_height_m) or opening.sill_height_m < 0.0:
-        return False, f"Invalid opening sill_height_m: {opening.sill_height_m}"
+        return False, f"Invalid or missing opening sill_height_m: {opening.sill_height_m}"
 
     if wall is not None:
         valid_w, msg_w = validate_wall_geometry(wall)
@@ -74,16 +77,48 @@ def validate_opening_geometry(opening: CanonicalOpening, wall: Optional[Canonica
         if opening.offset_along_wall_m + opening.width_m > w_len + 1e-3:
             return False, f"Opening width ({opening.width_m}m at offset {opening.offset_along_wall_m}m) exceeds wall length ({w_len:.2f}m)"
 
-        if opening.sill_height_m + opening.height_m > wall.height_m + 1e-3:
+        if wall.height_m is not None and opening.sill_height_m + opening.height_m > wall.height_m + 1e-3:
             return False, f"Opening top ({opening.sill_height_m + opening.height_m}m) exceeds wall height ({wall.height_m:.2f}m)"
 
     return True, "Valid Opening Geometry"
 
 
+def detect_opening_overlaps(openings: List[CanonicalOpening]) -> Tuple[bool, List[Tuple[str, str]]]:
+    """
+    Detects duplicate or partially overlapping openings along the wall.
+    Returns (has_overlaps, list_of_overlapping_pairs).
+    """
+    overlaps = []
+    n = len(openings)
+    for i in range(n):
+        op1 = openings[i]
+        valid1, _ = validate_opening_geometry(op1)
+        if not valid1:
+            continue
+        off1, w1 = op1.offset_along_wall_m, op1.width_m
+        sill1, h1 = op1.sill_height_m, op1.height_m
+
+        for j in range(i + 1, n):
+            op2 = openings[j]
+            valid2, _ = validate_opening_geometry(op2)
+            if not valid2:
+                continue
+            off2, w2 = op2.offset_along_wall_m, op2.width_m
+            sill2, h2 = op2.sill_height_m, op2.height_m
+
+            # Check 1D interval overlap along length AND height
+            horiz_overlap = max(0.0, min(off1 + w1, off2 + w2) - max(off1, off2))
+            vert_overlap = max(0.0, min(sill1 + h1, sill2 + h2) - max(sill1, sill2))
+
+            if horiz_overlap > 1e-3 and vert_overlap > 1e-3:
+                overlaps.append((op1.id, op2.id))
+
+    return len(overlaps) > 0, overlaps
+
+
 def wall_length(wall: CanonicalWall) -> float:
     """Calculates Euclidean length of a wall in meters."""
-    if not (_is_valid_float(wall.start_point.x) and _is_valid_float(wall.start_point.y) and
-            _is_valid_float(wall.end_point.x) and _is_valid_float(wall.end_point.y)):
+    if not (wall.start_point and wall.start_point.is_valid() and wall.end_point and wall.end_point.is_valid()):
         return 0.0
     dx = wall.end_point.x - wall.start_point.x
     dy = wall.end_point.y - wall.start_point.y
@@ -164,10 +199,10 @@ def potential_net_wall_area(wall: CanonicalWall) -> Dict[str, Any]:
     Calculates wall gross area, observed opening areas, authorized vs unauthorized opening deductions,
     and potential net area.
 
-    PREVENTS BLANKET DEDUCTION AUTHORIZATION:
-    One authorized opening does NOT authorize other unauthorized openings on the wall.
-    An opening deduction is ONLY authorized if both the wall AND the specific opening have
-    explicit deduction_authority=True.
+    STRICT DEDUCTION SAFETY & OVERLAP DETECTION:
+    1. Tracks valid, invalid/unresolved, authorized, and unauthorized opening counts.
+    2. Overlapping or duplicate openings trigger overlap conflicts and fail closed.
+    3. all_deductions_authorized is False if ANY opening is invalid, unresolved, unauthorized, or overlapping.
     """
     valid_w, msg_w = validate_wall_geometry(wall)
     if not valid_w:
@@ -181,36 +216,60 @@ def potential_net_wall_area(wall: CanonicalWall) -> Dict[str, Any]:
             "authorized_opening_deduction_area_m2": 0.0,
             "authorized_net_area_m2": 0.0,
             "unauthorized_opening_area_m2": 0.0,
+            "valid_opening_count": 0,
+            "invalid_unresolved_opening_count": len(wall.openings),
+            "authorized_opening_count": 0,
+            "unauthorized_opening_count": len(wall.openings),
+            "has_overlapping_openings": False,
             "all_deductions_authorized": False,
-            "authority_note": "Invalid Wall Geometry",
+            "authority_note": f"Invalid Wall Geometry: {msg_w}",
         }
 
     gross = wall_gross_area(wall)
     observed_opening_area = 0.0
     authorized_deduction_area = 0.0
 
+    valid_count = 0
+    invalid_count = 0
+    auth_count = 0
+    unauth_count = 0
+
     for op in wall.openings:
         valid_op, _ = validate_opening_geometry(op, wall)
         if not valid_op:
+            invalid_count += 1
             continue
+
+        valid_count += 1
         op_area = gross_opening_area(op)
         observed_opening_area += op_area
-        
-        # Deductions require explicit authority on BOTH wall and opening (or opening explicit authority)
+
         if wall.deduction_authority and op.deduction_authority:
             authorized_deduction_area += op_area
+            auth_count += 1
+        else:
+            unauth_count += 1
+
+    has_overlaps, overlap_pairs = detect_opening_overlaps(wall.openings)
 
     potential_net = max(0.0, gross - observed_opening_area)
     authorized_net = max(0.0, gross - authorized_deduction_area)
     unauthorized_opening_area = max(0.0, observed_opening_area - authorized_deduction_area)
 
     all_authorized = (
-        len(wall.openings) > 0 and
+        valid_count > 0 and
+        invalid_count == 0 and
+        unauth_count == 0 and
+        not has_overlaps and
         wall.deduction_authority and
-        pytest_approx_equal(observed_opening_area, authorized_deduction_area)
+        abs(observed_opening_area - authorized_deduction_area) <= 1e-4
     )
 
-    if all_authorized:
+    if has_overlaps:
+        note = f"Conflict: Overlapping / Duplicate Openings Detected on Wall ({len(overlap_pairs)} pair(s))"
+    elif invalid_count > 0:
+        note = f"Conflict: {invalid_count} Invalid/Unresolved Opening(s) Detected on Wall"
+    elif all_authorized:
         note = "All Opening Deductions Authorized by Evidence"
     elif authorized_deduction_area > 0:
         note = f"Partial Deduction Authorized ({authorized_deduction_area:.2f} m² authorized, {unauthorized_opening_area:.2f} m² unauthorized)"
@@ -226,14 +285,14 @@ def potential_net_wall_area(wall: CanonicalWall) -> Dict[str, Any]:
         "authorized_opening_deduction_area_m2": authorized_deduction_area,
         "authorized_net_area_m2": authorized_net,
         "unauthorized_opening_area_m2": unauthorized_opening_area,
-        "opening_count": len(wall.openings),
+        "valid_opening_count": valid_count,
+        "invalid_unresolved_opening_count": invalid_count,
+        "authorized_opening_count": auth_count,
+        "unauthorized_opening_count": unauth_count,
+        "has_overlapping_openings": has_overlaps,
         "all_deductions_authorized": all_authorized,
         "authority_note": note,
     }
-
-
-def pytest_approx_equal(a: float, b: float, tol: float = 1e-4) -> bool:
-    return abs(a - b) <= tol
 
 
 def space_floor_area(space: CanonicalSpace) -> float:
@@ -241,7 +300,7 @@ def space_floor_area(space: CanonicalSpace) -> float:
     if space.specified_floor_area_m2 is not None and _is_valid_float(space.specified_floor_area_m2) and space.specified_floor_area_m2 > 0:
         return float(space.specified_floor_area_m2)
 
-    poly = [pt for pt in space.boundary_polygon if _is_valid_float(pt.x) and _is_valid_float(pt.y)]
+    poly = [pt for pt in space.boundary_polygon if pt and pt.is_valid()]
     if len(poly) < 3:
         return 0.0
 
@@ -261,10 +320,10 @@ def level_extents(level: CanonicalLevel) -> Optional[BoundingBox3D]:
     min_y, max_y = float("inf"), float("-inf")
 
     z_min = level.elevation_m if _is_valid_float(level.elevation_m) else 0.0
-    h = level.height_m if _is_valid_float(level.height_m) else 2.7
+    h = level.height_m if _is_valid_float(level.height_m) else 0.0
     z_max = z_min + max(0.0, h)
 
-    def include_pt(x: float, y: float):
+    def include_pt(x: Optional[float], y: Optional[float]):
         nonlocal min_x, max_x, min_y, max_y
         if _is_valid_float(x) and _is_valid_float(y):
             min_x = min(min_x, x)
@@ -273,8 +332,8 @@ def level_extents(level: CanonicalLevel) -> Optional[BoundingBox3D]:
             max_y = max(max_y, y)
 
     for w in level.walls:
-        include_pt(w.start_point.x, w.start_point.y)
-        include_pt(w.end_point.x, w.end_point.y)
+        if w.start_point: include_pt(w.start_point.x, w.start_point.y)
+        if w.end_point: include_pt(w.end_point.x, w.end_point.y)
 
     for group in [level.floors, level.ceilings, level.roofs, level.soffits, level.balconies]:
         for item in group:
@@ -282,11 +341,11 @@ def level_extents(level: CanonicalLevel) -> Optional[BoundingBox3D]:
                 include_pt(pt.x, pt.y)
 
     for col in level.columns:
-        w2, d2 = col.width_m / 2.0, col.depth_m / 2.0
-        include_pt(col.center.x - w2, col.center.y - d2)
-        include_pt(col.center.x + w2, col.center.y + d2)
+        if col.center and col.width_m and col.depth_m:
+            w2, d2 = col.width_m / 2.0, col.depth_m / 2.0
+            include_pt(col.center.x - w2, col.center.y - d2)
+            include_pt(col.center.x + w2, col.center.y + d2)
 
-    # Fail closed on empty level
     if min_x == float("inf"):
         return None
 
@@ -333,7 +392,7 @@ def surface_metadata(element: CanonicalElement) -> Dict[str, Any]:
     """Returns detailed surface metadata, provenance, substrate, and review details for an element."""
     prov = element.provenance.to_dict() if element.provenance else {}
     has_explicit_provenance = bool(prov.get("source_pdf") or prov.get("drawing_id"))
-    
+
     return {
         "id": element.id,
         "name": element.name,

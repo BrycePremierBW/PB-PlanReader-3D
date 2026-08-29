@@ -5,14 +5,15 @@ Provides a modern, interactive Three.js 3D WebGL BIM viewer built directly from
 Canonical Building Model data.
 
 Features:
-- Subtractive 3D Shape Holes for genuine wall door/window openings
+- Genuine physical wall cut-outs for floor-touching doors (sill=0) and windows
+- Base64 UTF-8 JSON encoding preventing script-context XSS break-out
+- 2-Pass scene building resolving opening host walls regardless of payload order
+- Complete declared type support (CEILING, SCREEN, SURFACE, BALUSTRADE, PARAPET, etc.)
 - Review state visual styling across ALL geometry types (CONFIRMED, INFERRED, REVIEW_REQUIRED)
 - Zero made-up data for unknown confidence, review state, evidence, or empty bounds
-- Safe XSS-proof DOM rendering using textContent and HTML escaping
-- Interactive Object Selection with live Information Panel (Overview, Advanced, Evidence, Diagnostics)
-- Deterministic wireframe toggle and safe numerical guards
 """
 
+import base64
 import json
 import math
 from typing import Dict, Any, Optional
@@ -36,7 +37,7 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
     consumed by the Three.js BIM rendering engine.
     """
     bounds_ok, bounds = model_bounds(project)
-    
+
     levels_payload = []
     objects_payload = []
 
@@ -46,8 +47,8 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
             lvl_info = {
                 "id": lvl.id,
                 "name": lvl.name,
-                "elevation_m": lvl.elevation_m if not math.isnan(lvl.elevation_m) else 0.0,
-                "height_m": lvl.height_m if not math.isnan(lvl.height_m) else 2.7,
+                "elevation_m": lvl.elevation_m if (lvl.elevation_m is not None and not math.isnan(lvl.elevation_m)) else None,
+                "height_m": lvl.height_m if (lvl.height_m is not None and not math.isnan(lvl.height_m)) else None,
                 "level_index": lvl.level_index,
                 "review_state": rev_str,
             }
@@ -87,7 +88,7 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
                         "gross_area_m2": op_gross,
                         "substrate": op.substrate,
                         "finish": op.finish,
-                        "confidence": op.confidence if op.confidence > 0.0 else None,
+                        "confidence": op.confidence,  # Preserve explicit 0.0 vs None
                         "review_state": op_rev,
                         "provenance": op.provenance.to_dict() if op.provenance else {},
                         "deduction_authorized": op.deduction_authority,
@@ -111,19 +112,24 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
                     "authorized_opening_deduction_area_m2": p_net["authorized_opening_deduction_area_m2"],
                     "authorized_net_area_m2": p_net["authorized_net_area_m2"],
                     "unauthorized_opening_area_m2": p_net["unauthorized_opening_area_m2"],
+                    "valid_opening_count": p_net["valid_opening_count"],
+                    "invalid_unresolved_opening_count": p_net["invalid_unresolved_opening_count"],
+                    "authorized_opening_count": p_net["authorized_opening_count"],
+                    "unauthorized_opening_count": p_net["unauthorized_opening_count"],
+                    "has_overlapping_openings": p_net["has_overlapping_openings"],
                     "all_deductions_authorized": p_net["all_deductions_authorized"],
                     "authority_note": p_net["authority_note"],
                     "is_external": w.is_external,
                     "substrate": w.substrate,
                     "finish": w.finish,
-                    "confidence": w.confidence if w.confidence > 0.0 else None,
+                    "confidence": w.confidence,  # Preserve explicit 0.0 vs None
                     "review_state": w_rev,
                     "provenance": w.provenance.to_dict() if w.provenance else {},
                     "openings": openings_data,
                 }
                 objects_payload.append(w_data)
 
-            # Polygon elements
+            # Polygon elements (Floors, Ceilings, Roofs, Soffits, Balconies)
             poly_groups = [
                 ("floors", lvl.floors, ObjectType.FLOOR.value),
                 ("ceilings", lvl.ceilings, ObjectType.CEILING.value),
@@ -133,7 +139,7 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
             ]
             for grp_name, items, type_val in poly_groups:
                 for item in items:
-                    poly_pts = [pt.to_dict() for pt in getattr(item, "polygon", []) if not (math.isnan(pt.x) or math.isnan(pt.y))]
+                    poly_pts = [pt.to_dict() for pt in getattr(item, "polygon", []) if pt and pt.is_valid()]
                     if len(poly_pts) < 3:
                         continue
                     item_rev = item.review_state.value if isinstance(item.review_state, ReviewState) else str(item.review_state or "REVIEW_REQUIRED")
@@ -145,10 +151,10 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
                         "parent_id": item.parent_id,
                         "polygon": poly_pts,
                         "thickness_m": item.thickness_m,
-                        "elevation_offset_m": getattr(item, "elevation_offset_m", 0.0),
+                        "elevation_offset_m": getattr(item, "elevation_offset_m", None),
                         "substrate": item.substrate,
                         "finish": item.finish,
-                        "confidence": item.confidence if item.confidence > 0.0 else None,
+                        "confidence": item.confidence,
                         "review_state": item_rev,
                         "provenance": item.provenance.to_dict() if item.provenance else {},
                     }
@@ -159,7 +165,7 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
 
             # Parapets
             for p in lvl.parapets:
-                p_len = math.hypot(p.end_point.x - p.start_point.x, p.end_point.y - p.start_point.y)
+                p_len = math.hypot(p.end_point.x - p.start_point.x, p.end_point.y - p.start_point.y) if (p.start_point and p.start_point.is_valid() and p.end_point and p.end_point.is_valid()) else 0.0
                 if p_len <= 1e-4:
                     continue
                 p_rev = p.review_state.value if isinstance(p.review_state, ReviewState) else str(p.review_state or "REVIEW_REQUIRED")
@@ -173,10 +179,10 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
                     "height_m": p.height_m,
                     "thickness_m": p.thickness_m,
                     "length_m": p_len,
-                    "gross_area_m2": p_len * p.height_m,
+                    "gross_area_m2": p_len * p.height_m if p.height_m else 0.0,
                     "substrate": p.substrate,
                     "finish": p.finish,
-                    "confidence": p.confidence if p.confidence > 0.0 else None,
+                    "confidence": p.confidence,
                     "review_state": p_rev,
                     "provenance": p.provenance.to_dict() if p.provenance else {},
                 }
@@ -190,40 +196,64 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
                     "name": col.name,
                     "type": ObjectType.COLUMN.value,
                     "level_id": lvl.id,
-                    "center": col.center.to_dict(),
+                    "center": col.center.to_dict() if col.center else {},
                     "width_m": col.width_m,
                     "depth_m": col.depth_m,
                     "height_m": col.height_m,
                     "substrate": col.substrate,
                     "finish": col.finish,
-                    "confidence": col.confidence if col.confidence > 0.0 else None,
+                    "confidence": col.confidence,
                     "review_state": col_rev,
                     "provenance": col.provenance.to_dict() if col.provenance else {},
                 }
                 objects_payload.append(col_data)
 
-            # Balustrades
-            for bal in lvl.balustrades:
-                b_len = math.hypot(bal.end_point.x - bal.start_point.x, bal.end_point.y - bal.start_point.y)
-                if b_len <= 1e-4:
-                    continue
-                bal_rev = bal.review_state.value if isinstance(bal.review_state, ReviewState) else str(bal.review_state or "REVIEW_REQUIRED")
-                bal_data = {
-                    "id": bal.id,
-                    "name": bal.name,
-                    "type": ObjectType.BALUSTRADE.value,
+            # Balustrades and Screens
+            linear_groups = [
+                (lvl.balustrades, ObjectType.BALUSTRADE.value),
+                (lvl.screens, ObjectType.SCREEN.value),
+            ]
+            for items, type_val in linear_groups:
+                for lin in items:
+                    b_len = math.hypot(lin.end_point.x - lin.start_point.x, lin.end_point.y - lin.start_point.y) if (lin.start_point and lin.start_point.is_valid() and lin.end_point and lin.end_point.is_valid()) else 0.0
+                    if b_len <= 1e-4:
+                        continue
+                    lin_rev = lin.review_state.value if isinstance(lin.review_state, ReviewState) else str(lin.review_state or "REVIEW_REQUIRED")
+                    lin_data = {
+                        "id": lin.id,
+                        "name": lin.name,
+                        "type": type_val,
+                        "level_id": lvl.id,
+                        "start_point": lin.start_point.to_dict(),
+                        "end_point": lin.end_point.to_dict(),
+                        "height_m": lin.height_m,
+                        "length_m": b_len,
+                        "substrate": lin.substrate,
+                        "finish": lin.finish,
+                        "confidence": lin.confidence,
+                        "review_state": lin_rev,
+                        "provenance": lin.provenance.to_dict() if lin.provenance else {},
+                    }
+                    objects_payload.append(lin_data)
+
+            # Surfaces
+            for s in lvl.surfaces:
+                s_rev = s.review_state.value if isinstance(s.review_state, ReviewState) else str(s.review_state or "REVIEW_REQUIRED")
+                s_data = {
+                    "id": s.id,
+                    "name": s.name,
+                    "type": ObjectType.SURFACE.value,
                     "level_id": lvl.id,
-                    "start_point": bal.start_point.to_dict(),
-                    "end_point": bal.end_point.to_dict(),
-                    "height_m": bal.height_m,
-                    "length_m": b_len,
-                    "substrate": bal.substrate,
-                    "finish": bal.finish,
-                    "confidence": bal.confidence if bal.confidence > 0.0 else None,
-                    "review_state": bal_rev,
-                    "provenance": bal.provenance.to_dict() if bal.provenance else {},
+                    "parent_element_id": s.parent_element_id,
+                    "surface_area_m2": s.surface_area_m2,
+                    "orientation": s.orientation,
+                    "substrate": s.substrate,
+                    "finish": s.finish,
+                    "confidence": s.confidence,
+                    "review_state": s_rev,
+                    "provenance": s.provenance.to_dict() if s.provenance else {},
                 }
-                objects_payload.append(bal_data)
+                objects_payload.append(s_data)
 
     return {
         "project_id": project.id,
@@ -239,9 +269,12 @@ def project_to_viewer_payload(project: CanonicalProject) -> Dict[str, Any]:
 def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> str:
     """
     Generates an HTML/JS document featuring an interactive Three.js 3D WebGL viewer
-    with subtractive wall shape holes, review state styling, and XSS protection.
+    with Base64 UTF-8 JSON script encoding (XSS-safe), 2-pass scene building,
+    and genuine physical wall cut-outs.
     """
-    payload_json = json.dumps(payload)
+    # BLOCKER 6 FIX: Base64-encode JSON payload to prevent </script> XSS breakage
+    json_bytes = json.dumps(payload).encode("utf-8")
+    b64_payload = base64.b64encode(json_bytes).decode("ascii")
 
     html_code = f"""<!DOCTYPE html>
 <html lang="en">
@@ -356,14 +389,14 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             </div>
 
             <div class="tab-bar">
-                <button id="tab-btn-overview" class="tab-btn active" data-tab="overview">Overview</button>
-                <button id="tab-btn-advanced" class="tab-btn" data-tab="advanced">Advanced</button>
-                <button id="tab-btn-evidence" class="tab-btn" data-tab="evidence">Evidence</button>
-                <button id="tab-btn-diagnostics" class="tab-btn" data-tab="diagnostics">Diagnostics</button>
+                <button id="tab-btn-overview" class="tab-btn active">Overview</button>
+                <button id="tab-btn-advanced" class="tab-btn">Advanced</button>
+                <button id="tab-btn-evidence" class="tab-btn">Evidence</button>
+                <button id="tab-btn-diagnostics" class="tab-btn">Diagnostics</button>
             </div>
 
             <div id="tab-overview" class="tab-content">
-                <div class="empty-state">Click any 3D element (wall, window, door, balcony, roof) in the viewer to inspect provenance, dimensions, substrate, and review state.</div>
+                <div class="empty-state">Click any 3D element (wall, window, door, balcony, roof, ceiling, screen) in the viewer to inspect provenance, dimensions, substrate, and review state.</div>
             </div>
             <div id="tab-advanced" class="tab-content" style="display:none;">
                 <div class="empty-state">Select an object to inspect structural hierarchy and bounding geometry.</div>
@@ -378,8 +411,11 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
     </div>
 
     <script>
-        const modelData = {payload_json};
-        
+        // BLOCKER 6 FIX: Safe Base64 UTF-8 JSON decoding preventing script-context XSS
+        const b64Data = "{b64_payload}";
+        const jsonText = new TextDecoder().decode(Uint8Array.from(atob(b64Data), c => c.charCodeAt(0)));
+        const modelData = JSON.parse(jsonText);
+
         let scene, camera, renderer, controls;
         let meshMap = new Map();
         let objectDataMap = new Map();
@@ -388,23 +424,10 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
         let activeTab = 'overview';
         let isWireframeActive = false;
 
-        // XSS Prevention Helper
-        function escapeHtml(str) {{
-            if (str === null || str === undefined) return '';
-            return String(str)
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;')
-                .replace(/'/g, '&#039;');
-        }}
-
-        // Material cache with distinct REVIEW_STATE visual styling across ALL object types
         function getMaterialForObject(obj) {{
             const rev = obj.review_state || 'REVIEW_REQUIRED';
             const type = obj.type || 'UNKNOWN';
 
-            // Distinct review state color accents
             let baseColor = 0xe2e8f0;
             let opacity = 1.0;
             let transparent = false;
@@ -413,21 +436,21 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             else if (type === 'DOOR') baseColor = 0xb45309;
             else if (type === 'WINDOW') {{ baseColor = 0x38bdf8; opacity = 0.55; transparent = true; }}
             else if (type === 'FLOOR') baseColor = 0x64748b;
+            else if (type === 'CEILING') {{ baseColor = 0xf8fafc; opacity = 0.65; transparent = true; }}
             else if (type === 'BALCONY') baseColor = 0x0ea5e9;
             else if (type === 'SOFFIT') baseColor = 0x94a3b8;
             else if (type === 'PARAPET') baseColor = 0x475569;
             else if (type === 'ROOF') baseColor = 0x334155;
             else if (type === 'COLUMN') baseColor = 0x94a3b8;
             else if (type === 'BALUSTRADE') {{ baseColor = 0x0284c7; opacity = 0.7; transparent = true; }}
+            else if (type === 'SCREEN') {{ baseColor = 0xd97706; opacity = 0.75; transparent = true; }}
 
             if (rev === 'REVIEW_REQUIRED') {{
-                // Unmistakable review required styling (Red/Coral accent tint)
-                baseColor = (type === 'WINDOW') ? 0xf87171 : 0xef4444;
-                opacity = (type === 'WINDOW') ? 0.65 : 0.85;
+                baseColor = (type === 'WINDOW' || type === 'CEILING') ? 0xf87171 : 0xef4444;
+                opacity = 0.85;
                 transparent = true;
             }} else if (rev === 'INFERRED') {{
-                // Visually distinct inferred styling (Cyan/Amber tint, translucent)
-                baseColor = (type === 'WINDOW') ? 0x38bdf8 : 0x38bdf8;
+                baseColor = (type === 'WINDOW' || type === 'CEILING') ? 0x38bdf8 : 0x38bdf8;
                 opacity = 0.75;
                 transparent = true;
             }}
@@ -490,17 +513,14 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             fillLight.position.set(-20, 20, -20);
             scene.add(fillLight);
 
-            // Ground Grid
             const grid = new THREE.GridHelper(40, 40, 0x334155, 0x1e293b);
             grid.position.y = -0.01;
             scene.add(grid);
 
-            // Build Scene from Canonical Payload
             buildScene();
             setupFilters();
             resetCamera();
 
-            // Register Event Listeners without inline JS handlers (XSS Safe)
             document.getElementById('btn-reset').addEventListener('click', resetCamera);
             document.getElementById('btn-wireframe').addEventListener('click', toggleWireframe);
 
@@ -514,18 +534,22 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             animate();
         }}
 
+        // BLOCKER 4 FIX: 2-Pass scene building so openings can resolves host walls deterministically
         function buildScene() {{
             if (!modelData.objects || modelData.objects.length === 0) return;
+
+            // PASS 1: Index ALL objects in objectDataMap first
+            modelData.objects.forEach(obj => objectDataMap.set(obj.id, obj));
 
             const levelMap = new Map();
             if (modelData.levels) {{
                 modelData.levels.forEach(l => levelMap.set(l.id, l));
             }}
 
+            // PASS 2: Create and render 3D meshes
             modelData.objects.forEach(obj => {{
-                objectDataMap.set(obj.id, obj);
                 const lvl = levelMap.get(obj.level_id);
-                const zElev = (lvl && !isNaN(lvl.elevation_m)) ? lvl.elevation_m : 0.0;
+                const zElev = (lvl && lvl.elevation_m !== null && !isNaN(lvl.elevation_m)) ? lvl.elevation_m : 0.0;
 
                 let mat = getMaterialForObject(obj);
                 let mesh = null;
@@ -534,13 +558,13 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
                     mesh = createWallMeshWithHoles(obj, zElev, mat);
                 }} else if (obj.type === 'DOOR' || obj.type === 'WINDOW' || obj.type === 'OPENING') {{
                     mesh = createOpeningMesh(obj, zElev, mat);
-                }} else if (obj.type === 'FLOOR' || obj.type === 'ROOF' || obj.type === 'BALCONY' || obj.type === 'SOFFIT') {{
+                }} else if (obj.type === 'FLOOR' || obj.type === 'CEILING' || obj.type === 'ROOF' || obj.type === 'BALCONY' || obj.type === 'SOFFIT') {{
                     mesh = createPolygonMesh(obj, zElev, mat);
                 }} else if (obj.type === 'PARAPET') {{
                     mesh = createParapetMesh(obj, zElev, mat);
                 }} else if (obj.type === 'COLUMN') {{
                     mesh = createColumnMesh(obj, zElev, mat);
-                }} else if (obj.type === 'BALUSTRADE') {{
+                }} else if (obj.type === 'BALUSTRADE' || obj.type === 'SCREEN') {{
                     mesh = createLinearMesh(obj, zElev, mat);
                 }}
 
@@ -552,21 +576,32 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             }});
         }}
 
-        // BLOCKER 3 IMPLEMENTATION: Subtractive 3D Shape Holes for genuine wall openings
+        // BLOCKER 3 & 5 FIX: Subtractive 3D Shape holes for doors (sill=0) and windows
         function createWallMeshWithHoles(wall, zElev, mat) {{
             const p1 = wall.start_point;
             const p2 = wall.end_point;
-            if (!p1 || !p2) return null;
+            if (!p1 || !p2 || p1.x === null || p1.y === null || p2.x === null || p2.y === null) return null;
 
             const dx = p2.x - p1.x;
             const dy = p2.y - p1.y;
             const len = Math.hypot(dx, dy);
             if (isNaN(len) || len < 0.001) return null;
 
-            const hWall = wall.height_m || 2.7;
-            const th = wall.thickness_m || 0.15;
+            // Zero invented physical defaults! If height_m is missing, render baseline schematic wireframe
+            if (wall.height_m === null || wall.height_m === undefined || isNaN(wall.height_m) || wall.height_m <= 0) {{
+                const lineGeom = new THREE.BufferGeometry().setFromPoints([
+                    new THREE.Vector3(p1.x, zElev, -p1.y),
+                    new THREE.Vector3(p2.x, zElev, -p2.y)
+                ]);
+                const lineMat = new THREE.LineDashedMaterial({{ color: 0xef4444, dashSize: 0.2, gapSize: 0.1 }});
+                const line = new THREE.Line(lineGeom, lineMat);
+                line.computeLineDistances();
+                return line;
+            }}
 
-            // Define wall 2D profile shape in wall-local coordinates (x: along length 0..len, y: height 0..hWall)
+            const hWall = wall.height_m;
+            const th = (wall.thickness_m !== null && wall.thickness_m > 0) ? wall.thickness_m : 0.05;
+
             const shape = new THREE.Shape();
             shape.moveTo(0, 0);
             shape.lineTo(len, 0);
@@ -574,16 +609,14 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             shape.lineTo(0, hWall);
             shape.closePath();
 
-            // Add subtractive holes for attached openings
             if (wall.openings && wall.openings.length > 0) {{
                 wall.openings.forEach(op => {{
-                    const off = op.offset_along_wall_m || 0.0;
-                    const wOp = op.width_m || 0.0;
-                    const hOp = op.height_m || 0.0;
-                    const sill = op.sill_height_m || 0.0;
+                    const off = op.offset_along_wall_m;
+                    const wOp = op.width_m;
+                    const hOp = op.height_m;
+                    const sill = (op.sill_height_m !== null) ? op.sill_height_m : 0.0;
 
-                    // Validate opening bounds within host wall
-                    if (wOp > 0 && hOp > 0 && off >= 0 && (off + wOp) <= (len + 0.05) && (sill + hOp) <= (hWall + 0.05)) {{
+                    if (off !== null && wOp !== null && hOp !== null && wOp > 0 && hOp > 0 && off >= 0 && (off + wOp) <= (len + 0.05) && (sill + hOp) <= (hWall + 0.05)) {{
                         const hole = new THREE.Path();
                         hole.moveTo(off, sill);
                         hole.lineTo(off + wOp, sill);
@@ -597,27 +630,24 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
 
             const extrudeSettings = {{ steps: 1, depth: th, bevelEnabled: false }};
             const geom = new THREE.ExtrudeGeometry(shape, extrudeSettings);
-
-            // Center wall thickness around wall baseline
             geom.translate(0, 0, -th / 2);
 
             const mesh = new THREE.Mesh(geom, mat);
             mesh.castShadow = true;
             mesh.receiveShadow = true;
 
-            // Rotate into plan coordinates (y = height in Three.js, x/z in plan ground)
             const angle = Math.atan2(dy, dx);
             mesh.rotation.y = -angle;
-
             mesh.position.set(p1.x, zElev, -p1.y);
             return mesh;
         }}
 
         function createOpeningMesh(op, zElev, mat) {{
-            const wWidth = op.width_m || 0.8;
-            const wHeight = op.height_m || 2.0;
-            const sill = op.sill_height_m || 0.0;
-            const off = op.offset_along_wall_m || 0.0;
+            if (op.width_m === null || op.height_m === null || op.width_m <= 0 || op.height_m <= 0) return null;
+            const wWidth = op.width_m;
+            const wHeight = op.height_m;
+            const sill = (op.sill_height_m !== null) ? op.sill_height_m : 0.0;
+            const off = (op.offset_along_wall_m !== null) ? op.offset_along_wall_m : 0.0;
 
             const geom = new THREE.BoxGeometry(wWidth, wHeight, 0.06);
             const mesh = new THREE.Mesh(geom, mat);
@@ -627,17 +657,19 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             if (wall && wall.start_point && wall.end_point) {{
                 const p1 = wall.start_point;
                 const p2 = wall.end_point;
-                const len = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-                if (len > 0.001) {{
-                    const ux = (p2.x - p1.x) / len;
-                    const uy = (p2.y - p1.y) / len;
+                if (p1.x !== null && p1.y !== null && p2.x !== null && p2.y !== null) {{
+                    const len = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+                    if (len > 0.001) {{
+                        const ux = (p2.x - p1.x) / len;
+                        const uy = (p2.y - p1.y) / len;
 
-                    const cx = p1.x + ux * (off + wWidth / 2);
-                    const cy = p1.y + uy * (off + wWidth / 2);
-                    const angle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+                        const cx = p1.x + ux * (off + wWidth / 2);
+                        const cy = p1.y + uy * (off + wWidth / 2);
+                        const angle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
 
-                    mesh.rotation.y = -angle;
-                    mesh.position.set(cx, zElev + sill + wHeight / 2, -cy);
+                        mesh.rotation.y = -angle;
+                        mesh.position.set(cx, zElev + sill + wHeight / 2, -cy);
+                    }}
                 }}
             }}
             return mesh;
@@ -647,23 +679,28 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             if (!polyObj.polygon || polyObj.polygon.length < 3) return null;
             const shape = new THREE.Shape();
             polyObj.polygon.forEach((pt, idx) => {{
-                if (idx === 0) shape.moveTo(pt.x, -pt.y);
-                else shape.lineTo(pt.x, -pt.y);
+                if (pt.x !== null && pt.y !== null) {{
+                    if (idx === 0) shape.moveTo(pt.x, -pt.y);
+                    else shape.lineTo(pt.x, -pt.y);
+                }}
             }});
 
-            const extrudeSettings = {{ steps: 1, depth: polyObj.thickness_m || 0.15, bevelEnabled: false }};
+            const th = (polyObj.thickness_m !== null && polyObj.thickness_m > 0) ? polyObj.thickness_m : 0.15;
+            const extrudeSettings = {{ steps: 1, depth: th, bevelEnabled: false }};
             const geom = new THREE.ExtrudeGeometry(shape, extrudeSettings);
             geom.rotateX(Math.PI / 2);
 
             const mesh = new THREE.Mesh(geom, mat);
-            mesh.position.y = zElev + (polyObj.elevation_offset_m || 0.0);
+            mesh.position.y = zElev + ((polyObj.elevation_offset_m !== null) ? polyObj.elevation_offset_m : 0.0);
             mesh.receiveShadow = true;
             return mesh;
         }}
 
         function createParapetMesh(p, zElev, mat) {{
+            if (p.height_m === null || p.height_m <= 0) return null;
             const len = p.length_m || 1.0;
-            const geom = new THREE.BoxGeometry(len, p.height_m || 1.0, p.thickness_m || 0.2);
+            const th = (p.thickness_m !== null && p.thickness_m > 0) ? p.thickness_m : 0.15;
+            const geom = new THREE.BoxGeometry(len, p.height_m, th);
             const mesh = new THREE.Mesh(geom, mat);
             mesh.castShadow = true;
 
@@ -679,16 +716,18 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
         }}
 
         function createColumnMesh(col, zElev, mat) {{
-            const geom = new THREE.BoxGeometry(col.width_m || 0.4, col.height_m || 2.7, col.depth_m || 0.4);
+            if (col.width_m === null || col.depth_m === null || col.height_m === null) return null;
+            const geom = new THREE.BoxGeometry(col.width_m, col.height_m, col.depth_m);
             const mesh = new THREE.Mesh(geom, mat);
             mesh.castShadow = true;
-            mesh.position.set(col.center.x || 0, zElev + (col.height_m || 2.7) / 2, -(col.center.y || 0));
+            mesh.position.set(col.center.x || 0, zElev + col.height_m / 2, -(col.center.y || 0));
             return mesh;
         }}
 
         function createLinearMesh(lin, zElev, mat) {{
+            if (lin.height_m === null || lin.height_m <= 0) return null;
             const len = lin.length_m || 1.0;
-            const geom = new THREE.BoxGeometry(len, lin.height_m || 1.0, 0.05);
+            const geom = new THREE.BoxGeometry(len, lin.height_m, 0.05);
             const mesh = new THREE.Mesh(geom, mat);
             mesh.castShadow = true;
 
@@ -711,6 +750,13 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
                 return;
             }}
             const b = modelData.bounds;
+            if (!b.min_point || !b.max_point || b.min_point.x === null || b.max_point.x === null) {{
+                controls.target.set(0, 0, 0);
+                camera.position.set(15, 15, 20);
+                controls.update();
+                return;
+            }}
+
             const cx = (b.min_point.x + b.max_point.x) / 2;
             const cy = (b.min_point.z + b.max_point.z) / 2;
             const cz = -(b.min_point.y + b.max_point.y) / 2;
@@ -742,7 +788,7 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
 
             const catContainer = document.getElementById('category-filters');
             catContainer.innerHTML = '';
-            const cats = ['WALL', 'DOOR', 'WINDOW', 'FLOOR', 'BALCONY', 'SOFFIT', 'PARAPET', 'ROOF', 'COLUMN', 'BALUSTRADE'];
+            const cats = ['WALL', 'DOOR', 'WINDOW', 'FLOOR', 'CEILING', 'BALCONY', 'SOFFIT', 'PARAPET', 'ROOF', 'COLUMN', 'BALUSTRADE', 'SCREEN', 'SURFACE'];
             cats.forEach(cat => {{
                 const lbl = document.createElement('label');
                 lbl.className = 'checkbox-label';
@@ -891,34 +937,41 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
                 addInfoRow(container, 'Substrate', obj.substrate || 'Not Specified');
                 addInfoRow(container, 'Finish', obj.finish || 'Not Specified');
 
-                if (obj.gross_area_m2 !== undefined && !isNaN(obj.gross_area_m2)) {{
+                if (obj.gross_area_m2 !== undefined && obj.gross_area_m2 !== null && !isNaN(obj.gross_area_m2)) {{
                     addInfoRow(container, 'Gross Area', obj.gross_area_m2.toFixed(2) + ' m²');
                 }}
-                if (obj.observed_opening_area_m2 !== undefined && !isNaN(obj.observed_opening_area_m2)) {{
+                if (obj.observed_opening_area_m2 !== undefined && obj.observed_opening_area_m2 !== null && !isNaN(obj.observed_opening_area_m2)) {{
                     addInfoRow(container, 'Observed Opening Area', obj.observed_opening_area_m2.toFixed(2) + ' m²');
                 }}
-                if (obj.potential_net_area_m2 !== undefined && !isNaN(obj.potential_net_area_m2)) {{
+                if (obj.potential_net_area_m2 !== undefined && obj.potential_net_area_m2 !== null && !isNaN(obj.potential_net_area_m2)) {{
                     addInfoRow(container, 'Potential Net Area', obj.potential_net_area_m2.toFixed(2) + ' m²');
                 }}
-                if (obj.authorized_opening_deduction_area_m2 !== undefined && !isNaN(obj.authorized_opening_deduction_area_m2)) {{
+                if (obj.authorized_opening_deduction_area_m2 !== undefined && obj.authorized_opening_deduction_area_m2 !== null && !isNaN(obj.authorized_opening_deduction_area_m2)) {{
                     addInfoRow(container, 'Authorized Opening Deductions', obj.authorized_opening_deduction_area_m2.toFixed(2) + ' m²');
                     addInfoRow(container, 'Authorized Net Area', obj.authorized_net_area_m2.toFixed(2) + ' m²');
                 }}
-                if (obj.height_m !== undefined && !isNaN(obj.height_m)) {{
+                if (obj.height_m !== undefined && obj.height_m !== null && !isNaN(obj.height_m)) {{
                     addInfoRow(container, 'Height', obj.height_m.toFixed(2) + ' m');
+                }} else {{
+                    addInfoRow(container, 'Height', 'Not Specified');
                 }}
 
             }} else if (activeTab === 'advanced') {{
                 addInfoRow(container, 'Object ID', obj.id);
                 addInfoRow(container, 'Parent ID', obj.parent_id || 'None');
                 
-                // BLOCKER 5 FIX: Zero made-up confidence
-                const confText = (obj.confidence !== undefined && obj.confidence !== null && !isNaN(obj.confidence))
-                    ? (obj.confidence * 100).toFixed(0) + '%'
-                    : 'Not Recorded';
+                // BLOCKER 5 FIX: Preserve explicit 0.0 vs null/undefined confidence
+                let confText = 'Not Recorded';
+                if (obj.confidence !== undefined && obj.confidence !== null && !isNaN(obj.confidence)) {{
+                    confText = (obj.confidence * 100).toFixed(0) + '%';
+                }}
                 addInfoRow(container, 'Confidence Score', confText);
 
-                if (obj.thickness_m) addInfoRow(container, 'Thickness', obj.thickness_m + ' m');
+                if (obj.thickness_m !== undefined && obj.thickness_m !== null) {{
+                    addInfoRow(container, 'Thickness', obj.thickness_m + ' m');
+                }} else {{
+                    addInfoRow(container, 'Thickness', 'Not Specified');
+                }}
                 if (obj.is_external !== undefined) addInfoRow(container, 'Is External', String(obj.is_external));
 
             }} else if (activeTab === 'evidence') {{

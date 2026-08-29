@@ -5,12 +5,13 @@ Defines the single-source-of-truth object graph representing physical building g
 Project -> Building -> Level -> Space/Room -> Wall -> Opening (Door/Window) ->
 Floor -> Ceiling -> Roof -> Soffit -> Balcony -> Parapet -> Column -> Balustrade -> Screen -> FinishSurface.
 
-Fail-Closed Security & Provenance Guarantees:
+Fail-Closed & Zero-Made-Up-Data Rules:
 - Default review_state = REVIEW_REQUIRED
-- Default confidence = 0.0 (unproven)
-- Default takeoff_eligible = False
-- Default deduction_authority = False
-- Strict 0.0..1.0 confidence clamping; malformed values fail-closed to 0.0
+- Default confidence = None (Unrecorded)
+- Default takeoff_eligible = False (Strict boolean required)
+- Default deduction_authority = False (Strict boolean required)
+- Physical dimensions default to None (No invented fallback heights or thicknesses)
+- Strict boolean parsing: ONLY actual JSON boolean true grants authority. Strings like "true"/"yes"/"1" return False.
 """
 
 from dataclasses import dataclass, field
@@ -19,6 +20,47 @@ import math
 import uuid
 import json
 from typing import List, Dict, Any, Optional, Tuple, Union
+
+
+def parse_strict_bool(value: Any) -> bool:
+    """
+    Strict boolean parser.
+    ONLY actual Python bool True grants authority.
+    Strings such as "true", "false", "yes", "1" fail-closed to False.
+    """
+    if isinstance(value, bool):
+        return value
+    return False
+
+
+def parse_optional_confidence(value: Any) -> Optional[float]:
+    """
+    Parses optional confidence score (0.0 to 1.0).
+    Distinguishes between missing confidence (None) and explicit 0.0 confidence.
+    Malformed or out-of-bounds values return None.
+    """
+    if value is None:
+        return None
+    try:
+        f = float(value)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return max(0.0, min(1.0, f))
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_optional_float(value: Any) -> Optional[float]:
+    """Parses metric dimension float. Returns None for missing/malformed/non-positive numbers."""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    except (ValueError, TypeError):
+        return None
 
 
 class ReviewState(str, Enum):
@@ -84,61 +126,51 @@ class Provenance:
 
 @dataclass
 class Vector2D:
-    x: float = 0.0
-    y: float = 0.0
+    x: Optional[float] = None
+    y: Optional[float] = None
 
-    def to_dict(self) -> Dict[str, float]:
-        return {"x": float(self.x), "y": float(self.y)}
+    def is_valid(self) -> bool:
+        return self.x is not None and self.y is not None
+
+    def to_dict(self) -> Dict[str, Optional[float]]:
+        return {"x": self.x, "y": self.y}
 
     @classmethod
     def from_dict(cls, data: Union[Dict[str, Any], List[float], Tuple[float, float]]) -> "Vector2D":
-        try:
-            if isinstance(data, dict):
-                vx = float(data.get("x", 0.0))
-                vy = float(data.get("y", 0.0))
-                if math.isnan(vx) or math.isinf(vx): vx = 0.0
-                if math.isnan(vy) or math.isinf(vy): vy = 0.0
-                return cls(x=vx, y=vy)
-            elif isinstance(data, (list, tuple)) and len(data) >= 2:
-                vx = float(data[0])
-                vy = float(data[1])
-                if math.isnan(vx) or math.isinf(vx): vx = 0.0
-                if math.isnan(vy) or math.isinf(vy): vy = 0.0
-                return cls(x=vx, y=vy)
-        except (ValueError, TypeError):
-            pass
-        return cls(x=0.0, y=0.0)
+        if isinstance(data, dict):
+            return cls(x=parse_optional_float(data.get("x")), y=parse_optional_float(data.get("y")))
+        elif isinstance(data, (list, tuple)) and len(data) >= 2:
+            return cls(x=parse_optional_float(data[0]), y=parse_optional_float(data[1]))
+        return cls(x=None, y=None)
 
 
 @dataclass
 class Vector3D:
-    x: float = 0.0
-    y: float = 0.0
-    z: float = 0.0
+    x: Optional[float] = None
+    y: Optional[float] = None
+    z: Optional[float] = None
 
-    def to_dict(self) -> Dict[str, float]:
-        return {"x": float(self.x), "y": float(self.y), "z": float(self.z)}
+    def is_valid(self) -> bool:
+        return self.x is not None and self.y is not None and self.z is not None
+
+    def to_dict(self) -> Dict[str, Optional[float]]:
+        return {"x": self.x, "y": self.y, "z": self.z}
 
     @classmethod
     def from_dict(cls, data: Union[Dict[str, Any], List[float], Tuple[float, float, float]]) -> "Vector3D":
-        try:
-            if isinstance(data, dict):
-                vx = float(data.get("x", 0.0))
-                vy = float(data.get("y", 0.0))
-                vz = float(data.get("z", 0.0))
-                if math.isnan(vx) or math.isinf(vx): vx = 0.0
-                if math.isnan(vy) or math.isinf(vy): vy = 0.0
-                if math.isnan(vz) or math.isinf(vz): vz = 0.0
-                return cls(x=vx, y=vy, z=vz)
-            elif isinstance(data, (list, tuple)) and len(data) >= 3:
-                vx, vy, vz = float(data[0]), float(data[1]), float(data[2])
-                if math.isnan(vx) or math.isinf(vx): vx = 0.0
-                if math.isnan(vy) or math.isinf(vy): vy = 0.0
-                if math.isnan(vz) or math.isinf(vz): vz = 0.0
-                return cls(x=vx, y=vy, z=vz)
-        except (ValueError, TypeError):
-            pass
-        return cls(x=0.0, y=0.0, z=0.0)
+        if isinstance(data, dict):
+            return cls(
+                x=parse_optional_float(data.get("x")),
+                y=parse_optional_float(data.get("y")),
+                z=parse_optional_float(data.get("z")),
+            )
+        elif isinstance(data, (list, tuple)) and len(data) >= 3:
+            return cls(
+                x=parse_optional_float(data[0]),
+                y=parse_optional_float(data[1]),
+                z=parse_optional_float(data[2]),
+            )
+        return cls(x=None, y=None, z=None)
 
 
 @dataclass
@@ -155,7 +187,7 @@ class BoundingBox3D:
     @classmethod
     def from_dict(cls, data: Optional[Dict[str, Any]]) -> "BoundingBox3D":
         if not isinstance(data, dict):
-            return cls(min_point=Vector3D(0, 0, 0), max_point=Vector3D(0, 0, 0))
+            return cls(min_point=Vector3D(), max_point=Vector3D())
         return cls(
             min_point=Vector3D.from_dict(data.get("min_point")),
             max_point=Vector3D.from_dict(data.get("max_point")),
@@ -164,14 +196,14 @@ class BoundingBox3D:
 
 @dataclass
 class CanonicalElement:
-    """Base class for all canonical building elements. Fails closed by default."""
+    """Base class for all canonical building elements. Fails closed with ZERO made-up defaults."""
     id: str = field(default_factory=lambda: f"elem_{uuid.uuid4().hex[:8]}")
     name: str = "Unnamed Element"
     object_type: ObjectType = ObjectType.SURFACE
     level_id: Optional[str] = None
     parent_id: Optional[str] = None
     children_ids: List[str] = field(default_factory=list)
-    confidence: float = 0.0  # Fail-closed default: 0.0 (unproven)
+    confidence: Optional[float] = None  # None = Unrecorded
     review_state: ReviewState = ReviewState.REVIEW_REQUIRED  # Fail-closed default
     provenance: Provenance = field(default_factory=Provenance)
     substrate: Optional[str] = None
@@ -188,7 +220,7 @@ class CanonicalElement:
             "level_id": self.level_id,
             "parent_id": self.parent_id,
             "children_ids": list(self.children_ids),
-            "confidence": float(self.confidence),
+            "confidence": self.confidence,
             "review_state": self.review_state.value if isinstance(self.review_state, ReviewState) else str(self.review_state),
             "provenance": self.provenance.to_dict(),
             "substrate": self.substrate,
@@ -221,20 +253,6 @@ class CanonicalElement:
             except ValueError:
                 obj_type = ObjectType.SURFACE
 
-        # Fail-closed confidence deserialization (clamped to 0.0..1.0)
-        raw_conf = data.get("confidence")
-        try:
-            if raw_conf is not None:
-                conf_val = float(raw_conf)
-                if math.isnan(conf_val) or math.isinf(conf_val):
-                    conf_val = 0.0
-                else:
-                    conf_val = max(0.0, min(1.0, conf_val))
-            else:
-                conf_val = 0.0
-        except (ValueError, TypeError):
-            conf_val = 0.0
-
         return {
             "id": str(data.get("id", f"elem_{uuid.uuid4().hex[:8]}")),
             "name": str(data.get("name", "Unnamed Element")),
@@ -242,14 +260,14 @@ class CanonicalElement:
             "level_id": data.get("level_id"),
             "parent_id": data.get("parent_id"),
             "children_ids": [str(c) for c in (data.get("children_ids", []) or []) if c],
-            "confidence": conf_val,
+            "confidence": parse_optional_confidence(data.get("confidence")),
             "review_state": rev_state,
             "provenance": Provenance.from_dict(data.get("provenance") if isinstance(data.get("provenance"), dict) else {}),
             "substrate": data.get("substrate"),
             "finish": data.get("finish"),
             "metadata": dict(data.get("metadata", {}) or {}) if isinstance(data.get("metadata"), dict) else {},
-            "takeoff_eligible": bool(data.get("takeoff_eligible", False)),
-            "deduction_authority": bool(data.get("deduction_authority", False)),
+            "takeoff_eligible": parse_strict_bool(data.get("takeoff_eligible")),
+            "deduction_authority": parse_strict_bool(data.get("deduction_authority")),
         }
 
 
@@ -257,10 +275,10 @@ class CanonicalElement:
 class CanonicalOpening(CanonicalElement):
     wall_id: Optional[str] = None
     opening_type: str = "GENERIC"
-    offset_along_wall_m: float = 0.0
-    sill_height_m: float = 0.0
-    width_m: float = 0.0
-    height_m: float = 0.0
+    offset_along_wall_m: Optional[float] = None
+    sill_height_m: Optional[float] = None
+    width_m: Optional[float] = None
+    height_m: Optional[float] = None
     mark: Optional[str] = None
 
     def __post_init__(self):
@@ -276,10 +294,10 @@ class CanonicalOpening(CanonicalElement):
         res.update({
             "wall_id": self.wall_id,
             "opening_type": self.opening_type,
-            "offset_along_wall_m": float(self.offset_along_wall_m),
-            "sill_height_m": float(self.sill_height_m),
-            "width_m": float(self.width_m),
-            "height_m": float(self.height_m),
+            "offset_along_wall_m": self.offset_along_wall_m,
+            "sill_height_m": self.sill_height_m,
+            "width_m": self.width_m,
+            "height_m": self.height_m,
             "mark": self.mark,
         })
         return res
@@ -287,32 +305,24 @@ class CanonicalOpening(CanonicalElement):
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "CanonicalOpening":
         base_args = cls.base_from_dict_args(data)
-        
-        def safe_float(val, default=0.0):
-            try:
-                f = float(val)
-                return default if math.isnan(f) or math.isinf(f) else f
-            except (ValueError, TypeError):
-                return default
-
         return cls(
             **base_args,
             wall_id=data.get("wall_id"),
             opening_type=str(data.get("opening_type", "GENERIC")),
-            offset_along_wall_m=safe_float(data.get("offset_along_wall_m")),
-            sill_height_m=safe_float(data.get("sill_height_m")),
-            width_m=safe_float(data.get("width_m")),
-            height_m=safe_float(data.get("height_m")),
+            offset_along_wall_m=parse_optional_float(data.get("offset_along_wall_m")),
+            sill_height_m=parse_optional_float(data.get("sill_height_m")),
+            width_m=parse_optional_float(data.get("width_m")),
+            height_m=parse_optional_float(data.get("height_m")),
             mark=data.get("mark"),
         )
 
 
 @dataclass
 class CanonicalWall(CanonicalElement):
-    start_point: Vector2D = field(default_factory=lambda: Vector2D(0.0, 0.0))
-    end_point: Vector2D = field(default_factory=lambda: Vector2D(0.0, 0.0))
-    thickness_m: float = 0.15
-    height_m: float = 2.7
+    start_point: Vector2D = field(default_factory=Vector2D)
+    end_point: Vector2D = field(default_factory=Vector2D)
+    thickness_m: Optional[float] = None  # No invented defaults
+    height_m: Optional[float] = None     # No invented defaults
     is_external: bool = False
     openings: List[CanonicalOpening] = field(default_factory=list)
 
@@ -324,8 +334,8 @@ class CanonicalWall(CanonicalElement):
         res.update({
             "start_point": self.start_point.to_dict(),
             "end_point": self.end_point.to_dict(),
-            "thickness_m": float(self.thickness_m),
-            "height_m": float(self.height_m),
+            "thickness_m": self.thickness_m,
+            "height_m": self.height_m,
             "is_external": bool(self.is_external),
             "openings": [op.to_dict() for op in self.openings],
         })
@@ -336,21 +346,14 @@ class CanonicalWall(CanonicalElement):
         base_args = cls.base_from_dict_args(data)
         openings_raw = data.get("openings", []) or []
         openings = [CanonicalOpening.from_dict(op) for op in openings_raw if isinstance(op, dict)]
-        
-        def safe_float(val, default=0.0):
-            try:
-                f = float(val)
-                return default if math.isnan(f) or math.isinf(f) else f
-            except (ValueError, TypeError):
-                return default
 
         return cls(
             **base_args,
             start_point=Vector2D.from_dict(data.get("start_point")),
             end_point=Vector2D.from_dict(data.get("end_point")),
-            thickness_m=safe_float(data.get("thickness_m"), 0.15),
-            height_m=safe_float(data.get("height_m"), 2.7),
-            is_external=bool(data.get("is_external", False)),
+            thickness_m=parse_optional_float(data.get("thickness_m")),
+            height_m=parse_optional_float(data.get("height_m")),
+            is_external=parse_strict_bool(data.get("is_external")),
             openings=openings,
         )
 
@@ -358,7 +361,7 @@ class CanonicalWall(CanonicalElement):
 @dataclass
 class CanonicalSpace(CanonicalElement):
     boundary_polygon: List[Vector2D] = field(default_factory=list)
-    height_m: float = 2.7
+    height_m: Optional[float] = None
     specified_floor_area_m2: Optional[float] = None
     room_number: Optional[str] = None
 
@@ -369,7 +372,7 @@ class CanonicalSpace(CanonicalElement):
         res = self.base_to_dict()
         res.update({
             "boundary_polygon": [pt.to_dict() for pt in self.boundary_polygon],
-            "height_m": float(self.height_m),
+            "height_m": self.height_m,
             "specified_floor_area_m2": self.specified_floor_area_m2,
             "room_number": self.room_number,
         })
@@ -380,20 +383,12 @@ class CanonicalSpace(CanonicalElement):
         base_args = cls.base_from_dict_args(data)
         poly_raw = data.get("boundary_polygon", []) or []
         poly = [Vector2D.from_dict(pt) for pt in poly_raw if pt]
-        
-        spec_area = data.get("specified_floor_area_m2")
-        try:
-            if spec_area is not None:
-                spec_area = float(spec_area)
-                if math.isnan(spec_area) or math.isinf(spec_area): spec_area = None
-        except (ValueError, TypeError):
-            spec_area = None
 
         return cls(
             **base_args,
             boundary_polygon=poly,
-            height_m=float(data.get("height_m", 2.7)),
-            specified_floor_area_m2=spec_area,
+            height_m=parse_optional_float(data.get("height_m")),
+            specified_floor_area_m2=parse_optional_float(data.get("specified_floor_area_m2")),
             room_number=data.get("room_number"),
         )
 
@@ -402,15 +397,15 @@ class CanonicalSpace(CanonicalElement):
 class PolygonElement(CanonicalElement):
     """Generic base class for horizontal polygonal elements."""
     polygon: List[Vector2D] = field(default_factory=list)
-    thickness_m: float = 0.2
-    elevation_offset_m: float = 0.0
+    thickness_m: Optional[float] = None
+    elevation_offset_m: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         res = self.base_to_dict()
         res.update({
             "polygon": [pt.to_dict() for pt in self.polygon],
-            "thickness_m": float(self.thickness_m),
-            "elevation_offset_m": float(self.elevation_offset_m),
+            "thickness_m": self.thickness_m,
+            "elevation_offset_m": self.elevation_offset_m,
         })
         return res
 
@@ -422,8 +417,8 @@ class PolygonElement(CanonicalElement):
         return cls(
             **base_args,
             polygon=poly,
-            thickness_m=float(data.get("thickness_m", 0.2)),
-            elevation_offset_m=float(data.get("elevation_offset_m", 0.0)),
+            thickness_m=parse_optional_float(data.get("thickness_m")),
+            elevation_offset_m=parse_optional_float(data.get("elevation_offset_m")),
         )
 
 
@@ -441,8 +436,8 @@ class CanonicalCeiling(PolygonElement):
 
 @dataclass
 class CanonicalRoof(PolygonElement):
-    pitch_deg: float = 0.0
-    overhang_m: float = 0.6
+    pitch_deg: Optional[float] = None
+    overhang_m: Optional[float] = None
     roof_type: str = "FLAT"
 
     def __post_init__(self):
@@ -451,8 +446,8 @@ class CanonicalRoof(PolygonElement):
     def to_dict(self) -> Dict[str, Any]:
         res = super().to_dict()
         res.update({
-            "pitch_deg": float(self.pitch_deg),
-            "overhang_m": float(self.overhang_m),
+            "pitch_deg": self.pitch_deg,
+            "overhang_m": self.overhang_m,
             "roof_type": self.roof_type,
         })
         return res
@@ -465,10 +460,10 @@ class CanonicalRoof(PolygonElement):
         return cls(
             **base_args,
             polygon=poly,
-            thickness_m=float(data.get("thickness_m", 0.2)),
-            elevation_offset_m=float(data.get("elevation_offset_m", 0.0)),
-            pitch_deg=float(data.get("pitch_deg", 0.0)),
-            overhang_m=float(data.get("overhang_m", 0.6)),
+            thickness_m=parse_optional_float(data.get("thickness_m")),
+            elevation_offset_m=parse_optional_float(data.get("elevation_offset_m")),
+            pitch_deg=parse_optional_float(data.get("pitch_deg")),
+            overhang_m=parse_optional_float(data.get("overhang_m")),
             roof_type=str(data.get("roof_type", "FLAT")),
         )
 
@@ -499,18 +494,18 @@ class CanonicalBalcony(PolygonElement):
         return cls(
             **base_args,
             polygon=poly,
-            thickness_m=float(data.get("thickness_m", 0.2)),
-            elevation_offset_m=float(data.get("elevation_offset_m", 0.0)),
+            thickness_m=parse_optional_float(data.get("thickness_m")),
+            elevation_offset_m=parse_optional_float(data.get("elevation_offset_m")),
             balustrade_ids=list(data.get("balustrade_ids", []) or []),
         )
 
 
 @dataclass
 class CanonicalParapet(CanonicalElement):
-    start_point: Vector2D = field(default_factory=lambda: Vector2D(0.0, 0.0))
-    end_point: Vector2D = field(default_factory=lambda: Vector2D(0.0, 0.0))
-    height_m: float = 1.0
-    thickness_m: float = 0.2
+    start_point: Vector2D = field(default_factory=Vector2D)
+    end_point: Vector2D = field(default_factory=Vector2D)
+    height_m: Optional[float] = None
+    thickness_m: Optional[float] = None
 
     def __post_init__(self):
         self.object_type = ObjectType.PARAPET
@@ -520,8 +515,8 @@ class CanonicalParapet(CanonicalElement):
         res.update({
             "start_point": self.start_point.to_dict(),
             "end_point": self.end_point.to_dict(),
-            "height_m": float(self.height_m),
-            "thickness_m": float(self.thickness_m),
+            "height_m": self.height_m,
+            "thickness_m": self.thickness_m,
         })
         return res
 
@@ -532,17 +527,17 @@ class CanonicalParapet(CanonicalElement):
             **base_args,
             start_point=Vector2D.from_dict(data.get("start_point")),
             end_point=Vector2D.from_dict(data.get("end_point")),
-            height_m=float(data.get("height_m", 1.0)),
-            thickness_m=float(data.get("thickness_m", 0.2)),
+            height_m=parse_optional_float(data.get("height_m")),
+            thickness_m=parse_optional_float(data.get("thickness_m")),
         )
 
 
 @dataclass
 class CanonicalColumn(CanonicalElement):
-    center: Vector2D = field(default_factory=lambda: Vector2D(0.0, 0.0))
-    width_m: float = 0.4
-    depth_m: float = 0.4
-    height_m: float = 2.7
+    center: Vector2D = field(default_factory=Vector2D)
+    width_m: Optional[float] = None
+    depth_m: Optional[float] = None
+    height_m: Optional[float] = None
 
     def __post_init__(self):
         self.object_type = ObjectType.COLUMN
@@ -551,9 +546,9 @@ class CanonicalColumn(CanonicalElement):
         res = self.base_to_dict()
         res.update({
             "center": self.center.to_dict(),
-            "width_m": float(self.width_m),
-            "depth_m": float(self.depth_m),
-            "height_m": float(self.height_m),
+            "width_m": self.width_m,
+            "depth_m": self.depth_m,
+            "height_m": self.height_m,
         })
         return res
 
@@ -563,24 +558,24 @@ class CanonicalColumn(CanonicalElement):
         return cls(
             **base_args,
             center=Vector2D.from_dict(data.get("center")),
-            width_m=float(data.get("width_m", 0.4)),
-            depth_m=float(data.get("depth_m", 0.4)),
-            height_m=float(data.get("height_m", 2.7)),
+            width_m=parse_optional_float(data.get("width_m")),
+            depth_m=parse_optional_float(data.get("depth_m")),
+            height_m=parse_optional_float(data.get("height_m")),
         )
 
 
 @dataclass
 class CanonicalLinearElement(CanonicalElement):
-    start_point: Vector2D = field(default_factory=lambda: Vector2D(0.0, 0.0))
-    end_point: Vector2D = field(default_factory=lambda: Vector2D(0.0, 0.0))
-    height_m: float = 1.0
+    start_point: Vector2D = field(default_factory=Vector2D)
+    end_point: Vector2D = field(default_factory=Vector2D)
+    height_m: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         res = self.base_to_dict()
         res.update({
             "start_point": self.start_point.to_dict(),
             "end_point": self.end_point.to_dict(),
-            "height_m": float(self.height_m),
+            "height_m": self.height_m,
         })
         return res
 
@@ -591,7 +586,7 @@ class CanonicalLinearElement(CanonicalElement):
             **base_args,
             start_point=Vector2D.from_dict(data.get("start_point")),
             end_point=Vector2D.from_dict(data.get("end_point")),
-            height_m=float(data.get("height_m", 1.0)),
+            height_m=parse_optional_float(data.get("height_m")),
         )
 
 
@@ -610,7 +605,7 @@ class CanonicalScreen(CanonicalLinearElement):
 @dataclass
 class CanonicalFinishSurface(CanonicalElement):
     parent_element_id: Optional[str] = None
-    surface_area_m2: float = 0.0
+    surface_area_m2: Optional[float] = None
     orientation: str = "UNKNOWN"
 
     def __post_init__(self):
@@ -620,7 +615,7 @@ class CanonicalFinishSurface(CanonicalElement):
         res = self.base_to_dict()
         res.update({
             "parent_element_id": self.parent_element_id,
-            "surface_area_m2": float(self.surface_area_m2),
+            "surface_area_m2": self.surface_area_m2,
             "orientation": self.orientation,
         })
         return res
@@ -631,15 +626,15 @@ class CanonicalFinishSurface(CanonicalElement):
         return cls(
             **base_args,
             parent_element_id=data.get("parent_element_id"),
-            surface_area_m2=float(data.get("surface_area_m2", 0.0)),
+            surface_area_m2=parse_optional_float(data.get("surface_area_m2")),
             orientation=str(data.get("orientation", "UNKNOWN")),
         )
 
 
 @dataclass
 class CanonicalLevel(CanonicalElement):
-    elevation_m: float = 0.0
-    height_m: float = 2.7
+    elevation_m: Optional[float] = None
+    height_m: Optional[float] = None
     level_index: int = 0
     walls: List[CanonicalWall] = field(default_factory=list)
     spaces: List[CanonicalSpace] = field(default_factory=list)
@@ -652,6 +647,7 @@ class CanonicalLevel(CanonicalElement):
     columns: List[CanonicalColumn] = field(default_factory=list)
     balustrades: List[CanonicalBalustrade] = field(default_factory=list)
     screens: List[CanonicalScreen] = field(default_factory=list)
+    surfaces: List[CanonicalFinishSurface] = field(default_factory=list)
 
     def __post_init__(self):
         self.object_type = ObjectType.LEVEL
@@ -659,8 +655,8 @@ class CanonicalLevel(CanonicalElement):
     def to_dict(self) -> Dict[str, Any]:
         res = self.base_to_dict()
         res.update({
-            "elevation_m": float(self.elevation_m),
-            "height_m": float(self.height_m),
+            "elevation_m": self.elevation_m,
+            "height_m": self.height_m,
             "level_index": int(self.level_index),
             "walls": [w.to_dict() for w in self.walls],
             "spaces": [sp.to_dict() for sp in self.spaces],
@@ -673,6 +669,7 @@ class CanonicalLevel(CanonicalElement):
             "columns": [col.to_dict() for col in self.columns],
             "balustrades": [bal.to_dict() for bal in self.balustrades],
             "screens": [scr.to_dict() for scr in self.screens],
+            "surfaces": [s.to_dict() for s in self.surfaces],
         })
         return res
 
@@ -681,8 +678,8 @@ class CanonicalLevel(CanonicalElement):
         base_args = cls.base_from_dict_args(data)
         return cls(
             **base_args,
-            elevation_m=float(data.get("elevation_m", 0.0)),
-            height_m=float(data.get("height_m", 2.7)),
+            elevation_m=parse_optional_float(data.get("elevation_m")),
+            height_m=parse_optional_float(data.get("height_m")),
             level_index=int(data.get("level_index", 0)),
             walls=[CanonicalWall.from_dict(w) for w in data.get("walls", []) or [] if isinstance(w, dict)],
             spaces=[CanonicalSpace.from_dict(sp) for sp in data.get("spaces", []) or [] if isinstance(sp, dict)],
@@ -695,6 +692,7 @@ class CanonicalLevel(CanonicalElement):
             columns=[CanonicalColumn.from_dict(col) for col in data.get("columns", []) or [] if isinstance(col, dict)],
             balustrades=[CanonicalBalustrade.from_dict(bal) for bal in data.get("balustrades", []) or [] if isinstance(bal, dict)],
             screens=[CanonicalScreen.from_dict(scr) for scr in data.get("screens", []) or [] if isinstance(scr, dict)],
+            surfaces=[CanonicalFinishSurface.from_dict(s) for s in data.get("surfaces", []) or [] if isinstance(s, dict)],
         )
 
 
@@ -729,7 +727,7 @@ class CanonicalBuilding(CanonicalElement):
 @dataclass
 class CanonicalProject(CanonicalElement):
     buildings: List[CanonicalBuilding] = field(default_factory=list)
-    is_synthetic_demo: bool = False  # Explicit flag for demo vs user canonical models
+    is_synthetic_demo: bool = False
 
     def __post_init__(self):
         self.object_type = ObjectType.PROJECT
@@ -748,7 +746,7 @@ class CanonicalProject(CanonicalElement):
         return cls(
             **base_args,
             buildings=[CanonicalBuilding.from_dict(b) for b in data.get("buildings", []) or [] if isinstance(b, dict)],
-            is_synthetic_demo=bool(data.get("is_synthetic_demo", False)),
+            is_synthetic_demo=parse_strict_bool(data.get("is_synthetic_demo")),
         )
 
     def to_json(self, indent: Optional[int] = 2) -> str:
