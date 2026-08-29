@@ -26,6 +26,7 @@ production entry points (``run_p5_native_payload`` /
 """
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -78,6 +79,7 @@ PROVENANCE_UNKNOWN = "unknown"
 # one elevation make it too weak.  Production matching requires a stronger
 # instance-specific anchor.  These constants describe the anchor rules.
 PROD_POSITION_TOLERANCE_M = 0.25   # validated position/location correspondence tolerance
+_FRAME_EPS = 1e-6                  # tolerance when matching a registered frame's origin/direction
 
 
 @dataclass(frozen=True)
@@ -1018,14 +1020,15 @@ def _exact_mark_anchor(inst: Any, elev: ElevationOpening) -> bool:
 def _registered_wall_segment(
     facades: Any, side: str, wall_ref: str
 ) -> Optional[Dict[str, Any]]:
-    """Return the registration-derived facade segment for (side, wall_ref).
+    """Return the registered facade segment for (side, wall_ref_ref).
 
     ``facades`` is the shape produced by ``footprint_facades`` (keyed by
     cardinal side, each with a ``segments`` list of ``{wall_ref, a, b,
-    length_m, side, ...}``) — i.e. wall segments derived from the CALIBRATED
-    building footprint.  The returned segment is the SINGLE source of truth for
-    that wall's location frame: its ``a`` (origin), the direction toward ``b``,
-    and its ``length_m`` define the along-wall station axis.
+    length_m, side, source_polygon, ...}``) — i.e. wall segments derived from
+    the CALIBRATED building footprint.  The returned segment is the SINGLE
+    source of truth for that wall's location frame: its ``a`` (origin), the
+    direction toward ``b``, and its ``length_m`` define the along-wall station
+    axis, and its ``source_polygon`` + ``wall_ref`` define the frame identity.
 
     Returns None when the side/wall is not registered, or when no facade
     coregistration is supplied at all — a caller-attached string can never be
@@ -1042,29 +1045,105 @@ def _registered_wall_segment(
     return None
 
 
-def _registration_derived_plan_station(
-    inst: Any, segment: Dict[str, Any]
-) -> Optional[float]:
-    """Registration-derived plan station along the segment's origin/direction.
+def _vec2(value: Any) -> Optional[Tuple[float, float]]:
+    """Normalise a 2D vector from ``[x, y]``/``(x, y)``; None if malformed."""
+    try:
+        x = float(value[0])
+        y = float(value[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if x != x or y != y or abs(x) == float("inf") or abs(y) == float("inf"):
+        return None
+    return (x, y)
 
-    The plan instance's ``position_along_wall_m`` is interpreted strictly in
-    the REGISTERED segment's frame: a distance measured from the segment's
-    ORIGIN ``a`` along its direction toward ``b``.  A station is accepted only
-    when it lies on the segment (0..length_m); anything else — including a plan
-    that carries no station at all — is NOT registration-derived and yields
-    None.  Deriving the station from the same origin/direction as the elevation
-    is what makes the agreed position a genuine anchor rather than two arbitrary
-    caller-attached numbers that happen to match.
+
+def _segment_frame(segment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Canonical location frame derived from a REGISTERED facade segment.
+
+    Computed directly from the segment's own geometry: origin ``a``, unit
+    direction toward ``b``, length, and a frame identity ``<source_polygon>:
+    <wall_ref>``.  Returns None when the segment lacks usable geometry.
     """
-    station = _num(getattr(inst, "position_along_wall_m", None), float("nan"))
-    if station != station:
+    a = _vec2(segment.get("a"))
+    b = _vec2(segment.get("b"))
+    if a is None or b is None:
         return None
-    length = _num(segment.get("length_m"), None)
-    if length is None or length <= 0.0:
+    vx, vy = b[0] - a[0], b[1] - a[1]
+    length = math.hypot(vx, vy)
+    if length <= 0.0:
         return None
-    if station < 0.0 or station > length:
-        return None  # off the registered segment extent -> not derived here
-    return station
+    wall_ref = str(segment.get("wall_ref") or "").strip().upper()
+    source = str(segment.get("source_polygon") or "").strip()
+    return {
+        "origin": a,
+        "direction": (vx / length, vy / length),
+        "length_m": length,
+        "segment_id": f"{source}:{wall_ref}" if source else wall_ref,
+    }
+
+
+def _position_record(obj: Any) -> Optional[Dict[str, Any]]:
+    """Extract+normalise a STRUCTURED registration-derived position record.
+
+    Only a dict stored on the object (``registration_position``) counts.  A raw
+    scalar (``position_along_wall_m`` / ``wall_position_m``) carries no frame
+    identity, origin, direction, or derivation source and therefore can never
+    establish registration provenance — such scalar-only positions return None
+    and FAIL CLOSED (they are indistinguishable from an arbitrary number).
+
+    Canonical record: ``{wall_ref, segment_id, origin, direction, station_m,
+    derivation}``.  Returns None for any missing/malformed field so an
+    incomplete or fabricated record can never anchor.
+    """
+    rec = getattr(obj, "registration_position", None)
+    if not isinstance(rec, dict):
+        return None
+    wall_ref = str(rec.get("wall_ref") or "").strip().upper()
+    segment_id = str(rec.get("segment_id") or "").strip()
+    origin = _vec2(rec.get("origin"))
+    direction = _vec2(rec.get("direction"))
+    station = _num(rec.get("station_m"), None)
+    derivation = str(rec.get("derivation") or "").strip()
+    if not wall_ref or not segment_id or origin is None or direction is None:
+        return None
+    if station is None or station != station:
+        return None
+    if not derivation:
+        return None
+    dlen = math.hypot(direction[0], direction[1])
+    if dlen <= 0.0:
+        return None
+    return {
+        "wall_ref": wall_ref,
+        "segment_id": segment_id,
+        "origin": origin,
+        "direction": (direction[0] / dlen, direction[1] / dlen),
+        "station_m": station,
+        "derivation": derivation,
+    }
+
+
+def _record_in_registered_frame(
+    rec: Dict[str, Any], frame: Dict[str, Any]
+) -> bool:
+    """True when a position record was derived in the SAME registered frame.
+
+    The record's frame identity, ORIGIN and DIRECTION must each match the
+    registered facade segment's frame, and its station must fall on that
+    segment.  A different origin or direction (even with an agreeing station)
+    means the two sides are NOT in a shared registration frame -> reject.
+    """
+    if rec["segment_id"] != frame["segment_id"]:
+        return False  # different frame identity
+    if (abs(rec["origin"][0] - frame["origin"][0]) > _FRAME_EPS
+            or abs(rec["origin"][1] - frame["origin"][1]) > _FRAME_EPS):
+        return False  # different origin
+    if (abs(rec["direction"][0] - frame["direction"][0]) > _FRAME_EPS
+            or abs(rec["direction"][1] - frame["direction"][1]) > _FRAME_EPS):
+        return False  # different direction
+    if rec["derivation"] != "facade_registration":
+        return False  # not derived from the facade registration
+    return 0.0 <= rec["station_m"] <= frame["length_m"]
 
 
 def _validated_position_anchor(
@@ -1072,59 +1151,49 @@ def _validated_position_anchor(
 ) -> bool:
     """Strong anchor (b): GENUINELY registration-derived position correspondence.
 
-    A production elevation opening may carry a wall position (``wall_position_m``)
-    that must agree with the plan instance's ``position_along_wall_m`` within
-    tolerance.  Position is instance-specific (two same-width windows on one
-    elevation sit at different stations along the wall).
+    Production position identity is ONLY accepted when BOTH the plan instance
+    and the elevation opening carry a STRUCTURED registration-derived position
+    record that (a) names the SAME wall reference, (b) was derived in the SAME
+    registered facade segment frame — same segment identity, ORIGIN and
+    DIRECTION computed from that segment's ``a``/``b`` geometry, with derivation
+    source ``facade_registration`` — and (c) agree on the along-wall station.
 
-    This requires ALL of the following — matching PLAN AND ELEVATION wall
-    references, and a REGISTRATION-DERIVED position frame shared by both sides:
-
-      1. BOTH the plan instance and the elevation opening carry the SAME,
-         non-blank ``wall_ref`` (a wrong wall can never anchor, no matter how
-         close the stations numerically are).
-      2. A facade wall segment for that ref is REGISTERED from the calibrated
-         building footprint on the elevation side (``facades`` from
-         ``footprint_facades``).  No registration -> the position is NOT
-         derivation-backed and can never anchor.
-      3. The plan station is REGISTRATION-DERIVED: ``position_along_wall_m``
-         measured from the same segment's ORIGIN along its DIRECTION, and it
-         falls on that segment's extent.
-      4. The elevation ``wall_position_m`` is on the same segment extent and
-         agrees with the derived plan station within tolerance.
-
-    A dynamically attached ``wall_position_m`` — even when it numerically lies
-    within a registered extent — does NOT qualify BY ITSELF: without a matching
-    plan ``wall_ref`` AND a registration-derived plan station on the same
-    segment/origin/direction it is indistinguishable from an arbitrary number,
-    so it fails closed to ambiguity/review.
+    Raw scalar-only positions (``position_along_wall_m`` +
+    ``wall_position_m``) are NEVER accepted: an arbitrary in-range number
+    carries no frame identity, origin, direction, or derivation source, so even
+    with matching wall refs and values inside the registered extent it is
+    indistinguishable from a fabricated scalar and FAILS CLOSED.  Different
+    registration origins or directions likewise reject — same station in two
+    different frames is not a shared position.
     """
-    plan_wall = str(getattr(inst, "wall_ref", None) or "").strip().upper()
-    elev_wall = str(getattr(elev, "wall_ref", None) or "").strip().upper()
-    if not plan_wall or not elev_wall:
-        return False  # both sides must carry a wall reference
-    if plan_wall != elev_wall:
+    plan_rec = _position_record(inst)
+    elev_rec = _position_record(elev)
+    if plan_rec is None or elev_rec is None:
+        # Raw scalar-only / missing structural record -> cannot establish
+        # registration provenance; fail closed to ambiguity/review.
+        return False
+    if plan_rec["wall_ref"] != elev_rec["wall_ref"]:
         return False  # WRONG WALL: references must match before position anchors
-    elev_pos = _num(getattr(elev, "wall_position_m", None), float("nan"))
-    if elev_pos != elev_pos:
-        return False  # no elevation position supplied
     segment = _registered_wall_segment(
-        facades, str(getattr(elev, "elevation_side", "") or "").strip(), elev_wall
+        facades, str(getattr(elev, "elevation_side", "") or "").strip(),
+        plan_rec["wall_ref"],
     )
     if segment is None:
-        # Wall not registered from the footprint (or no facades) -> the attached
-        # position is NOT registration-derived and cannot be a genuine anchor.
+        # Wall not registered from the footprint (or no facades) -> the position
+        # is NOT registration-derived and cannot be a genuine anchor.
         return False
-    plan_station = _registration_derived_plan_station(inst, segment)
-    if plan_station is None:
-        # The plan has no registration-derived station on this segment -> an
-        # attached elevation position, even in extent, cannot anchor by itself.
+    frame = _segment_frame(segment)
+    if frame is None:
         return False
-    length = _num(segment.get("length_m"), None) or 0.0
-    if elev_pos < 0.0 or elev_pos > length:
-        # Elevation position off the registered segment extent -> wrong location.
-        return False
-    return abs(plan_station - elev_pos) <= PROD_POSITION_TOLERANCE_M
+    if not _record_in_registered_frame(plan_rec, frame):
+        return False  # plan not in the shared registered frame
+    if not _record_in_registered_frame(elev_rec, frame):
+        return False  # elevation not in the shared registered frame
+    if plan_rec["segment_id"] != elev_rec["segment_id"]:
+        return False  # different frame identity
+    # Both sides derived in the SAME registered origin/direction frame; their
+    # stations must agree on a physical opening.
+    return abs(plan_rec["station_m"] - elev_rec["station_m"]) <= PROD_POSITION_TOLERANCE_M
 
 
 def _proven_unique_anchor(elev: ElevationOpening) -> bool:

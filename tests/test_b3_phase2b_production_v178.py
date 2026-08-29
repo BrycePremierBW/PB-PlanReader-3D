@@ -168,7 +168,32 @@ def _register_facades():
     }
 
 
-# ---------------------------------------------------------------------------
+def _reg_pos(
+    wall_ref: str, station: float, *,
+    origin=(0.0, 0.0), direction=(1.0, 0.0),
+    segment_id="fp-1:E01", derivation="facade_registration",
+):
+    """A STRUCTURED registration-derived position record (R2 contract).
+
+    Matches the E01/East segment registered by ``_register_facades`` (origin
+    ``a`` = (0,0), unit direction toward ``b`` = (1,0), frame ``fp-1:E01``).
+    A genuine anchor requires this record on BOTH the plan and the elevation;
+    raw scalar positions alone fail closed.
+    """
+    return {
+        "wall_ref": wall_ref,
+        "segment_id": segment_id,
+        "origin": list(origin),
+        "direction": list(direction),
+        "station_m": station,
+        "derivation": derivation,
+    }
+
+
+def _attach_reg_position(obj, record):
+    """Attach a structured registration-derived position record to an object."""
+    object.__setattr__(obj, "registration_position", record)
+    return obj
 # Fixture helpers (real evidence; expected geometry stated independently)
 # ---------------------------------------------------------------------------
 def _load_fixture():
@@ -314,10 +339,15 @@ def test_valid_elevation_reaches_production_evidence_pipeline():
         opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
     )
     plan.elevation_side = "East"
-    # Production strict identity: the real facade cell carries an explicit,
-    # validated wall position (m) that agrees with the plan instance's station,
-    # so it has a strong position+width anchor (NOT blank-mark + side + width).
-    object.__setattr__(opening, "wall_position_m", plan.position_along_wall_m)
+    # Production strict identity: BOTH sides carry a STRUCTURED
+    # registration-derived position record (same registered E01 frame, origin,
+    # direction, agreeing station) — NOT a raw scalar, which would fail closed.
+    _attach_reg_position(
+        plan, _reg_pos("E01", plan.position_along_wall_m),
+    )
+    _attach_reg_position(
+        opening, _reg_pos("E01", plan.position_along_wall_m),
+    )
 
     native = {"segments": [], "words": []}
     with patch(
@@ -696,9 +726,10 @@ def test_analyse_stored_page_openings_threads_elevation():
         opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
     )
     plan.elevation_side = "East"
-    # Production strict identity anchor for the real facade cell: validated
-    # wall position (m) agreeing with the plan station (NOT blank-mark+side+width).
-    object.__setattr__(opening, "wall_position_m", plan.position_along_wall_m)
+    # Production strict identity for the real facade cell: BOTH sides carry a
+    # STRUCTURED registration-derived position record in the shared E01 frame.
+    _attach_reg_position(plan, _reg_pos("E01", plan.position_along_wall_m))
+    _attach_reg_position(opening, _reg_pos("E01", plan.position_along_wall_m))
 
     fd, path = tempfile.mkstemp(suffix=".pdf")
     os.close(fd)
@@ -1029,13 +1060,15 @@ def test_c2_exact_mark_plus_width_may_correlate():
 
 
 def test_c2_footprint_validated_position_plus_width_may_correlate():
-    """Footprint-registered wall/side + agreeing stations + width -> MAY correlate.
+    """Shared registered frame + STRUCTURED registration-derived stations ->
+    MAY correlate.
 
-    The position anchor is GENUINE: the elevation opening's ``wall_ref``/side
-    (E01/East) matches a facade segment registered from the calibrated
-    building-footprint index (``pb_elevation_registration_v135
-    .footprint_facades``), the plan station lies within that segment's
-    footprint-derived extent, and both stations agree within tolerance.
+    The position anchor is GENUINE only when BOTH the plan and the elevation
+    carry a structured registration-derived position record (same registered
+    E01/East frame identity, origin, direction, and an agreeing station) backed
+    by the calibrated ``footprint_facades`` registration.  A pair that agrees
+    on raw in-range scalars alone, or falls outside the shared frame, must NOT
+    anchor.
     """
     plan = _b1_candidate(
         mark="", wall="E01", position=2.0, width=1.0,
@@ -1048,28 +1081,33 @@ def test_c2_footprint_validated_position_plus_width_may_correlate():
         label="", confidence=0.7,
         wall_ref="E01",
     )
-    # E01/East is registered (length 8 m) and the agreed station is on extent.
-    object.__setattr__(elev, "wall_position_m", plan.position_along_wall_m)
+    # Both sides carry a STRUCTURED registration-derived record in the shared
+    # E01 frame (origin (0,0), direction (1,0), segment fp-1:E01).
+    _attach_reg_position(plan, _reg_pos("E01", plan.position_along_wall_m))
+    _attach_reg_position(elev, _reg_pos("E01", plan.position_along_wall_m))
     enriched, unmatched = bridge.correlate_elevation_to_plan_production(
         [elev], [plan], facades=_register_facades(),
     )
     assert len(unmatched) == 0
     assert enriched[0].elevation_geometry is not None
 
-    # A position outside station tolerance must NOT anchor (wrong location).
+    # A position outside station tolerance must NOT anchor (wrong location),
+    # even as a fully-structured pair in the same frame.
     out_tol = ElevationOpening(
         elevation_page_no=86, elevation_side="East",
         bbox_px=(100, 100, 200, 300), width_m=1.0, height_m=1.5,
         label="", confidence=0.7,
         wall_ref="E01",
     )
-    object.__setattr__(out_tol, "wall_position_m", plan.position_along_wall_m + 5.0)
+    _attach_reg_position(plan, _reg_pos("E01", 2.0))
+    _attach_reg_position(out_tol, _reg_pos("E01", 2.0 + 5.0))
     enriched2, unmatched2 = bridge.correlate_elevation_to_plan_production(
         [out_tol], [plan], facades=_register_facades(),
     )
     assert len(unmatched2) == 1, "mismatched position must not correlate"
+    _attach_reg_position(plan, _reg_pos("E01", 2.0))  # reset plan record
 
-    # A plan station OUTSIDE the registered facade extent must NOT anchor
+    # A structured station OUTSIDE the registered facade extent does NOT anchor
     # (the footprint-derived length limits where a position is valid).
     far_elev = ElevationOpening(
         elevation_page_no=86, elevation_side="East",
@@ -1082,7 +1120,8 @@ def test_c2_footprint_validated_position_plus_width_may_correlate():
         opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
     )
     far_plan.elevation_side = "East"
-    object.__setattr__(far_elev, "wall_position_m", far_plan.position_along_wall_m)
+    _attach_reg_position(far_plan, _reg_pos("E01", 12.0))
+    _attach_reg_position(far_elev, _reg_pos("E01", 12.0))
     enriched3, unmatched3 = bridge.correlate_elevation_to_plan_production(
         [far_elev], [far_plan], facades=_register_facades(),
     )
@@ -1232,13 +1271,15 @@ def test_r2_unproven_position_never_anchors():
 
 
 def test_r2_registration_derived_position_still_correlates():
-    """R2 sanity: a genuinely registration-derived position DOES anchor.
+    """R2 regression (positive): a genuinely registration-derived pair in the
+    SAME registered frame DOES anchor.
 
-    Matching plan/elevation wall_ref (E01), a registered E01/East segment
-    (origin 0 + direction toward 8), a registration-derived plan station
-    (2.0, on extent) and an agreeing elevation station (2.0) -> a genuine
-    production identity anchor, so the pair correlates.  This is the positive
-    counterpart to the wrong-wall / unproven-position regressions above.
+    Both plan and elevation carry a structured registration-derived position
+    record for the shared E01/East frame — same segment identity ``fp-1:E01``,
+    same origin ``(0,0)``, same direction ``(1,0)``, agreeing station 2.0,
+    derivation source ``facade_registration`` — so the pair shares a genuine
+    physical location and correlates.  This is the positive counterpart to the
+    raw-scalar and different-frame regressions.
     """
     plan = _b1_candidate(
         mark="", wall="E01", position=2.0, width=1.0,
@@ -1251,12 +1292,103 @@ def test_r2_registration_derived_position_still_correlates():
         label="", confidence=0.7,
         wall_ref="E01",
     )
-    object.__setattr__(elev, "wall_position_m", plan.position_along_wall_m)
+    _attach_reg_position(plan, _reg_pos("E01", 2.0))
+    _attach_reg_position(elev, _reg_pos("E01", 2.0))
     enriched, unmatched = bridge.correlate_elevation_to_plan_production(
         [elev], [plan], facades=_register_facades(),
     )
     assert len(unmatched) == 0
     assert enriched[0].elevation_geometry is not None
+
+
+def test_r2_matching_wall_in_range_raw_scalars_reject():
+    """R2 regression: matching wall refs + arbitrary IN-RANGE raw scalars reject.
+
+    The plan and elevation share wall_ref ``E01``, the raw plan station and the
+    dynamically attached ``wall_position_m`` are BOTH numerically inside the
+    registered 0..8 extent and agree exactly — but neither side carries a
+    STRUCTURED registration-derived position record.  Range-checking two raw
+    scalars does NOT establish registration provenance or a shared origin/
+    direction, so the pair must FAIL CLOSED (ambiguous -> review).
+    """
+    plan = _b1_candidate(
+        mark="", wall="E01", position=2.0, width=1.0,
+        opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
+    )
+    plan.elevation_side = "East"
+    elev = ElevationOpening(
+        elevation_page_no=86, elevation_side="East",
+        bbox_px=(100, 100, 200, 300), width_m=1.0, height_m=1.5,
+        label="", confidence=0.7,
+        wall_ref="E01",
+    )
+    # Raw scalars only: matching refs, in-range, agreeing values, yet NO
+    # registration-derived record on either side.
+    object.__setattr__(elev, "wall_position_m", plan.position_along_wall_m)
+    enriched, unmatched = bridge.correlate_elevation_to_plan_production(
+        [elev], [plan], facades=_register_facades(),
+    )
+    assert len(unmatched) == 1, (
+        "raw in-range scalars must not establish a validated position anchor"
+    )
+    assert enriched[0].elevation_geometry is None
+
+
+def test_r2_different_registration_origin_or_direction_rejects():
+    """R2 regression: DIFFERENT registration origins or directions reject — the
+    same station in two different frames is NOT a shared physical position.
+
+    Both sides carry structured records with the same station 2.0 and the same
+    wall_ref, but one claims a different REGISTERED frame than the other —
+    instead of the segment's true origin (0,0)/direction (1,0) a fabricated
+    frame is supplied.  Without the SAME registered origin and direction the
+    two records are not derived in a common frame, so the pair must reject.
+    """
+    plan = _b1_candidate(
+        mark="", wall="E01", position=2.0, width=1.0,
+        opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
+    )
+    plan.elevation_side = "East"
+    elev = ElevationOpening(
+        elevation_page_no=86, elevation_side="East",
+        bbox_px=(100, 100, 200, 300), width_m=1.0, height_m=1.5,
+        label="", confidence=0.7,
+        wall_ref="E01",
+    )
+    # Plan is genuinely in the registered E01 frame.
+    _attach_reg_position(plan, _reg_pos("E01", 2.0))
+
+    # (a) Elevation claims a DIFFERENT ORIGIN (translated frame) for the same
+    #     wall/station.
+    elev_wrong_origin = ElevationOpening(
+        elevation_page_no=86, elevation_side="East",
+        bbox_px=(100, 100, 200, 300), width_m=1.0, height_m=1.5,
+        label="", confidence=0.7, wall_ref="E01",
+    )
+    _attach_reg_position(
+        elev_wrong_origin,
+        _reg_pos("E01", 2.0, origin=(100.0, 0.0)),  # NOT the registered origin
+    )
+    enriched_a, unmatched_a = bridge.correlate_elevation_to_plan_production(
+        [elev_wrong_origin], [plan], facades=_register_facades(),
+    )
+    assert len(unmatched_a) == 1, "different origin must reject (different frame)"
+
+    # (b) Elevation claims a DIFFERENT DIRECTION (rotated frame) for the same
+    #     wall/station.
+    elev_wrong_dir = ElevationOpening(
+        elevation_page_no=86, elevation_side="East",
+        bbox_px=(100, 100, 200, 300), width_m=1.0, height_m=1.5,
+        label="", confidence=0.7, wall_ref="E01",
+    )
+    _attach_reg_position(
+        elev_wrong_dir,
+        _reg_pos("E01", 2.0, direction=(0.0, 1.0)),  # NOT the registered direction
+    )
+    enriched_b, unmatched_b = bridge.correlate_elevation_to_plan_production(
+        [elev_wrong_dir], [plan], facades=_register_facades(),
+    )
+    assert len(unmatched_b) == 1, "different direction must reject (different frame)"
 
 
 def test_c2_wrong_mark_rejects():
@@ -1501,7 +1633,12 @@ def test_r1_opening_provenance_is_index_aligned_and_consistent():
         opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
     )
     plan.elevation_side = "East"
-    object.__setattr__(result.openings[0], "wall_position_m", plan.position_along_wall_m)
+    # Genuine registration-derived position on BOTH sides so the pair has a
+    # strong anchor (single authoritative provenance, reused for correlation).
+    _attach_reg_position(plan, _reg_pos("E01", plan.position_along_wall_m))
+    _attach_reg_position(
+        result.openings[0], _reg_pos("E01", plan.position_along_wall_m),
+    )
     with patch(
         "pb_plan_opening_detection_v171.plan_opening_candidates",
         return_value=_mock_b1([plan]),
