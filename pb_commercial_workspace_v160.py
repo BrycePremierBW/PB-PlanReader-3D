@@ -8,7 +8,8 @@ or estimator-confirmed data.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, asdict
+import math
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
 
@@ -59,7 +60,26 @@ def _query(app: Any, sql: str, params: tuple) -> List[Dict[str, Any]]:
 
 def _positive(value: Any) -> bool:
     try:
-        return float(value) > 0
+        result = float(value)
+        return math.isfinite(result) and result > 0
+    except Exception:
+        return False
+
+
+def _selected(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _quantity_present(value: Any) -> bool:
+    """Distinguish a legitimate numeric zero from missing/malformed quantity data."""
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, str) and not value.strip():
+        return False
+    try:
+        return math.isfinite(float(value))
     except Exception:
         return False
 
@@ -70,6 +90,8 @@ def _takeoff_needs_review(row: Dict[str, Any]) -> bool:
     inclusion = str(row.get("inclusion_status") or "").strip().lower()
 
     if status in {"to measure", "provisional measured", "provisional", ""}:
+        return True
+    if status in {"measured", "allowance"} and not _quantity_present(row.get("quantity")):
         return True
     if any(token in confidence for token in ("review", "check", "provisional", "derived", "low")):
         return True
@@ -84,12 +106,17 @@ def _takeoff_ready(row: Dict[str, Any]) -> bool:
         return False
     if status in {"excluded", "not applicable"}:
         return True
-    # A measured zero can be a legitimate confirmed zero, so readiness is based
-    # on explicit status rather than forcing quantity > 0.
-    return status in {"measured", "allowance"}
+    # A measured zero can be a legitimate confirmed zero, but measured/allowance
+    # rows still require an explicitly present finite numeric quantity.
+    return status in {"measured", "allowance"} and _quantity_present(row.get("quantity"))
 
 
 def _model_setting(app: Any, workspace_id: int) -> tuple[bool, Optional[str]]:
+    """Recognise only structurally valid persisted model snapshots.
+
+    This deliberately says only "saved", never "fresh": checking source staleness
+    requires the heavier canonical evidence snapshot and is left to the 3D page.
+    """
     if not hasattr(app, "workspace_setting"):
         return False, None
     try:
@@ -110,7 +137,9 @@ def _model_setting(app: Any, workspace_id: int) -> tuple[bool, Optional[str]]:
     if not isinstance(payload.get("model_data"), dict):
         return False, None
     fingerprint = payload.get("source_revision_fingerprint")
-    return True, str(fingerprint) if fingerprint else None
+    if not isinstance(fingerprint, str) or not fingerprint.strip():
+        return False, None
+    return True, fingerprint.strip()
 
 
 def _workflow_state(
@@ -124,8 +153,10 @@ def _workflow_state(
     if review_total > 0:
         return "Review", "Review required"
     if not canonical_model_saved:
-        return "3D", "Take-off ready"
-    return "Export", "Ready to export"
+        return "3D", "Take-off reviewed"
+    # "Available" is intentionally weaker than "ready": this lightweight shell
+    # does not recompute canonical source staleness on every Streamlit rerun.
+    return "Export", "Export available"
 
 
 def derive_workspace_status(app: Any, workspace: Dict[str, Any]) -> CommercialWorkspaceStatus:
@@ -153,8 +184,10 @@ def derive_workspace_status(app: Any, workspace: Dict[str, Any]) -> CommercialWo
         (workspace_id,),
     )
 
-    pages_selected = sum(1 for row in pages if bool(row.get("selected")))
-    pages_calibrated = sum(1 for row in pages if bool(row.get("selected")) and _positive(row.get("px_per_m")))
+    pages_selected = sum(1 for row in pages if _selected(row.get("selected")))
+    pages_calibrated = sum(
+        1 for row in pages if _selected(row.get("selected")) and _positive(row.get("px_per_m"))
+    )
     takeoff_review = sum(1 for row in takeoff if _takeoff_needs_review(row))
     takeoff_ready = sum(1 for row in takeoff if _takeoff_ready(row))
     register_review = sum(
@@ -169,6 +202,8 @@ def derive_workspace_status(app: Any, workspace: Dict[str, Any]) -> CommercialWo
         except Exception:
             scale_review = 0
 
+    # This is a count of independent review signals from existing sources, not a
+    # deduplicated issue ledger. The UI labels it accordingly.
     review_total = takeoff_review + register_review + scale_review
     canonical_model_saved, fingerprint = _model_setting(app, workspace_id)
     current_step, overall_state = _workflow_state(
@@ -212,15 +247,15 @@ def workflow_step_states(status: CommercialWorkspaceStatus) -> List[Dict[str, st
 
         if label == "Review" and status.review_total > 0:
             state = "review" if current_index >= 2 else state
-            detail = f"{status.review_total} item{'s' if status.review_total != 1 else ''}"
+            detail = f"{status.review_total} signal{'s' if status.review_total != 1 else ''}"
         elif label == "3D":
-            detail = "saved" if status.canonical_model_saved else "not saved"
+            detail = "saved snapshot" if status.canonical_model_saved else "not saved"
         elif label == "Upload":
             detail = f"{status.pages_total} sheet{'s' if status.pages_total != 1 else ''}"
         elif label == "Scope & Read":
             detail = f"{status.takeoff_total} row{'s' if status.takeoff_total != 1 else ''}"
-        elif label == "Export" and status.overall_state == "Ready to export":
-            detail = "ready"
+        elif label == "Export" and status.overall_state == "Export available":
+            detail = "available"
         result.append({"label": label, "state": state, "detail": detail})
     return result
 
@@ -267,9 +302,13 @@ def render_commercial_workspace_shell(app: Any, workspace: Dict[str, Any]) -> Co
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Drawings", status.pages_total, f"{status.pages_selected} selected")
-    c2.metric("Take-off", status.takeoff_total, f"{status.takeoff_ready} ready")
-    c3.metric("Review", status.review_total, "needs attention" if status.review_total else "clear")
-    c4.metric("3D Model", "Saved" if status.canonical_model_saved else "Not saved")
+    c2.metric("Take-off", status.takeoff_total, f"{status.takeoff_ready} reviewed")
+    c3.metric(
+        "Review signals",
+        status.review_total,
+        "needs attention" if status.review_total else "none detected",
+    )
+    c4.metric("3D Model", "Saved snapshot" if status.canonical_model_saved else "Not saved")
     return status
 
 
