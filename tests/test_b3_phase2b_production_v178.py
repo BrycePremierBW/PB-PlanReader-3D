@@ -1391,24 +1391,69 @@ def test_r2_different_registration_origin_or_direction_rejects():
     assert len(unmatched_b) == 1, "different direction must reject (different frame)"
 
 
-def test_c2_wrong_mark_rejects():
-    """Wrong opening mark -> reject (no correlation even with width/side)."""
+def test_r2_record_wall_ref_must_match_owning_object_wall_ref():
+    """R2 fail-closed: each structured record's ``wall_ref`` MUST equal its OWN
+    object's nonblank ``wall_ref``.
+
+    Plan object ``wall_ref=W02``, elevation object ``wall_ref=E01``, both sides
+    East, dimensions agree, and BOTH structured records falsely claim the SAME
+    valid E01/East frame + station 2.0.  Even though the two records agree with
+    each other and the claimed frame is genuinely registered, the plan's record
+    names E01 while the plan object itself is associated with W02 — that is
+    mis-attached wall evidence, so the position anchor must FAIL CLOSED.
+    """
     plan = _b1_candidate(
-        mark="D01", wall="W01", position=1.5, width=0.82,
-        opening_type=OPENING_TYPE_DOOR, geom_conf=0.9, assoc_conf=0.85,
+        mark="", wall="W02", position=2.0, width=1.0,
+        opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
     )
-    plan.elevation_side = "North"
+    plan.elevation_side = "East"
     elev = ElevationOpening(
-        elevation_page_no=3, elevation_side="North",
-        bbox_px=(100, 100, 200, 300), width_m=0.82, height_m=2.1,
-        label="D02", confidence=0.8,  # D02 != D01
+        elevation_page_no=86, elevation_side="East",
+        bbox_px=(100, 100, 200, 300), width_m=1.0, height_m=1.5,
+        label="", confidence=0.7,
+        wall_ref="E01",
     )
-    # Give a validated position so the ONLY disqualifier is the wrong mark.
-    object.__setattr__(elev, "wall_position_m", plan.position_along_wall_m)
+    # Both records falsely claim the valid E01/East frame + station 2.0.
+    _attach_reg_position(plan, _reg_pos("E01", 2.0))
+    _attach_reg_position(elev, _reg_pos("E01", 2.0))
     enriched, unmatched = bridge.correlate_elevation_to_plan_production(
-        [elev], [plan],
+        [elev], [plan], facades=_register_facades(),
     )
-    assert len(unmatched) == 1, "conflicting mark must reject"
+    assert len(unmatched) == 1, (
+        "record wall_ref conflicting with its own object's wall_ref must reject"
+    )
+    assert enriched[0].elevation_geometry is None
+
+
+def test_c2_wrong_mark_rejects():
+    """Wrong opening mark -> reject, even with an otherwise-VALID structured
+    position pair and facade registration.
+
+    The pair shares side East, wall E01, a GENUINELY registered position frame
+    (valid structured records on both sides) and compatible dimensions — so the
+    ONLY disqualifier is the CONFLICTING mark (plan D01 vs elevation D02).  This
+    proves the wrong mark, not the absence of an anchor, is what forces
+    rejection.
+    """
+    plan = _b1_candidate(
+        mark="D01", wall="E01", position=2.0, width=1.0,
+        opening_type=OPENING_TYPE_WINDOW, geom_conf=0.9, assoc_conf=0.85,
+    )
+    plan.elevation_side = "East"
+    elev = ElevationOpening(
+        elevation_page_no=86, elevation_side="East",
+        bbox_px=(100, 100, 200, 300), width_m=1.0, height_m=1.5,
+        label="D02", confidence=0.8,  # D02 != D01  (the ONLY conflict)
+        wall_ref="E01",
+    )
+    # A genuinely valid structured position pair in the registered E01/East
+    # frame, so the conflicting mark (not a missing anchor) causes rejection.
+    _attach_reg_position(plan, _reg_pos("E01", 2.0))
+    _attach_reg_position(elev, _reg_pos("E01", 2.0))
+    enriched, unmatched = bridge.correlate_elevation_to_plan_production(
+        [elev], [plan], facades=_register_facades(),
+    )
+    assert len(unmatched) == 1, "conflicting mark must reject despite valid anchor"
     assert enriched[0].elevation_geometry is None
 
 

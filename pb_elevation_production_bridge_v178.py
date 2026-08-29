@@ -1153,10 +1153,12 @@ def _validated_position_anchor(
 
     Production position identity is ONLY accepted when BOTH the plan instance
     and the elevation opening carry a STRUCTURED registration-derived position
-    record that (a) names the SAME wall reference, (b) was derived in the SAME
-    registered facade segment frame — same segment identity, ORIGIN and
-    DIRECTION computed from that segment's ``a``/``b`` geometry, with derivation
-    source ``facade_registration`` — and (c) agree on the along-wall station.
+    record that (a) names the SAME wall reference, (b) is consistent with the
+    OWNING OBJECT's own wall association — each record's ``wall_ref`` MUST equal
+    its object's nonblank ``wall_ref`` — (c) was derived in the SAME registered
+    facade segment frame — same segment identity, ORIGIN and DIRECTION computed
+    from that segment's ``a``/``b`` geometry, with derivation source
+    ``facade_registration`` — and (d) agree on the along-wall station.
 
     Raw scalar-only positions (``position_along_wall_m`` +
     ``wall_position_m``) are NEVER accepted: an arbitrary in-range number
@@ -1164,7 +1166,9 @@ def _validated_position_anchor(
     with matching wall refs and values inside the registered extent it is
     indistinguishable from a fabricated scalar and FAILS CLOSED.  Different
     registration origins or directions likewise reject — same station in two
-    different frames is not a shared position.
+    different frames is not a shared position.  A record that conflicts with,
+    or lacks, its OWN object's wall association also FAILS CLOSED: a well-formed
+    record frame alone cannot overrule mis-attached wall evidence.
     """
     plan_rec = _position_record(inst)
     elev_rec = _position_record(elev)
@@ -1172,8 +1176,20 @@ def _validated_position_anchor(
         # Raw scalar-only / missing structural record -> cannot establish
         # registration provenance; fail closed to ambiguity/review.
         return False
-    if plan_rec["wall_ref"] != elev_rec["wall_ref"]:
-        return False  # WRONG WALL: references must match before position anchors
+    plan_wall = str(getattr(inst, "wall_ref", None) or "").strip().upper()
+    elev_wall = str(getattr(elev, "wall_ref", None) or "").strip().upper()
+    if not plan_wall or not elev_wall:
+        # Each governing object must carry its OWN nonblank wall association; a
+        # missing wall on either side means the record cannot be trusted.
+        return False
+    if plan_rec["wall_ref"] != plan_wall:
+        # The plan record names a DIFFERENT wall than the plan object itself is
+        # associated with -> mis-attached evidence -> fail closed.
+        return False
+    if elev_rec["wall_ref"] != elev_wall:
+        # The elevation record names a DIFFERENT wall than the elevation object
+        # itself is associated with -> mis-attached evidence -> fail closed.
+        return False
     segment = _registered_wall_segment(
         facades, str(getattr(elev, "elevation_side", "") or "").strip(),
         plan_rec["wall_ref"],
@@ -1189,8 +1205,6 @@ def _validated_position_anchor(
         return False  # plan not in the shared registered frame
     if not _record_in_registered_frame(elev_rec, frame):
         return False  # elevation not in the shared registered frame
-    if plan_rec["segment_id"] != elev_rec["segment_id"]:
-        return False  # different frame identity
     # Both sides derived in the SAME registered origin/direction frame; their
     # stations must agree on a physical opening.
     return abs(plan_rec["station_m"] - elev_rec["station_m"]) <= PROD_POSITION_TOLERANCE_M
