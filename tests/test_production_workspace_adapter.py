@@ -797,3 +797,191 @@ def test_section_21_three_storey_level_registry_isolation():
 
     l2 = next(l for l in bld.levels if "level 2" in l.name.lower() and l.walls)
     assert len(l2.walls) == 1 and l2.walls[0].provenance.wall_ref == "W2"
+
+
+def test_phase5j_opening_host_identity():
+    """SECTION A, B, C: Test host identity enforcement, c_opening.wall_id, and wrong-host fail-closed behavior."""
+    payload = {
+        "walls": [
+            {
+                "wall_ref": "W1",
+                "level": "Ground",
+                "a": {"x": 0, "y": 0},
+                "b": {"x": 10, "y": 0},
+                "height_m": 3.0,
+                "openings": [
+                    {
+                        "id": "op_wrong_host",
+                        "opening_type": "DOOR",
+                        "resolved_wall_ref": "W2",  # WRONG HOST! (Nested under W1, claims W2)
+                        "offset_along_wall_m": 2.0,
+                        "sill_height_m": 0.0,
+                        "width_m": 1.0,
+                        "height_m": 2.1,
+                        "deduct": True,
+                        "manual_override_confirmed": True,
+                    },
+                    {
+                        "id": "op_correct_host",
+                        "opening_type": "WINDOW",
+                        "resolved_wall_ref": "W1",  # CORRECT HOST!
+                        "offset_along_wall_m": 5.0,
+                        "sill_height_m": 0.9,
+                        "width_m": 1.2,
+                        "height_m": 1.2,
+                        "deduct": True,
+                        "manual_override_confirmed": True,
+                    }
+                ]
+            }
+        ]
+    }
+
+    project, skipped = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
+    w1 = project.buildings[0].levels[0].walls[0]
+    op_wrong = w1.openings[0]
+    op_correct = w1.openings[1]
+
+    # Wrong host: deduction authority is FALSE, wall_id is None, physical_state is wrong_host
+    assert op_wrong.deduction_authority is False
+    assert op_wrong.wall_id is None
+    assert op_wrong.metadata["physical_state"] == "wrong_host"
+    assert op_wrong.metadata["claimed_wall_ref"] == "W2"
+    assert op_wrong.metadata["actual_container_wall_ref"] == "W1"
+
+    # Correct host: deduction authority is TRUE, wall_id equals w1.id
+    assert op_correct.deduction_authority is True
+    assert op_correct.wall_id == w1.id
+    assert op_correct.metadata["claimed_wall_ref"] == "W1"
+
+    # Wall net area deduction comes ONLY from correct host opening (1.44 m²), not wrong host (2.1 m²)
+    from pb_geometry_services import potential_net_wall_area
+    net_info = potential_net_wall_area(w1)
+    assert net_info["gross_wall_area_m2"] == 30.0
+    assert abs(net_info["authorized_opening_deduction_area_m2"] - 1.44) < 1e-3
+    assert abs(net_info["authorized_net_area_m2"] - 28.56) < 1e-3
+
+
+def test_phase5j_no_lago_defaults_in_generic_elevation():
+    """SECTION D & E: Test generic elevation candidate translation contains ZERO invented LAGO defaults."""
+    payload = {
+        "workspace_id": "ws_generic",
+        "elevation_opening_candidates": [
+            {
+                "candidate_id": "cand_empty",
+                # Missing page_no, drawing_no, side, level, confidence, producer
+            }
+        ]
+    }
+
+    project, _ = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
+    obs = project.evidence_observations[0]
+
+    assert obs.page_no is None
+    assert obs.drawing_reference is None
+    assert obs.side is None
+    assert obs.level_name is None
+    assert obs.confidence is None
+    assert obs.producer is None
+    assert obs.producer_version is None
+
+
+def test_phase5j_exact_v139_wall_ref_identity():
+    """SECTION I & V: Test exact v139 wall ref matching for N01, E01, S01, W01 without W-only regex."""
+    payload = {
+        "registered_walls": [
+            {"wall_ref": "N01", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 3.0, "height_status": "confirmed"},
+            {"wall_ref": "E01", "a": {"x": 10, "y": 0}, "b": {"x": 10, "y": 10}, "height_m": 3.0, "height_status": "confirmed"},
+        ],
+        "takeoff_rows": [
+            {"id": 1, "unit": "m²", "row_role": "wall", "quantity": 30.0, "source_reference": "PB Unified Building v1.3.9 · N01"},
+            {"id": 2, "unit": "m²", "row_role": "wall", "quantity": 30.0, "source_reference": "PB Unified Building v1.3.9 · E01"},
+            {"id": 3, "unit": "m²", "row_role": "wall", "quantity": 30.0, "source_reference": "PB Unified Building v1.3.9 · UNKNOWN99"},
+        ]
+    }
+
+    project, _ = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
+    diag = generate_production_diagnostics_report(project, workspace_data=payload)
+
+    recs = diag["per_wall_quantity_reconciliation"]
+    n01_rec = next(r for r in recs if r["wall_ref"] == "N01")
+    e01_rec = next(r for r in recs if r["wall_ref"] == "E01")
+
+    assert n01_rec["reconciliation_status"] == "matched"
+    assert e01_rec["reconciliation_status"] == "matched"
+
+
+def test_phase5j_roof_form_and_objective_z_proof():
+    """SECTION J, K, L: Test pitch does not invent GABLE, and roof Z requires ALL contributing wall heights to be confirmed."""
+    # Positive pitch alone leaves roof_type = UNKNOWN
+    payload_pitch = {
+        "walls": [{"wall_ref": "W1", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 3.0, "height_status": "confirmed"}],
+        "roof_data": {
+            "evidence": {"pitches_deg": [22.5], "flat": False},
+            "caps": [{"id": "cap1", "polygon": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}], "z": 4.5}]
+        }
+    }
+    proj_p, _ = planreader_to_canonical_model(payload_pitch, is_validated_internal_workspace=True)
+    roof_p = proj_p.buildings[0].levels[0].roofs[0]
+    assert roof_p.roof_type == "UNKNOWN"
+    assert roof_p.elevation == 4.5
+    assert roof_p.metadata["z"] == 4.5
+
+    # One confirmed wall + one unconfirmed wall -> Roof Z rejected!
+    payload_mixed = {
+        "walls": [
+            {"wall_ref": "W1", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 3.0, "height_status": "confirmed"},
+            {"wall_ref": "W2", "a": {"x": 10, "y": 0}, "b": {"x": 10, "y": 10}, "height_m": 2.7, "height_status": "inferred"},
+        ],
+        "roof_data": {
+            "evidence": {"pitches_deg": [15.0], "flat": False},
+            "caps": [{"id": "cap2", "polygon": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}], "z": 2.7}]
+        }
+    }
+    proj_m, _ = planreader_to_canonical_model(payload_mixed, is_validated_internal_workspace=True)
+    roof_m = proj_m.buildings[0].levels[0].roofs[0]
+    assert roof_m.elevation is None
+    assert roof_m.metadata["z"] is None
+    assert roof_m.review_state == ReviewState.REVIEW_REQUIRED
+
+
+def test_phase5j_level_identity_and_unregistered_storeys():
+    """SECTION M, N, O, P: Test sheet text is not a level, Ground / unregistered remains REVIEW_REQUIRED."""
+    payload = {
+        "walls": [
+            {"wall_ref": "W_UNREG", "level": "Ground / unregistered", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 3.0},
+            {"wall_ref": "W_SHEET", "level": "A101", "a": {"x": 0, "y": 10}, "b": {"x": 10, "y": 10}, "height_m": 3.0},
+        ]
+    }
+
+    project, _ = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
+    bld = project.buildings[0]
+
+    # Ground / unregistered stays "Ground / unregistered" and REVIEW_REQUIRED
+    unreg_lvl = next(l for l in bld.levels if "unregistered" in l.name.lower())
+    assert unreg_lvl.name == "Ground / unregistered"
+    assert unreg_lvl.review_state == ReviewState.REVIEW_REQUIRED
+    assert unreg_lvl.metadata.get("registered_storey") is False
+
+    # A101 sheet text routes to Unresolved Level Container (Review Required)
+    unres_lvl = next(l for l in bld.levels if "unresolved" in l.name.lower())
+    assert unres_lvl.review_state == ReviewState.REVIEW_REQUIRED
+    assert any(w.provenance.wall_ref == "W_SHEET" for w in unres_lvl.walls)
+
+
+def test_phase5j_persistence_missing_fingerprint_rejection():
+    """SECTION Z: Test load_workspace_canonical_model rejects saved model if missing source_revision_fingerprint."""
+    class MockApp:
+        def workspace_setting(self, wid, key, default=None):
+            return json.dumps({
+                "schema_version": "1.0.0",
+                "persistence_key": "canonical_3d_model_v1",
+                "workspace_id": 101,
+                # "source_revision_fingerprint" IS MISSING!
+                "model_data": CanonicalProject(id="proj_1").to_dict(),
+            })
+
+    ok, proj, msg, _ = load_workspace_canonical_model(MockApp(), 101)
+    assert ok is False
+    assert proj is None
+    assert "Missing or invalid source_revision_fingerprint" in msg

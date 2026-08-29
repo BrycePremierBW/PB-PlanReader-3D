@@ -486,7 +486,8 @@ class CanonicalCeiling(PolygonElement):
 class CanonicalRoof(PolygonElement):
     pitch_deg: Optional[float] = None
     overhang_m: Optional[float] = None
-    roof_type: str = "FLAT"
+    roof_type: str = "UNKNOWN"
+    elevation: Optional[float] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -498,6 +499,7 @@ class CanonicalRoof(PolygonElement):
             "pitch_deg": self.pitch_deg,
             "overhang_m": self.overhang_m,
             "roof_type": self.roof_type,
+            "elevation": self.elevation,
         })
         return res
 
@@ -513,7 +515,8 @@ class CanonicalRoof(PolygonElement):
             elevation_offset_m=parse_optional_float(data.get("elevation_offset_m")),
             pitch_deg=parse_optional_float(data.get("pitch_deg")),
             overhang_m=parse_optional_float(data.get("overhang_m")),
-            roof_type=str(data.get("roof_type", "FLAT")),
+            roof_type=str(data.get("roof_type", "UNKNOWN")),
+            elevation=parse_optional_float(data.get("elevation")),
         )
 
 
@@ -785,7 +788,7 @@ class CanonicalBuilding(CanonicalElement):
 @dataclass
 class CanonicalEvidenceObservation:
     """
-    SECTION B: Represents non-physical source evidence observations (e.g. elevation opening candidates,
+    SECTION Y: Represents non-physical source evidence observations (e.g. elevation opening candidates,
     roof pitch evidence, manual floor allowances, uncalibrated polygons).
     Evidence observations MUST NOT create fake geometry, gain takeoff authority, or gain deduction authority.
     """
@@ -798,12 +801,24 @@ class CanonicalEvidenceObservation:
     drawing_reference: Optional[str] = None
     side: Optional[str] = None
     level_name: Optional[str] = None
+    wall_ref: Optional[str] = None
     source_coords: Optional[Dict[str, Any]] = None
+    coordinate_space: Optional[str] = None
+    width_m: Optional[float] = None
+    height_m: Optional[float] = None
     producer: Optional[str] = None
     producer_version: Optional[str] = None
     confidence: Optional[float] = None
     review_state: ReviewState = ReviewState.REVIEW_REQUIRED
     reason_physical_unavailable: str = "Elevation evidence without plan host wall placement"
+    dimension_basis: str = "unknown"
+    deduction_authority: bool = False
+    no_instance_creation: bool = True
+    calibration_status: Optional[str] = None
+
+    def __post_init__(self):
+        self.deduction_authority = parse_strict_bool(self.deduction_authority)
+        self.no_instance_creation = parse_strict_bool(self.no_instance_creation)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -816,12 +831,20 @@ class CanonicalEvidenceObservation:
             "drawing_reference": self.drawing_reference,
             "side": self.side,
             "level_name": self.level_name,
+            "wall_ref": self.wall_ref,
             "source_coords": self.source_coords,
+            "coordinate_space": self.coordinate_space,
+            "width_m": self.width_m,
+            "height_m": self.height_m,
             "producer": self.producer,
             "producer_version": self.producer_version,
             "confidence": self.confidence,
             "review_state": self.review_state.value if isinstance(self.review_state, ReviewState) else str(self.review_state),
             "reason_physical_unavailable": self.reason_physical_unavailable,
+            "dimension_basis": self.dimension_basis,
+            "deduction_authority": parse_strict_bool(self.deduction_authority),
+            "no_instance_creation": parse_strict_bool(self.no_instance_creation),
+            "calibration_status": self.calibration_status,
         }
 
     @classmethod
@@ -842,12 +865,20 @@ class CanonicalEvidenceObservation:
             drawing_reference=str(data.get("drawing_reference")) if data.get("drawing_reference") is not None else None,
             side=str(data.get("side")) if data.get("side") is not None else None,
             level_name=str(data.get("level_name")) if data.get("level_name") is not None else None,
+            wall_ref=str(data.get("wall_ref")) if data.get("wall_ref") is not None else None,
             source_coords=data.get("source_coords") if isinstance(data.get("source_coords"), dict) else None,
+            coordinate_space=str(data.get("coordinate_space")) if data.get("coordinate_space") is not None else None,
+            width_m=parse_optional_float(data.get("width_m")),
+            height_m=parse_optional_float(data.get("height_m")),
             producer=str(data.get("producer")) if data.get("producer") is not None else None,
             producer_version=str(data.get("producer_version")) if data.get("producer_version") is not None else None,
             confidence=parse_optional_confidence(data.get("confidence")),
             review_state=rev_enum,
             reason_physical_unavailable=str(data.get("reason_physical_unavailable") or "Physical geometry unavailable"),
+            dimension_basis=str(data.get("dimension_basis", "unknown")),
+            deduction_authority=parse_strict_bool(data.get("deduction_authority")),
+            no_instance_creation=parse_strict_bool(data.get("no_instance_creation", True)),
+            calibration_status=str(data.get("calibration_status")) if data.get("calibration_status") is not None else None,
         )
 
 

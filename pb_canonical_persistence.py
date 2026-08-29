@@ -120,11 +120,14 @@ def save_workspace_canonical_model(
         "source_revision_fingerprint": fingerprint,
         "producer_versions": {
             "3d_engine": "v1.5.1",
-            "v139_walls": "v139",
-            "v175_openings": "v175",
+            "v127_mapper": "v127",
             "v128_mapper": "v128",
-            "v140_roof": "v140",
             "v135_levels": "v135",
+            "v139_walls": "v139",
+            "v140_roof": "v140",
+            "v175_openings": "v175",
+            "v178_elevation_bridge": "v178",
+            "v172_elevation_evidence": "v172",
         },
         "model_data": project.to_dict(),
     }
@@ -143,7 +146,7 @@ def load_workspace_canonical_model(
     current_snapshot: Optional[Dict[str, Any]] = None,
     current_workspace_data: Optional[Dict[str, Any]] = None
 ) -> Tuple[bool, Optional[CanonicalProject], str, Optional[Dict[str, Any]]]:
-    """SECTION 19 & S: Loads persisted canonical model with strict require_workspace_id validation."""
+    """SECTION 19, Z & S: Loads persisted canonical model with strict require_workspace_id validation."""
     try:
         wid = require_workspace_id(workspace_id)
     except Exception as e:
@@ -180,6 +183,10 @@ def load_workspace_canonical_model(
     except Exception as e:
         return False, None, f"Corrupt or invalid workspace_id in saved model: {e}", None
 
+    saved_fp = saved_payload.get("source_revision_fingerprint")
+    if not saved_fp or not isinstance(saved_fp, str) or not saved_fp.strip():
+        return False, None, "Missing or invalid source_revision_fingerprint in saved model payload", saved_payload
+
     proj_dict = saved_payload.get("model_data")
     if not isinstance(proj_dict, dict):
         return False, None, "Missing or invalid model_data in payload", None
@@ -188,7 +195,6 @@ def load_workspace_canonical_model(
 
     effective_snapshot = current_snapshot or current_workspace_data
     if effective_snapshot:
-        saved_fp = saved_payload.get("source_revision_fingerprint")
         current_fp = compute_workspace_source_fingerprint(effective_snapshot)
         if saved_fp != current_fp:
             return False, project, f"⚠️ Stale saved model detected (Saved FP: {saved_fp}, Current FP: {current_fp})", saved_payload

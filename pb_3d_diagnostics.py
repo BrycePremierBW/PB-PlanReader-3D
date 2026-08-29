@@ -13,6 +13,16 @@ SAFETY GUARANTEES:
 5. Filters production takeoff units strictly to m² and wall role.
 6. If canonical wall height/geometry is unresolved, status = 'canonical_geometry_unavailable'.
 7. Separates physical opening placement from deduction authority.
+8. Blocker #4: STRONG IDENTITY ONLY — production rows are matched ONLY via explicit
+   wall_ref OR a source_reference that parses to a real wall code (no bare `id` fallback,
+   no `location`-derived refs). Missing/weak identity rows are simply excluded.
+9. Blocker #4: STRICT quantity read — explicit zero is a real value; missing quantity
+   returns None and is NEVER coerced to 0.0 (prevents fabricated `matched` against a
+   zeroed net area).
+10. Blocker #3: Opening state buckets come from Adapter's explicit
+    metadata['physical_state'] (invalid_geometry / wrong_level / conflict_overlap /
+    manual_exclusion / physical_b5_authorised / physical_not_authorised / evidence_only),
+    consumed directly — not inferred from placement+b5 flags.
 """
 
 from typing import Dict, Any, List, Optional
@@ -92,14 +102,16 @@ def generate_production_diagnostics_report(
 
     per_wall_reconciliation: List[Dict[str, Any]] = []
 
-    # SECTION G (blocker #4): Map production takeoff rows by wall_ref -> list[candidates].
-    # STRONG IDENTITY ONLY: a row is matched ONLY via an explicit wall_ref, OR a
-    # source_reference that parses to a real wall code. A bare table-row `id` or free-text
-    # `location` is NEVER treated as a wall identity (prevents phantom matches / fabricated
-    # reconciliation). If a row lacks a strong identity it simply cannot be a candidate.
+    # SECTION I & V: Map production takeoff rows by exact wall_ref identity.
+    # Parse exact "PB Unified Building v1.3.9 · <wall_ref>" terminal separator.
+    # Supports N01, E01, S01, W01, EXT-A2, etc. (NO W-only regex assumptions!).
+    registered_wall_refs_set = {
+        w.provenance.wall_ref for bld in project.buildings for lvl in bld.levels for w in lvl.walls
+        if w.provenance and w.provenance.wall_ref
+    }
+
     takeoff_candidates_by_ref: Dict[str, List[Dict[str, Any]]] = {}
     raw_rows = workspace_data.get("takeoff_rows") or []
-    import re as _re
     for r in raw_rows:
         if isinstance(r, dict):
             unit = str(r.get("unit") or "").lower().strip()
@@ -108,23 +120,21 @@ def generate_production_diagnostics_report(
                 continue
 
             ref = ""
-            # 1) Explicit strong wall_ref wins.
             wref = r.get("wall_ref")
             if wref and str(wref).strip():
                 ref = str(wref).strip()
             else:
-                # 2) Parse a real wall code out of source_reference ONLY.
                 src = str(r.get("source_reference") or "")
-                if "PB Unified Building" in src or "·" in src:
-                    m_wall = _re.search(r"(?:W\d+|W-[A-Z0-9]+|\bW\d+\b)", src)
-                    if m_wall:
-                        ref = m_wall.group(0)
-                else:
-                    m_wall = _re.search(r"^W[-_]?[A-Z0-9]+(?=\s|$|\·|,|;)", src)
-                    if m_wall:
-                        ref = m_wall.group(0)
+                if "·" in src:
+                    cand_ref = src.split("·")[-1].strip()
+                    if cand_ref:
+                        ref = cand_ref
+                elif "PB Unified Building" in src:
+                    cand_ref = src.replace("PB Unified Building v1.3.9", "").replace("PB Unified Building", "").strip(" ·:-")
+                    if cand_ref:
+                        ref = cand_ref
 
-            if ref:
+            if ref and (not registered_wall_refs_set or ref in registered_wall_refs_set):
                 takeoff_candidates_by_ref.setdefault(ref, []).append(r)
 
     for bld in project.buildings:
