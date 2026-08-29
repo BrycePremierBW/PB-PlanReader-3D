@@ -334,7 +334,7 @@ def test_production_diagnostics_report():
         ]
     }
     project, _ = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
-    ws_data = {"takeoff_rows": [{"wall_ref": "w1", "m2": 30.0, "unit": "m²"}]}
+    ws_data = {"takeoff_rows": [{"wall_ref": "w1", "m2": 30.0, "unit": "m²", "row_role": "wall"}]}
 
     diagnostics = generate_production_diagnostics_report(project, workspace_data=ws_data)
     assert diagnostics["total_canonical_objects"] == 1

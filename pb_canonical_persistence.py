@@ -5,7 +5,7 @@ Provides versioned serialization, workspace persistence, deterministic fingerpri
 for generated CanonicalProject models tied to PlanReader workspaces.
 
 SAFETY GUARANTEES:
-1. Versioned schema contract (PERSISTENCE_KEY = "canonical_3d_model_v1").
+1. Versioned schema contract (PERSISTENCE_KEY = "canonical_3d_model_v1", SCHEMA_VERSION = "1.0.0").
 2. Real production set_workspace_setting API string serialization (json.dumps / json.loads).
 3. Fingerprints underlying Workspace Evidence Snapshot using deterministic collection canonicalization.
 4. Detects stale persisted models when workspace evidence changes.
@@ -35,7 +35,7 @@ def _sort_item_key(item: Any) -> str:
 
 def canonicalize_evidence_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     """
-    SECTION I: Canonicalizes unordered evidence snapshot collections by strong stable identities.
+    SECTION 37, 38, 39: Canonicalizes unordered evidence snapshot collections by strong stable identities.
     Ensures that identical semantic evidence in different list order produces the EXACT same fingerprint.
     """
     if not isinstance(snapshot, dict):
@@ -54,6 +54,7 @@ def canonicalize_evidence_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
 
     clean_snapshot = {
         "workspace_metadata": snapshot.get("workspace_metadata"),
+        "documents": snapshot.get("documents"),
         "pages": snapshot.get("pages"),
         "registered_walls": snapshot.get("registered_walls"),
         "mapper_shapes": snapshot.get("mapper_shapes"),
@@ -66,7 +67,7 @@ def canonicalize_evidence_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
 
 def compute_workspace_source_fingerprint(snapshot: Dict[str, Any]) -> str:
     """
-    SECTION I & K: Computes a deterministic SHA-256 fingerprint representing the current
+    SECTION 37, 40: Computes a deterministic SHA-256 fingerprint representing the current
     revision of the Workspace Evidence Snapshot after collection canonicalization.
     
     GUARANTEE: Excludes generation_timestamp, UI toggles, and viewer camera.
@@ -84,13 +85,17 @@ def save_workspace_canonical_model(
     workspace_data: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    SECTION I & J: Saves canonical model to workspace settings using deterministic JSON string storage.
+    SECTION 41: Saves canonical model to workspace settings using deterministic JSON string storage.
+    Initial production save MUST compute a real tracked fingerprint!
     """
     if project.is_synthetic_demo:
         raise ValueError("Cannot persist synthetic demonstration data to production workspace storage.")
 
     effective_snapshot = snapshot or workspace_data
-    fingerprint = compute_workspace_source_fingerprint(effective_snapshot) if effective_snapshot else "untracked_revision"
+    if not effective_snapshot:
+        raise ValueError("Cannot persist canonical model without a valid source evidence snapshot.")
+
+    fingerprint = compute_workspace_source_fingerprint(effective_snapshot)
 
     persistence_payload = {
         "schema_version": SCHEMA_VERSION,
@@ -107,7 +112,6 @@ def save_workspace_canonical_model(
         "model_data": project.to_dict(),
     }
 
-    # SECTION I: Real production set_workspace_setting converts values to strings!
     json_str = json.dumps(persistence_payload, sort_keys=True, indent=2)
 
     if app and hasattr(app, "set_workspace_setting"):
@@ -123,8 +127,7 @@ def load_workspace_canonical_model(
     current_workspace_data: Optional[Dict[str, Any]] = None
 ) -> Tuple[bool, Optional[CanonicalProject], str, Optional[Dict[str, Any]]]:
     """
-    SECTION I & J: Loads persisted canonical model and checks for staleness.
-    Handles string JSON decoding from real set_workspace_setting API.
+    SECTION 42 & 43: Loads persisted canonical model and checks for staleness.
     Returns (is_valid_and_fresh, project, status_msg, saved_payload).
     """
     if not (app and hasattr(app, "workspace_setting")):
@@ -147,7 +150,6 @@ def load_workspace_canonical_model(
     if saved_payload.get("persistence_key") != PERSISTENCE_KEY:
         return False, None, f"Invalid persistence key: {saved_payload.get('persistence_key')}", None
 
-    # Check schema version
     if saved_payload.get("schema_version") != SCHEMA_VERSION:
         return False, None, f"Schema version mismatch: expected {SCHEMA_VERSION}, got {saved_payload.get('schema_version')}", saved_payload
 
