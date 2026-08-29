@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from pb_opening_evidence_v170 import (
     OpeningEvidence,
     merge_opening_evidence,
+    record_decision_reason,
     DIMENSION_BASIS_UNKNOWN,
     DEDUCTION_REVIEW,
     NON_INSTANCE_SOURCES,
@@ -102,6 +103,13 @@ class ElevationOpening:
     level: Optional[str] = None           # level band when objectively derived
     wall_ref: str = ""                    # candidate wall association
     calibration: Dict[str, Any] = field(default_factory=dict)  # calibration provenance
+    # --- B3 correlation diagnostics (ADDITIVE, defaulted) ---
+    # Recorded by correlate_elevation_to_plan() so the WHY of a match /
+    # rejection / ambiguity / non-creation is inspectable.  Diagnostic-only:
+    # never influences matching or enrichment decisions.  The dataclass stays
+    # frozen for geometry; this list is mutated as an immutable-container
+    # ledger (items are appended, the object itself is never replaced).
+    correlation_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +405,153 @@ def _opening_type_conflicts(inst: OpeningEvidence, elev_label: str) -> bool:
     return False
 
 
+def _correlation_assessment(
+    inst: OpeningEvidence,
+    elev: ElevationOpening,
+) -> Tuple[float, Dict[str, Any]]:
+    """Structured correlation assessment for a (plan instance, elevation) pair.
+
+    Returns ``(score, details)``:
+      - score: 0.0-1.0 (higher = better match).  0.0 for incompatible pairs
+        or insufficient identity evidence — identical to ``_correlation_score``.
+      - details: a structured dict of WHY the pair matched / was rejected
+        (diagnostic-only, never used in the decision itself):
+          rejection_reason     : str|None   — explicit hard-reject reason
+          correlation_score    : float
+          mark_evidence        : str|None   — exact_plan_mark_match,
+                                              elevation_label_only,
+                                              plan_mark_only, none, conflict
+          side_match           : bool|None  — True/False/None (no side data)
+          level_match          : bool|None  — True/False/None (no level data)
+          width_match_m        : float|None — |plan.width - elev.width| diff
+          opening_type_compatible : bool
+
+    Qualification requires BOTH:
+      - compatible width (baseline check), AND
+      - at least one identity signal: exact mark match, OR
+        registered side match with opening_type compatibility.
+
+    Width alone is NOT sufficient — common 820mm doors repeat many times.
+    """
+    details: Dict[str, Any] = {
+        "rejection_reason": None,
+        "correlation_score": 0.0,
+        "mark_evidence": None,
+        "side_match": None,
+        "level_match": None,
+        "width_match_m": None,
+        "opening_type_compatible": True,
+    }
+    score = 0.0
+    has_width_signal = False
+    has_identity_signal = False
+
+    def _reject(reason: str) -> Tuple[float, Dict[str, Any]]:
+        details["rejection_reason"] = reason
+        details["correlation_score"] = 0.0
+        return 0.0, details
+
+    # --- Hard reject: conflicting marks (any nonblank mismatch) ---
+    if _marks_conflict(inst.type_mark, elev.label):
+        details["mark_evidence"] = "conflict"
+        return _reject(
+            "mark_conflict "
+            f"(plan '{inst.type_mark}' vs elevation '{elev.label}')"
+        )
+
+    # --- Hard reject: opening_type vs mark type conflict ---
+    if _opening_type_conflicts(inst, elev.label):
+        details["opening_type_compatible"] = False
+        return _reject(
+            "opening_type_conflict "
+            f"(plan '{inst.opening_type}' vs mark '{elev.label}')"
+        )
+
+    # --- Hard reject: different sides ---
+    if inst.elevation_side and elev.elevation_side:
+        if inst.elevation_side != elev.elevation_side:
+            details["side_match"] = False
+            return _reject(
+                "wrong_side "
+                f"(plan '{inst.elevation_side}' vs elevation '{elev.elevation_side}')"
+            )
+        details["side_match"] = True
+    else:
+        details["side_match"] = None
+
+    # --- Hard reject: different known levels ---
+    # When BOTH sources carry a reliable level, different levels hard-reject
+    # the association.  An unknown level is NEUTRAL: it never becomes a
+    # positive match signal and never rejects.
+    inst_level = str(inst.level or "").strip()
+    elev_level = str(elev.level or "").strip()
+    if inst_level and elev_level:
+        details["level_match"] = inst_level.upper() == elev_level.upper()
+        if not details["level_match"]:
+            return _reject(
+                "wrong_level "
+                f"(plan '{inst_level}' vs elevation '{elev_level}')"
+            )
+    else:
+        details["level_match"] = None
+
+    # --- Side match: contextual evidence (not sufficient alone) ---
+    side_match = details["side_match"] is True
+    if side_match:
+        score += 0.15
+
+    # --- Width agreement: baseline compatibility (not identity) ---
+    if inst.width_m is not None:
+        if not _width_compatible(inst.width_m, elev.width_m):
+            details["width_match_m"] = round(inst.width_m - elev.width_m, 4)
+            return _reject(
+                "width_mismatch "
+                f"(plan {inst.width_m:.3f}m vs elevation {elev.width_m:.3f}m, "
+                f"diff {abs(inst.width_m - elev.width_m):.3f}m "
+                f"over tolerance {ELEVATION_WIDTH_TOLERANCE_M:.2f}m)"
+            )
+        diff = abs(inst.width_m - elev.width_m)
+        details["width_match_m"] = round(diff, 4)
+        width_score = 0.30 * max(0, 1.0 - diff / ELEVATION_WIDTH_TOLERANCE_M)
+        score += width_score
+        has_width_signal = width_score > 0
+    else:
+        details["width_match_m"] = None
+
+    # --- Mark match: strong identity signal ---
+    if inst.type_mark and elev.label:
+        if inst.type_mark.upper() == elev.label.upper():
+            details["mark_evidence"] = "exact_plan_mark_match"
+            score += 0.40
+            has_identity_signal = True
+        else:
+            details["mark_evidence"] = "mark_mismatch"
+    elif elev.label:
+        details["mark_evidence"] = "elevation_label_only"
+    elif inst.type_mark:
+        details["mark_evidence"] = "plan_mark_only"
+    else:
+        details["mark_evidence"] = "none"
+
+    # --- Side + width as weaker identity signal ---
+    if side_match and has_width_signal and not has_identity_signal:
+        has_identity_signal = True
+        score += 0.15  # side+width combined is moderate identity
+
+    # --- Require width baseline + identity signal ---
+    if not has_width_signal:
+        return _reject(
+            "no_width_signal (plan width missing or incompatible)"
+        )
+    if not has_identity_signal:
+        return _reject(
+            "no_identity_signal (no mark match and no side+width identity)"
+        )
+
+    details["correlation_score"] = round(min(score, 1.0), 4)
+    return min(score, 1.0), details
+
+
 def _correlation_score(
     inst: OpeningEvidence,
     elev: ElevationOpening,
@@ -406,73 +561,10 @@ def _correlation_score(
     Returns 0.0-1.0 (higher = better match).  Returns 0.0 for
     incompatible pairs or insufficient identity evidence.
 
-    Qualification requires BOTH:
-      - compatible width (baseline check), AND
-      - at least one identity signal: exact mark match, OR
-        registered side match with opening_type compatibility.
-
-    Width alone is NOT sufficient — common 820mm doors repeat many times.
+    This is the score-only façade over ``_correlation_assessment``; the
+    structured WHY of the decision is available via that function.
     """
-    score = 0.0
-    has_width_signal = False
-    has_identity_signal = False
-
-    # --- Hard reject: conflicting marks (any nonblank mismatch) ---
-    if _marks_conflict(inst.type_mark, elev.label):
-        return 0.0
-
-    # --- Hard reject: opening_type vs mark type conflict ---
-    if _opening_type_conflicts(inst, elev.label):
-        return 0.0
-
-    # --- Hard reject: different sides ---
-    if inst.elevation_side and elev.elevation_side:
-        if inst.elevation_side != elev.elevation_side:
-            return 0.0
-
-    # --- Hard reject: different known levels ---
-    # When BOTH sources carry a reliable level, different levels hard-reject
-    # the association.  An unknown level is NEUTRAL: it never becomes a
-    # positive match signal and never rejects.
-    inst_level = str(inst.level or "").strip()
-    elev_level = str(elev.level or "").strip()
-    if inst_level and elev_level and inst_level.upper() != elev_level.upper():
-        return 0.0
-
-    # --- Side match: contextual evidence (not sufficient alone) ---
-    side_match = False
-    if inst.elevation_side and elev.elevation_side:
-        side_match = inst.elevation_side == elev.elevation_side
-        if side_match:
-            score += 0.15
-
-    # --- Width agreement: baseline compatibility (not identity) ---
-    if inst.width_m is not None:
-        if not _width_compatible(inst.width_m, elev.width_m):
-            return 0.0  # incompatible widths → hard reject
-        diff = abs(inst.width_m - elev.width_m)
-        width_score = 0.30 * max(0, 1.0 - diff / ELEVATION_WIDTH_TOLERANCE_M)
-        score += width_score
-        has_width_signal = width_score > 0
-
-    # --- Mark match: strong identity signal ---
-    if inst.type_mark and elev.label:
-        if inst.type_mark.upper() == elev.label.upper():
-            score += 0.40
-            has_identity_signal = True
-
-    # --- Side + width as weaker identity signal ---
-    if side_match and has_width_signal and not has_identity_signal:
-        has_identity_signal = True
-        score += 0.15  # side+width combined is moderate identity
-
-    # --- Require width baseline + identity signal ---
-    if not has_width_signal:
-        return 0.0
-    if not has_identity_signal:
-        return 0.0
-
-    return min(score, 1.0)
+    return _correlation_assessment(inst, elev)[0]
 
 
 def _find_unique_best_pairs(
@@ -516,6 +608,59 @@ def _find_unique_best_pairs(
     return qualified
 
 
+# ---------------------------------------------------------------------------
+# B3 correlation diagnostics helpers (ADDITIVE, diagnostic-only)
+# ---------------------------------------------------------------------------
+def _record_elev_rejection(
+    elev: ElevationOpening,
+    *,
+    plan_instance_id: Optional[str],
+    plan_mark: str = "",
+    score: float = 0.0,
+    reason: str,
+    **extra: Any,
+) -> None:
+    """Record a structured rejection reason on an elevation candidate.
+
+    Diagnostic-only ledger appended to ``ElevationOpening.correlation_diagnostics``
+    so an unmatched / hard-rejected elevation explains WHY it was not matched
+    (wrong level, wrong side, mark/type conflict, width mismatch, ambiguity,
+    no plan instance, ...).  Never influences matching decisions.
+    """
+    rec: Dict[str, Any] = {
+        "plan_instance_id": plan_instance_id,
+        "plan_mark": plan_mark or "",
+        "correlation_score": round(float(score), 4),
+        "match_decided": False,
+        "rejection_reason": reason,
+    }
+    for k, v in extra.items():
+        if v is not None:
+            rec[k] = v
+    elev.correlation_diagnostics.append(rec)
+
+
+def _record_elev_match(
+    elev: ElevationOpening,
+    *,
+    plan_instance_id: str,
+    plan_mark: str = "",
+    score: float,
+    **extra: Any,
+) -> None:
+    """Record a structured acceptance marker on an elevation candidate."""
+    rec: Dict[str, Any] = {
+        "plan_instance_id": plan_instance_id,
+        "plan_mark": plan_mark or "",
+        "correlation_score": round(float(score), 4),
+        "match_decided": True,
+    }
+    for k, v in extra.items():
+        if v is not None:
+            rec[k] = v
+    elev.correlation_diagnostics.append(rec)
+
+
 def correlate_elevation_to_plan(
     elevation_openings: Sequence[ElevationOpening],
     plan_instances: Sequence[OpeningEvidence],
@@ -536,6 +681,17 @@ def correlate_elevation_to_plan(
       - If two plan instances score equally for one elevation → unmatched.
       - If two elevations score equally for one plan → unmatched.
 
+    B3 diagnostics (ADDITIVE): every outcome is recorded without changing
+    any decision —
+      - Accepted matches write a structured decision record on the enriched
+        instance (``decision_reasons``) AND diagnostic keys on the elevation
+        observation in ``source_observations`` (correlation score, mark/side/
+        level/width evidence, dimension basis).
+      - Hard-rejected / unmatched / ambiguous pairs record an explicit
+        ``rejection_reason`` on the elevation candidate's
+        ``correlation_diagnostics`` and a structured decision record on the
+        plan instance's ``decision_reasons``.
+
     Args:
         elevation_openings: Detected rectangles from elevation drawings.
         plan_instances: Existing B1/B2 OpeningEvidence instances.
@@ -547,19 +703,85 @@ def correlate_elevation_to_plan(
         enriched_instances: All plan instances, with matched ones enriched.
         unmatched_elevations: Elevation candidates that didn't match.
     """
-    if not elevation_openings or not plan_instances:
+    if not elevation_openings:
+        # No elevation evidence at all — nothing to correlate or explain.
         return list(plan_instances), list(elevation_openings)
 
-    # Step 1: Build ALL eligible pairs with scores
-    pairs: List[Tuple[float, int, int]] = []  # (score, plan_idx, elev_idx)
+    if not plan_instances:
+        # Elevation candidates with NO plan instance: B3 NEVER creates an
+        # instance.  Record that explicitly so the "why" is inspectable.
+        for elev in elevation_openings:
+            _record_elev_rejection(
+                elev,
+                plan_instance_id=None,
+                reason="no_plan_instance (B3 correlates elevation evidence "
+                       "to existing B1/B2 instances and NEVER creates instances)",
+                instance_creation_authority=False,
+            )
+        return list(plan_instances), list(elevation_openings)
+
+    # Step 1: Build ALL pairs with scores + structured assessments.
+    # ``all_pairs`` retains rejected pairs too so we can record the WHY.
+    all_pairs: List[Tuple[float, int, int, Dict[str, Any]]] = []
     for p_idx, inst in enumerate(plan_instances):
         for e_idx, elev in enumerate(elevation_openings):
-            sc = _correlation_score(inst, elev)
-            if sc >= _MIN_STRONG_SIGNAL:
-                pairs.append((sc, p_idx, e_idx))
+            sc, details = _correlation_assessment(inst, elev)
+            all_pairs.append((sc, p_idx, e_idx, details))
+
+    # Eligible pairs (qualify for matching)
+    eligible_triples: List[Tuple[float, int, int]] = [
+        (sc, p_idx, e_idx)
+        for sc, p_idx, e_idx, _details in all_pairs
+        if sc >= _MIN_STRONG_SIGNAL
+    ]
+
+    # Step 1b: record structured rejections for every non-eligible pair.
+    for sc, p_idx, e_idx, details in all_pairs:
+        if sc >= _MIN_STRONG_SIGNAL:
+            continue
+        inst = plan_instances[p_idx]
+        elev = elevation_openings[e_idx]
+        reason = details.get("rejection_reason") or (
+            f"score_below_minimum ({sc:.2f} < {_MIN_STRONG_SIGNAL:.2f})"
+        )
+        _record_elev_rejection(
+            elev,
+            plan_instance_id=inst.opening_instance_id,
+            plan_mark=inst.type_mark,
+            score=sc,
+            reason=reason,
+        )
+        record_decision_reason(
+            inst,
+            stage="B3",
+            outcome="rejected",
+            source="elevation_rect",
+            elevation_page_no=elev.elevation_page_no,
+            elevation_side=elev.elevation_side,
+            drawing_ref=elev.drawing_ref,
+            coord_space=elev.coord_space,
+            correlation_score=round(sc, 4),
+            rejection_reason=reason,
+            candidate_source=elev.extraction_method,
+            deduction_authority=False,
+            instance_creation_authority=False,
+        )
 
     # Step 2: Filter to uniquely-best pairs (reject ambiguity)
-    qualified = _find_unique_best_pairs(pairs)
+    qualified = _find_unique_best_pairs(eligible_triples)
+
+    # Step 2b: ambiguity detection — best score tied for either side.
+    plan_best: Dict[int, Tuple[float, int]] = {}
+    elev_best: Dict[int, Tuple[float, int]] = {}
+    for sc, p_idx, e_idx in eligible_triples:
+        if p_idx not in plan_best or sc > plan_best[p_idx][0]:
+            plan_best[p_idx] = (sc, 1)
+        elif sc == plan_best[p_idx][0]:
+            plan_best[p_idx] = (sc, plan_best[p_idx][1] + 1)
+        if e_idx not in elev_best or sc > elev_best[e_idx][0]:
+            elev_best[e_idx] = (sc, 1)
+        elif sc == elev_best[e_idx][0]:
+            elev_best[e_idx] = (sc, elev_best[e_idx][1] + 1)
 
     # Step 3: Greedy one-to-one assignment on qualified pairs
     qualified.sort(key=lambda x: x[0], reverse=True)
@@ -574,13 +796,115 @@ def correlate_elevation_to_plan(
         assigned_plan.add(p_idx)
         assigned_elev.add(e_idx)
 
+    # Step 3b: record ambiguity for unassigned plan instances whose best
+    # eligible score was tied (they were deliberately left unmatched).
+    for p_idx, inst in enumerate(plan_instances):
+        if p_idx in assignments:
+            continue
+        if p_idx not in plan_best:
+            continue  # no eligible pairs at all — rejection already recorded
+        best_sc, count_at_best = plan_best[p_idx]
+        if count_at_best > 1:
+            tied_elevs = [
+                elevation_openings[e_idx].elevation_page_no
+                for sc, _p, e_idx in eligible_triples
+                if _p == p_idx and sc == best_sc
+            ]
+            reason = (
+                f"ambiguous_tie ({count_at_best} elevation candidates tied "
+                f"at score {best_sc:.4f} — no unique best)"
+            )
+            record_decision_reason(
+                inst,
+                stage="B3",
+                outcome="unmatched",
+                source="elevation_rect",
+                ambiguity_reason="ambiguous_tie",
+                rejection_reason=reason,
+                review_required_reason=(
+                    "ambiguous elevation tie; instance left unmatched and "
+                    "stays review pending manual reconciliation"
+                ),
+                correlation_score=round(best_sc, 4),
+                tied_elevation_pages=_ordered_unique(tied_elevs),
+                deduction_authority=False,
+                instance_creation_authority=False,
+            )
+
+    # Step 3c: record ambiguity on unassigned elevation candidates.
+    for e_idx, elev in enumerate(elevation_openings):
+        if e_idx in assigned_elev:
+            continue
+        if e_idx not in elev_best:
+            continue
+        best_sc, count_at_best = elev_best[e_idx]
+        if count_at_best > 1:
+            reason = (
+                f"ambiguous_tie ({count_at_best} plan instances tied "
+                f"at score {best_sc:.4f} — no unique best)"
+            )
+            _record_elev_rejection(
+                elev,
+                plan_instance_id=None,
+                score=best_sc,
+                reason=reason,
+                ambiguity_reason="ambiguous_tie",
+                tied_plan_marks=_ordered_unique([
+                    plan_instances[p_idx].type_mark
+                    for sc, p_idx, _e in eligible_triples
+                    if _e == e_idx and sc == best_sc
+                ]),
+            )
+
     # Step 4: Build enriched list
     enriched: List[OpeningEvidence] = []
+    pair_lookup: Dict[Tuple[int, int], Tuple[float, Dict[str, Any]]] = {
+        (p_idx, e_idx): (sc, details)
+        for sc, p_idx, e_idx, details in all_pairs
+    }
     for p_idx, inst in enumerate(plan_instances):
         if p_idx in assignments:
             e_idx = assignments[p_idx]
             elev = elevation_openings[e_idx]
-            merged = _enrich_from_elevation(inst, elev)
+            sc, details = pair_lookup[(p_idx, e_idx)]
+            merged = _enrich_from_elevation(
+                inst, elev, correlation_score=sc, assessment=details
+            )
+            record_decision_reason(
+                merged,
+                stage="B3",
+                outcome="accepted",
+                source="elevation_rect",
+                purpose="height_evidence",
+                elevation_page_no=elev.elevation_page_no,
+                elevation_side=elev.elevation_side,
+                drawing_ref=elev.drawing_ref,
+                coord_space=elev.coord_space,
+                correlation_score=round(sc, 4),
+                mark_evidence=details.get("mark_evidence"),
+                side_match=details.get("side_match"),
+                level_match=details.get("level_match"),
+                width_match_m=details.get("width_match_m"),
+                width_evidence_m=elev.width_m,
+                height_evidence_m=elev.height_m,
+                candidate_source=elev.extraction_method,
+                dimension_basis=DIMENSION_BASIS_UNKNOWN,
+                dimension_basis_authority=(
+                    "none (generic elevation_rect does not manufacture "
+                    "rough_opening authority)"
+                ),
+                deduction_authority=False,
+                instance_creation_authority=False,
+            )
+            _record_elev_match(
+                elev,
+                plan_instance_id=merged.opening_instance_id,
+                plan_mark=inst.type_mark,
+                score=sc,
+                side_match=details.get("side_match"),
+                level_match=details.get("level_match"),
+                width_match_m=details.get("width_match_m"),
+            )
             enriched.append(merged)
         else:
             enriched.append(inst)
@@ -589,12 +913,20 @@ def correlate_elevation_to_plan(
     return enriched, unmatched
 
 
+def _ordered_unique(items: Sequence[Any]) -> List[Any]:
+    """Order-preserving unique (used for readable diagnostic lists)."""
+    return list(dict.fromkeys(items))
+
+
 # ---------------------------------------------------------------------------
 # Enrichment: merge elevation data into a plan instance
 # ---------------------------------------------------------------------------
 def _enrich_from_elevation(
     inst: OpeningEvidence,
     elev: ElevationOpening,
+    *,
+    correlation_score: Optional[float] = None,
+    assessment: Optional[Dict[str, Any]] = None,
 ) -> OpeningEvidence:
     """Enrich a plan instance with elevation-derived evidence.
 
@@ -605,6 +937,12 @@ def _enrich_from_elevation(
     elevation rectangles measure the visible opening (frame/leaf),
     not necessarily the wall void rough opening.  Only explicit
     wall-void evidence would upgrade the basis.
+
+    When called from correlate_elevation_to_plan() a structured,
+    ADDITIVE diagnostic record is added to the elevation observation in
+    ``source_observations`` (correlation score, mark/side/level/width
+    evidence, coordinate space, candidate source).  Existing keys are never
+    renamed, removed, or clobbered.
     """
     # Build an elevation-sourced evidence record.
     # Preserve the existing plan type_mark — elevation labels must NOT
@@ -655,12 +993,37 @@ def _enrich_from_elevation(
         "accepted": False,  # updated after merge
     }
 
+    # Structured correlation "why" (ADDITIVE, only when enrichment came from a
+    # scored correlation pair — direct calls without an assessment stay lean).
+    if assessment is not None:
+        elev_obs["match_decided"] = True
+        elev_obs["correlation_score"] = round(float(correlation_score or 0.0), 4)
+        elev_obs["mark_evidence"] = assessment.get("mark_evidence")
+        elev_obs["side_match"] = assessment.get("side_match")
+        elev_obs["level_match"] = assessment.get("level_match")
+        elev_obs["width_match_m"] = assessment.get("width_match_m")
+        elev_obs["width_evidence_m"] = elev.width_m
+        elev_obs["height_evidence_m"] = elev.height_m
+        elev_obs["elevation_side"] = elev.elevation_side
+        elev_obs["candidate_source"] = elev.extraction_method
+        elev_obs["correlated_plan_id"] = inst.opening_instance_id
+        elev_obs["correlated_plan_mark"] = inst.type_mark
+        elev_obs["correlated_plan_wall_ref"] = inst.wall_ref
+
     # Use B0's merge logic
     merged = merge_opening_evidence(inst, elev_ev)
 
     # Determine if elevation won the atomic bundle
     if merged.dimension_source == "elevation_rect":
         elev_obs["accepted"] = True
+    else:
+        # Elevation dims arrived but the atomic bundle stayed with a prior
+        # source (higher basis priority / higher same-basis confidence).
+        # Record the WHY as an additive rejection reason on the observation.
+        elev_obs["rejection_reason"] = (
+            "dimension_bundle_not_won (existing dimension basis/confidence "
+            "took precedence over elevation_rect)"
+        )
 
     # Ensure elevation_side is set on the result (merge may not overwrite)
     if not merged.elevation_side and elev.elevation_side:
