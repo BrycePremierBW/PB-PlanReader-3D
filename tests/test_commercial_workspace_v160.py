@@ -74,7 +74,17 @@ def test_processed_drawings_without_takeoff_move_to_scope_and_read():
     assert status.pages_calibrated == 2
 
 
-def test_review_heavy_workspace_stops_at_review_and_counts_real_sources():
+def test_string_zero_selected_flag_is_not_counted_as_selected():
+    pages = [
+        {"id": 1, "selected": "1", "px_per_m": 50},
+        {"id": 2, "selected": "0", "px_per_m": 50},
+    ]
+    status = derive_workspace_status(FakeApp(documents=[{"id": 1}], pages=pages), WORKSPACE)
+    assert status.pages_selected == 1
+    assert status.pages_calibrated == 1
+
+
+def test_review_heavy_workspace_stops_at_review_and_counts_real_signals():
     app = FakeApp(
         documents=[{"id": 1}],
         pages=_base_pages(),
@@ -98,7 +108,23 @@ def test_review_heavy_workspace_stops_at_review_and_counts_real_sources():
     assert status.takeoff_review == 2
     assert status.register_review == 2
     assert status.scale_review == 1
+    # This is intentionally a signal count, not a promise of five unique issues.
     assert status.review_total == 5
+
+
+def test_measured_row_without_numeric_quantity_is_not_counted_ready():
+    app = FakeApp(
+        documents=[{"id": 1}],
+        pages=_base_pages(),
+        takeoff=[
+            {"id": 1, "quantity": None, "quantity_status": "Measured", "confidence": "Verified", "inclusion_status": "INCLUSION"},
+            {"id": 2, "quantity": "", "quantity_status": "Allowance", "confidence": "Verified", "inclusion_status": "INCLUSION"},
+        ],
+    )
+    status = derive_workspace_status(app, WORKSPACE)
+    assert status.takeoff_ready == 0
+    assert status.takeoff_review == 2
+    assert status.current_step == "Review"
 
 
 def test_review_clear_takeoff_without_saved_model_moves_to_3d():
@@ -116,10 +142,10 @@ def test_review_clear_takeoff_without_saved_model_moves_to_3d():
     assert status.review_total == 0
     assert status.takeoff_ready == 3
     assert status.current_step == "3D"
-    assert status.overall_state == "Take-off ready"
+    assert status.overall_state == "Take-off reviewed"
 
 
-def test_saved_canonical_model_allows_export_ready_state():
+def test_saved_canonical_model_allows_export_available_state_without_claiming_freshness():
     model = json.dumps({
         "model_data": {"id": "ws_101_canonical"},
         "source_revision_fingerprint": "abc123",
@@ -134,7 +160,22 @@ def test_saved_canonical_model_allows_export_ready_state():
     assert status.canonical_model_saved is True
     assert status.canonical_model_fingerprint == "abc123"
     assert status.current_step == "Export"
-    assert status.overall_state == "Ready to export"
+    assert status.overall_state == "Export available"
+    export = next(step for step in workflow_step_states(status) if step["label"] == "Export")
+    assert export["detail"] == "available"
+
+
+def test_saved_model_without_source_fingerprint_is_not_claimed_valid():
+    app = FakeApp(
+        documents=[{"id": 1}],
+        pages=_base_pages(),
+        takeoff=[{"id": 1, "quantity": 1, "quantity_status": "Measured", "confidence": "Verified", "inclusion_status": "INCLUSION"}],
+        model=json.dumps({"model_data": {"id": "ws_101_canonical"}}),
+    )
+    status = derive_workspace_status(app, WORKSPACE)
+    assert status.canonical_model_saved is False
+    assert status.canonical_model_fingerprint is None
+    assert status.current_step == "3D"
 
 
 def test_malformed_saved_model_does_not_claim_3d_readiness():
@@ -149,7 +190,7 @@ def test_malformed_saved_model_does_not_claim_3d_readiness():
     assert status.current_step == "3D"
 
 
-def test_workflow_step_states_are_fixed_order_and_review_is_visible():
+def test_workflow_step_states_are_fixed_order_and_review_signals_are_visible():
     app = FakeApp(
         documents=[{"id": 1}],
         pages=_base_pages(),
@@ -160,7 +201,7 @@ def test_workflow_step_states_are_fixed_order_and_review_is_visible():
     assert tuple(step["label"] for step in steps) == WORKFLOW_STEPS
     review = next(step for step in steps if step["label"] == "Review")
     assert review["state"] == "review"
-    assert review["detail"] == "1 item"
+    assert review["detail"] == "1 signal"
 
 
 def test_apply_is_idempotent_and_only_wraps_existing_hero_once():
