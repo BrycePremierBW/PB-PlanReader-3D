@@ -605,18 +605,119 @@ def run_p5_native_payload(
     native: Dict[str, Any], *, page_no: int, page_id: int = 0,
     workspace_id: int = 0, scale_info: Dict[str, Any] | None = None,
     schedule_entries: Optional[Sequence[Any]] = None,
+    elevation_openings: Optional[Sequence[Any]] = None,
+    elevation_diagnostics: Optional[Sequence[Dict[str, Any]]] = None,
+    elevation_provenance: Optional[Sequence[Dict[str, Any]]] = None,
+    facade_registration: Any = None,
 ) -> Dict[str, Any]:
+    """Run the native payload through B1->B5 with optional elevation evidence.
+
+    Phase 2B controlled seam: ``elevation_openings`` may carry a
+    provenance-complete, dimensional list of ``ElevationOpening`` objects
+    produced by the fail-closed v1.7.8 production bridge.  They are correlated
+    against the B1/B2 instances with the PRODUCTION strict B3 stage
+    (``correlate_elevation_to_plan_production`` in the v1.7.8 bridge), which
+    requires a GENUINELY VALIDATED instance-specific identity anchor (exact
+    opening mark, or validated position backed by a registered facade
+    ``wall_ref``) — generic "same elevation side + compatible width" and
+    arbitrary caller-attached identifiers/positions are never sufficient.
+
+    ``elevation_provenance`` is index-aligned with ``elevation_openings``: it
+    carries the SAME resolved provenance (original source filename, page,
+    drawing ref/title, coordinate space, calibration source+state, elevation
+    side, level) as the matching accepted opening, so reviewers can trace each
+    persisted opening back to its source.  It is persisted additively as
+    ``elevation_provenance`` (never overwriting existing fields).
+
+    ``facade_registration`` (optional, shape of
+    ``pb_elevation_registration_v135.footprint_facades``) supplies the
+    drawing-derived facade coregistration used to validate GENUINE position
+    anchors: a validated-position anchor is only accepted when the elevation
+    opening's ``wall_ref`` is registered on its side AND the plan station lies
+    within that registered segment's extent.  When omitted, no position anchor
+    is genuine (positions fail closed), so only exact-mark anchors can
+    correlate — corroboration never relies on arbitrary caller-attached data.
+
+    Because the strict B3 stage is owned by the production seam (and must not
+    reuse v1.7.2's permissive side+width identity), elevation openings are NOT
+    threaded into ``run_opening_pipeline``'s shared weak B3 stage; instead the
+    pipeline runs B1->B2 (and B4/B5) and production applies the strict
+    elevation correlation afterwards.  This ordering is SAFE for all safety
+    guarantees: elevation is CORROBORATION ONLY — it never creates instances,
+    never sets ``deduct=True``, and always keeps ``dimension_basis="unknown"``
+    — so running it after B4/B5 cannot change any deduction outcome.
+
+    Safety guarantees preserved:
+      - Default is ``None``/empty -> identical to previous behaviour (no B3
+        stage, no elevation influence).
+      - Elevation evidence is CORROBORATION ONLY: B3 never creates instances
+        and never sets ``deduct=True``; generic elevation observations keep
+        ``dimension_basis="unknown"`` so the B5 rough-opening gate still
+        rejects them.
+      - Outcomes are persisted additively in ``elevation_openings``,
+        ``elevation_diagnostics`` and ``elevation_provenance`` (never
+        overwriting existing fields), so a reviewer can see WHY every candidate
+        was accepted/rejected, how it correlated, and trace it to its source.
+    """
     segments = [_segment_from_native(row) for row in native.get("segments") or []]
     words = [_word_from_native(row, page_no) for row in native.get("words") or []]
+    # Elevation is NOT passed to the shared weak pipeline B3 stage (v1.7.2
+    # treats side+width as sufficient identity).  Production correlation uses
+    # the strict gated stage below instead.
     pipeline = run_opening_pipeline(
         segments=segments, words=words,
         schedule_entries=schedule_entries, elevation_openings=None,
         scale_info=scale_info or {}, page_no=int(page_no),
     )
-    for inst in pipeline.get("instances") or []:
+    pipeline_instances = list(pipeline.get("instances") or [])
+
+    elevation_openings_payload = [asdict(open) for open in (elevation_openings or [])]
+    elevation_diagnostics_payload = list(elevation_diagnostics or [])
+    # index-aligned provenance for each persisted opening (R1): same resolution
+    # as the matching accepted diagnostic, so persisting can never disagree.
+    elevation_provenance_payload = [dict(p) for p in (elevation_provenance or [])]
+
+    # --- Production strict B3 correlation (C2) ------------------------------
+    matched_openings = 0
+    unmatched_openings = len(elevation_openings or [])
+    if (elevation_openings or []) and pipeline_instances:
+        try:
+            from pb_elevation_production_bridge_v178 import (
+                correlate_elevation_to_plan_production,
+            )
+            correlated, unmatched = correlate_elevation_to_plan_production(
+                list(elevation_openings), pipeline_instances,
+                facades=facade_registration,
+            )
+            pipeline_instances = list(correlated)
+            matched_openings = len(elevation_openings) - len(unmatched)
+            unmatched_openings = len(unmatched)
+        except Exception:
+            # If the strict seam is unavailable, elevation never influences the
+            # result (fail closed to the no-elevation path).
+            matched_openings = 0
+            unmatched_openings = len(elevation_openings or [])
+    if (elevation_openings or []):
+        elevation_diagnostics_payload.append({
+            "kind": "b3_correlation",
+            "note": (
+                f"B3 strict production correlation: {matched_openings} correlated, "
+                f"{unmatched_openings} unmatched/review"
+            ),
+            "source": "pb_elevation_production_bridge_v178.correlate_elevation_to_plan_production",
+            "identity_rule": (
+                "requires GENUINELY validated anchor (exact mark / validated "
+                "position backed by registered wall_ref); side+width alone or "
+                "attached identity signals never identify"
+            ),
+            "matched_count": matched_openings,
+            "unmatched_count": unmatched_openings,
+        })
+
+    for inst in pipeline_instances:
         inst.workspace_id = int(workspace_id)
         inst.page_id = int(page_id) if page_id else None
-    instances = [asdict(inst) for inst in pipeline.get("instances") or []]
+    instances = [asdict(inst) for inst in pipeline_instances]
     conflicts = [asdict(conflict) for conflict in pipeline.get("conflicts") or []]
     return {
         "version": VERSION, "workspace_id": int(workspace_id), "page_id": int(page_id),
@@ -626,11 +727,31 @@ def run_p5_native_payload(
         "candidate_count": len(instances),
         "deducted_count": sum(1 for row in instances if bool(row.get("deduct"))),
         "review_count": sum(1 for row in instances if str(row.get("deduction_status")) == "review"),
+        "elevation_openings": elevation_openings_payload,
+        "elevation_diagnostics": elevation_diagnostics_payload,
+        "elevation_provenance": elevation_provenance_payload,
         "status": "ok", "error": "",
     }
 
 
-def analyse_stored_page_openings(app: Any, page_id: int, vector_result: Dict[str, Any]) -> Dict[str, Any]:
+def analyse_stored_page_openings(
+    app: Any, page_id: int, vector_result: Dict[str, Any], *,
+    elevation_openings: Optional[Sequence[Any]] = None,
+    elevation_diagnostics: Optional[Sequence[Dict[str, Any]]] = None,
+    elevation_provenance: Optional[Sequence[Dict[str, Any]]] = None,
+    facade_registration: Any = None,
+) -> Dict[str, Any]:
+    """Analyse a stored page via the P5 native-vector path.
+
+    ``elevation_openings`` / ``elevation_diagnostics`` are the Phase 2B
+    controlled-elevation seam: a provenance-complete list of ElevationOpening
+    objects (plus diagnostics) is threaded into ``run_p5_native_payload`` and
+    from there into ``run_opening_pipeline(elevation_openings=...)``.  Defaults
+    keep pages without elevation evidence a no-op.  ``elevation_provenance`` is
+    the index-aligned resolved provenance for each opening.
+    ``facade_registration`` is the footprint-derived facade coregistration used
+    to validate genuine position anchors (see ``run_p5_native_payload``).
+    """
     rows = app.lquery(
         "SELECT p.*,d.path FROM pages p JOIN documents d ON d.id=p.document_id WHERE p.id=?",
         (int(page_id),),
@@ -655,6 +776,10 @@ def analyse_stored_page_openings(app: Any, page_id: int, vector_result: Dict[str
         workspace_id=int(row.get("workspace_id") or 0),
         scale_info={"px_per_m": px_per_m, "render_zoom": render_zoom},
         schedule_entries=schedule_entries,
+        elevation_openings=elevation_openings,
+        elevation_diagnostics=elevation_diagnostics,
+        elevation_provenance=elevation_provenance,
+        facade_registration=facade_registration,
     )
 
 
@@ -707,6 +832,21 @@ def install_native_vector_bridge(app: Any) -> None:
     app.is_authorised_opening_deduction_v175 = is_authorised_deduction
     app.merge_p5_authoritative_v175 = merge_b5_authoritative
     app.extract_p5_schedule_entries_v175 = extract_schedule_entries
+    # Phase 2B: expose the fail-closed elevation-evidence production bridge
+    # (additive; existing guard-required bindings are untouched).
+    try:
+        from pb_elevation_production_bridge_v178 import (
+            produce_elevation_openings,
+            raster_openings_from_candidates,
+            vector_openings_from_candidates,
+        )
+        app.extract_p5_elevation_openings_v178 = produce_elevation_openings
+        app.raster_to_p5_elevation_openings_v178 = raster_openings_from_candidates
+        app.vector_to_p5_elevation_openings_v178 = vector_openings_from_candidates
+    except Exception:
+        # Elevation evidence is an optional corroboration source; the core
+        # production integration must still install without it.
+        pass
     app._pb_opening_native_bridge_v175 = True
 
 
