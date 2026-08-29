@@ -9,7 +9,7 @@ ARCHITECTURE GUARANTEES:
 1. Smallest safe hook architecture (uses existing apply(app) extension pattern with idempotency guard).
 2. Preserves and executes original app.model_3d_page while embedding the canonical 3D WebGL viewer.
 3. Converts workspace evidence automatically via planreader_workspace_to_canonical().
-4. Safe canonical caching in Streamlit session_state keyed by (workspace_id, snapshot_fingerprint, schema_version).
+4. Bounded canonical caching in Streamlit session_state (max 10 entries per session) keyed by (workspace_id, snapshot_fingerprint, schema_version).
 5. Integrates persistence (pb_canonical_persistence.py) and diagnostics (pb_3d_diagnostics.py).
 """
 
@@ -21,10 +21,12 @@ from pb_bim_viewer import project_to_viewer_payload, generate_bim_viewer_html
 from pb_canonical_persistence import load_workspace_canonical_model, save_workspace_canonical_model
 from pb_3d_diagnostics import generate_production_diagnostics_report
 
+MAX_SESSION_CACHE_ENTRIES = 10
+
 
 def render_workspace_3d_canonical_view(app: Any, workspace: Any = None) -> None:
     """
-    SECTION L, J, P, R: Renders the approved canonical 3D WebGL BIM viewer inside the active PlanReader workspace view.
+    SECTION L, J, P, R, T: Renders the approved canonical 3D WebGL BIM viewer inside the active PlanReader workspace view.
     """
     try:
         workspace_id = None
@@ -40,7 +42,6 @@ def render_workspace_3d_canonical_view(app: Any, workspace: Any = None) -> None:
             except Exception:
                 pass
 
-        # SECTION 3 & 4: Require valid active workspace ID!
         wid_int = require_workspace_id(workspace_id)
     except Exception as e:
         st.error(f"Workspace Context Error: {e}")
@@ -62,11 +63,10 @@ def render_workspace_3d_canonical_view(app: Any, workspace: Any = None) -> None:
     if project.is_synthetic_demo:
         st.warning("⚠️ SYNTHETIC VIEWER DEMONSTRATION FIXTURE — NOT BENCHMARK TRUTH / NOT TAKEOFF AUTHORITATIVE")
 
-    # SECTION J & 43: Initial Persistence & Refresh Lifecycle
     is_fresh, saved_proj, status_msg, saved_payload = load_workspace_canonical_model(app, wid_int, current_snapshot=snapshot)
     if saved_payload is None:
         save_workspace_canonical_model(app, wid_int, project, snapshot=snapshot)
-        is_fresh = True  # SECTION 43: Immediately fresh on initial save!
+        is_fresh = True
         st.caption("ℹ️ Initial model saved to workspace 3D persistence store (`canonical_3d_model_v1`).")
     elif not is_fresh:
         st.warning(status_msg)
@@ -75,7 +75,7 @@ def render_workspace_3d_canonical_view(app: Any, workspace: Any = None) -> None:
             st.success("Model refreshed and saved to workspace persistence store.")
             st.rerun()
 
-    # SECTION 44 & 45: Safe Canonical Caching in Streamlit Session State
+    # SECTION T: Bounded Session-State Model Caching
     if "_CANONICAL_MODEL_SESSION_CACHE" not in st.session_state:
         st.session_state["_CANONICAL_MODEL_SESSION_CACHE"] = {}
 
@@ -85,6 +85,11 @@ def render_workspace_3d_canonical_view(app: Any, workspace: Any = None) -> None:
     if cache_key in cache_dict:
         html_code = cache_dict[cache_key]
     else:
+        # Enforce cache size bound (evict oldest entry if limit reached)
+        if len(cache_dict) >= MAX_SESSION_CACHE_ENTRIES:
+            oldest_key = next(iter(cache_dict))
+            cache_dict.pop(oldest_key, None)
+
         payload = project_to_viewer_payload(project)
         html_code = generate_bim_viewer_html(payload, height_px=750)
         cache_dict[cache_key] = html_code
@@ -122,7 +127,7 @@ def apply(app: Any) -> None:
         orig_model_3d = getattr(app, "model_3d_page")
 
         def model_3d_page_canonical_wrapper(workspace: Any = None, *args, **kwargs):
-            # 1. Render original reconstruction/model page (do NOT swallow exceptions!)
+            # 1. Render original reconstruction/model page
             if callable(orig_model_3d):
                 orig_model_3d(workspace, *args, **kwargs)
             
