@@ -9,9 +9,9 @@ SAFETY GUARANTEES:
 1. Does NOT alter tender/takeoff quantity authority (read-only diagnostic).
 2. Provides concise Estimator QA Summary panel for non-technical users.
 3. Performs PER-WALL quantity reconciliation using strong wall_ref identity only.
-4. Filters production takeoff units strictly to m². Excludes lm, No., item, L, allowances.
-5. If strong identity is missing, status = 'unresolved' (no misleading whole-table variances).
-6. Reports explicit skip diagnostics for elements without registered physical producers.
+4. Filters production takeoff units strictly to m² and wall role.
+5. If canonical wall height/geometry is unresolved, status = 'canonical_geometry_unavailable' (no fake zero variance).
+6. Separates physical opening placement from deduction authority.
 """
 
 from typing import Dict, Any, List, Optional
@@ -57,17 +57,28 @@ def generate_production_diagnostics_report(
     unresolved_levels_count = 0
     missing_provenance_count = 0
 
+    opening_state_counts = {
+        "evidence_only": 0,
+        "physical_not_authorised": 0,
+        "physical_b5_authorised": 0,
+        "invalid_geometry": 0,
+        "wrong_host": 0,
+        "wrong_level": 0,
+        "conflict_overlap": 0,
+        "manual_exclusion": 0,
+    }
+
     per_wall_reconciliation: List[Dict[str, Any]] = []
 
-    # Map production takeoff rows by strong identity (wall_ref / id)
+    # Map production takeoff rows by strong identity (source_reference / wall_ref / id)
     takeoff_rows_by_ref: Dict[str, Dict[str, Any]] = {}
     raw_rows = workspace_data.get("takeoff_rows") or []
     for r in raw_rows:
         if isinstance(r, dict):
-            ref = str(r.get("wall_ref") or r.get("id") or r.get("location") or "")
-            unit = str(r.get("unit") or "m2").lower().strip()
-            row_role = str(r.get("row_role") or "wall").lower().strip()
-            # SECTION J: Filter units strictly to m² and wall role!
+            ref = str(r.get("wall_ref") or r.get("source_reference") or r.get("id") or "")
+            unit = str(r.get("unit") or "").lower().strip()
+            row_role = str(r.get("row_role") or "").lower().strip()
+            # SECTION 26: Must require explicit m² unit and wall role!
             if ref and unit in ("m2", "m²", "sqm", "sq m") and row_role == "wall":
                 takeoff_rows_by_ref[ref] = r
 
@@ -111,8 +122,24 @@ def generate_production_diagnostics_report(
                 ref_key = str(prov.wall_ref or w.id)
                 matched_row = takeoff_rows_by_ref.get(ref_key)
 
-                if matched_row:
-                    prod_qty = float(matched_row.get("quantity") or matched_row.get("m2") or matched_row.get("net_m2") or 0.0)
+                # SECTION 30: If canonical wall geometry/height is unresolved, status = canonical_geometry_unavailable!
+                if w.height_m is None or w.height_m <= 0:
+                    per_wall_reconciliation.append({
+                        "canonical_wall_id": w.id,
+                        "wall_ref": ref_key,
+                        "canonical_gross_m2": None,
+                        "observed_opening_m2": None,
+                        "authorized_deduction_m2": None,
+                        "authorized_net_m2": None,
+                        "matched_production_row_id": str(matched_row.get("id") or ref_key) if matched_row else None,
+                        "production_quantity": float(matched_row.get("quantity") or 0.0) if matched_row else None,
+                        "unit": "m²" if matched_row else None,
+                        "variance_m2": None,
+                        "reconciliation_status": "canonical_geometry_unavailable",
+                        "explanation": "Canonical wall height is unresolved/missing.",
+                    })
+                elif matched_row:
+                    prod_qty = float(matched_row.get("quantity") or matched_row.get("m2") or 0.0)
                     variance = c_net - prod_qty
                     if abs(variance) <= 1e-2:
                         rec_status = "matched"
@@ -153,21 +180,25 @@ def generate_production_diagnostics_report(
 
                 for op in w.openings:
                     total_openings += 1
-                    # SECTION K: Separate physical placement from deduction authority!
                     is_physically_placed = (
                         op.offset_along_wall_m is not None and
                         op.width_m is not None and op.width_m > 0 and
                         op.height_m is not None and op.height_m > 0
                     )
-                    
+                    b5_auth = parse_strict_bool(op.deduction_authority)
+
+                    # SECTION 23: Report distinct opening states
                     if is_physically_placed:
                         physical_openings += 1
+                        if b5_auth:
+                            opening_state_counts["physical_b5_authorised"] += 1
+                            authorized_deduction_count += 1
+                        else:
+                            opening_state_counts["physical_not_authorised"] += 1
+                            rejected_deduction_claims += 1
                     else:
                         evidence_only_openings += 1
-
-                    if parse_strict_bool(op.deduction_authority):
-                        authorized_deduction_count += 1
-                    else:
+                        opening_state_counts["evidence_only"] += 1
                         rejected_deduction_claims += 1
 
             for f in lvl.floors:
@@ -182,7 +213,7 @@ def generate_production_diagnostics_report(
 
     total_canonical_objects = total_walls + total_openings + total_floors + total_roofs
 
-    # SECTION P: Expanded Estimator QA Summary Breakdown
+    # SECTION 57: Expanded Estimator QA Summary Breakdown
     estimator_qa_summary = {
         "physical_walls_rendered": physical_walls_rendered,
         "baseline_only_walls": baseline_only_walls,
@@ -195,11 +226,13 @@ def generate_production_diagnostics_report(
         "evidence_only_openings": evidence_only_openings,
         "authorised_b5_deductions": authorized_deduction_count,
         "rejected_deduction_claims": rejected_deduction_claims,
+        "opening_state_counts": opening_state_counts,
         "roof_geometry_rendered": roof_geometry_rendered,
         "provenance_gaps": missing_provenance_count,
         "matched_reconciliations": len([r for r in per_wall_reconciliation if r["reconciliation_status"] == "matched"]),
         "unresolved_reconciliations": len([r for r in per_wall_reconciliation if r["reconciliation_status"] == "unresolved"]),
         "variances_detected": len([r for r in per_wall_reconciliation if r["reconciliation_status"] == "variance_detected"]),
+        "canonical_geometry_unavailable": len([r for r in per_wall_reconciliation if r["reconciliation_status"] == "canonical_geometry_unavailable"]),
         "producer_diagnostics_log": workspace_data.get("diagnostics_log", []),
     }
 
