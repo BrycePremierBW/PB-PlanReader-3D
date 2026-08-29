@@ -28,6 +28,7 @@ def generate_production_diagnostics_report(
     Generates a production diagnostic report and Estimator QA summary for a CanonicalProject instance.
     """
     skipped_items = skipped_items or []
+    workspace_data = workspace_data or {}
     
     total_walls = 0
     physical_walls_rendered = 0
@@ -60,15 +61,15 @@ def generate_production_diagnostics_report(
 
     # Map production takeoff rows by strong identity (wall_ref / id)
     takeoff_rows_by_ref: Dict[str, Dict[str, Any]] = {}
-    if workspace_data and isinstance(workspace_data, dict):
-        raw_rows = workspace_data.get("takeoff_rows") or []
-        for r in raw_rows:
-            if isinstance(r, dict):
-                ref = str(r.get("wall_ref") or r.get("id") or "")
-                unit = str(r.get("unit") or "m2").lower().strip()
-                # SECTION 9 & N: Filter units strictly to m²!
-                if ref and unit in ("m2", "m²", "sqm", "sq m"):
-                    takeoff_rows_by_ref[ref] = r
+    raw_rows = workspace_data.get("takeoff_rows") or []
+    for r in raw_rows:
+        if isinstance(r, dict):
+            ref = str(r.get("wall_ref") or r.get("id") or r.get("location") or "")
+            unit = str(r.get("unit") or "m2").lower().strip()
+            row_role = str(r.get("row_role") or "wall").lower().strip()
+            # SECTION J: Filter units strictly to m² and wall role!
+            if ref and unit in ("m2", "m²", "sqm", "sq m") and row_role == "wall":
+                takeoff_rows_by_ref[ref] = r
 
     for bld in project.buildings:
         for lvl in bld.levels:
@@ -107,7 +108,6 @@ def generate_production_diagnostics_report(
                 c_ded = p_net["authorized_opening_deduction_area_m2"]
                 c_net = p_net["authorized_net_area_m2"]
 
-                # SECTION 9 & N: Per-Wall Reconciliation using strong identity
                 ref_key = str(prov.wall_ref or w.id)
                 matched_row = takeoff_rows_by_ref.get(ref_key)
 
@@ -153,7 +153,14 @@ def generate_production_diagnostics_report(
 
                 for op in w.openings:
                     total_openings += 1
-                    if op.offset_along_wall_m is not None and op.width_m is not None and op.height_m is not None:
+                    # SECTION K: Separate physical placement from deduction authority!
+                    is_physically_placed = (
+                        op.offset_along_wall_m is not None and
+                        op.width_m is not None and op.width_m > 0 and
+                        op.height_m is not None and op.height_m > 0
+                    )
+                    
+                    if is_physically_placed:
                         physical_openings += 1
                     else:
                         evidence_only_openings += 1
@@ -175,7 +182,7 @@ def generate_production_diagnostics_report(
 
     total_canonical_objects = total_walls + total_openings + total_floors + total_roofs
 
-    # SECTION O: Estimator QA Summary Breakdown
+    # SECTION P: Expanded Estimator QA Summary Breakdown
     estimator_qa_summary = {
         "physical_walls_rendered": physical_walls_rendered,
         "baseline_only_walls": baseline_only_walls,
@@ -193,6 +200,7 @@ def generate_production_diagnostics_report(
         "matched_reconciliations": len([r for r in per_wall_reconciliation if r["reconciliation_status"] == "matched"]),
         "unresolved_reconciliations": len([r for r in per_wall_reconciliation if r["reconciliation_status"] == "unresolved"]),
         "variances_detected": len([r for r in per_wall_reconciliation if r["reconciliation_status"] == "variance_detected"]),
+        "producer_diagnostics_log": workspace_data.get("diagnostics_log", []),
     }
 
     return {

@@ -1,13 +1,13 @@
 """
 PlanReader Canonical Building Model Persistence & Staleness Tracking Module.
 
-Provides versioned serialization, workspace persistence, fingerprinting, and staleness detection
+Provides versioned serialization, workspace persistence, deterministic fingerprinting, and staleness detection
 for generated CanonicalProject models tied to PlanReader workspaces.
 
 SAFETY GUARANTEES:
 1. Versioned schema contract (PERSISTENCE_KEY = "canonical_3d_model_v1").
 2. Real production set_workspace_setting API string serialization (json.dumps / json.loads).
-3. Fingerprints underlying Workspace Evidence Snapshot (excluding generation_timestamp).
+3. Fingerprints underlying Workspace Evidence Snapshot using deterministic collection canonicalization.
 4. Detects stale persisted models when workspace evidence changes.
 5. Provides 'Refresh model from source evidence' flow.
 6. Refuses to persist synthetic demo data to production workspace stores.
@@ -23,18 +23,36 @@ PERSISTENCE_KEY = "canonical_3d_model_v1"
 SCHEMA_VERSION = "1.0.0"
 
 
-def compute_workspace_source_fingerprint(snapshot: Dict[str, Any]) -> str:
+def _sort_item_key(item: Any) -> str:
+    """Helper to derive a stable sorting key for list elements in snapshot canonicalization."""
+    if isinstance(item, dict):
+        for k in ("id", "wall_ref", "page_id", "document_id", "setting_key", "name"):
+            if item.get(k) is not None:
+                return f"{k}:{item.get(k)}"
+        return json.dumps(item, sort_keys=True)
+    return str(item)
+
+
+def canonicalize_evidence_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     """
-    SECTION K: Computes a deterministic SHA-256 fingerprint representing the current
-    revision of the Workspace Evidence Snapshot (metadata, pages, walls, openings, mapper, roof).
-    
-    GUARANTEE: Excludes generation_timestamp, UI toggles, and viewer camera.
+    SECTION I: Canonicalizes unordered evidence snapshot collections by strong stable identities.
+    Ensures that identical semantic evidence in different list order produces the EXACT same fingerprint.
     """
     if not isinstance(snapshot, dict):
-        return "empty_snapshot_fingerprint"
+        return {}
 
-    # Filter snapshot fields for deterministic hashing
-    clean_sources = {
+    def _canonicalize_obj(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: _canonicalize_obj(v) for k, v in sorted(obj.items())}
+        elif isinstance(obj, list):
+            canonicalized_list = [_canonicalize_obj(x) for x in obj]
+            try:
+                return sorted(canonicalized_list, key=_sort_item_key)
+            except Exception:
+                return canonicalized_list
+        return obj
+
+    clean_snapshot = {
         "workspace_metadata": snapshot.get("workspace_metadata"),
         "pages": snapshot.get("pages"),
         "registered_walls": snapshot.get("registered_walls"),
@@ -43,7 +61,18 @@ def compute_workspace_source_fingerprint(snapshot: Dict[str, Any]) -> str:
         "takeoff_rows": snapshot.get("takeoff_rows"),
     }
 
-    serialized = json.dumps(clean_sources, sort_keys=True, default=str)
+    return _canonicalize_obj(clean_snapshot)
+
+
+def compute_workspace_source_fingerprint(snapshot: Dict[str, Any]) -> str:
+    """
+    SECTION I & K: Computes a deterministic SHA-256 fingerprint representing the current
+    revision of the Workspace Evidence Snapshot after collection canonicalization.
+    
+    GUARANTEE: Excludes generation_timestamp, UI toggles, and viewer camera.
+    """
+    canonical_dict = canonicalize_evidence_snapshot(snapshot)
+    serialized = json.dumps(canonical_dict, sort_keys=True, default=str)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
 
 
@@ -105,7 +134,6 @@ def load_workspace_canonical_model(
     if raw_setting is None:
         return False, None, "No persisted canonical model found in workspace", None
 
-    # SECTION I: Handle string JSON or dict payload
     if isinstance(raw_setting, str):
         try:
             saved_payload = json.loads(raw_setting)
@@ -118,6 +146,10 @@ def load_workspace_canonical_model(
 
     if saved_payload.get("persistence_key") != PERSISTENCE_KEY:
         return False, None, f"Invalid persistence key: {saved_payload.get('persistence_key')}", None
+
+    # Check schema version
+    if saved_payload.get("schema_version") != SCHEMA_VERSION:
+        return False, None, f"Schema version mismatch: expected {SCHEMA_VERSION}, got {saved_payload.get('schema_version')}", saved_payload
 
     saved_wid = saved_payload.get("workspace_id")
     if saved_wid is not None and int(saved_wid) != int(workspace_id):
