@@ -1168,6 +1168,27 @@ def test_phase5k_roof_z_reproduction_verification():
     assert roof_b.review_state == ReviewState.REVIEW_REQUIRED
 
 
+    roof_a = proj_a.buildings[0].levels[0].roofs[0]
+    assert roof_a.elevation == 3.4
+    assert roof_a.review_state == ReviewState.CONFIRMED
+
+    # Case B: Confirmed heights 3.0 and 3.4, cap_z = 9.0 (mismatch > 0.05m) => cap Z rejected!
+    payload_b = {
+        "walls": [
+            {"wall_ref": "W1", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 3.0, "height_status": "confirmed"},
+            {"wall_ref": "W2", "a": {"x": 10, "y": 0}, "b": {"x": 10, "y": 10}, "height_m": 3.4, "height_status": "confirmed"},
+        ],
+        "roof_data": {
+            "evidence": {"pitches_deg": [15.0], "flat": False},
+            "caps": [{"id": "cap2", "polygon": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}], "z": 9.0}]
+        }
+    }
+    proj_b, _ = planreader_to_canonical_model(payload_b, is_validated_internal_workspace=True)
+    roof_b = proj_b.buildings[0].levels[0].roofs[0]
+    assert roof_b.elevation is None
+    assert roof_b.review_state == ReviewState.REVIEW_REQUIRED
+
+
 def test_phase5k_model_bounds_includes_roof_z():
     """PHASE 5K - Section 12: Test model_bounds includes objective roof elevation Z."""
     from pb_geometry_services import model_bounds
@@ -1188,4 +1209,175 @@ def test_phase5k_model_bounds_includes_roof_z():
     assert has_b is True
     assert bbox is not None
     assert bbox.max_point.z == 3.4
+
+
+def test_phase5l_v175_v178_exact_asdict_contract():
+    """PHASE 5L - Section 1: Persisted evidence uses exact asdict(ElevationOpening) and real v178 provenance shape."""
+    from dataclasses import asdict
+    from pb_elevation_evidence_v172 import ElevationOpening
+    from pb_production_3d_adapter import collect_workspace_3d_evidence
+
+    class DummyApp:
+        def lquery(self, sql, args=()):
+            if "FROM workspaces" in sql:
+                return [{"id": 99, "job_no": "J1", "job_name": "Job 1", "builder_client": "Client", "site_address": "Addr"}]
+            if "FROM documents" in sql:
+                return [{"id": 55, "workspace_id": 99, "file_name": "A101.pdf", "sha256": "abc", "category": "elevation", "page_count": 1, "source_type": "pdf"}]
+            if "FROM pages" in sql:
+                return [{"id": 101, "workspace_id": 99, "document_id": 55, "page_no": 1, "page_label": "E1", "page_type": "elevation", "scale_text": "1:100", "px_per_m": 100, "width_px": 1000, "height_px": 1000, "render_zoom": 1.0, "selected": 1}]
+            return []
+
+        def workspace_setting(self, wid, key, default=None):
+            if key == "opening_evidence_v175_pages":
+                return json.dumps([101])
+            if key == "opening_evidence_v175_page_101":
+                op = ElevationOpening(
+                    elevation_page_no=1,
+                    elevation_side="East",
+                    bbox_px=(100.0, 200.0, 300.0, 400.0),
+                    width_m=1.2,
+                    height_m=2.1,
+                    drawing_ref="CD3001",
+                    drawing_title="E1 EAST ELEVATION",
+                    level="Ground",
+                    wall_ref="W1",
+                )
+                prov = {
+                    "source_filename": "A101.pdf",
+                    "source_page": 1,
+                    "drawing_ref": "CD3001",
+                    "drawing_title": "E1 EAST ELEVATION",
+                    "elevation_side": "East",
+                    "coord_space": "render_pixel",
+                    "level": "Ground",
+                    "wall_ref": "W1",
+                    "calibration_source": "auto",
+                    "calibration_state": "valid",
+                }
+                return json.dumps({
+                    "elevation_openings": [asdict(op)],
+                    "elevation_provenance": [prov],
+                    "elevation_diagnostics": [{"status": "accepted"}],
+                })
+            return default
+
+    app = DummyApp()
+    snap = collect_workspace_3d_evidence(app, 99)
+    obs = snap["evidence_observations"]
+    assert len(obs) == 1
+    o = obs[0]
+    assert o["source_filename"] == "A101.pdf"
+    assert o["drawing_reference"] == "CD3001"
+    assert o["drawing_title"] == "E1 EAST ELEVATION"
+    assert o["side"] == "East"
+    assert o["level_name"] == "Ground"
+    assert o["wall_ref"] == "W1"
+    assert o["calibration_source"] == "auto"
+    assert o["calibration_state"] == "valid"
+    assert o["accepted_state"] is True
+    assert o["width_m"] == 1.2
+    assert o["height_m"] == 2.1
+
+
+def test_phase5l_v135_storey_identity_source_polygon():
+    """PHASE 5L - Section 4: Actual v135 wall_records provide source_polygon without level_index."""
+    payload = {
+        "walls": [
+            {
+                "wall_ref": "W1",
+                "a": {"x": 0, "y": 0},
+                "b": {"x": 5, "y": 0},
+                "level": "Level 1",
+                "source_polygon": "poly_A",
+            },
+            {
+                "wall_ref": "W2",
+                "a": {"x": 0, "y": 0},
+                "b": {"x": 5, "y": 0},
+                "level": "Level 1",
+                "source_polygon": "poly_B",
+            },
+        ]
+    }
+    proj, _ = planreader_to_canonical_model(payload, is_validated_internal_workspace=True)
+    b = proj.buildings[0]
+    assert len(b.levels) == 2
+    level_names = [lvl.name for lvl in b.levels]
+    assert len(level_names) == 2
+
+
+def test_phase5l_roof_z_semantics():
+    """PHASE 5L - Section 5: Roof Z semantics for Ground (3.4), Level 1 (6.4), Level 2 (unresolved)."""
+    # Ground at 0.0 + height 3.4 => roof Z 3.4
+    p_ground = {
+        "levels": [{"id": "L0", "name": "Ground", "elevation_m": 0.0}],
+        "walls": [{"wall_ref": "W0", "level": "Ground", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 3.4, "height_status": "confirmed"}],
+        "roof_data": {"caps": [{"id": "cap0", "level": "Ground", "polygon": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}], "z": 3.4}]}
+    }
+    proj0, _ = planreader_to_canonical_model(p_ground, is_validated_internal_workspace=True)
+    r0 = next(r for lvl in proj0.buildings[0].levels for r in lvl.roofs if r.id == "cap0")
+    assert r0.elevation == 3.4
+
+    # Level 1 at 3.4 + height 3.0 => roof Z 6.4
+    p_l1 = {
+        "levels": [{"id": "L1", "name": "Level 1", "elevation_m": 3.4}],
+        "walls": [{"wall_ref": "W1", "level": "Level 1", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 3.0, "height_status": "confirmed"}],
+        "roof_data": {"caps": [{"id": "cap1", "level": "Level 1", "polygon": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}], "z": 3.0}]}
+    }
+    proj1, _ = planreader_to_canonical_model(p_l1, is_validated_internal_workspace=True)
+    r1 = next(r for lvl in proj1.buildings[0].levels for r in lvl.roofs if r.id == "cap1")
+    assert r1.elevation == 6.4
+
+    # Level 2 unresolved elevation => no absolute roof Z
+    p_l2 = {
+        "levels": [{"id": "L2", "name": "Level 2", "elevation_m": None}],
+        "walls": [{"wall_ref": "W2", "level": "Level 2", "a": {"x": 0, "y": 0}, "b": {"x": 10, "y": 0}, "height_m": 3.0, "height_status": "confirmed"}],
+        "roof_data": {"caps": [{"id": "cap2", "level": "Level 2", "polygon": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}], "z": 3.0}]}
+    }
+    proj2, _ = planreader_to_canonical_model(p_l2, is_validated_internal_workspace=True)
+    r2 = next(r for lvl in proj2.buildings[0].levels for r in lvl.roofs if r.id == "cap2")
+    assert r2.elevation is None
+    assert r2.review_state == ReviewState.REVIEW_REQUIRED
+
+
+def test_phase5l_model_bounds_math_isfinite():
+    """PHASE 5L - Section 6: Assert math.isfinite() for every returned bound coordinate."""
+    import math
+    from pb_geometry_services import model_bounds
+
+    lvl = CanonicalLevel(
+        id="L1",
+        name="Ground",
+        elevation_m=0.0,
+        walls=[CanonicalWall(id="W1", name="W1", start_point=Vector2D(x=0.0, y=0.0), end_point=Vector2D(x=10.0, y=0.0), height_m=3.0)]
+    )
+    proj = CanonicalProject(id="P1", name="P1", buildings=[CanonicalBuilding(id="B1", name="B1", levels=[lvl])])
+    has_b, bbox = model_bounds(proj)
+    assert has_b is True
+    assert math.isfinite(bbox.min_point.x)
+    assert math.isfinite(bbox.max_point.x)
+    assert math.isfinite(bbox.min_point.y)
+    assert math.isfinite(bbox.max_point.y)
+    assert math.isfinite(bbox.min_point.z)
+    assert math.isfinite(bbox.max_point.z)
+
+    # Unresolved level elevation returns (False, None)
+    lvl_unresolved = CanonicalLevel(
+        id="L2",
+        name="Unresolved",
+        elevation_m=None,
+        walls=[CanonicalWall(id="W2", name="W2", start_point=Vector2D(x=0.0, y=0.0), end_point=Vector2D(x=10.0, y=0.0), height_m=3.0)]
+    )
+    proj_unresolved = CanonicalProject(id="P2", name="P2", buildings=[CanonicalBuilding(id="B2", name="B2", levels=[lvl_unresolved])])
+    has_b2, bbox2 = model_bounds(proj_unresolved)
+    assert has_b2 is False
+    assert bbox2 is None
+
+
+def test_phase5l_v140_producer_version():
+    """PHASE 5L - Section 7: get_producer_versions() includes v140_roof = 1.4.0."""
+    from pb_production_3d_adapter import get_producer_versions
+    v_map = get_producer_versions()
+    assert v_map.get("v140_roof") == "1.4.0"
+
 

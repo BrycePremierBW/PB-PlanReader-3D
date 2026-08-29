@@ -682,6 +682,11 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
         }}
 
         function createOpeningMesh(op, zElev, mat) {{
+            if (!op || op.is_host_attached === false || !op.wall_id) return null;
+            const physState = op.physical_state || '';
+            if (physState === 'wrong_host' || physState === 'wrong_level' || physState === 'invalid_geometry' || physState === 'conflict_overlap' || physState === 'evidence_only') {{
+                return null;
+            }}
             if (op.width_m === null || op.height_m === null || op.width_m <= 0 || op.height_m <= 0) return null;
             if (op.sill_height_m === null || op.sill_height_m === undefined || isNaN(op.sill_height_m) || op.sill_height_m < 0) return null;
             if (op.offset_along_wall_m === null || op.offset_along_wall_m === undefined || isNaN(op.offset_along_wall_m) || op.offset_along_wall_m < 0) return null;
@@ -750,7 +755,7 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
                 const geom = new THREE.ShapeGeometry(shape);
                 geom.rotateX(Math.PI / 2);
                 const mesh = new THREE.Mesh(geom, mat);
-                mesh.position.y = zElev + elevOff;
+                mesh.position.y = renderZ;
                 mesh.receiveShadow = true;
                 return mesh;
             }}
@@ -761,7 +766,7 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             geom.rotateX(Math.PI / 2);
 
             const mesh = new THREE.Mesh(geom, mat);
-            mesh.position.y = zElev + elevOff;
+            mesh.position.y = renderZ;
             mesh.receiveShadow = true;
             return mesh;
         }}

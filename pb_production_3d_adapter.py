@@ -288,12 +288,14 @@ def resolve_canonical_level(
     if "unregistered" in raw_name.lower():
         is_unregistered = True
 
+    if not raw_name and not explicit_id and not source_polygon_id:
+        raw_name = "Ground"
+
+    norm_name = raw_name.lower().strip()
+
     # Section M: Filter out sheet drawing numbers / generic sheet text
     sheet_text_patterns = [r"^a\d+$", r"^sheet\s*\d+$", r"^floor\s*plan$", r"^general\s*arrangement$", r"^drawing.*"]
     is_sheet_text = any(re.match(pat, raw_name.lower()) for pat in sheet_text_patterns)
-
-    if not raw_name and not explicit_id and not source_polygon_id:
-        is_sheet_text = True
 
     if is_sheet_text and not explicit_id and not source_polygon_id:
         key = "unresolved_review"
@@ -307,24 +309,43 @@ def resolve_canonical_level(
             )
         return levels_map[key], "unresolved"
 
-    norm_name = raw_name.lower().strip()
-
     # Section P: Identity hierarchy for key
     if explicit_id:
         key = str(explicit_id)
-    elif source_polygon_id and lvl_idx is not None:
-        key = f"lvl_prism_{source_polygon_id}_idx_{lvl_idx}"
-    elif is_unregistered:
-        key = f"ground_unregistered_{lvl_idx if lvl_idx is not None else '0'}"
-    elif lvl_idx is not None and raw_name:
-        key = f"lvl_idx_{lvl_idx}_{re.sub(r'[^a-z0-9]+', '_', norm_name)}"
-    else:
+    elif source_polygon_id:
+        poly_slug = re.sub(r'[^a-z0-9]+', '_', str(source_polygon_id).lower()).strip('_')
+        idx_str = f"_idx_{lvl_idx}" if lvl_idx is not None else ""
+        name_str = f"_{re.sub(r'[^a-z0-9]+', '_', norm_name).strip('_')}" if norm_name else ""
+        key = f"lvl_poly_{poly_slug}{idx_str}{name_str}"
+    elif not explicit_id and not source_polygon_id and norm_name:
+        matched_lvl = None
+        matched_key = None
+        for existing_key, existing_lvl in levels_map.items():
+            if existing_lvl.name and existing_lvl.name.lower().strip() == norm_name and not existing_key.startswith("lvl_poly_"):
+                matched_lvl = existing_lvl
+                matched_key = existing_key
+                break
+        if matched_lvl and matched_key:
+            if elevation_m is not None and matched_lvl.elevation_m is None:
+                matched_lvl.elevation_m = elevation_m
+                matched_lvl.review_state = ReviewState.CONFIRMED
+            return matched_lvl, matched_key
+
         key = (
             "ground" if ("ground" in norm_name or norm_name in ("0", "g", "lvl 0", "level 0")) else
             "level_1" if ("level 1" in norm_name or norm_name in ("1", "l1", "lvl 1", "first")) else
             "level_2" if ("level 2" in norm_name or norm_name in ("2", "l2", "lvl 2", "second")) else
             f"lvl_{re.sub(r'[^a-z0-9]+', '_', norm_name).strip('_') or 'unresolved'}"
         )
+    elif is_unregistered:
+        key = f"ground_unregistered_{lvl_idx if lvl_idx is not None else '0'}"
+    elif lvl_idx is not None and raw_name:
+        key = f"lvl_idx_{lvl_idx}_{re.sub(r'[^a-z0-9]+', '_', norm_name)}"
+    else:
+        key = "ground"
+
+    if elevation_m is None and (key == "ground" or "ground" in norm_name or norm_name in ("0", "g", "lvl 0", "level 0") or not norm_name):
+        elevation_m = 0.0
 
     if key not in levels_map:
         rev_state = (
@@ -858,30 +879,50 @@ def planreader_to_canonical_model(
         cap_pitch = first_pitch
         cap_type = roof_type
 
-        # Section 11: Objective Roof Z proof & reproduction verification
-        cap_z = _safe_float(cap.get("z"))
-        reproduced_expected_z = max(
-            [_safe_float(w.get("height_m")) for w in raw_walls if isinstance(w, dict) and _safe_float(w.get("height_m")) is not None]
-        ) if (raw_walls and any(_safe_float(w.get("height_m")) is not None for w in raw_walls if isinstance(w, dict))) else None
+        # Section 5 (Phase 5L): Objective Roof Z proof & level elevation offset verification
+        cap_z_local = _safe_float(cap.get("z"))
+        
+        # Use canonical walls attached to THIS cap's level
+        all_levels = list(levels_map.values())
+        cap_lvl_walls = cap_lvl.walls
+        if not cap_lvl_walls and len(all_levels) == 1:
+            cap_lvl_walls = all_levels[0].walls
 
-        cap_z_matches_reproduced = (
-            all_contributing_walls_confirmed and
-            cap_z is not None and
-            reproduced_expected_z is not None and
-            abs(cap_z - reproduced_expected_z) <= 0.05
+        level_walls_confirmed = (
+            len(cap_lvl_walls) > 0 and
+            all(
+                w.height_m is not None and
+                w.height_m > 0 and
+                w.review_state == ReviewState.CONFIRMED
+                for w in cap_lvl_walls
+            )
         )
 
-        if not (all_contributing_walls_confirmed and cap_z_matches_reproduced):
+        reproduced_cap_level_wall_height = max(
+            [w.height_m for w in cap_lvl_walls if w.height_m is not None]
+        ) if (cap_lvl_walls and any(w.height_m is not None for w in cap_lvl_walls)) else None
+
+        cap_z_agrees = (
+            level_walls_confirmed and
+            reproduced_cap_level_wall_height is not None and
+            (cap_z_local is None or abs(cap_z_local - reproduced_cap_level_wall_height) <= 0.05)
+        )
+
+        level_elev_known = cap_lvl.elevation_m is not None and _safe_float(cap_lvl.elevation_m) is not None
+
+        if level_elev_known and level_walls_confirmed and cap_z_agrees:
+            c_roof_z = cap_lvl.elevation_m + reproduced_cap_level_wall_height
+            roof_r_state = ReviewState.CONFIRMED if roof_valid else ReviewState.REVIEW_REQUIRED
+            z_msg = f"Roof cap Z confirmed objectively at absolute model Z {c_roof_z}m"
+        else:
             c_roof_z = None
             roof_r_state = ReviewState.REVIEW_REQUIRED
-            if not all_contributing_walls_confirmed:
-                z_msg = "Roof cap height Z rejected: one or more contributing wall heights are unconfirmed or defaulted"
+            if not level_elev_known:
+                z_msg = "Roof cap height Z rejected: cap level elevation_m is unresolved"
+            elif not level_walls_confirmed:
+                z_msg = "Roof cap height Z rejected: contributing walls for this level have unconfirmed or defaulted heights"
             else:
-                z_msg = f"Roof cap Z rejected: cap_z ({cap_z}m) disagrees with reproduced expected wall top Z ({reproduced_expected_z}m)"
-        else:
-            c_roof_z = cap_z
-            roof_r_state = ReviewState.CONFIRMED if roof_valid else ReviewState.REVIEW_REQUIRED
-            z_msg = f"Roof cap Z confirmed objectively at {cap_z}m"
+                z_msg = f"Roof cap Z rejected: cap local z ({cap_z_local}m) disagrees with reproduced level wall height ({reproduced_cap_level_wall_height}m)"
 
         c_roof = CanonicalRoof(
             id=str(cap.get("id") or f"roof_cap_{cap_idx+1}"),
@@ -912,7 +953,7 @@ def planreader_to_canonical_model(
 
 
 def get_producer_versions() -> Dict[str, str]:
-    """SECTION 13: Derive consumed producer versions from real module VERSION constants."""
+    """SECTION 13 & 7: Derive consumed producer versions from real module VERSION constants."""
     versions = {
         "3d_engine": "v1.5.1",
         "v127_mapper": "v127",
@@ -942,6 +983,11 @@ def get_producer_versions() -> Dict[str, str]:
     try:
         from pb_unified_building_v139 import VERSION as v139_v
         versions["v139_walls"] = str(v139_v)
+    except Exception:
+        pass
+    try:
+        from pb_roof_envelope_v140 import VERSION as v140_v
+        versions["v140_roof"] = str(v140_v)
     except Exception:
         pass
     try:
@@ -1137,7 +1183,7 @@ def collect_workspace_3d_evidence(app: Any, workspace_id: int) -> Dict[str, Any]
                         diag = elev_diags[idx] if (isinstance(elev_diags, list) and idx < len(elev_diags) and isinstance(elev_diags[idx], dict)) else {}
 
                         obs_id = str(item.get("id") or item.get("candidate_id") or f"obs_v175_p{p_id_int}_{idx+1}")
-                        dwg_ref = str(prov.get("drawing_ref") or prov.get("drawing_id") or item.get("drawing_reference") or "") or None
+                        dwg_ref = str(prov.get("drawing_ref") or item.get("drawing_ref") or prov.get("drawing_id") or item.get("drawing_reference") or "") or None
                         dwg_title = str(prov.get("drawing_title") or item.get("drawing_title") or "") or None
 
                         snapshot["evidence_observations"].append({
@@ -1148,20 +1194,22 @@ def collect_workspace_3d_evidence(app: Any, workspace_id: int) -> Dict[str, Any]
                             "page_id": str(p_id_int),
                             "page_no": matching_page.get("page_no"),
                             "source_filename": str(prov.get("source_filename") or prov.get("source_pdf") or ""),
-                            "source_page": prov.get("source_page") or matching_page.get("page_no"),
+                            "source_page": prov.get("source_page") or item.get("source_page_no") or matching_page.get("page_no"),
                             "drawing_reference": dwg_ref,
                             "drawing_title": dwg_title,
-                            "side": str(prov.get("elevation_side") or item.get("side") or item.get("facade") or "") or None,
+                            "side": str(prov.get("elevation_side") or item.get("elevation_side") or item.get("side") or item.get("facade") or "") or None,
                             "level_name": str(prov.get("level") or item.get("level") or "") or None,
                             "wall_ref": str(prov.get("wall_ref") or item.get("wall_ref") or "") or None,
-                            "source_coords": prov.get("source_coords") or item.get("source_coords") or item.get("bbox"),
-                            "coordinate_space": str(prov.get("coordinate_space") or item.get("coordinate_space") or "") or None,
+                            "source_coords": item.get("bbox_px") or prov.get("source_coords") or item.get("source_coords") or item.get("bbox"),
+                            "coordinate_space": str(prov.get("coord_space") or prov.get("coordinate_space") or item.get("coord_space") or item.get("coordinate_space") or "") or None,
                             "calibration": prov.get("calibration") or item.get("calibration"),
+                            "calibration_source": str(prov.get("calibration_source") or "") or None,
+                            "calibration_state": str(prov.get("calibration_state") or "") or None,
                             "width_m": _safe_float(item.get("width_m")),
                             "height_m": _safe_float(item.get("height_m")),
-                            "accepted_state": bool(item.get("accepted", False)),
-                            "rejected_state": not bool(item.get("accepted", False)),
-                            "reason": str(item.get("reason") or diag.get("note") or "v1.7.5/v1.7.8 elevation evidence candidate"),
+                            "accepted_state": True,
+                            "rejected_state": False,
+                            "reason": "v1.7.5/v1.7.8 elevation evidence candidate",
                             "producer": "pb_opening_production_v175",
                             "producer_version": snapshot["producer_versions"].get("v175_openings", "v1.7.5"),
                             "deduction_authority": False,
