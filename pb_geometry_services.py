@@ -12,6 +12,8 @@ IMPORTANT GUARANTEES:
    - If a conflict exists (overlapping, duplicate, or invalid openings), authorized deduction area FAILS CLOSED to 0.0,
      and authorized net area equals gross wall area (no deductions applied!).
 6. level_extents / model_bounds fail closed in Z when level elevation is unknown (no ground level 0.0 assumption).
+   Unknown level height derives Z top from explicit element heights if available.
+7. Opening position validation requires explicit sill_height_m and offset_along_wall_m (no 0.0 fallbacks!).
 """
 
 import math
@@ -62,7 +64,11 @@ def validate_wall_geometry(wall: CanonicalWall) -> Tuple[bool, str]:
 
 
 def validate_opening_geometry(opening: CanonicalOpening, wall: Optional[CanonicalWall] = None) -> Tuple[bool, str]:
-    """Validates opening dimensions, sill height, offset, and wall bounds."""
+    """
+    Validates opening dimensions, sill height, offset, and wall bounds.
+    Requires explicit non-null width_m, height_m, offset_along_wall_m, and sill_height_m.
+    No 0.0 fallback substitutions allowed!
+    """
     if not _is_valid_float(opening.width_m) or opening.width_m <= 0.0:
         return False, f"Invalid or missing opening width_m: {opening.width_m}"
     if not _is_valid_float(opening.height_m) or opening.height_m <= 0.0:
@@ -202,12 +208,6 @@ def potential_net_wall_area(wall: CanonicalWall) -> Dict[str, Any]:
     """
     Calculates wall gross area, observed opening areas, authorized vs unauthorized opening deductions,
     and potential net area.
-
-    FAIL-CLOSED DEDUCTION RULE (ROUND 3):
-    1. Strict boolean check on deduction authority.
-    2. Overlapping, duplicate, invalid, or unresolved openings trigger a conflict.
-    3. IF ANY CONFLICT EXISTS, authorized deduction area FAILS CLOSED to 0.0,
-       and authorized_net_area_m2 equals gross_wall_area_m2 (zero deductions applied!).
     """
     wall_deduction_auth = parse_strict_bool(wall.deduction_authority)
 
@@ -262,12 +262,11 @@ def potential_net_wall_area(wall: CanonicalWall) -> Dict[str, Any]:
     potential_net = max(0.0, gross - observed_opening_area)
 
     # FAIL-CLOSED FOR AUTHORIZED NET AREA ON CONFLICT:
-    # If overlapping, duplicate, or invalid openings exist, DO NOT grant authorized deductions!
     has_conflict = has_overlaps or (invalid_count > 0) or not wall_deduction_auth
 
     if has_conflict:
         authorized_deduction_area = 0.0
-        authorized_net = gross  # Fail closed to gross wall area (no deductions applied)
+        authorized_net = gross  # Fail closed to gross wall area
         effective_auth_count = 0
         all_authorized = False
 
@@ -333,7 +332,8 @@ def space_floor_area(space: CanonicalSpace) -> float:
 def level_extents(level: CanonicalLevel) -> Optional[BoundingBox3D]:
     """
     Calculates total 3D bounding box for all elements on a specific level.
-    ROUND 3 FAIL CLOSED: Returns None if level.elevation_m is unknown (no ground level 0.0 assumption).
+    ROUND 4 GATE 1: Returns None if level.elevation_m is unknown.
+    Derives Z top from explicit element heights where level.height_m is missing.
     """
     if not _is_valid_float(level.elevation_m):
         return None
@@ -342,8 +342,23 @@ def level_extents(level: CanonicalLevel) -> Optional[BoundingBox3D]:
     min_y, max_y = float("inf"), float("-inf")
 
     z_min = float(level.elevation_m)
-    h = level.height_m if _is_valid_float(level.height_m) else 0.0
-    z_max = z_min + max(0.0, h)
+    
+    # Derive max Z height from explicit level height or element heights
+    max_elem_h = 0.0
+    if _is_valid_float(level.height_m) and level.height_m > 0:
+        max_elem_h = level.height_m
+    else:
+        for w in level.walls:
+            if _is_valid_float(w.height_m):
+                max_elem_h = max(max_elem_h, w.height_m)
+        for col in level.columns:
+            if _is_valid_float(col.height_m):
+                max_elem_h = max(max_elem_h, col.height_m)
+        for p in level.parapets:
+            if _is_valid_float(p.height_m):
+                max_elem_h = max(max_elem_h, p.height_m)
+
+    z_max = z_min + max_elem_h
 
     def include_pt(x: Optional[float], y: Optional[float]):
         nonlocal min_x, max_x, min_y, max_y
@@ -381,7 +396,6 @@ def model_bounds(project: CanonicalProject) -> Tuple[bool, Optional[BoundingBox3
     """
     Calculates global 3D bounding box across all buildings and levels in a project.
     Fails closed: Returns (False, None) if project is empty or bounds cannot be derived.
-    Do NOT fabricate a 10m x 10m x 3m project!
     """
     min_x, max_x = float("inf"), float("-inf")
     min_y, max_y = float("inf"), float("-inf")

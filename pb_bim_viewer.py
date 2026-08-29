@@ -10,10 +10,11 @@ Features:
 - 2-Pass scene building resolving opening host walls regardless of payload order
 - Complete declared type support (CEILING, SCREEN, SURFACE, BALUSTRADE, PARAPET, etc.)
 - Review state visual styling across ALL geometry types (CONFIRMED, INFERRED, REVIEW_REQUIRED)
-- Zero invented physical fallbacks:
+- ZERO invented physical fallbacks:
   - Unknown level elevation is NOT treated as ground level 0.0
-  - Missing thickness renders as 2D flat planar/line geometry, NOT arbitrary 5cm or 15cm blocks
-  - Missing column center/dimensions are excluded, NOT placed at (0,0)
+  - Missing sill_height_m or offset_along_wall_m does NOT position physical openings at origin/floor (skipped)
+  - Missing thickness renders as 2D flat planar/line geometry, NOT arbitrary blocks
+  - Missing parapet/linear length removes || 1.0 fallbacks (must come strictly from endpoints)
 """
 
 import base64
@@ -535,7 +536,7 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             animate();
         }}
 
-        // 2-Pass Scene Building: NO INVENTED PHYSICAL FALLBACKS
+        // 2-Pass Scene Building: ZERO INVENTED PHYSICAL FALLBACKS
         function buildScene() {{
             if (!modelData.objects || modelData.objects.length === 0) return;
 
@@ -550,7 +551,7 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             // PASS 2: Create and render 3D meshes
             modelData.objects.forEach(obj => {{
                 const lvl = levelMap.get(obj.level_id);
-                // ROUND 3 FIX: Unknown level elevation is NOT treated as ground level 0.0!
+                // ROUND 3 & 4 FIX: Unknown level elevation is NOT treated as ground level 0.0!
                 if (!lvl || lvl.elevation_m === null || lvl.elevation_m === undefined || isNaN(lvl.elevation_m)) {{
                     return;
                 }}
@@ -581,7 +582,6 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             }});
         }}
 
-        // ZERO INVENTED PHYSICAL FALLBACKS FOR WALL THICKNESS / HEIGHT
         function createWallMeshWithHoles(wall, zElev, mat) {{
             const p1 = wall.start_point;
             const p2 = wall.end_point;
@@ -593,7 +593,6 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             if (isNaN(len) || len < 0.001) return null;
 
             if (wall.height_m === null || wall.height_m === undefined || isNaN(wall.height_m) || wall.height_m <= 0) {{
-                // Missing wall height: render as 2D baseline wireframe
                 const lineGeom = new THREE.BufferGeometry().setFromPoints([
                     new THREE.Vector3(p1.x, zElev, -p1.y),
                     new THREE.Vector3(p2.x, zElev, -p2.y)
@@ -606,7 +605,6 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
 
             const hWall = wall.height_m;
 
-            // ROUND 3 FIX: Missing wall thickness is rendered as 2D flat planar ribbon, NOT a 5cm block!
             if (wall.thickness_m === null || wall.thickness_m === undefined || isNaN(wall.thickness_m) || wall.thickness_m <= 0) {{
                 const planeGeom = new THREE.PlaneGeometry(len, hWall);
                 const mesh = new THREE.Mesh(planeGeom, mat);
@@ -631,9 +629,12 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
                     const off = op.offset_along_wall_m;
                     const wOp = op.width_m;
                     const hOp = op.height_m;
-                    const sill = (op.sill_height_m !== null && op.sill_height_m !== undefined) ? op.sill_height_m : 0.0;
+                    const sill = op.sill_height_m;
 
-                    if (off !== null && wOp !== null && hOp !== null && wOp > 0 && hOp > 0 && off >= 0 && (off + wOp) <= (len + 0.05) && (sill + hOp) <= (hWall + 0.05)) {{
+                    // ROUND 4 GATE 1 FIX: Missing sill_height_m or offset_along_wall_m MUST NOT default to 0.0!
+                    if (off !== null && off !== undefined && sill !== null && sill !== undefined &&
+                        wOp !== null && hOp !== null && wOp > 0 && hOp > 0 && off >= 0 && sill >= 0 &&
+                        (off + wOp) <= (len + 0.05) && (sill + hOp) <= (hWall + 0.05)) {{
                         const hole = new THREE.Path();
                         hole.moveTo(off, sill);
                         hole.lineTo(off + wOp, sill);
@@ -659,12 +660,16 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             return mesh;
         }}
 
+        // ROUND 4 GATE 1 FIX: Missing sill_height_m or offset_along_wall_m MUST NOT render opening at origin!
         function createOpeningMesh(op, zElev, mat) {{
             if (op.width_m === null || op.height_m === null || op.width_m <= 0 || op.height_m <= 0) return null;
+            if (op.sill_height_m === null || op.sill_height_m === undefined || isNaN(op.sill_height_m) || op.sill_height_m < 0) return null;
+            if (op.offset_along_wall_m === null || op.offset_along_wall_m === undefined || isNaN(op.offset_along_wall_m) || op.offset_along_wall_m < 0) return null;
+
             const wWidth = op.width_m;
             const wHeight = op.height_m;
-            const sill = (op.sill_height_m !== null && op.sill_height_m !== undefined) ? op.sill_height_m : 0.0;
-            const off = (op.offset_along_wall_m !== null && op.offset_along_wall_m !== undefined) ? op.offset_along_wall_m : 0.0;
+            const sill = op.sill_height_m;
+            const off = op.offset_along_wall_m;
 
             const geom = new THREE.BoxGeometry(wWidth, wHeight, 0.06);
             const mesh = new THREE.Mesh(geom, mat);
@@ -692,7 +697,6 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             return mesh;
         }}
 
-        // ROUND 3 FIX: Missing polygon thickness renders 2D flat planar polygon, NOT 15cm block!
         function createPolygonMesh(polyObj, zElev, mat) {{
             if (!polyObj.polygon || polyObj.polygon.length < 3) return null;
             const shape = new THREE.Shape();
@@ -703,7 +707,7 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
                 }}
             }});
 
-            const elevOff = (polyObj.elevation_offset_m !== null && polyObj.elevation_offset_m !== undefined) ? polyObj.elevation_offset_m : 0.0;
+            const elevOff = (polyObj.elevation_offset_m !== null && polyObj.elevation_offset_m !== undefined && !isNaN(polyObj.elevation_offset_m)) ? polyObj.elevation_offset_m : 0.0;
 
             if (polyObj.thickness_m === null || polyObj.thickness_m === undefined || isNaN(polyObj.thickness_m) || polyObj.thickness_m <= 0) {{
                 const geom = new THREE.ShapeGeometry(shape);
@@ -725,9 +729,11 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             return mesh;
         }}
 
+        // ROUND 4 GATE 1 FIX: Parapet length must come strictly from endpoints (NO || 1.0 fallback!)
         function createParapetMesh(p, zElev, mat) {{
             if (p.height_m === null || p.height_m <= 0) return null;
-            const len = p.length_m || 1.0;
+            if (p.length_m === null || p.length_m === undefined || isNaN(p.length_m) || p.length_m <= 0) return null;
+            const len = p.length_m;
 
             const dx = p.end_point.x - p.start_point.x;
             const dy = p.end_point.y - p.start_point.y;
@@ -751,7 +757,6 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             return mesh;
         }}
 
-        // ROUND 3 FIX: Missing column center/dimensions excluded, NOT placed at (0,0)!
         function createColumnMesh(col, zElev, mat) {{
             if (!col.center || col.center.x === null || col.center.y === null || col.width_m === null || col.depth_m === null || col.height_m === null) {{
                 return null;
@@ -763,9 +768,11 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             return mesh;
         }}
 
+        // ROUND 4 GATE 1 FIX: Linear element length must come strictly from endpoints (NO || 1.0 fallback!)
         function createLinearMesh(lin, zElev, mat) {{
             if (lin.height_m === null || lin.height_m <= 0) return null;
-            const len = lin.length_m || 1.0;
+            if (lin.length_m === null || lin.length_m === undefined || isNaN(lin.length_m) || lin.length_m <= 0) return null;
+            const len = lin.length_m;
             const geom = new THREE.PlaneGeometry(len, lin.height_m);
             const mesh = new THREE.Mesh(geom, mat);
             mesh.castShadow = true;
@@ -957,7 +964,8 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
         }}
 
         function addSectionTitle(container, titleText) {{
-            const title = document.className = 'info-section-title';
+            const title = document.createElement('div');
+            title.className = 'info-section-title';
             title.textContent = titleText;
             container.appendChild(title);
         }}

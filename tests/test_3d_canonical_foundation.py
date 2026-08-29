@@ -1,6 +1,6 @@
 """
 Unit test suite for Phase 1-4 3D Canonical Building Model, Geometry Services,
-Synthetic Demonstration Fixture, Viewer Payload Generator, and Round 3 Security/Safety Regressions.
+Synthetic Demonstration Fixture, Viewer Payload Generator, and Round 4 Gate 1 Security/Safety Regressions.
 """
 
 import base64
@@ -104,10 +104,44 @@ def test_direct_python_construction_strict_boolean_normalization():
     assert w_true.takeoff_eligible is True
     assert w_true.is_external is True
 
-    # Test serialization base_to_dict
     w_false_dict = w_false.to_dict()
     assert w_false_dict["deduction_authority"] is False
     assert w_false_dict["takeoff_eligible"] is False
+
+
+def test_missing_opening_position_fails_placement():
+    """ROUND 4 GATE 1: Missing sill_height_m or offset_along_wall_m CANNOT position a physical opening."""
+    wall = CanonicalWall(
+        id="wall_pos",
+        start_point=Vector2D(0.0, 0.0),
+        end_point=Vector2D(10.0, 0.0),
+        height_m=3.0,
+    )
+    # Opening missing sill_height_m (None)
+    op_no_sill = CanonicalOpening(
+        id="op_no_sill",
+        wall_id=wall.id,
+        offset_along_wall_m=2.0,
+        sill_height_m=None,
+        width_m=1.0,
+        height_m=2.0,
+    )
+    valid_sill, msg_sill = validate_opening_geometry(op_no_sill, wall)
+    assert valid_sill is False
+    assert "Invalid or missing opening sill_height_m" in msg_sill
+
+    # Opening missing offset_along_wall_m (None)
+    op_no_off = CanonicalOpening(
+        id="op_no_off",
+        wall_id=wall.id,
+        offset_along_wall_m=None,
+        sill_height_m=1.0,
+        width_m=1.0,
+        height_m=2.0,
+    )
+    valid_off, msg_off = validate_opening_geometry(op_no_off, wall)
+    assert valid_off is False
+    assert "Invalid or missing opening offset_along_wall_m" in msg_off
 
 
 def test_synthetic_demo_fixture_flags():
@@ -119,13 +153,12 @@ def test_synthetic_demo_fixture_flags():
 
 
 def test_model_bounds_api_contract_and_z_fail_closed():
-    """ROUND 3: Test model_bounds returns (bounds_available: bool, bounds: Optional[BoundingBox3D]) and fails closed in Z."""
+    """ROUND 3 & 4: Test model_bounds returns (bounds_available: bool, bounds: Optional[BoundingBox3D]) and fails closed in Z."""
     empty_proj = CanonicalProject(name="Empty")
     ok_empty, bounds_empty = model_bounds(empty_proj)
     assert ok_empty is False
     assert bounds_empty is None
 
-    # Level with unknown elevation_m must fail closed in Z (returns None for extents)
     lvl_no_elev = CanonicalLevel(name="Unknown Elev", elevation_m=None)
     lvl_no_elev.walls = [CanonicalWall(start_point=Vector2D(0,0), end_point=Vector2D(10,0), height_m=3.0)]
     assert level_extents(lvl_no_elev) is None
@@ -140,7 +173,7 @@ def test_model_bounds_api_contract_and_z_fail_closed():
 
 
 def test_no_invented_physical_geometry_defaults():
-    """ROUND 2 & 3: Test that missing physical geometry parameters remain None."""
+    """ROUND 2, 3, 4: Test that missing physical geometry parameters remain None."""
     wall = CanonicalWall(start_point=Vector2D(0.0, 0.0), end_point=Vector2D(10.0, 0.0))
     assert wall.height_m is None
     assert wall.thickness_m is None
@@ -231,8 +264,8 @@ def test_deduction_and_overlap_conflict_fail_closed_net_area():
     p_overlap = potential_net_wall_area(wall_op)
     assert p_overlap["has_overlapping_openings"] is True
     assert p_overlap["all_deductions_authorized"] is False
-    assert p_overlap["authorized_opening_deduction_area_m2"] == 0.0  # Fails closed to 0.0 deduction!
-    assert p_overlap["authorized_net_area_m2"] == 30.0  # Equals gross wall area (30.0 m²)!
+    assert p_overlap["authorized_opening_deduction_area_m2"] == 0.0
+    assert p_overlap["authorized_net_area_m2"] == 30.0
     assert "Conflict: Overlapping / Duplicate Openings" in p_overlap["authority_note"]
 
 
