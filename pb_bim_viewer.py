@@ -15,6 +15,7 @@ Features:
   - Missing sill_height_m or offset_along_wall_m does NOT position physical openings at origin/floor (skipped)
   - Missing thickness renders as 2D flat planar/line geometry, NOT arbitrary blocks
   - Missing parapet/linear length removes || 1.0 fallbacks (must come strictly from endpoints)
+  - Missing elevation_offset_m in createPolygonMesh fails closed (does NOT default to 0.0)
 """
 
 import base64
@@ -551,7 +552,6 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             // PASS 2: Create and render 3D meshes
             modelData.objects.forEach(obj => {{
                 const lvl = levelMap.get(obj.level_id);
-                // ROUND 3 & 4 FIX: Unknown level elevation is NOT treated as ground level 0.0!
                 if (!lvl || lvl.elevation_m === null || lvl.elevation_m === undefined || isNaN(lvl.elevation_m)) {{
                     return;
                 }}
@@ -631,7 +631,6 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
                     const hOp = op.height_m;
                     const sill = op.sill_height_m;
 
-                    // ROUND 4 GATE 1 FIX: Missing sill_height_m or offset_along_wall_m MUST NOT default to 0.0!
                     if (off !== null && off !== undefined && sill !== null && sill !== undefined &&
                         wOp !== null && hOp !== null && wOp > 0 && hOp > 0 && off >= 0 && sill >= 0 &&
                         (off + wOp) <= (len + 0.05) && (sill + hOp) <= (hWall + 0.05)) {{
@@ -660,7 +659,6 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             return mesh;
         }}
 
-        // ROUND 4 GATE 1 FIX: Missing sill_height_m or offset_along_wall_m MUST NOT render opening at origin!
         function createOpeningMesh(op, zElev, mat) {{
             if (op.width_m === null || op.height_m === null || op.width_m <= 0 || op.height_m <= 0) return null;
             if (op.sill_height_m === null || op.sill_height_m === undefined || isNaN(op.sill_height_m) || op.sill_height_m < 0) return null;
@@ -699,6 +697,13 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
 
         function createPolygonMesh(polyObj, zElev, mat) {{
             if (!polyObj.polygon || polyObj.polygon.length < 3) return null;
+
+            // FAIL CLOSED: elevation_offset_m=None means offset is unknown. Do NOT silently render at level elevation 0.0!
+            if (polyObj.elevation_offset_m === null || polyObj.elevation_offset_m === undefined || isNaN(polyObj.elevation_offset_m)) {{
+                return null;
+            }}
+            const elevOff = polyObj.elevation_offset_m;
+
             const shape = new THREE.Shape();
             polyObj.polygon.forEach((pt, idx) => {{
                 if (pt.x !== null && pt.y !== null) {{
@@ -706,8 +711,6 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
                     else shape.lineTo(pt.x, -pt.y);
                 }}
             }});
-
-            const elevOff = (polyObj.elevation_offset_m !== null && polyObj.elevation_offset_m !== undefined && !isNaN(polyObj.elevation_offset_m)) ? polyObj.elevation_offset_m : 0.0;
 
             if (polyObj.thickness_m === null || polyObj.thickness_m === undefined || isNaN(polyObj.thickness_m) || polyObj.thickness_m <= 0) {{
                 const geom = new THREE.ShapeGeometry(shape);
@@ -729,7 +732,6 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             return mesh;
         }}
 
-        // ROUND 4 GATE 1 FIX: Parapet length must come strictly from endpoints (NO || 1.0 fallback!)
         function createParapetMesh(p, zElev, mat) {{
             if (p.height_m === null || p.height_m <= 0) return null;
             if (p.length_m === null || p.length_m === undefined || isNaN(p.length_m) || p.length_m <= 0) return null;
@@ -768,7 +770,6 @@ def generate_bim_viewer_html(payload: Dict[str, Any], height_px: int = 750) -> s
             return mesh;
         }}
 
-        // ROUND 4 GATE 1 FIX: Linear element length must come strictly from endpoints (NO || 1.0 fallback!)
         function createLinearMesh(lin, zElev, mat) {{
             if (lin.height_m === null || lin.height_m <= 0) return null;
             if (lin.length_m === null || lin.length_m === undefined || isNaN(lin.length_m) || lin.length_m <= 0) return null;

@@ -1,6 +1,6 @@
 """
 Unit test suite for Phase 1-4 3D Canonical Building Model, Geometry Services,
-Synthetic Demonstration Fixture, Viewer Payload Generator, and Round 4 Gate 1 Security/Safety Regressions.
+Synthetic Demonstration Fixture, Viewer Payload Generator, and Round 5 Security/Safety Regressions.
 """
 
 import base64
@@ -88,6 +88,30 @@ def test_canonical_model_creation_and_fail_closed_defaults():
     assert wall.takeoff_eligible is False
 
 
+def test_polygon_elevation_offset_none_fails_closed():
+    """ROUND 5: Test that PolygonElement.elevation_offset_m=None stays None and cannot become 0.0."""
+    floor_no_off = CanonicalFloor(
+        name="Floor Unknown Offset",
+        polygon=[Vector2D(0, 0), Vector2D(10, 0), Vector2D(10, 10), Vector2D(0, 10)],
+        elevation_offset_m=None,
+    )
+    assert floor_no_off.elevation_offset_m is None
+
+    proj = CanonicalProject(name="Floor Test")
+    bld = CanonicalBuilding(name="Bld")
+    lvl = CanonicalLevel(name="L1", elevation_m=0.0, height_m=3.0, floors=[floor_no_off])
+    bld.levels = [lvl]
+    proj.buildings = [bld]
+
+    payload = project_to_viewer_payload(proj)
+    obj = next(o for o in payload["objects"] if o["name"] == "Floor Unknown Offset")
+    assert obj["elevation_offset_m"] is None  # MUST remain None in payload!
+
+    html_code = generate_bim_viewer_html(payload)
+    # Verify viewer JS contains fail-closed check on elevation_offset_m
+    assert "elevation_offset_m === null" in html_code
+
+
 def test_direct_python_construction_strict_boolean_normalization():
     """ROUND 3: Direct Python construction with 'false', 'true', 'yes', 1 must NOT grant authority."""
     w_false = CanonicalWall(deduction_authority="false", takeoff_eligible="true", is_external="yes")
@@ -117,7 +141,6 @@ def test_missing_opening_position_fails_placement():
         end_point=Vector2D(10.0, 0.0),
         height_m=3.0,
     )
-    # Opening missing sill_height_m (None)
     op_no_sill = CanonicalOpening(
         id="op_no_sill",
         wall_id=wall.id,
@@ -130,7 +153,6 @@ def test_missing_opening_position_fails_placement():
     assert valid_sill is False
     assert "Invalid or missing opening sill_height_m" in msg_sill
 
-    # Opening missing offset_along_wall_m (None)
     op_no_off = CanonicalOpening(
         id="op_no_off",
         wall_id=wall.id,

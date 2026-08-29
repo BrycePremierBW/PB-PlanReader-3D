@@ -259,6 +259,7 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
         level_id=lvl0.id,
         polygon=[Vector2D(0, 0), Vector2D(12, 0), Vector2D(12, 8), Vector2D(0, 8)],
         thickness_m=0.15,
+        elevation_offset_m=0.0,  # Explicit zero offset known
         substrate="Reinforced Concrete Slab",
         finish="Polished Epoxy Sealant",
         confidence=1.0,
@@ -424,6 +425,7 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
         level_id=lvl1.id,
         polygon=[Vector2D(0, 0), Vector2D(12, 0), Vector2D(12, 8), Vector2D(0, 8)],
         thickness_m=0.25,
+        elevation_offset_m=0.0,  # Explicit zero offset known
         substrate="Engineered Timber Joists & Particleboard Floor",
         finish="Carpet & Underlay",
         confidence=0.85,
@@ -436,7 +438,7 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
         level_id=lvl1.id,
         polygon=[Vector2D(0.0, -1.8), Vector2D(4.5, -1.8), Vector2D(4.5, 0.0), Vector2D(0.0, 0.0)],
         thickness_m=0.20,
-        elevation_offset_m=0.0,
+        elevation_offset_m=0.0,  # Explicit zero offset known
         substrate="Waterproofed FC Sheet Substrate",
         finish="External Non-Slip Porcelain Tiles",
         confidence=0.90,
@@ -543,6 +545,7 @@ def get_synthetic_viewer_demo_model() -> CanonicalProject:
         level_id=lvl2.id,
         polygon=[Vector2D(0, 0), Vector2D(12, 0), Vector2D(12, 8), Vector2D(0, 8)],
         thickness_m=0.15,
+        elevation_offset_m=0.0,  # Explicit zero offset known
         pitch_deg=3.0,
         overhang_m=0.3,
         roof_type="FLAT",
