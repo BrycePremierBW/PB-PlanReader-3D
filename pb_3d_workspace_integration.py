@@ -9,40 +9,54 @@ ARCHITECTURE GUARANTEES:
 1. Smallest safe hook architecture (uses existing apply(app) extension pattern).
 2. Preserves and executes original app.model_3d_page while embedding the canonical 3D WebGL viewer.
 3. Converts workspace evidence automatically via planreader_workspace_to_canonical().
-4. Integrates persistence (pb_canonical_persistence.py) and diagnostics (pb_3d_diagnostics.py).
+4. Safe canonical caching keyed by (workspace_id, snapshot_fingerprint, schema_version).
+5. Integrates persistence (pb_canonical_persistence.py) and diagnostics (pb_3d_diagnostics.py).
 """
 
 import streamlit as st
 import streamlit.components.v1 as components
 from typing import Any, Dict, Optional
-from pb_production_3d_adapter import planreader_workspace_to_canonical
+from pb_production_3d_adapter import planreader_workspace_to_canonical, require_workspace_id
 from pb_bim_viewer import project_to_viewer_payload, generate_bim_viewer_html
 from pb_canonical_persistence import load_workspace_canonical_model, save_workspace_canonical_model
 from pb_3d_diagnostics import generate_production_diagnostics_report
 
+# SECTION R: Safe Canonical Model Cache in Session Memory
+_MODEL_CACHE: Dict[tuple, Any] = {}
+
 
 def render_workspace_3d_canonical_view(app: Any, workspace: Any = None) -> None:
     """
-    SECTION L & J: Renders the approved canonical 3D WebGL BIM viewer inside the active PlanReader workspace view.
+    SECTION L, J, P, R: Renders the approved canonical 3D WebGL BIM viewer inside the active PlanReader workspace view.
     """
-    workspace_id = 1
-    if isinstance(workspace, dict):
-        workspace_id = workspace.get("id", 1)
-    elif isinstance(workspace, (int, str)) and str(workspace).isdigit():
-        workspace_id = int(workspace)
-    elif hasattr(app, "current_workspace"):
-        try:
-            curr = app.current_workspace() if callable(app.current_workspace) else app.current_workspace
-            if isinstance(curr, dict):
-                workspace_id = curr.get("id", 1)
-        except Exception:
-            pass
-
-    # Load canonical project from workspace evidence snapshot
     try:
-        project, diagnostics = planreader_workspace_to_canonical(app, workspace_id)
+        workspace_id = 101
+        if isinstance(workspace, dict):
+            workspace_id = workspace.get("id", 101)
+        elif isinstance(workspace, (int, str)) and str(workspace).isdigit():
+            workspace_id = int(workspace)
+        elif hasattr(app, "current_workspace"):
+            try:
+                curr = app.current_workspace() if callable(app.current_workspace) else app.current_workspace
+                if isinstance(curr, dict):
+                    workspace_id = curr.get("id", 101)
+            except Exception:
+                pass
+
+        wid_int = require_workspace_id(workspace_id)
     except Exception as e:
-        st.error(f"Error building 3D canonical model for workspace #{workspace_id}: {e}")
+        st.error(f"Workspace Identity Error: {e}")
+        return
+
+    # Load canonical project & diagnostics from workspace evidence snapshot
+    try:
+        ws_result = planreader_workspace_to_canonical(app, wid_int)
+        project = ws_result.project
+        snapshot = ws_result.snapshot
+        snapshot_fp = ws_result.snapshot_fingerprint
+        diagnostics = ws_result.diagnostics
+    except Exception as e:
+        st.error(f"Error building 3D canonical model for workspace #{wid_int}: {e}")
         return
 
     st.markdown("### 🏗️ Canonical 3D WebGL BIM Model")
@@ -51,25 +65,34 @@ def render_workspace_3d_canonical_view(app: Any, workspace: Any = None) -> None:
         st.warning("⚠️ SYNTHETIC VIEWER DEMONSTRATION FIXTURE — NOT BENCHMARK TRUTH / NOT TAKEOFF AUTHORITATIVE")
 
     # SECTION J: Initial Persistence & Refresh Lifecycle
-    is_fresh, saved_proj, status_msg, saved_payload = load_workspace_canonical_model(app, workspace_id)
+    is_fresh, saved_proj, status_msg, saved_payload = load_workspace_canonical_model(app, wid_int, current_snapshot=snapshot)
     if saved_payload is None:
-        save_workspace_canonical_model(app, workspace_id, project)
-        st.caption("ℹ️ Model saved to workspace 3D persistence store (`canonical_3d_model_v1`).")
-    elif "Stale" in status_msg:
+        save_workspace_canonical_model(app, wid_int, project, snapshot=snapshot)
+        st.caption("ℹ️ Initial model saved to workspace 3D persistence store (`canonical_3d_model_v1`).")
+    elif not is_fresh:
         st.warning(status_msg)
-        if st.button("🔄 Refresh 3D Model from Source Evidence", key=f"refresh_3d_model_{workspace_id}"):
-            save_workspace_canonical_model(app, workspace_id, project)
+        if st.button("🔄 Refresh 3D Model from Source Evidence", key=f"refresh_3d_model_{wid_int}"):
+            save_workspace_canonical_model(app, wid_int, project, snapshot=snapshot)
             st.success("Model refreshed and saved to workspace persistence store.")
             st.rerun()
 
+    # SECTION R: Safe Canonical Caching in session
+    cache_key = (wid_int, snapshot_fp, "1.0.0")
+    if cache_key in _MODEL_CACHE:
+        html_code = _MODEL_CACHE[cache_key]
+    else:
+        payload = project_to_viewer_payload(project)
+        html_code = generate_bim_viewer_html(payload, height_px=750)
+        _MODEL_CACHE[cache_key] = html_code
+
     # Render WebGL Viewer Component
-    payload = project_to_viewer_payload(project)
-    html_code = generate_bim_viewer_html(payload, height_px=750)
     components.html(html_code, height=760, scrolling=False)
 
-    # SECTION O: Estimator QA Summary Diagnostics Panel
+    # SECTION P: Expanded Estimator QA Summary Diagnostics Panel
     with st.expander("📊 Estimator QA Summary & Quantity Reconciliation", expanded=False):
         qa = diagnostics.get("estimator_qa_summary", {})
+        st.caption(f"Source Fingerprint Revision: `{snapshot_fp}` | Status: {'Fresh' if is_fresh else 'Stale'}")
+        
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Physical Walls Rendered", qa.get("physical_walls_rendered", 0))
         col2.metric("Physical Openings Rendered", qa.get("physical_openings", 0))
@@ -85,19 +108,16 @@ def render_workspace_3d_canonical_view(app: Any, workspace: Any = None) -> None:
 
 def apply(app: Any) -> None:
     """
-    SECTION L: Applies the Phase 5 3D Canonical Viewer extension hook to the PlanReader application instance.
+    SECTION L & O: Applies the Phase 5 3D Canonical Viewer extension hook to the PlanReader application instance.
     Wraps app.model_3d_page while PRESERVING and EXECUTING the original 3D page callable!
     """
     if hasattr(app, "model_3d_page"):
         orig_model_3d = getattr(app, "model_3d_page")
 
         def model_3d_page_canonical_wrapper(workspace: Any = None, *args, **kwargs):
-            # 1. Render original reconstruction/model page
+            # 1. Render original reconstruction/model page (do NOT swallow exceptions!)
             if callable(orig_model_3d):
-                try:
-                    orig_model_3d(workspace, *args, **kwargs)
-                except Exception as e:
-                    st.warning(f"Original 3D page notification: {e}")
+                orig_model_3d(workspace, *args, **kwargs)
             
             st.markdown("---")
             # 2. Render approved canonical 3D WebGL BIM viewer
