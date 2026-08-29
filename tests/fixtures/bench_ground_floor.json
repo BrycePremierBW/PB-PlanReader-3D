@@ -1,0 +1,111 @@
+{
+  "fixture_version": 3,
+  "geometry": {
+    "segments": [
+      {
+        "drawing_index": 1,
+        "x1": 0.0,
+        "x2": 900.0,
+        "y1": 0.0,
+        "y2": 0.0
+      },
+      {
+        "drawing_index": 2,
+        "x1": 160.0,
+        "x2": 160.0,
+        "y1": 0.0,
+        "y2": -45.0
+      },
+      {
+        "drawing_index": 3,
+        "x1": 490.0,
+        "x2": 490.0,
+        "y1": -8.0,
+        "y2": 30.0
+      },
+      {
+        "drawing_index": 4,
+        "x1": 535.0,
+        "x2": 535.0,
+        "y1": -8.0,
+        "y2": 30.0
+      }
+    ],
+    "wall_lines": [
+      {
+        "wall_ref": "W-GF1",
+        "x1": 0.0,
+        "x2": 900.0,
+        "y1": 0.0,
+        "y2": 0.0
+      }
+    ],
+    "words": [
+      {
+        "page_no": 1,
+        "text": "D01",
+        "x0": 158.0,
+        "x1": 178.0,
+        "y0": -53.0,
+        "y1": -43.0
+      },
+      {
+        "page_no": 1,
+        "text": "W01",
+        "x0": 502.5,
+        "x1": 522.5,
+        "y0": 55.0,
+        "y1": 65.0
+      }
+    ]
+  },
+  "source": {
+    "drawing_ref": "BMK/GF/01",
+    "drawing_title": "Ground Floor Plan",
+    "extraction": "deterministic synthetic geometry (50 pt/m)",
+    "generation": "benchmark_fixtures.py",
+    "pdf": "synthetic-benchmark-plans.pdf",
+    "pdf_page_0based": 0,
+    "pdf_page_1based": 1,
+    "scale_a1": "1:100",
+    "scale_pt_per_m": 50.0
+  },
+  "truth": {
+    "authority": "committed independent plan truth (synthesised); detector output never defines truth",
+    "deduct_must_be_false": true,
+    "dimension_basis": "unknown",
+    "doors": [
+      {
+        "height_m": null,
+        "mark": "D01",
+        "opening_type": "door",
+        "position_along_wall_m": 3.2,
+        "wall_ref": "W-GF1",
+        "width_m": 0.9
+      }
+    ],
+    "expected_candidate_counts": {
+      "door": 1,
+      "gap": 0,
+      "window": 1
+    },
+    "gaps": [],
+    "safety_note": "Plan-only evidence has unknown dimension basis; deduction must remain review, never deduct.",
+    "windows": [
+      {
+        "height_m": null,
+        "mark": "W01",
+        "opening_type": "window",
+        "position_along_wall_m": 10.25,
+        "wall_ref": "W-GF1",
+        "width_m": 0.9
+      }
+    ]
+  },
+  "workspace": {
+    "id": "bench_ground_floor",
+    "page_no": 1,
+    "scale_pt_per_m": 50.0,
+    "title": "Benchmark Ground Floor \u2014 Plan GF.01"
+  }
+}

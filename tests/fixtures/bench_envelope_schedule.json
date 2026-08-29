@@ -1,0 +1,143 @@
+{
+  "fixture_version": 3,
+  "geometry": {
+    "segments": [
+      {
+        "drawing_index": 1,
+        "x1": 0.0,
+        "x2": 800.0,
+        "y1": 100.0,
+        "y2": 100.0
+      },
+      {
+        "drawing_index": 2,
+        "x1": 215.0,
+        "x2": 215.0,
+        "y1": 85.0,
+        "y2": 115.0
+      },
+      {
+        "drawing_index": 3,
+        "x1": 260.0,
+        "x2": 260.0,
+        "y1": 85.0,
+        "y2": 115.0
+      },
+      {
+        "drawing_index": 4,
+        "x1": 515.0,
+        "x2": 515.0,
+        "y1": 85.0,
+        "y2": 115.0
+      },
+      {
+        "drawing_index": 5,
+        "x1": 560.0,
+        "x2": 560.0,
+        "y1": 85.0,
+        "y2": 115.0
+      }
+    ],
+    "wall_lines": [
+      {
+        "wall_ref": "W-ENV1",
+        "x1": 0.0,
+        "x2": 800.0,
+        "y1": 100.0,
+        "y2": 100.0
+      }
+    ],
+    "words": [
+      {
+        "page_no": 3,
+        "text": "W01",
+        "x0": 227.5,
+        "x1": 247.5,
+        "y0": 60.0,
+        "y1": 70.0
+      },
+      {
+        "page_no": 3,
+        "text": "W02",
+        "x0": 527.5,
+        "x1": 547.5,
+        "y0": 60.0,
+        "y1": 70.0
+      }
+    ]
+  },
+  "session": {
+    "schedule": {
+      "header": [
+        "mark",
+        "width",
+        "height"
+      ],
+      "heading_dimension_basis": "",
+      "heading_note": "generic width/height headings \u2014 schedule dimensions alone must never create an automatic void deduction",
+      "page_no": 3,
+      "rows": [
+        [
+          "W01",
+          "900",
+          "1500"
+        ],
+        [
+          "W02",
+          "900",
+          "1200"
+        ]
+      ]
+    }
+  },
+  "source": {
+    "drawing_ref": "BMK/ES/03",
+    "drawing_title": "Envelope Plan + Schedule 01",
+    "extraction": "deterministic synthetic geometry (50 pt/m)",
+    "generation": "benchmark_fixtures.py",
+    "pdf": "synthetic-benchmark-plans.pdf",
+    "pdf_page_0based": 2,
+    "pdf_page_1based": 3,
+    "scale_a1": "1:100",
+    "scale_pt_per_m": 50.0
+  },
+  "truth": {
+    "authority": "committed independent plan + schedule truth (synthesised); detector output never defines truth",
+    "doors": [],
+    "expected_candidate_counts": {
+      "door": 0,
+      "gap": 0,
+      "window": 2
+    },
+    "gaps": [],
+    "schedule_safety": {
+      "deduct_must_be_false": true,
+      "dimension_basis_expected_after_enrichment": "unknown",
+      "reason": "LAGO safety authority: generic schedule WIDTH/HEIGHT headings do not prove a rough-opening basis, so schedule dimensions alone must never create an automatic wall-void deduction."
+    },
+    "windows": [
+      {
+        "height_m_mm": 1500,
+        "mark": "W01",
+        "opening_type": "window",
+        "position_along_wall_m": 4.75,
+        "wall_ref": "W-ENV1",
+        "width_m": 0.9
+      },
+      {
+        "height_m_mm": 1200,
+        "mark": "W02",
+        "opening_type": "window",
+        "position_along_wall_m": 10.75,
+        "wall_ref": "W-ENV1",
+        "width_m": 0.9
+      }
+    ]
+  },
+  "workspace": {
+    "id": "bench_envelope_schedule",
+    "page_no": 3,
+    "scale_pt_per_m": 50.0,
+    "title": "Benchmark Envelope + Door/Window Schedule"
+  }
+}
