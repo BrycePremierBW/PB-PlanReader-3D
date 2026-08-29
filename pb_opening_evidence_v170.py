@@ -20,9 +20,30 @@ Safety contract:
   - Width + height + basis + dimension_confidence + dimension_source
     are one atomic measurement bundle; partial dimension updates
     never relabel basis.  Rejected dimensions never donate confidence.
+
+B3 diagnostics / explainability (ADDITIVE — see ``decision_reasons``):
+  - ``decision_reasons`` is a list-of-dict ledger appended by B3/B4/B5 so
+    every accepted / rejected / review-only decision is inspectable as
+    structured data.  It is DIAGNOSTIC-ONLY: it never influences an
+    eligibility, reconciliation, or deduction decision, and it never
+    implies authority (``deduction_authority`` / ``instance_creation_authority``
+    keys, when present, are informational booleans that must stay False
+    unless a real authority gate granted them).
+  - Serialization: the field defaults to ``[]``, so legacy constructors,
+    legacy dicts, and persisted records WITHOUT the key keep working, and
+    ``asdict()`` now emits a ``decision_reasons`` key (tolerant consumers
+    ignore it).
+  - Dataclass EQUALITY DOMAIN (documented, intentionally extended):
+    (a) two legacy-created instances that are otherwise identical remain
+        equal, because both default to the same empty ``decision_reasons``;
+    (b) the equality domain now INCLUDES ``decision_reasons`` — two
+        instances equal in every legacy field (incl. ``opening_instance_id``)
+        but with different ``decision_reasons`` NO LONGER compare equal.
+        This is deliberate: diagnostics are part of the visible record.
 """
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -123,6 +144,22 @@ def _ordered_dedup(items: list) -> list:
     return list(dict.fromkeys(items))
 
 
+def _dedup_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove exact-duplicate dict records preserving order.
+
+    Used for structured diagnostic ledgers (list-of-dict) where the plain
+    ``_ordered_dedup`` (hash-based) cannot handle unhashable dict values.
+    """
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    for rec in records:
+        key = json.dumps(rec, sort_keys=True, default=str)
+        if key not in seen:
+            seen.add(key)
+            out.append(rec)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # OpeningEvidence dataclass
 # ---------------------------------------------------------------------------
@@ -220,6 +257,29 @@ class OpeningEvidence:
 
     # --- Reconciliation (computed by B4, separate from per-source confidence) ---
     reconciliation_confidence: float = 0.0
+
+    # --- Structured decision diagnostics (ADDITIVE, OPTIONAL, diagnostic-only) ---
+    # B3 diagnostics / explainability ledger.  B3/B4/B5 append one dict per
+    # decision point — WHY a candidate was accepted, rejected, or sent to
+    # review.  This ledger NEVER influences an eligibility/reconciliation/
+    # deduction decision; it only records the structured reasons after the
+    # fact so outcomes are inspectable.  Safe to round-trip via asdict().
+    #
+    # Each dict uses a stable minimal shape:
+    #   {"stage": "B3"|"B4"|"B5", "outcome": <str>, ...context}
+    # Context keys are additive and may include: "reason", "rejection_reason",
+    # "review_required_reason", "ambiguity_reason", "correlation_score",
+    # "mark_evidence", "side_match", "level_match", "width_match_m",
+    # "dimension_basis", "deduction_authority" (bool, informational only),
+    # "instance_creation_authority" (bool, informational only).
+    #
+    # Equality-domain note (DOCUMENTED, intentionally extended):
+    #   (a) two legacy-created instances that are otherwise identical remain
+    #       equal because both default to the same empty list;
+    #   (b) the dataclass equality domain now INCLUDES ``decision_reasons`` —
+    #       instances equal in all legacy fields (incl. opening_instance_id)
+    #       but with different ``decision_reasons`` NO LONGER compare equal.
+    decision_reasons: List[Dict[str, Any]] = field(default_factory=list)
 
     # --- Provenance ---
     evidence: List[str] = field(default_factory=list)
@@ -505,6 +565,12 @@ def merge_opening_evidence(
     # Merge evidence sources (ordered dedup, not set)
     merged.evidence = _ordered_dedup(existing.evidence + new.evidence)
 
+    # Merge structured decision diagnostics (additive, order-preserving).
+    # Diagnostic-only: never influences dedup/eligibility decisions.
+    merged.decision_reasons = _dedup_records(
+        existing.decision_reasons + new.decision_reasons
+    )
+
     # Merge source observations (append non-duplicate observations from new)
     # Keyed by (source, accepted) to avoid exact duplicates while preserving
     # observations from both records for B4 reconciliation.
@@ -651,6 +717,89 @@ def record_plan_observation(inst: OpeningEvidence) -> None:
         "accepted": True,
     }
     inst.source_observations = [obs]
+
+
+# ---------------------------------------------------------------------------
+# B3 diagnostics / explainability helpers (read-only, additive)
+# ---------------------------------------------------------------------------
+def record_decision_reason(
+    inst: OpeningEvidence,
+    *,
+    stage: str,
+    outcome: str,
+    **context: Any,
+) -> Dict[str, Any]:
+    """Append one structured decision-reason record to an instance.
+
+    ADDITIVE and DIAGNOSTIC-ONLY: this ledger never influences eligibility,
+    reconciliation, or deduction decisions.  It only records the structured
+    reasons after the fact so B3 opening-evidence outcomes (accepted /
+    rejected / review-only) are inspectable.
+
+    Args:
+        inst: The OpeningEvidence instance receiving the record.
+        stage: Pipeline stage that produced the record ("B3", "B4", "B5").
+        outcome: Outcome label ("accepted", "rejected", "review", "deducted",
+                 "not_deducted", ...).
+        **context: Additive context keys (reason, rejection_reason,
+                 review_required_reason, correlation_score, deduction_authority,
+                 instance_creation_authority, ...).  None values are skipped.
+
+    Returns the appended record (useful for tests / rendering).
+    """
+    rec: Dict[str, Any] = {"stage": stage, "outcome": outcome}
+    for k, v in context.items():
+        if v is not None:
+            rec[k] = v
+    inst.decision_reasons.append(rec)
+    return rec
+
+
+def render_decision_reasons(inst: OpeningEvidence) -> List[str]:
+    """Render the structured decision ledger as human-readable lines.
+
+    Read-only diagnostic helper — never mutates the instance.
+    """
+    lines: List[str] = []
+    for rec in inst.decision_reasons:
+        stage = rec.get("stage", "?")
+        outcome = rec.get("outcome", "?")
+        reason = (
+            rec.get("reason")
+            or rec.get("review_required_reason")
+            or rec.get("rejection_reason")
+            or rec.get("ambiguity_reason")
+            or ""
+        )
+        parts = [f"[{stage}] {outcome}"]
+        if reason:
+            parts.append(f"why: {reason}")
+        for k in (
+            "conflict_type",
+            "correlation_score",
+            "dimension_basis",
+            "deduction_authority",
+            "instance_creation_authority",
+        ):
+            if k in rec:
+                parts.append(f"{k}={rec[k]}")
+        lines.append(" | ".join(parts))
+    return lines
+
+
+def decision_reasons_summary(inst: OpeningEvidence) -> Dict[str, Any]:
+    """Compact structured summary of the decision ledger (read-only)."""
+    return {
+        "opening_instance_id": inst.opening_instance_id,
+        "type_mark": inst.type_mark,
+        "wall_ref": inst.wall_ref,
+        "level": inst.level,
+        "dimension_basis": inst.dimension_basis,
+        "deduction_status": inst.deduction_status,
+        "deduct": bool(inst.deduct),
+        "reconciliation_complete": bool(inst.reconciliation_complete),
+        "decision_reasons": list(inst.decision_reasons),
+    }
 
 
 # ---------------------------------------------------------------------------
