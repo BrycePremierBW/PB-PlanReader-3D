@@ -161,16 +161,13 @@ def _query(app: Any, sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, A
     if hasattr(app, "ldf"):
         return _normalize_rows(app.ldf(sql, params))
     if hasattr(app, "execute") or hasattr(app, "cursor"):
-        # Handle raw sqlite3 Connection
-        try:
-            conn = app
-            cur = conn.cursor()
-            cur.execute(sql, params)
-            cols = [d[0] for d in cur.description] if cur.description else []
-            rows = cur.fetchall()
-            return [dict(zip(cols, r)) for r in rows]
-        except Exception:
-            return []
+        # Handle raw sqlite3 Connection — allow query exceptions to propagate so collector marks family UNAVAILABLE
+        conn = app
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        rows = cur.fetchall()
+        return [dict(zip(cols, r)) for r in rows]
     if "documents" in sql:
         return _normalize_rows(getattr(app, "documents", []))
     if "pages" in sql:

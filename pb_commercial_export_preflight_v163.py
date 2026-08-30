@@ -6,8 +6,12 @@ Phase 6D Authority:
     or readiness database. Phase 6D consumes Phase 6B.
   - Fail-Closed Source Availability: If any required source family (takeoff, register, scale)
     is unavailable or incomplete, preflight_status is forced to BLOCKED.
+  - Complete Canonical Review Fingerprint: Hashes source_coverage + full normalized signal content.
+  - Consequential Payload Hash: Hashes all takeoff pricing, quantity, substrate, finish, rates,
+    and metadata fields affecting JobHub packages and quotation exports.
   - TOCTOU Safety: Immediately before consequential final JobHub publish, re-derives
     Phase 6B review and fresh Phase 6D preflight, verifying exact fingerprint & payload match.
+  - Server-Level Duplicate Guard: Checks existing JobHub package receipts for matching preflight fingerprint.
 """
 from __future__ import annotations
 
@@ -111,18 +115,18 @@ def _get_workspace_meta(conn_or_app: Any, workspace_id: int) -> Dict[str, Any]:
     row = rows[0]
     return {
         "id": row.get("id"),
-        "job_no": row.get("job_no") or "",
-        "job_name": row.get("job_name") or "",
-        "drawing_issue": row.get("drawing_issue") or "",
+        "job_no": str(row.get("job_no") or ""),
+        "job_name": str(row.get("job_name") or ""),
+        "drawing_issue": str(row.get("drawing_issue") or ""),
         "jobhub_job_id": row.get("jobhub_job_id"),
     }
 
 
 def _get_takeoff_row_stats(conn_or_app: Any, workspace_id: int) -> Tuple[int, int, int, int, int, str]:
-    """Retrieves row statistics and payload fingerprint for a workspace."""
+    """Retrieves row statistics and payload fingerprint for a workspace across all consequential publish fields."""
     rows = _db_query(
         conn_or_app,
-        "SELECT id, section, element, location, unit, quantity, inclusion_status, row_role FROM takeoff_rows WHERE workspace_id=? ORDER BY id",
+        "SELECT id, section, element, location, substrate, unit, quantity, coats, rate_per_unit, labour_hours, paint_litres, value_ex_gst, finish_system, coverage_m2_per_litre, productivity_m2_per_hour, inclusion_status, row_role, notes, confidence, source_reference FROM takeoff_rows WHERE workspace_id=? ORDER BY id",
         (workspace_id,)
     )
     total = len(rows)
@@ -149,22 +153,86 @@ def _get_takeoff_row_stats(conn_or_app: Any, workspace_id: int) -> Tuple[int, in
             floor_ref += 1
         else:
             publishable += 1
-            pub_payload_items.append({
-                "id": r_id,
-                "sec": str(r.get("section") or ""),
-                "elem": str(r.get("element") or ""),
-                "loc": str(r.get("location") or ""),
-                "unit": unit_str,
-                "qty": float(qty) if qty is not None else None,
-            })
 
         if qty is not None and float(qty) == 0.0:
             measured_zero += 1
 
-    payload_json = json.dumps(pub_payload_items, sort_keys=True)
+        # Build comprehensive payload dict of consequential export fields
+        pub_payload_items.append({
+            "id": r_id,
+            "section": str(r.get("section") or ""),
+            "element": str(r.get("element") or ""),
+            "location": str(r.get("location") or ""),
+            "substrate": str(r.get("substrate") or ""),
+            "unit": unit_str,
+            "quantity": float(qty) if qty is not None else None,
+            "coats": float(r.get("coats")) if r.get("coats") is not None else None,
+            "rate_per_unit": float(r.get("rate_per_unit")) if r.get("rate_per_unit") is not None else None,
+            "labour_hours": float(r.get("labour_hours")) if r.get("labour_hours") is not None else None,
+            "paint_litres": float(r.get("paint_litres")) if r.get("paint_litres") is not None else None,
+            "value_ex_gst": float(r.get("value_ex_gst")) if r.get("value_ex_gst") is not None else None,
+            "finish_system": str(r.get("finish_system") or ""),
+            "coverage_m2_per_litre": float(r.get("coverage_m2_per_litre")) if r.get("coverage_m2_per_litre") is not None else None,
+            "productivity_m2_per_hour": float(r.get("productivity_m2_per_hour")) if r.get("productivity_m2_per_hour") is not None else None,
+            "inclusion_status": inclusion_str,
+            "row_role": role_str,
+            "notes": str(r.get("notes") or ""),
+            "confidence": str(r.get("confidence") or ""),
+            "source_reference": str(r.get("source_reference") or ""),
+        })
+
+    # Sort payload deterministically by row ID
+    sorted_payload = sorted(pub_payload_items, key=lambda x: str(x.get("id") or ""))
+    payload_json = json.dumps(sorted_payload, sort_keys=True)
     payload_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
 
     return total, publishable, excluded, floor_ref, measured_zero, payload_hash
+
+
+def compute_canonical_review_fingerprint(review_res: CommercialReviewResult) -> str:
+    """Computes a deterministic, canonical SHA-256 fingerprint of the complete Phase 6B Review state."""
+    coverage_dict = dict(getattr(review_res, "source_coverage", {}))
+    signals = list(getattr(review_res, "signals", getattr(review_res, "items", [])))
+
+    canonical_signals = []
+    for sig in signals:
+        reasons_val = getattr(sig, "reasons", ())
+        if isinstance(reasons_val, (list, tuple)):
+            reasons_tuple = tuple(str(x) for x in reasons_val)
+        else:
+            reasons_tuple = (str(reasons_val),)
+
+        sig_dict = {
+            "signal_id": str(getattr(sig, "signal_id", "")),
+            "source_family": str(getattr(sig, "source_family", "")),
+            "source_type": str(getattr(sig, "source_type", "")),
+            "source_id": str(getattr(sig, "source_id", "")),
+            "category": str(getattr(sig, "category", "")),
+            "severity": str(getattr(sig, "severity", "")),
+            "title": str(getattr(sig, "title", "")),
+            "summary": str(getattr(sig, "summary", "")),
+            "reasons": reasons_tuple,
+            "status": str(getattr(sig, "status", "")),
+            "location": str(getattr(sig, "location", "") or ""),
+            "element": str(getattr(sig, "element", "") or ""),
+            "unit": str(getattr(sig, "unit", "") or ""),
+            "quantity": float(getattr(sig, "quantity")) if getattr(sig, "quantity", None) is not None else None,
+            "inclusion_status": str(getattr(sig, "inclusion_status", "") or ""),
+        }
+        canonical_signals.append(sig_dict)
+
+    # Sort signals deterministically by (severity, category, source_family, source_id, signal_id)
+    sorted_signals = sorted(
+        canonical_signals,
+        key=lambda s: (s["severity"], s["category"], s["source_family"], s["source_id"], s["signal_id"])
+    )
+
+    review_state_structure = {
+        "source_coverage": coverage_dict,
+        "signals": sorted_signals,
+    }
+    raw_json = json.dumps(review_state_structure, sort_keys=True)
+    return hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
 
 
 def derive_export_preflight(conn_or_app: Any, workspace_id: int, bridge_available: bool = True) -> CommercialPreflightResult:
@@ -175,11 +243,16 @@ def derive_export_preflight(conn_or_app: Any, workspace_id: int, bridge_availabl
     workspace_dict = {"id": workspace_id, "job_no": meta["job_no"], "job_name": meta["job_name"], "drawing_issue": meta["drawing_issue"]}
     review_res: CommercialReviewResult = collect_commercial_review_signals(conn_or_app, workspace_dict)
 
-    total_rows, pub_rows, excl_rows, floor_rows, zero_rows, payload_hash = _get_takeoff_row_stats(conn_or_app, workspace_id)
-
     blocking_reasons: List[str] = []
     warnings: List[str] = []
     unavailable_sources: List[str] = []
+
+    try:
+        total_rows, pub_rows, excl_rows, floor_rows, zero_rows, payload_hash = _get_takeoff_row_stats(conn_or_app, workspace_id)
+    except Exception as exc:
+        total_rows, pub_rows, excl_rows, floor_rows, zero_rows, payload_hash = 0, 0, 0, 0, 0, "error"
+        blocking_reasons.append(f"Take-off query error: {exc}")
+        unavailable_sources.append("takeoff")
 
     # Fail-Closed Required Sources & Coverage Check
     signals = getattr(review_res, "signals", getattr(review_res, "items", []))
@@ -243,9 +316,8 @@ def derive_export_preflight(conn_or_app: Any, workspace_id: int, bridge_availabl
     else:
         final_publish_state = "AVAILABLE"
 
-    # Compute Deterministic Fingerprints
-    sig_ids = [getattr(s, "signal_id", str(idx)) for idx, s in enumerate(signals)]
-    review_fp = hashlib.sha256(json.dumps(sorted(sig_ids)).encode("utf-8")).hexdigest()
+    # Compute Deterministic Canonical Review & Preflight Fingerprints
+    review_fp = compute_canonical_review_fingerprint(review_res)
 
     fingerprint_data = {
         "workspace_id": workspace_id,
@@ -304,6 +376,7 @@ def verify_toctou_and_publish_jobhub(
 
     Re-derives Phase 6B review, fresh Phase 6D preflight, and payload hash immediately prior to calling downstream
     final publish. Raises RuntimeError if state changed, payload mutated, or blocked.
+    Checks server/downstream level for existing duplicate package to enforce true double-submit safety.
     """
     if not bridge:
         raise RuntimeError("JobHub bridge unavailable for final publish.")
@@ -323,10 +396,29 @@ def verify_toctou_and_publish_jobhub(
     if preflight.preflight_status == "AVAILABLE_WITH_WARNING" and not acknowledgement_confirmed:
         raise RuntimeError("Typed acknowledgement required to publish a project with REVIEW warnings.")
 
+    # Server / Downstream Level Duplicate Guard: Check existing JobHub packages for matching preflight fingerprint in notes
+    job_id = preflight.jobhub_job_id
+    if job_id:
+        try:
+            query_sql = "SELECT id, takeoff_no, notes FROM painting_takeoff_packages WHERE job_id=? AND status='Published' ORDER BY id DESC"
+            existing_pkgs = bridge.query(query_sql, (job_id,))
+            for pkg in existing_pkgs:
+                notes_str = str(pkg.get("notes") or "")
+                if preflight.preflight_fingerprint in notes_str or preflight.payload_hash in notes_str:
+                    raise RuntimeError(f"Package for preflight fingerprint {preflight.preflight_fingerprint[:12]}... has already been published to JobHub for job #{job_id} (Package #{pkg.get('id')}).")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
     # Execute downstream publish function with return verification
     result = publish_fn(workspace_id, bridge, user_name)
     if not isinstance(result, dict) or not result.get("package_id"):
         raise RuntimeError("Downstream final publish failed to generate a valid JobHub package receipt.")
+
+    # Ensure partial failures bubble up cleanly
+    if not result.get("published", True):
+        raise RuntimeError(f"Final publish partially failed on JobHub job #{result.get('job_id')}. Details: {result}")
 
     result["preflight_fingerprint"] = preflight.preflight_fingerprint
     result["review_fingerprint"] = preflight.review_fingerprint
