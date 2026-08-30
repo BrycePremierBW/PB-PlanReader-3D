@@ -509,26 +509,27 @@ class Phase6DPreflightTests(unittest.TestCase):
 
         def worker_publish(user_name):
             try:
-                with patch("pb_planreader_3d_app.lquery", return_value=[{"id": 1, "job_no": "JOB-6D1", "job_name": "Test", "drawing_issue": "Rev A", "jobhub_job_id": 101, "file_name": "A-01.pdf"}]), \
-                     patch("pb_planreader_3d_app.dataframe_for_takeoff", return_value=sample_takeoff), \
-                     patch("pb_planreader_3d_app.quote_workbook_bytes", return_value=b"mock_excel"), \
-                     patch("pb_planreader_3d_app.progress_package_bytes", return_value=b"mock_zip"):
-                    out = verify_toctou_and_publish_jobhub(
-                        self.app, 1, bridge=bridge, user_name=user_name,
-                        expected_fingerprint=res.preflight_fingerprint,
-                        acknowledgement_confirmed=True, publish_fn=custom_publish_fn
-                    )
-                    results.append(out)
+                out = verify_toctou_and_publish_jobhub(
+                    self.app, 1, bridge=bridge, user_name=user_name,
+                    expected_fingerprint=res.preflight_fingerprint,
+                    acknowledgement_confirmed=True, publish_fn=custom_publish_fn
+                )
+                results.append(out)
             except Exception as exc:
                 errors.append(exc)
 
-        # Launch 2 concurrent threads simultaneously
-        t1 = threading.Thread(target=worker_publish, args=("User1",))
-        t2 = threading.Thread(target=worker_publish, args=("User2",))
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
+        # Launch 2 concurrent threads simultaneously inside active patch context
+        with patch("pb_planreader_3d_app.lquery", return_value=[{"id": 1, "job_no": "JOB-6D1", "job_name": "Test", "drawing_issue": "Rev A", "jobhub_job_id": 101, "file_name": "A-01.pdf"}]), \
+             patch("pb_planreader_3d_app.dataframe_for_takeoff", return_value=sample_takeoff), \
+             patch("pb_planreader_3d_app.quote_workbook_bytes", return_value=b"mock_excel"), \
+             patch("pb_planreader_3d_app.progress_package_bytes", return_value=b"mock_zip"):
+
+            t1 = threading.Thread(target=worker_publish, args=("User1",))
+            t2 = threading.Thread(target=worker_publish, args=("User2",))
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
 
         # Exactly 1 thread succeeded and 1 thread failed with duplicate error
         self.assertEqual(len(results), 1)
