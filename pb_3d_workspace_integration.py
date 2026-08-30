@@ -1,81 +1,149 @@
-"""
-PlanReader 3D Canonical Workspace Integration Module.
+"""PlanReader canonical 3D workspace integration.
 
-Provides the apply(app) extension hook connecting the approved canonical 3D BIM model
-and Three.js WebGL viewer directly into the actual PlanReader workspace application flow
-(pb_planreader_v133_app.py).
+Connects the reviewed canonical building model and Three.js viewer to the production
+PlanReader workspace. The estimator-facing 3D page is canonical by default. The
+historical manual/reconstruction editor is retained only as an explicit developer
+escape hatch and is never executed during an ordinary production 3D render.
 
-ARCHITECTURE GUARANTEES:
-1. Smallest safe hook architecture (uses existing apply(app) extension pattern with idempotency guard).
-2. Preserves and executes original app.model_3d_page while embedding the canonical 3D WebGL viewer.
-3. Converts workspace evidence automatically via planreader_workspace_to_canonical().
-4. Bounded canonical caching in Streamlit session_state (max 10 entries per session) keyed by (workspace_id, snapshot_fingerprint, schema_version).
-5. Integrates persistence (pb_canonical_persistence.py) and diagnostics (pb_3d_diagnostics.py).
+Architecture guarantees:
+1. Uses the existing ``apply(app)`` extension pattern with an idempotency guard.
+2. Canonical 3D is the only default estimator-facing 3D surface.
+3. The legacy editor requires an environment feature flag, an authorised admin or
+   developer session, and an explicit per-session opt-in before it is called.
+4. The existing shared ``hero(workspace)`` hook still renders exactly once on the
+   ordinary canonical page, preserving the Phase 6A commercial workspace shell.
+5. Workspace evidence is converted through ``planreader_workspace_to_canonical``.
+6. Canonical HTML caching is bounded to 10 entries per Streamlit session.
+7. Canonical persistence, staleness checks and Phase 5 diagnostics remain intact.
+
+The retained legacy callable is intentionally not a source of quantity, geometry,
+calibration, opening or deduction authority. Its presence is for controlled
+privileged diagnostics only; ordinary estimators cannot expose it.
 """
+
+from __future__ import annotations
+
+import os
+from typing import Any
 
 import streamlit as st
 import streamlit.components.v1 as components
-from typing import Any, Dict, Optional
-from pb_production_3d_adapter import planreader_workspace_to_canonical, require_workspace_id
-from pb_bim_viewer import project_to_viewer_payload, generate_bim_viewer_html
-from pb_canonical_persistence import load_workspace_canonical_model, save_workspace_canonical_model
-from pb_3d_diagnostics import generate_production_diagnostics_report
 
+from pb_bim_viewer import generate_bim_viewer_html, project_to_viewer_payload
+from pb_canonical_persistence import (
+    load_workspace_canonical_model,
+    save_workspace_canonical_model,
+)
+from pb_production_3d_adapter import (
+    planreader_workspace_to_canonical,
+    require_workspace_id,
+)
+
+VERSION = "1.6.2"
 MAX_SESSION_CACHE_ENTRIES = 10
+LEGACY_EDITOR_ENV = "PLANREADER_ENABLE_LEGACY_3D_EDITOR"
+_TRUTHY_ENV = {"1", "true", "yes", "on"}
+_LEGACY_EDITOR_ROLES = {"admin", "developer"}
+
+
+def legacy_editor_feature_enabled() -> bool:
+    """Return whether the server-side legacy editor feature flag is enabled."""
+    return str(os.environ.get(LEGACY_EDITOR_ENV, "")).strip().lower() in _TRUTHY_ENV
+
+
+def legacy_editor_user_authorized() -> bool:
+    """Require an explicit privileged PlanReader session for the legacy escape hatch."""
+    try:
+        user = st.session_state.get("planreader_user")
+    except Exception:
+        return False
+    if not isinstance(user, dict):
+        return False
+    role = str(user.get("role") or "").strip().lower()
+    return role in _LEGACY_EDITOR_ROLES
+
+
+def _workspace_id_from_context(app: Any, workspace: Any = None) -> int:
+    workspace_id = None
+    if isinstance(workspace, dict):
+        workspace_id = workspace.get("id")
+    elif isinstance(workspace, (int, str, float)):
+        workspace_id = workspace
+    elif hasattr(app, "current_workspace"):
+        try:
+            curr = app.current_workspace() if callable(app.current_workspace) else app.current_workspace
+            if isinstance(curr, dict):
+                workspace_id = curr.get("id")
+        except Exception:
+            pass
+    return require_workspace_id(workspace_id)
+
+
+def _render_shared_workspace_header(app: Any, workspace: Any = None) -> None:
+    """Preserve the normal shared hero/commercial shell without invoking legacy 3D."""
+    hero = getattr(app, "hero", None)
+    if callable(hero):
+        hero(workspace)
 
 
 def render_workspace_3d_canonical_view(app: Any, workspace: Any = None) -> None:
-    """
-    SECTION L, J, P, R, T: Renders the approved canonical 3D WebGL BIM viewer inside the active PlanReader workspace view.
-    """
+    """Render the reviewed canonical 3D BIM model for the active workspace."""
     try:
-        workspace_id = None
-        if isinstance(workspace, dict):
-            workspace_id = workspace.get("id")
-        elif isinstance(workspace, (int, str, float)):
-            workspace_id = workspace
-        elif hasattr(app, "current_workspace"):
-            try:
-                curr = app.current_workspace() if callable(app.current_workspace) else app.current_workspace
-                if isinstance(curr, dict):
-                    workspace_id = curr.get("id")
-            except Exception:
-                pass
-
-        wid_int = require_workspace_id(workspace_id)
-    except Exception as e:
-        st.error(f"Workspace Context Error: {e}")
+        wid_int = _workspace_id_from_context(app, workspace)
+    except Exception as exc:
+        st.error(f"Workspace Context Error: {exc}")
         return
 
-    # Load canonical project & diagnostics from workspace evidence snapshot v3
     try:
         ws_result = planreader_workspace_to_canonical(app, wid_int)
         project = ws_result.project
         snapshot = ws_result.snapshot
         snapshot_fp = ws_result.snapshot_fingerprint
         diagnostics = ws_result.diagnostics
-    except Exception as e:
-        st.error(f"Error building 3D canonical model for workspace #{wid_int}: {e}")
+    except Exception as exc:
+        st.error(f"Error building 3D canonical model for workspace #{wid_int}: {exc}")
         return
 
-    st.markdown("### 🏗️ Canonical 3D WebGL BIM Model")
+    st.markdown("### Canonical 3D Model")
+    st.caption(
+        "Built from the reviewed PlanReader source-evidence pipeline. Unknown geometry "
+        "remains unresolved rather than being filled with convenience defaults."
+    )
 
     if project.is_synthetic_demo:
-        st.warning("⚠️ SYNTHETIC VIEWER DEMONSTRATION FIXTURE — NOT BENCHMARK TRUTH / NOT TAKEOFF AUTHORITATIVE")
+        st.warning(
+            "SYNTHETIC VIEWER DEMONSTRATION FIXTURE — NOT BENCHMARK TRUTH / "
+            "NOT TAKEOFF AUTHORITATIVE"
+        )
 
-    is_fresh, saved_proj, status_msg, saved_payload = load_workspace_canonical_model(app, wid_int, current_snapshot=snapshot)
+    is_fresh, _saved_proj, status_msg, saved_payload = load_workspace_canonical_model(
+        app, wid_int, current_snapshot=snapshot
+    )
     if saved_payload is None:
         save_workspace_canonical_model(app, wid_int, project, snapshot=snapshot)
         is_fresh = True
-        st.caption("ℹ️ Initial model saved to workspace 3D persistence store (`canonical_3d_model_v1`).")
+        st.caption("Initial canonical model snapshot saved for this workspace.")
     elif not is_fresh:
         st.warning(status_msg)
-        if st.button("🔄 Refresh 3D Model from Source Evidence", key=f"refresh_3d_model_{wid_int}"):
+        if st.button(
+            "Refresh 3D model from source evidence",
+            key=f"refresh_3d_model_{wid_int}",
+        ):
             save_workspace_canonical_model(app, wid_int, project, snapshot=snapshot)
-            st.success("Model refreshed and saved to workspace persistence store.")
+            st.success("Canonical model refreshed from current source evidence.")
             st.rerun()
 
-    # SECTION T: Bounded Session-State Model Caching
+    qa = diagnostics.get("estimator_qa_summary", {})
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Physical walls", qa.get("physical_walls_rendered", 0))
+    c2.metric("Physical openings", qa.get("physical_openings", 0))
+    c3.metric("Authorised deductions", qa.get("authorised_b5_deductions", 0))
+    c4.metric("Calibrated floors", qa.get("calibrated_floors", 0))
+    st.caption(
+        f"Source revision: `{snapshot_fp}` · "
+        f"Saved snapshot: {'current' if is_fresh else 'stale'}"
+    )
+
     if "_CANONICAL_MODEL_SESSION_CACHE" not in st.session_state:
         st.session_state["_CANONICAL_MODEL_SESSION_CACHE"] = {}
 
@@ -85,7 +153,6 @@ def render_workspace_3d_canonical_view(app: Any, workspace: Any = None) -> None:
     if cache_key in cache_dict:
         html_code = cache_dict[cache_key]
     else:
-        # Enforce cache size bound (evict oldest entry if limit reached)
         if len(cache_dict) >= MAX_SESSION_CACHE_ENTRIES:
             oldest_key = next(iter(cache_dict))
             cache_dict.pop(oldest_key, None)
@@ -94,46 +161,71 @@ def render_workspace_3d_canonical_view(app: Any, workspace: Any = None) -> None:
         html_code = generate_bim_viewer_html(payload, height_px=750)
         cache_dict[cache_key] = html_code
 
-    # Render WebGL Viewer Component
     components.html(html_code, height=760, scrolling=False)
 
-    # SECTION P & 57: Expanded Estimator QA Summary Diagnostics Panel
-    with st.expander("📊 Estimator QA Summary & Quantity Reconciliation", expanded=False):
-        qa = diagnostics.get("estimator_qa_summary", {})
-        st.caption(f"Source Fingerprint Revision: `{snapshot_fp}` | Status: {'Fresh' if is_fresh else 'Stale'}")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Physical Walls Rendered", qa.get("physical_walls_rendered", 0))
-        col2.metric("Physical Openings Rendered", qa.get("physical_openings", 0))
-        col3.metric("B5 Authorised Deductions", qa.get("authorised_b5_deductions", 0))
-        col4.metric("Calibrated Floors", qa.get("calibrated_floors", 0))
-        
-        st.markdown("#### Per-Wall Quantity Reconciliation")
+    with st.expander("Estimator QA & quantity reconciliation", expanded=False):
+        st.markdown("#### Per-wall quantity reconciliation")
         st.dataframe(diagnostics.get("per_wall_quantity_reconciliation", []))
-        
-        with st.expander("Technical Diagnostics Data", expanded=False):
+        with st.expander("Technical diagnostics", expanded=False):
             st.json(diagnostics)
 
 
+def _render_legacy_editor_opt_in(
+    app: Any,
+    original_model_page: Any,
+    workspace: Any,
+    args: tuple,
+    kwargs: dict,
+) -> None:
+    """Expose the historical editor only after all three developer gates pass."""
+    if not legacy_editor_feature_enabled():
+        return
+    if not legacy_editor_user_authorized():
+        return
+    if not callable(original_model_page):
+        return
+
+    try:
+        wid_int = _workspace_id_from_context(app, workspace)
+    except Exception:
+        wid_int = "unknown"
+
+    st.markdown("---")
+    st.caption("Advanced developer tools are enabled for this privileged session.")
+    enabled = st.checkbox(
+        "Enable legacy manual 3D editor for this session",
+        value=False,
+        key=f"legacy_3d_editor_opt_in_{wid_int}",
+        help=(
+            "This historical editor is not the canonical source of truth and may expose "
+            "legacy convenience defaults. Use it only for controlled diagnostics."
+        ),
+    )
+    if not enabled:
+        return
+
+    st.warning(
+        "LEGACY MANUAL 3D EDITOR — NON-CANONICAL / NON-TAKEOFF-AUTHORITATIVE. "
+        "Do not use legacy defaults as measured geometry."
+    )
+    original_model_page(workspace, *args, **kwargs)
+
+
 def apply(app: Any) -> None:
-    """
-    SECTION L & 62: Applies the Phase 5 3D Canonical Viewer extension hook to the PlanReader application instance.
-    Idempotency guard: calling apply(app) twice will NOT wrap model_3d_page twice.
-    """
+    """Install the canonical estimator-facing 3D page exactly once."""
     if getattr(app, "_canonical_3d_extension_installed", False):
-        return  # Already installed!
+        return
 
-    if hasattr(app, "model_3d_page"):
-        orig_model_3d = getattr(app, "model_3d_page")
+    if not hasattr(app, "model_3d_page"):
+        return
 
-        def model_3d_page_canonical_wrapper(workspace: Any = None, *args, **kwargs):
-            # 1. Render original reconstruction/model page
-            if callable(orig_model_3d):
-                orig_model_3d(workspace, *args, **kwargs)
-            
-            st.markdown("---")
-            # 2. Render approved canonical 3D WebGL BIM viewer
-            render_workspace_3d_canonical_view(app, workspace)
+    original_model_3d = getattr(app, "model_3d_page")
+    setattr(app, "_legacy_model_3d_page", original_model_3d)
 
-        setattr(app, "model_3d_page", model_3d_page_canonical_wrapper)
-        setattr(app, "_canonical_3d_extension_installed", True)
+    def model_3d_page_canonical_wrapper(workspace: Any = None, *args, **kwargs):
+        _render_shared_workspace_header(app, workspace)
+        render_workspace_3d_canonical_view(app, workspace)
+        _render_legacy_editor_opt_in(app, original_model_3d, workspace, args, kwargs)
+
+    setattr(app, "model_3d_page", model_3d_page_canonical_wrapper)
+    setattr(app, "_canonical_3d_extension_installed", True)
