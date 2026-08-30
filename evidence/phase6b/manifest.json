@@ -1,0 +1,132 @@
+[
+  {
+    "filename": "phase6b_01_review_empty.png",
+    "size": 111341,
+    "width": 1600,
+    "height": 1000,
+    "sha256": "86ebc937458052f578b394bbe13967f190ba15f4b741fc67b1c56bd94283ee34",
+    "job_no": "JOB-201",
+    "expected_state": "Clean Scope Project",
+    "code_sha": "dda98a208e30ff83fbd39408592564151e516ddd"
+  },
+  {
+    "filename": "phase6b_02_measurement_signal.png",
+    "size": 146404,
+    "width": 1600,
+    "height": 1000,
+    "sha256": "0242e0b8447b37eab27b65f6d892eb353f580d251a5ce60efecfa5a6876f0213",
+    "job_no": "JOB-202",
+    "expected_state": "Concrete Slab",
+    "code_sha": "dda98a208e30ff83fbd39408592564151e516ddd"
+  },
+  {
+    "filename": "phase6b_03_mixed_review_signals.png",
+    "size": 147087,
+    "width": 1600,
+    "height": 1000,
+    "sha256": "38bcc5b3cfc5557f0a0ce9e86bb1b2038e80685c1b7235d2c48478caa0167a3c",
+    "job_no": "JOB-203",
+    "expected_state": "RFI 10",
+    "code_sha": "dda98a208e30ff83fbd39408592564151e516ddd"
+  },
+  {
+    "filename": "phase6b_04_filters_search.png",
+    "size": 148755,
+    "width": 1600,
+    "height": 1000,
+    "sha256": "c65000d83d30dd38fafb7c4e9256ba66a425741a520f58674306683df6e2435a",
+    "job_no": "JOB-204",
+    "expected_state": "Filtered Signals Project",
+    "code_sha": "dda98a208e30ff83fbd39408592564151e516ddd"
+  },
+  {
+    "filename": "phase6b_05_takeoff_source_navigation.png",
+    "size": 121337,
+    "width": 1600,
+    "height": 1000,
+    "sha256": "c2d20d76c6d4b57828767038671eb907ce19c4a5115aa8cd19bc327a2a9e7271",
+    "job_no": "JOB-205",
+    "expected_state": "Subscription Take-off",
+    "code_sha": "dda98a208e30ff83fbd39408592564151e516ddd"
+  },
+  {
+    "filename": "phase6b_06_register_signal.png",
+    "size": 141165,
+    "width": 1600,
+    "height": 1000,
+    "sha256": "5ee88df89913583ea470fe7c4cad5b0ecaab85f3ab1c0b0bdd5be137cbbe3e7b",
+    "job_no": "JOB-206",
+    "expected_state": "Technical Query 05",
+    "code_sha": "dda98a208e30ff83fbd39408592564151e516ddd"
+  },
+  {
+    "filename": "phase6b_07_scale_signal.png",
+    "size": 144619,
+    "width": 1600,
+    "height": 1000,
+    "sha256": "770b4d9a5c2335d32c8769ae165ea0005203baa8f4026f7f1d1f2c874079679e",
+    "job_no": "JOB-207",
+    "expected_state": "Uncalibrated Scale",
+    "code_sha": "dda98a208e30ff83fbd39408592564151e516ddd"
+  },
+  {
+    "filename": "phase6b_08_source_fixed_signal_cleared.png",
+    "size": 113156,
+    "width": 1600,
+    "height": 1000,
+    "sha256": "1437361dc86505c3d2653f4dedc0d1ea9056bb98bdb8e3a1db2d2de2573dced7",
+    "job_no": "JOB-208",
+    "expected_state": "Resolved Scope Project",
+    "code_sha": "dda98a208e30ff83fbd39408592564151e516ddd"
+  },
+  {
+    "filename": "phase6b_09_narrow_screen_layout.png",
+    "size": 89074,
+    "width": 768,
+    "height": 1024,
+    "sha256": "f5426e7cb6ecca805e97014810fbe46975285ef8e63a315a0c22f752e143695e",
+    "job_no": "JOB-209",
+    "expected_state": "Mobile Layout Project",
+    "code_sha": "dda98a208e30ff83fbd39408592564151e516ddd"
+  },
+  {
+    "filename": "phase6b_10_html_escaping_safety.png",
+    "size": 142729,
+    "width": 1600,
+    "height": 1000,
+    "sha256": "faa9a35a65a96726d36d76021da300fe77c5cbbab7620d9dead702746d060ed0",
+    "job_no": "JOB-<210>",
+    "expected_state": "<script>alert(1)</script>",
+    "code_sha": "dda98a208e30ff83fbd39408592564151e516ddd"
+  },
+  {
+    "filename": "phase6b_11_failure_isolation.png",
+    "size": 142993,
+    "width": 1600,
+    "height": 1000,
+    "sha256": "17029837638bf7c346f8dc125cc0c20e1419cb5db3851a9be54990eb24313b6f",
+    "job_no": "JOB-211",
+    "expected_state": "Outage Failure Project",
+    "code_sha": "dda98a208e30ff83fbd39408592564151e516ddd"
+  },
+  {
+    "filename": "phase6b_12_incomplete_coverage_shell.png",
+    "size": 148547,
+    "width": 1600,
+    "height": 1000,
+    "sha256": "2a96769a2c2becb4c3d242de3aed8f3e7750ecab0ebd5d0b20d222e8bc81bb36",
+    "job_no": "JOB-212",
+    "expected_state": "Incomplete Coverage Shell Project",
+    "code_sha": "dda98a208e30ff83fbd39408592564151e516ddd"
+  },
+  {
+    "filename": "phase6b_13_drawing_page_filter.png",
+    "size": 149759,
+    "width": 1600,
+    "height": 1000,
+    "sha256": "e89d80202ad6f08eb7bc6b90e461bd3ba5b2bdbf55b28f51069e77f3c6c1ef05",
+    "job_no": "JOB-213",
+    "expected_state": "Multi Drawing Set Project",
+    "code_sha": "dda98a208e30ff83fbd39408592564151e516ddd"
+  }
+]
