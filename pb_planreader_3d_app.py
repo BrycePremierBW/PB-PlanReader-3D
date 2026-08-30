@@ -6422,17 +6422,30 @@ def main() -> None:
         "Settings",
     ]
     nav_target = st.session_state.pop("_pb_nav_target", None)
+    nav_payload = st.session_state.pop("_pb_nav_payload", None)
+
     default_index = 0
-    if nav_target == "takeoff":
-        default_index = menu_options.index("Subscription Take-off")
-    elif nav_target in ("drawing", "page"):
-        default_index = menu_options.index("Plan Mapper")
-    elif nav_target == "register":
-        default_index = menu_options.index("Drawing Register")
-    elif nav_target == "model":
-        default_index = menu_options.index("3D Building Model")
-    elif nav_target == "review":
-        default_index = menu_options.index("Review & QA")
+    active_ws_id = int(workspace["id"]) if isinstance(workspace, dict) and workspace.get("id") else None
+
+    if nav_target and isinstance(nav_payload, dict):
+        payload_ws_id = nav_payload.get("workspace_id")
+        if payload_ws_id == active_ws_id:
+            if nav_target == "takeoff":
+                default_index = menu_options.index("Subscription Take-off")
+                if nav_payload.get("takeoff_row_id"):
+                    st.session_state["active_takeoff_row_id"] = nav_payload["takeoff_row_id"]
+            elif nav_target in ("drawing", "page"):
+                default_index = menu_options.index("Plan Mapper")
+                if nav_payload.get("page_id"):
+                    st.session_state["active_page_id"] = nav_payload["page_id"]
+            elif nav_target == "register":
+                default_index = menu_options.index("Drawing Register")
+                if nav_payload.get("register_item_id"):
+                    st.session_state["active_register_item_id"] = nav_payload["register_item_id"]
+            elif nav_target == "model":
+                default_index = menu_options.index("3D Building Model")
+            elif nav_target == "review":
+                default_index = menu_options.index("Review & QA")
 
     saved_menu = st.session_state.get("_pb_current_menu")
     if saved_menu in menu_options and nav_target is None:

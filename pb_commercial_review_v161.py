@@ -1,8 +1,8 @@
-"""PlanReader Commercial Review & QA Workspace (Phase 6B).
+"""PlanReader Commercial Review & QA Workspace (Phase 6B Correction Pass).
 
 Version: 1.6.1
 Provides normalized, read-only review signal derivation from authoritative
-source data (take-off rows, register items, scale gate issues, 3D model settings).
+source data (take-off rows, register items, scale gate issues).
 
 Review signals are DERIVED FROM UNDERLYING SOURCE DATA ONLY.
 Zero parallel truth database or arbitrary bulk silencing allowed.
@@ -18,9 +18,32 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 MODULE_VERSION = "1.6.1"
 
-# -----------------------------------------------------------------------------
-# Data Models
-# -----------------------------------------------------------------------------
+REQUIRED_FAMILIES = ("takeoff", "register", "scale")
+OPTIONAL_FAMILIES = ("model",)
+
+
+def _safe_str(val: Any) -> str:
+    """Safely convert any value (dict, list, None, int, float, str) to string without throwing."""
+    if val is None:
+        return ""
+    if isinstance(val, (dict, list, tuple)):
+        try:
+            return json.dumps(val)
+        except Exception:
+            return str(val)
+    return str(val)
+
+
+def _safe_int(val: Any) -> Optional[int]:
+    """Parse integer safely without treating bools or floats as invalid int."""
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        ival = int(val)
+        return ival
+    except (ValueError, TypeError):
+        return None
+
 
 @dataclass(frozen=True)
 class CommercialReviewSignal:
@@ -88,13 +111,21 @@ class CommercialReviewResult:
         return sum(1 for s in self.signals if s.severity == "INFORMATION")
 
     @property
+    def required_coverage_complete(self) -> bool:
+        """Required coverage is complete if workspace_id > 0 and all REQUIRED_FAMILIES are AVAILABLE or NOT_SUPPORTED."""
+        if not self.workspace_id or self.workspace_id <= 0:
+            return False
+        for fam in REQUIRED_FAMILIES:
+            status = self.source_coverage.get(fam, "UNAVAILABLE")
+            if status not in ("AVAILABLE", "NOT_SUPPORTED"):
+                return False
+        return True
+
+    @property
     def is_complete(self) -> bool:
-        return all(status == "AVAILABLE" for status in self.source_coverage.values())
+        """Alias for required_coverage_complete."""
+        return self.required_coverage_complete
 
-
-# -----------------------------------------------------------------------------
-# Helper Utilities
-# -----------------------------------------------------------------------------
 
 def _safe_float(val: Any) -> Optional[float]:
     """Parse numeric quantity safely without throwing or treating bools as float."""
@@ -103,7 +134,7 @@ def _safe_float(val: Any) -> Optional[float]:
     if isinstance(val, (int, float)):
         fval = float(val)
         return fval if math.isfinite(fval) else None
-    s = str(val).strip()
+    s = _safe_str(val).strip()
     if not s:
         return None
     try:
@@ -147,7 +178,7 @@ def _query(app: Any, sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, A
 # -----------------------------------------------------------------------------
 
 def collect_takeoff_review_signals(app: Any, workspace_id: int) -> List[CommercialReviewSignal]:
-    """Derive deduplicated review signals from takeoff_rows table."""
+    """Derive deduplicated review signals from takeoff_rows table with per-row quarantine."""
     signals: List[CommercialReviewSignal] = []
     rows = _query(
         app,
@@ -156,15 +187,20 @@ def collect_takeoff_review_signals(app: Any, workspace_id: int) -> List[Commerci
     )
 
     for row in rows:
-        row_id = str(row.get("id"))
-        qty_status = str(row.get("quantity_status") or "").strip()
+        raw_id = row.get("id")
+        parsed_id = _safe_int(raw_id)
+        if parsed_id is None or parsed_id <= 0:
+            # Per-row quarantine for missing/non-numeric ID: skip item safely without killing entire family
+            continue
+
+        row_id_str = str(parsed_id)
+        qty_status = _safe_str(row.get("quantity_status")).strip()
         qty_raw = row.get("quantity")
         parsed_qty = _safe_float(qty_raw)
-        conf = str(row.get("confidence") or "").strip().lower()
-        incl = str(row.get("inclusion_status") or "").strip().lower()
+        conf = _safe_str(row.get("confidence")).strip().lower()
+        incl = _safe_str(row.get("inclusion_status")).strip().lower()
         
-        # Check non-finite or invalid string numbers when quantity was supplied
-        qty_str = str(qty_raw).strip() if qty_raw is not None else ""
+        qty_str = _safe_str(qty_raw).strip() if qty_raw is not None else ""
         is_nonfinite = False
         if qty_raw is not None and not isinstance(qty_raw, bool):
             if isinstance(qty_raw, float) and not math.isfinite(qty_raw):
@@ -213,20 +249,17 @@ def collect_takeoff_review_signals(app: Any, workspace_id: int) -> List[Commerci
 
         # Excluded / Not applicable filter
         if qty_status.lower() in ("excluded", "not applicable", "n/a"):
-            # Excluded rows only produce signals if they carry explicit clarification or confidence flags
             if not any("Confidence" in r or "Scope inclusion" in r for r in reasons):
                 continue
 
         if not reasons:
             continue
 
-        # Sort reasons deterministically
         reasons_sorted = tuple(sorted(reasons))
-
-        signal_id = f"review:{workspace_id}:takeoff:{row_id}:{primary_category.replace(' ', '_').replace('/', '_')}"
-        element_name = str(row.get("element") or row.get("description") or row.get("item_name") or f"Take-off Row #{row_id}").strip()
-        location_name = str(row.get("location") or row.get("zone") or row.get("level") or "").strip() or None
-        dwg_ref = str(row.get("drawing_reference") or row.get("drawing_ref") or "").strip() or None
+        signal_id = f"review:{workspace_id}:takeoff:{row_id_str}:{primary_category.replace(' ', '_').replace('/', '_')}"
+        element_name = _safe_str(row.get("element") or row.get("description") or row.get("item_name") or row.get("item") or f"Take-off Row #{row_id_str}").strip()
+        location_name = _safe_str(row.get("location") or row.get("zone") or row.get("level")).strip() or None
+        dwg_ref = _safe_str(row.get("source_reference") or row.get("drawing_reference") or row.get("drawing_ref")).strip() or None
 
         signals.append(
             CommercialReviewSignal(
@@ -234,28 +267,28 @@ def collect_takeoff_review_signals(app: Any, workspace_id: int) -> List[Commerci
                 workspace_id=int(workspace_id),
                 source_family="takeoff",
                 source_type="takeoff_row",
-                source_id=row_id,
+                source_id=row_id_str,
                 category=primary_category,
                 severity=primary_severity,
                 title=f"{element_name}",
                 summary=reasons_sorted[0],
                 reasons=reasons_sorted,
                 status=qty_status or "Unrecorded",
-                page_id=int(row["page_id"]) if row.get("page_id") else None,
-                document_id=int(row["document_id"]) if row.get("document_id") else None,
-                takeoff_row_id=int(row_id),
+                page_id=_safe_int(row.get("page_id")),
+                document_id=_safe_int(row.get("document_id")),
+                takeoff_row_id=parsed_id,
                 drawing_reference=dwg_ref,
                 location=location_name,
                 element=element_name,
-                unit=str(row.get("unit") or "").strip() or None,
+                unit=_safe_str(row.get("unit")).strip() or None,
                 quantity=parsed_qty,
                 quantity_status=qty_status or None,
                 confidence=conf or None,
                 inclusion_status=incl or None,
                 recommended_action="Open take-off row to confirm quantity, status, and measurement evidence.",
                 navigation_target="takeoff",
-                navigation_payload={"workspace_id": int(workspace_id), "takeoff_row_id": int(row_id)},
-                metadata={"row_id": int(row_id), "raw_quantity": qty_raw},
+                navigation_payload={"workspace_id": int(workspace_id), "takeoff_row_id": parsed_id},
+                metadata={"row_id": parsed_id},
             )
         )
 
@@ -263,7 +296,7 @@ def collect_takeoff_review_signals(app: Any, workspace_id: int) -> List[Commerci
 
 
 def collect_register_review_signals(app: Any, workspace_id: int) -> List[CommercialReviewSignal]:
-    """Derive review signals from register_items table."""
+    """Derive review signals from register_items table with explicit status allowlist."""
     signals: List[CommercialReviewSignal] = []
     items = _query(
         app,
@@ -271,87 +304,94 @@ def collect_register_review_signals(app: Any, workspace_id: int) -> List[Commerc
         (int(workspace_id),),
     )
 
-    for item in items:
-        item_id = str(item.get("id"))
-        status_val = str(item.get("status") or item.get("review_state") or "").strip()
-        status_lower = status_val.lower()
+    RESOLVED_STATUSES = {"accepted", "closed", "resolved", "approved"}
+    UNRESOLVED_ALLOWLIST = {"open", "to review", "review required", "pending", "unresolved"}
 
-        # Unresolved states: "open", "to review", "review required", "pending", "unresolved"
-        if status_lower in ("accepted", "closed", "resolved", "approved"):
+    for item in items:
+        raw_id = item.get("id")
+        parsed_id = _safe_int(raw_id)
+        if parsed_id is None or parsed_id <= 0:
+            # Per-row quarantine for missing/non-numeric ID: skip item safely
             continue
 
-        reasons = [f"Register item remains in '{status_val or 'Open'}' state"]
-        priority = str(item.get("priority") or "").strip().upper()
-        severity = "BLOCKER" if priority in ("HIGH", "URGENT", "BLOCKER") else "REVIEW"
+        item_id_str = str(parsed_id)
+        status_val = _safe_str(item.get("status") or item.get("review_state")).strip()
+        status_lower = status_val.lower()
 
-        reg_name = str(item.get("register_name") or "").strip()
-        reg_title = str(item.get("title") or "").strip()
+        if status_lower in RESOLVED_STATUSES:
+            continue
+
+        # All unresolved register items have REVIEW severity (Priority does NOT create BLOCKER authority)
+        severity = "REVIEW"
+        reasons: List[str] = []
+
+        if status_lower in UNRESOLVED_ALLOWLIST:
+            reasons.append(f"Register item remains in '{status_val or 'Open'}' state")
+        elif not status_val:
+            reasons.append("Register item status is blank/unrecorded")
+        else:
+            # Unknown/malformed status is explicitly surfaced with REVIEW severity
+            reasons.append(f"Register item has unrecognised status ('{status_val}')")
+
+        reg_name = _safe_str(item.get("register_name")).strip()
+        reg_title = _safe_str(item.get("title")).strip()
         if reg_name and reg_title and reg_name.lower() != reg_title.lower():
             title_text = f"{reg_name} — {reg_title}"
         else:
-            title_text = reg_title or reg_name or f"Clarification Item #{item_id}"
+            title_text = reg_title or reg_name or f"Clarification Item #{item_id_str}"
 
-        detail_text = str(item.get("detail") or item.get("notes") or "").strip()
-        dwg_ref = str(item.get("drawing_ref") or item.get("drawing_reference") or "").strip() or None
+        detail_text = _safe_str(item.get("detail") or item.get("notes")).strip()
+        dwg_ref = _safe_str(item.get("source_reference") or item.get("drawing_ref") or item.get("drawing_reference")).strip() or None
+        priority = _safe_str(item.get("priority")).strip().upper()
 
         signals.append(
             CommercialReviewSignal(
-                signal_id=f"review:{workspace_id}:register:{item_id}:Clarification",
+                signal_id=f"review:{workspace_id}:register:{item_id_str}:Clarification",
                 workspace_id=int(workspace_id),
                 source_family="register",
                 source_type="register_item",
-                source_id=item_id,
+                source_id=item_id_str,
                 category="Clarification",
                 severity=severity,
                 title=title_text,
                 summary=detail_text[:120] if detail_text else reasons[0],
                 reasons=tuple(reasons),
-                status=status_val or "Open",
-                register_item_id=int(item_id),
+                status=status_val or "Unrecorded",
+                register_item_id=parsed_id,
                 drawing_reference=dwg_ref,
                 recommended_action="Open clarification register to review and resolve project query.",
                 navigation_target="register",
-                navigation_payload={"workspace_id": int(workspace_id), "register_item_id": int(item_id)},
-                metadata={"register_id": int(item_id), "priority": priority},
+                navigation_payload={"workspace_id": int(workspace_id), "register_item_id": parsed_id},
+                metadata={"register_id": parsed_id, "priority": priority or "NORMAL"},
             )
         )
 
     return signals
 
 
-def collect_scale_review_signals(app: Any, workspace_id: int) -> List[CommercialReviewSignal]:
-    """Derive review signals from scale_gate_issues(workspace_id)."""
+def collect_scale_review_signals(app: Any, workspace_id: int) -> Tuple[List[CommercialReviewSignal], str]:
+    """Derive review signals strictly from app.scale_gate_issues(workspace_id). No fallback SQL engine."""
     signals: List[CommercialReviewSignal] = []
-    
-    # Safely call scale_gate_issues helper
-    issues: List[Dict[str, Any]] = []
-    if hasattr(app, "scale_gate_issues"):
-        try:
-            issues = app.scale_gate_issues(int(workspace_id))
-        except Exception:
-            raise
-    else:
-        # Fallback query if app scale_gate_issues is not mounted
-        pages = _query(
-            app,
-            "SELECT p.id, p.page_no, p.page_label, p.document_id, d.file_name FROM pages p "
-            "JOIN documents d ON d.id=p.document_id "
-            "WHERE p.workspace_id=? AND (p.px_per_m IS NULL OR p.px_per_m <= 0) "
-            "AND p.id IN (SELECT DISTINCT page_id FROM mapped_zones WHERE workspace_id=?)",
-            (int(workspace_id), int(workspace_id)),
-        )
-        for pg in pages:
-            issues.append({
-                "page_id": int(pg["id"]),
-                "page_label": str(pg.get("page_label") or pg.get("page_no") or ""),
-                "reason": "Drawing page feeds measurement but scale calibration is not confirmed",
-            })
+
+    if not hasattr(app, "scale_gate_issues") or not callable(getattr(app, "scale_gate_issues")):
+        # scale_gate_issues authority is not mounted on app -> NOT_SUPPORTED
+        return signals, "NOT_SUPPORTED"
+
+    try:
+        issues = app.scale_gate_issues(int(workspace_id))
+        if not isinstance(issues, list):
+            return signals, "UNAVAILABLE"
+    except Exception:
+        # Authority raised an error -> UNAVAILABLE
+        return signals, "UNAVAILABLE"
 
     for issue in issues:
+        if not isinstance(issue, dict):
+            continue
         page_id_val = issue.get("page_id")
         page_id_str = str(page_id_val or issue.get("page_label") or "unknown")
-        reason_text = str(issue.get("reason") or "Selected drawing page requires scale calibration").strip()
-        label_text = str(issue.get("page_label") or f"Page #{page_id_str}").strip()
+        reason_text = _safe_str(issue.get("reason") or "Selected drawing page requires scale calibration").strip()
+        label_text = _safe_str(issue.get("page_label") or f"Page #{page_id_str}").strip()
 
         signals.append(
             CommercialReviewSignal(
@@ -366,77 +406,21 @@ def collect_scale_review_signals(app: Any, workspace_id: int) -> List[Commercial
                 summary=reason_text,
                 reasons=(reason_text,),
                 status="Uncalibrated",
-                page_id=int(page_id_val) if page_id_val and str(page_id_val).isdigit() else None,
+                page_id=_safe_int(page_id_val),
                 drawing_reference=label_text,
                 recommended_action="Open drawing in Plan Mapper to calibrate scale (px/m) before trusting quantities.",
                 navigation_target="drawing",
-                navigation_payload={"workspace_id": int(workspace_id), "page_id": page_id_val},
-                metadata={"issue_raw": issue},
+                navigation_payload={"workspace_id": int(workspace_id), "page_id": _safe_int(page_id_val)},
+                metadata={"page_label": label_text, "source": "scale_gate_issues"},
             )
         )
 
-    return signals
+    return signals, "AVAILABLE"
 
 
-def collect_model_review_signals(app: Any, workspace_id: int) -> List[CommercialReviewSignal]:
-    """Derive optional 3D review signals from persisted canonical_3d_model_v1 setting."""
-    signals: List[CommercialReviewSignal] = []
-    raw_val = None
-    if hasattr(app, "workspace_setting"):
-        try:
-            raw_val = app.workspace_setting(int(workspace_id), "canonical_3d_model_v1", None)
-        except Exception:
-            raw_val = None
-    else:
-        try:
-            rows = _query(
-                app,
-                "SELECT value FROM workspace_settings WHERE workspace_id=? AND key='canonical_3d_model_v1'",
-                (int(workspace_id),),
-            )
-            if rows:
-                raw_val = rows[0].get("value")
-        except Exception:
-            raw_val = None
-
-    if raw_val is None:
-        return signals
-
-    try:
-        data = json.loads(raw_val) if isinstance(raw_val, str) else (raw_val if isinstance(raw_val, dict) else {})
-    except Exception:
-        # Malformed model payload is handled as not-saved by Phase 6A workflow step
-        return signals
-
-    if not isinstance(data, dict):
-        return signals
-
-    is_stale = bool(data.get("is_stale") or data.get("stale"))
-    diagnostics = data.get("review_diagnostics") or []
-
-    if is_stale or diagnostics:
-        reasons = tuple(diagnostics) if diagnostics else ("Saved 3D model source evidence has changed",)
-        signals.append(
-            CommercialReviewSignal(
-                signal_id=f"review:{workspace_id}:model:setting:canonical_3d_model_v1:3D_model",
-                workspace_id=int(workspace_id),
-                source_family="model",
-                source_type="model_setting",
-                source_id="canonical_3d_model_v1",
-                category="3D model",
-                severity="INFORMATION",
-                title="3D Model Diagnostics Available",
-                summary=reasons[0],
-                reasons=reasons,
-                status="Stale" if is_stale else "Diagnostics",
-                recommended_action="Open 3D Model viewer to refresh canonical building model.",
-                navigation_target="model",
-                navigation_payload={"workspace_id": int(workspace_id)},
-                metadata={"key": "canonical_3d_model_v1"},
-            )
-        )
-
-    return signals
+def collect_model_review_signals(app: Any, workspace_id: int) -> Tuple[List[CommercialReviewSignal], str]:
+    """3D Model review signals are NOT_SUPPORTED (no parallel staleness engine created)."""
+    return [], "NOT_SUPPORTED"
 
 
 # -----------------------------------------------------------------------------
@@ -445,12 +429,21 @@ def collect_model_review_signals(app: Any, workspace_id: int) -> List[Commercial
 
 def collect_commercial_review_signals(app: Any, workspace: Dict[str, Any]) -> CommercialReviewResult:
     """Collect and deterministically sort all normalized review signals for a workspace."""
-    workspace_id = int(workspace.get("id") or 0)
-    result = CommercialReviewResult(workspace_id=workspace_id)
-    if not workspace_id:
-        return result
+    if not isinstance(workspace, dict):
+        return CommercialReviewResult(workspace_id=0, source_coverage={fam: "UNAVAILABLE" for fam in REQUIRED_FAMILIES})
 
-    # 1. Collect Take-off Signals
+    workspace_id = _safe_int(workspace.get("id"))
+    if not workspace_id or workspace_id <= 0:
+        res = CommercialReviewResult(workspace_id=0)
+        for fam in REQUIRED_FAMILIES:
+            res.source_coverage[fam] = "UNAVAILABLE"
+        for fam in OPTIONAL_FAMILIES:
+            res.source_coverage[fam] = "NOT_SUPPORTED"
+        return res
+
+    result = CommercialReviewResult(workspace_id=workspace_id)
+
+    # 1. Collect Take-off Signals (Required)
     try:
         to_signals = collect_takeoff_review_signals(app, workspace_id)
         result.signals.extend(to_signals)
@@ -459,7 +452,7 @@ def collect_commercial_review_signals(app: Any, workspace: Dict[str, Any]) -> Co
         result.source_coverage["takeoff"] = "UNAVAILABLE"
         result.errors.append(f"Take-off collector error: {exc}")
 
-    # 2. Collect Register Signals
+    # 2. Collect Register Signals (Required)
     try:
         reg_signals = collect_register_review_signals(app, workspace_id)
         result.signals.extend(reg_signals)
@@ -468,23 +461,22 @@ def collect_commercial_review_signals(app: Any, workspace: Dict[str, Any]) -> Co
         result.source_coverage["register"] = "UNAVAILABLE"
         result.errors.append(f"Register collector error: {exc}")
 
-    # 3. Collect Scale Signals
+    # 3. Collect Scale Signals (Required)
     try:
-        scale_signals = collect_scale_review_signals(app, workspace_id)
+        scale_signals, scale_status = collect_scale_review_signals(app, workspace_id)
         result.signals.extend(scale_signals)
-        result.source_coverage["scale"] = "AVAILABLE"
+        result.source_coverage["scale"] = scale_status
     except Exception as exc:
         result.source_coverage["scale"] = "UNAVAILABLE"
         result.errors.append(f"Scale collector error: {exc}")
 
-    # 4. Collect 3D Model Signals
+    # 4. Collect 3D Model Signals (Optional)
     try:
-        model_signals = collect_model_review_signals(app, workspace_id)
+        model_signals, model_status = collect_model_review_signals(app, workspace_id)
         result.signals.extend(model_signals)
-        result.source_coverage["model"] = "AVAILABLE"
+        result.source_coverage["model"] = model_status
     except Exception as exc:
-        result.source_coverage["model"] = "UNAVAILABLE"
-        result.errors.append(f"3D Model collector error: {exc}")
+        result.source_coverage["model"] = "NOT_SUPPORTED"
 
     # Deterministic Sort: Severity (BLOCKER -> REVIEW -> INFORMATION) -> Category -> Drawing -> Source ID -> Signal ID
     sev_rank = {"BLOCKER": 0, "REVIEW": 1, "INFORMATION": 2}
@@ -511,23 +503,32 @@ def render_commercial_review_workspace(app: Any, workspace: Dict[str, Any]) -> N
     if not st:
         return
 
-    workspace_id = int(workspace.get("id") or 0)
-    job_no = html.escape(str(workspace.get("job_no") or f"WS-{workspace_id}"))
-    job_name = html.escape(str(workspace.get("job_name") or "Unnamed Project"))
-    drawing_issue = html.escape(str(workspace.get("drawing_issue") or "Current Issue"))
+    workspace_id = _safe_int(workspace.get("id")) if isinstance(workspace, dict) else None
+    if not workspace_id or workspace_id <= 0:
+        st.error("Invalid or unselected workspace. Select a valid workspace to view commercial review signals.")
+        return
+
+    job_no_raw = _safe_str(workspace.get("job_no")).strip()
+    job_name_raw = _safe_str(workspace.get("job_name")).strip()
+    drawing_issue_raw = _safe_str(workspace.get("drawing_issue")).strip()
+
+    job_no = html.escape(job_no_raw) if job_no_raw else "Not recorded"
+    job_name = html.escape(job_name_raw) if job_name_raw else "Not recorded"
+    drawing_issue = html.escape(drawing_issue_raw) if drawing_issue_raw else "Not recorded"
 
     # Collect signals safely
     try:
         review_res = collect_commercial_review_signals(app, workspace)
     except Exception as exc:
         st.caption("Review status unavailable. Estimator tools remain available.")
-        st.warning(f"Unable to derive commercial review signals: {exc}")
+        st.warning(f"Unable to derive commercial review signals: {html.escape(str(exc))}")
         return
 
     # Partial source failure alert
-    if not review_res.is_complete:
-        unavail = [src for src, status in review_res.source_coverage.items() if status != "AVAILABLE"]
-        st.warning(f"⚠️ Review coverage incomplete — Sources unavailable: {', '.join(unavail)}. Estimator tools remain fully functional.")
+    if not review_res.required_coverage_complete:
+        unavail = [src for src, status in review_res.source_coverage.items() if status == "UNAVAILABLE"]
+        unavail_str = html.escape(", ".join(unavail)) if unavail else "Required sources"
+        st.warning(f"⚠️ Review coverage incomplete — Sources unavailable: {unavail_str}. Estimator tools remain fully functional.")
 
     # Header Card
     st.markdown(
@@ -575,21 +576,26 @@ def render_commercial_review_workspace(app: Any, workspace: Dict[str, Any]) -> N
     m5.metric("3D Model", str(model_count))
 
     if review_res.signal_count == 0:
-        st.success("✅ No current review signals detected from the available sources.")
+        if review_res.required_coverage_complete:
+            st.success("✅ No current review signals detected from the available sources.")
+        else:
+            st.warning("⚠️ Review coverage is incomplete. No review signals were detected from the sources currently available.")
         return
 
-    # Filter Controls
+    # Filter Controls (Severity, Category, Source Family, Drawing / Page, Search text)
     st.markdown("### Search & Filters")
-    f1, f2, f3, f4 = st.columns([1.5, 1.5, 1.5, 2])
+    f1, f2, f3, f4, f5 = st.columns([1.2, 1.2, 1.2, 1.4, 2])
     
     severities = ["All", "BLOCKER", "REVIEW", "INFORMATION"]
     categories = ["All"] + sorted(list({s.category for s in review_res.signals}))
     families = ["All"] + sorted(list({s.source_family for s in review_res.signals}))
+    drawings = ["All"] + sorted(list({s.drawing_reference for s in review_res.signals if s.drawing_reference}))
 
     selected_sev = f1.selectbox("Severity", severities, key="_pb_rev_sev")
     selected_cat = f2.selectbox("Category", categories, key="_pb_rev_cat")
     selected_fam = f3.selectbox("Source Family", families, key="_pb_rev_fam")
-    search_query = f4.text_input("Search text", placeholder="Filter by element, location, drawing...", key="_pb_rev_search").strip().lower()
+    selected_dwg = f4.selectbox("Drawing / Page", drawings, key="_pb_rev_dwg")
+    search_query = f5.text_input("Search text", placeholder="Filter by element, location, drawing...", key="_pb_rev_search").strip().lower()
 
     # Apply Filters
     filtered_signals = review_res.signals
@@ -599,15 +605,17 @@ def render_commercial_review_workspace(app: Any, workspace: Dict[str, Any]) -> N
         filtered_signals = [s for s in filtered_signals if s.category == selected_cat]
     if selected_fam != "All":
         filtered_signals = [s for s in filtered_signals if s.source_family == selected_fam]
+    if selected_dwg != "All":
+        filtered_signals = [s for s in filtered_signals if s.drawing_reference == selected_dwg]
     if search_query:
         filtered_signals = [
             s for s in filtered_signals
-            if search_query in (s.title or "").lower()
-            or search_query in (s.summary or "").lower()
-            or search_query in (s.element or "").lower()
-            or search_query in (s.location or "").lower()
-            or search_query in (s.drawing_reference or "").lower()
-            or any(search_query in r.lower() for r in s.reasons)
+            if search_query in _safe_str(s.title).lower()
+            or search_query in _safe_str(s.summary).lower()
+            or search_query in _safe_str(s.element).lower()
+            or search_query in _safe_str(s.location).lower()
+            or search_query in _safe_str(s.drawing_reference).lower()
+            or any(search_query in _safe_str(r).lower() for r in s.reasons)
         ]
 
     st.caption(f"Showing {len(filtered_signals)} of {review_res.signal_count} review signals")
@@ -620,13 +628,13 @@ def render_commercial_review_workspace(app: Any, workspace: Dict[str, Any]) -> N
     st.markdown("---")
     for idx, sig in enumerate(filtered_signals):
         badge_bg = "#EF4444" if sig.severity == "BLOCKER" else ("#F59E0B" if sig.severity == "REVIEW" else "#3B82F6")
-        title_esc = html.escape(sig.title)
-        summary_esc = html.escape(sig.summary)
-        cat_esc = html.escape(sig.category)
-        elem_esc = html.escape(sig.element or "—")
-        loc_esc = html.escape(sig.location or "—")
-        dwg_esc = html.escape(sig.drawing_reference or "—")
-        status_esc = html.escape(sig.status or "Unspecified")
+        title_esc = html.escape(_safe_str(sig.title))
+        summary_esc = html.escape(_safe_str(sig.summary))
+        cat_esc = html.escape(_safe_str(sig.category))
+        elem_esc = html.escape(_safe_str(sig.element) or "—")
+        loc_esc = html.escape(_safe_str(sig.location) or "—")
+        dwg_esc = html.escape(_safe_str(sig.drawing_reference) or "—")
+        status_esc = html.escape(_safe_str(sig.status) or "Unspecified")
 
         st.markdown(
             f"""
@@ -650,7 +658,7 @@ def render_commercial_review_workspace(app: Any, workspace: Dict[str, Any]) -> N
                 <div style="margin-top:0.5rem; font-size:0.83rem; color:#475569; display:flex; gap:1.25rem; flex-wrap:wrap;">
                     <div><strong>Element:</strong> {elem_esc}</div>
                     <div><strong>Location:</strong> {loc_esc}</div>
-                    <div><strong>Source:</strong> {sig.source_family.upper()} #{html.escape(sig.source_id)}</div>
+                    <div><strong>Source:</strong> {html.escape(_safe_str(sig.source_family)).upper()} #{html.escape(_safe_str(sig.source_id))}</div>
                 </div>
             </div>
             """,
@@ -661,10 +669,11 @@ def render_commercial_review_workspace(app: Any, workspace: Dict[str, Any]) -> N
         with col1:
             with st.expander(f"Why am I seeing this? ({len(sig.reasons)} reasons)", expanded=False):
                 for reason in sig.reasons:
-                    st.markdown(f"- {html.escape(reason)}")
-                st.caption(f"Deterministic Signal ID: `{sig.signal_id}`")
-                if sig.metadata:
-                    st.json(sig.metadata)
+                    st.markdown(f"- {html.escape(_safe_str(reason))}")
+                st.caption(f"Deterministic Signal ID: `{html.escape(_safe_str(sig.signal_id))}`")
+                if sig.metadata and isinstance(sig.metadata, dict):
+                    bounded_meta = {html.escape(_safe_str(k)): html.escape(_safe_str(v)) for k, v in sig.metadata.items()}
+                    st.json(bounded_meta)
 
         with col2:
             if sig.navigation_target:
@@ -679,7 +688,6 @@ def render_commercial_review_workspace(app: Any, workspace: Dict[str, Any]) -> N
                     btn_label = "Open 3D model"
 
                 if st.button(btn_label, key=f"nav_{sig.signal_id}_{idx}", use_container_width=True):
-                    # Set navigation target in session state
                     st.session_state["_pb_nav_target"] = sig.navigation_target
                     st.session_state["_pb_nav_payload"] = sig.navigation_payload
                     st.rerun()
