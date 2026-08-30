@@ -126,7 +126,7 @@ def _get_takeoff_row_stats(conn_or_app: Any, workspace_id: int) -> Tuple[int, in
     """Retrieves row statistics and payload fingerprint for a workspace across all consequential publish fields."""
     rows = _db_query(
         conn_or_app,
-        "SELECT id, section, element, location, substrate, unit, quantity, coats, rate_per_unit, labour_hours, paint_litres, value_ex_gst, finish_system, coverage_m2_per_litre, productivity_m2_per_hour, inclusion_status, row_role, notes, confidence, source_reference FROM takeoff_rows WHERE workspace_id=? ORDER BY id",
+        "SELECT id, section, element, location, substrate, unit, quantity, quantity_status, coats, rate_per_unit, labour_hours, paint_litres, value_ex_gst, finish_system, coverage_m2_per_litre, productivity_m2_per_hour, inclusion_status, row_role, notes, confidence, source_reference FROM takeoff_rows WHERE workspace_id=? ORDER BY id",
         (workspace_id,)
     )
     total = len(rows)
@@ -154,8 +154,10 @@ def _get_takeoff_row_stats(conn_or_app: Any, workspace_id: int) -> Tuple[int, in
         else:
             publishable += 1
 
+        qty_status_str = str(r.get("quantity_status") or "").strip().lower()
         if qty is not None and float(qty) == 0.0:
-            measured_zero += 1
+            if qty_status_str in ("measured", "confirmed", "allowance"):
+                measured_zero += 1
 
         # Build comprehensive payload dict of consequential export fields
         pub_payload_items.append({
@@ -408,8 +410,8 @@ def verify_toctou_and_publish_jobhub(
                     raise RuntimeError(f"Package for preflight fingerprint {preflight.preflight_fingerprint[:12]}... has already been published to JobHub for job #{job_id} (Package #{pkg.get('id')}).")
         except RuntimeError:
             raise
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError(f"Duplicate verification failed closed: unable to query existing JobHub packages ({exc}).")
 
     # Execute downstream publish function with return verification
     result = publish_fn(workspace_id, bridge, user_name)

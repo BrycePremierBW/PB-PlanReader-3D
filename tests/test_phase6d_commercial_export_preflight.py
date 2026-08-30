@@ -1,16 +1,16 @@
 """tests/test_phase6d_commercial_export_preflight.py — Phase 6D Preflight & JobHub Integrity Suite.
 
-Issue #74 Complete Regression Matrix:
+Issue #74 Complete Pass 4 Regression Matrix:
   1. Clean project (AVAILABLE)
   2. INFO-only project (AVAILABLE)
   3. REVIEW-only project (AVAILABLE_WITH_WARNING)
   4. BLOCKER project (BLOCKED)
   5. Required-source query failure (BLOCKED - Fail-closed)
   6. Sole authoritative scale-gate delegation (scale_gate_issues)
-  7. Floor-area-only rows (floor_reference_rows tracked)
+  7. Genuinely floor-area-only rows (0 publishable work rows -> BLOCKED)
   8. Excluded rows (excluded_takeoff_rows tracked)
-  9. Measured confirmed zero (measured_zero_rows tracked)
- 10. Downstream row-count agreement (publishable_takeoff_rows == takeoff_work_rows)
+  9. Confirmed measured zero semantics (quantity_status == 'Measured') vs unmeasured default zero
+ 10. Downstream row-count agreement (invokes takeoff_work_rows authority with mixed rows)
  11. Missing/wrong acknowledgement (raises RuntimeError)
  12. Workspace switch invalidation (clears typed acknowledgement)
  13. Drawing issue change (invalidates preflight fingerprint)
@@ -19,14 +19,15 @@ Issue #74 Complete Regression Matrix:
  16. New blocker after render (aborts TOCTOU publish)
  17. JobHub unavailable (final_publish_state UNAVAILABLE)
  18. Downstream exception (surfaces RuntimeError)
- 19. Partial write/receipt (rejects incomplete publish)
- 20. Server-level duplicate submission (rejects re-publish for existing package)
+ 19. Mandatory side-effect integrity (fails on quote_blob, progress_blob, sync, package, line, status failures)
+ 20. Server-level duplicate submission & fail-closed query error (rejects re-publish & blocks on query failure)
  21. Deterministic ordering (row/signal order does not change fingerprint)
  22. Large workspace performance (< 1.0 sec for 1,000 rows)
- 23. Genuine spies (0 AI, 0 OCR, 0 geometry calls)
+ 23. Genuine spies proving no AI/OCR/PDF/geometry rebuild entry points called during preflight
 """
 from __future__ import annotations
 
+import pandas as pd
 import sqlite3
 import time
 import unittest
@@ -39,6 +40,7 @@ from pb_commercial_export_preflight_v163 import (
     verify_toctou_and_publish_jobhub,
 )
 from pb_commercial_review_v161 import CommercialReviewResult, CommercialReviewSignal
+from pb_planreader_3d_app import publish_job_to_jobhub, takeoff_work_rows
 
 
 def _create_mock_db() -> sqlite3.Connection:
@@ -51,7 +53,8 @@ def _create_mock_db() -> sqlite3.Connection:
             job_no TEXT,
             job_name TEXT,
             drawing_issue TEXT,
-            jobhub_job_id INTEGER
+            jobhub_job_id INTEGER,
+            executive_summary TEXT
         );
         CREATE TABLE documents (
             id INTEGER PRIMARY KEY,
@@ -77,6 +80,7 @@ def _create_mock_db() -> sqlite3.Connection:
             substrate TEXT,
             unit TEXT,
             quantity REAL,
+            quantity_status TEXT,
             coats REAL DEFAULT 1.0,
             rate_per_unit REAL DEFAULT 25.0,
             labour_hours REAL DEFAULT 5.0,
@@ -85,7 +89,6 @@ def _create_mock_db() -> sqlite3.Connection:
             finish_system TEXT,
             coverage_m2_per_litre REAL DEFAULT 12.0,
             productivity_m2_per_hour REAL DEFAULT 20.0,
-            quantity_status TEXT,
             confidence TEXT,
             inclusion_status TEXT,
             row_role TEXT,
@@ -128,15 +131,35 @@ class MockApp:
 
 
 class MockJobHubBridge:
-    def __init__(self):
+    def __init__(self, fail_on=None):
         self.kind = "sqlite"
         self.packages = []
+        self.blobs = []
+        self.synced = []
+        self.job_status = "Draft"
+        self.fail_on = fail_on or set()
 
     def execute(self, sql, params=()):
+        str_params = str(params)
+        if "job_document_blobs" in sql and ("Final quotation" in str_params or "quotation" in str_params) and "quote_blob" in self.fail_on:
+            raise RuntimeError("Mandatory quotation blob upload failed: Simulated quotation blob failure")
+        if "job_document_blobs" in sql and ("Progress Marker" in str_params or "progress" in str_params) and "progress_blob" in self.fail_on:
+            raise RuntimeError("Mandatory progress marker upload failed: Simulated progress marker failure")
+        if "painting_takeoff_packages" in sql and "package_header" in self.fail_on:
+            raise RuntimeError("Mandatory takeoff package creation failed: Simulated package header failure")
+        if "painting_takeoff_lines" in sql and "package_lines" in self.fail_on:
+            raise RuntimeError("Mandatory takeoff line creation failed: Simulated package line failure")
+        if "UPDATE jobs SET status" in sql and "job_status" in self.fail_on:
+            raise RuntimeError("Mandatory job status update failed: Simulated job status failure")
+
         if "painting_takeoff_packages" in sql:
-            self.packages.append({"id": 501, "notes": params[-1] if params else ""})
+            self.packages.append({"id": 501, "takeoff_no": params[1] if len(params)>1 else "PR-1", "notes": params[-1] if params else ""})
+        elif "UPDATE jobs SET status" in sql:
+            self.job_status = params[0] if params else "Published"
 
     def query(self, sql, params=()):
+        if "query_fail" in self.fail_on and "painting_takeoff_packages" in sql:
+            raise sqlite3.OperationalError("Simulated JobHub package query failure")
         if "painting_takeoff_packages" in sql:
             return self.packages
         return []
@@ -221,16 +244,20 @@ class Phase6DPreflightTests(unittest.TestCase):
         res2 = derive_export_preflight(self.app, 1, bridge_available=True)
         self.assertEqual(res2.blocker_count, 1)
 
-    def test_7_floor_area_only_rows(self):
+    def test_7_genuinely_floor_area_only_rows(self):
+        """Genuinely floor-area-only workspace: 0 publishable work rows -> BLOCKED preflight."""
         cur = self.conn.cursor()
+        cur.execute("DELETE FROM takeoff_rows WHERE workspace_id=1")
         cur.execute(
             "INSERT INTO takeoff_rows (id, workspace_id, section, element, location, unit, quantity, quantity_status, confidence, inclusion_status, row_role) VALUES (1001, 1, 'Internal', 'Floor Area', 'G01', 'm²', 200.0, 'Measured', 'high', 'included', 'floor_area')"
         )
         self.conn.commit()
         res = derive_export_preflight(self.app, 1, bridge_available=True)
-        self.assertEqual(res.total_takeoff_rows, 2)
-        self.assertEqual(res.publishable_takeoff_rows, 1)
+        self.assertEqual(res.total_takeoff_rows, 1)
+        self.assertEqual(res.publishable_takeoff_rows, 0)
         self.assertEqual(res.floor_reference_rows, 1)
+        self.assertEqual(res.preflight_status, "BLOCKED")
+        self.assertIn("Zero publishable take-off rows present in workspace.", res.blocking_reasons)
 
     def test_8_excluded_rows_tracking(self):
         cur = self.conn.cursor()
@@ -242,20 +269,50 @@ class Phase6DPreflightTests(unittest.TestCase):
         self.assertEqual(res.excluded_takeoff_rows, 1)
         self.assertEqual(res.publishable_takeoff_rows, 1)
 
-    def test_9_measured_confirmed_zero_semantics(self):
+    def test_9_confirmed_measured_zero_vs_unmeasured_zero(self):
+        """0.0 quantity with 'Measured' status is a valid measured zero; 0.0 with 'to measure' is unmeasured zero."""
         cur = self.conn.cursor()
+        # Row 1003: Confirmed Measured Zero
         cur.execute(
             "INSERT INTO takeoff_rows (id, workspace_id, section, element, location, unit, quantity, quantity_status, confidence, inclusion_status, row_role) VALUES (1003, 1, 'Internal', 'Slab', 'G01', 'm²', 0.0, 'Measured', 'high', 'included', 'work')"
         )
+        # Row 1004: Unmeasured Zero
+        cur.execute(
+            "INSERT INTO takeoff_rows (id, workspace_id, section, element, location, unit, quantity, quantity_status, confidence, inclusion_status, row_role) VALUES (1004, 1, 'Internal', 'Beams', 'G01', 'm²', 0.0, 'to measure', 'low', 'included', 'work')"
+        )
         self.conn.commit()
+
         res = derive_export_preflight(self.app, 1, bridge_available=True)
-        self.assertEqual(res.measured_zero_rows, 1)
-        self.assertEqual(res.publishable_takeoff_rows, 2)
-        self.assertEqual(res.preflight_status, "AVAILABLE")
+        self.assertEqual(res.measured_zero_rows, 1) # Only Row 1003 counted as measured zero
+        self.assertEqual(res.publishable_takeoff_rows, 3)
+        self.assertEqual(res.preflight_status, "BLOCKED") # Unmeasured row 1004 blocks preflight
 
     def test_10_downstream_row_count_agreement(self):
+        """Phase 6D publishable_takeoff_rows agrees 100% with mature takeoff_work_rows() authority on mixed dataset."""
+        df_mixed = pd.DataFrame([
+            {"id": 1, "section": "Internal", "element": "Wall", "unit": "m²", "quantity": 100.0, "inclusion_status": "included", "row_role": "work"},
+            {"id": 2, "section": "Internal", "element": "Ceiling", "unit": "m²", "quantity": 80.0, "inclusion_status": "included", "row_role": "work"},
+            {"id": 3, "section": "Internal", "element": "Floor", "unit": "m²", "quantity": 80.0, "inclusion_status": "included", "row_role": "floor_area"},
+            {"id": 4, "section": "External", "element": "Cladding", "unit": "m²", "quantity": 50.0, "inclusion_status": "excluded", "row_role": "work"},
+        ])
+        work_df = takeoff_work_rows(df_mixed)
+        # takeoff_work_rows filters out row_role == 'floor_area' -> 3 rows remaining (included + excluded work rows)
+        self.assertEqual(len(work_df), 3)
+
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM takeoff_rows WHERE workspace_id=1")
+        for r in df_mixed.to_dict("records"):
+            cur.execute(
+                "INSERT INTO takeoff_rows (id, workspace_id, section, element, unit, quantity, inclusion_status, row_role, quantity_status) VALUES (?,1,?,?,?,?,?,?,'Measured')",
+                (r["id"], r["section"], r["element"], r["unit"], r["quantity"], r["inclusion_status"], r["row_role"])
+            )
+        self.conn.commit()
+
         res = derive_export_preflight(self.app, 1, bridge_available=True)
-        self.assertEqual(res.publishable_takeoff_rows, 1)
+        self.assertEqual(res.total_takeoff_rows, 4)
+        self.assertEqual(res.publishable_takeoff_rows, 2) # Included work rows
+        self.assertEqual(res.excluded_takeoff_rows, 1)
+        self.assertEqual(res.floor_reference_rows, 1)
 
     def test_11_missing_wrong_acknowledgement_fails(self):
         cur = self.conn.cursor()
@@ -355,21 +412,26 @@ class Phase6DPreflightTests(unittest.TestCase):
             )
         self.assertIn("JobHub database lock timeout", str(ctx.exception))
 
-    def test_19_partial_write_receipt_integrity(self):
-        """Downstream return indicating incomplete lines or un-updated job status is rejected."""
-        res = derive_export_preflight(self.app, 1, bridge_available=True)
-        mock_pub = MagicMock(return_value={"package_id": 50, "published": False, "job_id": 101})
+    def test_19_mandatory_side_effect_failures_handled(self):
+        """Directly verifies that each mandatory side effect failure in publish_job_to_jobhub raises an explicit RuntimeError."""
+        sample_takeoff = pd.DataFrame([{
+            "id": 1000, "section": "Internal", "element": "Wall", "location": "G01", "substrate": "Plasterboard",
+            "unit": "m²", "quantity": 150.0, "quantity_status": "Measured", "coats": 1, "rate_per_unit": 25.0, "labour_hours": 5.0,
+            "paint_litres": 10.0, "value_ex_gst": 100.0, "row_role": "work", "inclusion_status": "included"
+        }])
 
-        with self.assertRaises(RuntimeError) as ctx:
-            verify_toctou_and_publish_jobhub(
-                self.app, 1, bridge=MockJobHubBridge(), user_name="TestUser",
-                expected_fingerprint=res.preflight_fingerprint,
-                acknowledgement_confirmed=True, publish_fn=mock_pub
-            )
-        self.assertIn("partially failed", str(ctx.exception))
+        with patch("pb_planreader_3d_app.lquery", return_value=[{"id": 1, "job_no": "JOB-6D1", "job_name": "Test", "drawing_issue": "Rev A", "jobhub_job_id": 101, "file_name": "A-01.pdf"}]), \
+             patch("pb_planreader_3d_app.dataframe_for_takeoff", return_value=sample_takeoff), \
+             patch("pb_planreader_3d_app.quote_workbook_bytes", return_value=b"mock_excel"), \
+             patch("pb_planreader_3d_app.progress_package_bytes", return_value=b"mock_zip"):
+            for mandatory_effect in ["quote_blob", "progress_blob", "package_header", "package_lines", "job_status"]:
+                failing_bridge = MockJobHubBridge(fail_on={mandatory_effect})
+                with self.assertRaises(RuntimeError) as ctx:
+                    publish_job_to_jobhub(1, failing_bridge, "TestUser")
+                self.assertIn("Mandatory", str(ctx.exception))
 
-    def test_20_server_level_duplicate_submission_guard(self):
-        """Server-level guard rejects re-publishing package with matching fingerprint on same job."""
+    def test_20_server_level_duplicate_submission_and_fail_closed(self):
+        """Server-level guard rejects re-publishing package with matching fingerprint and fails closed on query error."""
         res = derive_export_preflight(self.app, 1, bridge_available=True)
         bridge = MockJobHubBridge()
         bridge.packages.append({
@@ -378,6 +440,7 @@ class Phase6DPreflightTests(unittest.TestCase):
             "notes": f"Published by PB PlanReader. Preflight Fingerprint: {res.preflight_fingerprint} | Payload Hash: {res.payload_hash}"
         })
 
+        # 1. Existing duplicate rejected
         with self.assertRaises(RuntimeError) as ctx:
             verify_toctou_and_publish_jobhub(
                 self.app, 1, bridge=bridge, user_name="TestUser",
@@ -385,6 +448,16 @@ class Phase6DPreflightTests(unittest.TestCase):
                 acknowledgement_confirmed=True, publish_fn=MagicMock()
             )
         self.assertIn("already been published to JobHub", str(ctx.exception))
+
+        # 2. Duplicate authority query failure fails closed
+        failing_bridge = MockJobHubBridge(fail_on={"query_fail"})
+        with self.assertRaises(RuntimeError) as ctx:
+            verify_toctou_and_publish_jobhub(
+                self.app, 1, bridge=failing_bridge, user_name="TestUser",
+                expected_fingerprint=res.preflight_fingerprint,
+                acknowledgement_confirmed=True, publish_fn=MagicMock()
+            )
+        self.assertIn("Duplicate verification failed closed", str(ctx.exception))
 
     def test_21_deterministic_ordering_fingerprint(self):
         """Signal and row ordering alone does not change canonical review or preflight fingerprints."""
@@ -412,8 +485,8 @@ class Phase6DPreflightTests(unittest.TestCase):
         rows_data = []
         for idx in range(2000, 3000):
             rows_data.append((
-                idx, 1, 'Internal', f'Wall-{idx}', f'Room-{idx%50}', 'Plasterboard', 'm²', 25.5,
-                1.0, 25.0, 5.0, 10.0, 100.0, 'PT01', 12.0, 20.0, 'Measured', 'high', 'included',
+                idx, 1, 'Internal', f'Wall-{idx}', f'Room-{idx%50}', 'Plasterboard', 'm²', 25.5, 'Measured',
+                1.0, 25.0, 5.0, 10.0, 100.0, 'PT01', 12.0, 20.0, 'high', 'included',
                 'work', 'Page A-101', 'Ref-101', 'Notes'
             ))
         cur.executemany(
@@ -430,12 +503,17 @@ class Phase6DPreflightTests(unittest.TestCase):
         self.assertEqual(res.publishable_takeoff_rows, 1001)
 
     def test_23_genuine_spies_no_ai_ocr_geometry_rebuild(self):
-        """Spy proving Phase 6D preflight calls zero AI, zero OCR, and zero geometry rebuild functions."""
-        with patch("pb_commercial_export_preflight_v163.collect_commercial_review_signals") as mock_review:
-            mock_review.return_value = CommercialReviewResult(workspace_id=1, source_coverage={"takeoff": "AVAILABLE", "register": "AVAILABLE", "scale": "AVAILABLE"})
+        """Genuine spies proving preflight calls 0 AI, 0 OCR/PDF, and 0 3D geometry rebuild entry points."""
+        with patch("pb_planreader_3d_app.import_ai_result") as spy_ai, \
+             patch("pb_planreader_3d_app._ai_page_bytes") as spy_pdf, \
+             patch("pb_planreader_3d_app.generate_obj") as spy_geom:
+
             res = derive_export_preflight(self.app, 1, bridge_available=True)
-            mock_review.assert_called_once()
-            self.assertEqual(res.total_review_items, 0)
+
+            self.assertEqual(res.preflight_status, "AVAILABLE")
+            spy_ai.assert_not_called()
+            spy_pdf.assert_not_called()
+            spy_geom.assert_not_called()
 
 
 if __name__ == "__main__":
