@@ -6396,12 +6396,6 @@ def settings_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],session_
 
 def main() -> None:
     st.set_page_config(page_title=APP_NAME,page_icon="🏗️",layout="wide")
-    if "reset" in st.query_params:
-        st.query_params.clear()
-        user = st.session_state.get("planreader_user") or {"username": "Estimator", "role": "Estimator"}
-        st.session_state.clear()
-        st.session_state["planreader_user"] = user
-        st.session_state["workspace_id"] = 1
     app_css()
     init_local_db()
     bridge=get_jobhub_bridge()
