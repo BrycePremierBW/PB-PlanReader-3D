@@ -5846,6 +5846,12 @@ def export_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],user:Dict[
     finally:
         conn.close()
 
+    # Workspace switch / Fingerprint invalidation check for acknowledgement state
+    if st.session_state.get("_pb_ack_workspace_id") != wid or st.session_state.get("_pb_ack_fp") != preflight.preflight_fingerprint:
+        st.session_state["_pb_ack_workspace_id"] = wid
+        st.session_state["_pb_ack_fp"] = preflight.preflight_fingerprint
+        st.session_state["_pb_ack_confirmed"] = False
+
     # --- PHASE 6D COMMERCIAL EXPORT PREFLIGHT CARD ---
     st.markdown("<div class='pb-card'>", unsafe_allow_html=True)
     st.subheader("Commercial Export Preflight & QA Integrity (Phase 6D)")
@@ -5872,7 +5878,7 @@ def export_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],user:Dict[
     c1.metric("Blockers", preflight.blocker_count)
     c2.metric("Warnings", preflight.warning_count)
     c3.metric("Publishable Rows", preflight.publishable_takeoff_rows)
-    c4.metric("Excluded Rows", preflight.excluded_takeoff_rows)
+    c4.metric("Excluded / Floor Rows", preflight.excluded_takeoff_rows + preflight.floor_reference_rows)
 
     if preflight.blocking_reasons:
         st.markdown("<div style='background:#3B1717; border-left:4px solid #B33A3A; padding:12px; border-radius:4px; margin-top:12px;'>", unsafe_allow_html=True)
@@ -5964,6 +5970,10 @@ def export_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],user:Dict[
     elif preflight.final_publish_state == "BLOCKED":
         st.error("Final publish is BLOCKED by preflight QA gate. Correct the blocker items above before publishing.")
         st.button("Publish to JobHub", type="primary", disabled=True)
+    elif st.session_state.get("_pb_last_published_fp") == preflight.preflight_fingerprint:
+        # Duplicate submission protection
+        st.info(f"Package for preflight fingerprint {preflight.preflight_fingerprint[:12]}... has already been published to JobHub.")
+        st.button("Publish to JobHub", type="primary", disabled=True)
     else:
         st.markdown("<div class='pb-warning'>Publishes final take-off package (status <b>Published</b>), priced Excel quotation and progress package, syncs take-off rows live, and marks shared JobHub job as <b>Published</b>. Only do this when quantities, drawing revision and pricing are final.</div>", unsafe_allow_html=True)
 
@@ -5984,6 +5994,7 @@ def export_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],user:Dict[
                     )
                 finally:
                     c2.close()
+                st.session_state["_pb_last_published_fp"] = res["preflight_fingerprint"]
                 st.success(f"Published job #{res['job_id']}: final package #{res['package_id']} ({res['package_lines']} lines), quotation '{res['quotation']}' and progress marker '{res['progress_marker']}' stored. JobHub status: {res.get('job_status', 'Published')}.")
             except Exception as exc:
                 st.error(f"Publish Aborted: {exc}")

@@ -382,27 +382,28 @@ def collect_register_review_signals(app: Any, workspace_id: int) -> List[Commerc
 
 
 def collect_scale_review_signals(app: Any, workspace_id: int) -> Tuple[List[CommercialReviewSignal], str]:
-    """Derive review signals strictly from scale gate issues. Supports app or DB connection."""
+    """Derive review signals strictly from scale gate issues."""
     signals: List[CommercialReviewSignal] = []
 
-    issues = None
     if hasattr(app, "scale_gate_issues") and callable(getattr(app, "scale_gate_issues")):
         try:
             issues = app.scale_gate_issues(int(workspace_id))
+            if not isinstance(issues, list):
+                return signals, "UNAVAILABLE"
         except Exception:
             return signals, "UNAVAILABLE"
-    elif hasattr(app, "execute") or hasattr(app, "cursor"):
-        # Direct DB connection passed as app
-        conn = app
-        cur = conn.cursor()
-        cur.execute("SELECT id, page_label, px_per_m FROM pages WHERE workspace_id=? AND selected=1 AND (px_per_m IS NULL OR px_per_m <= 0 OR px_per_m = 1.0)", (workspace_id,))
-        rows = cur.fetchall()
-        issues = [{"page_id": r[0], "page_label": r[1] or f"Page #{r[0]}", "reason": "Selected drawing page requires scale calibration"} for r in rows]
-
-    if issues is None:
+    elif hasattr(app, "execute") or hasattr(app, "cursor") or app is None:
+        try:
+            from pb_planreader_3d_app import scale_gate_issues as _authoritative_scale_gate
+            issues = _authoritative_scale_gate(int(workspace_id))
+        except Exception:
+            return signals, "NOT_SUPPORTED"
+    else:
         return signals, "NOT_SUPPORTED"
 
     for issue in issues:
+
+
 
         if not isinstance(issue, dict):
             continue
