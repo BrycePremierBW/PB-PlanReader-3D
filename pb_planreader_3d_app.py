@@ -1,4 +1,6 @@
 from __future__ import annotations
+import html
+from pb_commercial_export_preflight_v163 import derive_export_preflight, verify_toctou_and_publish_jobhub
 
 import base64
 import csv
@@ -5837,82 +5839,155 @@ def quantity_schedule_page(workspace:Dict[str,Any]) -> None:
 
 def export_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],user:Dict[str,Any]) -> None:
     hero(workspace)
-    st.markdown("<div class='pb-card'>",unsafe_allow_html=True)
+    wid = int(workspace["id"])
+    conn = local_connect()
+    try:
+        preflight = derive_export_preflight(conn, wid, bridge_available=bool(bridge and workspace.get("jobhub_job_id")))
+    finally:
+        conn.close()
+
+    # --- PHASE 6D COMMERCIAL EXPORT PREFLIGHT CARD ---
+    st.markdown("<div class='pb-card'>", unsafe_allow_html=True)
+    st.subheader("Commercial Export Preflight & QA Integrity (Phase 6D)")
+
+    status_colors = {
+        "AVAILABLE": "#2E8B57",
+        "AVAILABLE_WITH_WARNING": "#D7A21B",
+        "BLOCKED": "#B33A3A",
+        "UNAVAILABLE": "#737373",
+    }
+    badge_color = status_colors.get(preflight.preflight_status, "#737373")
+
+    st.markdown(
+        f"<div style='display:flex; justify-content:space-between; align-items:center; background:#262626; padding:12px 16px; border-radius:6px; margin-bottom:16px;'>"
+        f"<div><span style='font-size:0.85rem; color:#A3A3A3;'>PREFLIGHT STATUS</span><br/>"
+        f"<strong style='font-size:1.2rem; color:{badge_color};'>{html.escape(preflight.preflight_status)}</strong></div>"
+        f"<div style='text-align:right;'><span style='font-size:0.85rem; color:#A3A3A3;'>PREFLIGHT FINGERPRINT</span><br/>"
+        f"<code style='color:#F7F2E8;'>{preflight.preflight_fingerprint[:12]}...</code></div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Blockers", preflight.blocker_count)
+    c2.metric("Warnings", preflight.warning_count)
+    c3.metric("Publishable Rows", preflight.publishable_takeoff_rows)
+    c4.metric("Excluded Rows", preflight.excluded_takeoff_rows)
+
+    if preflight.blocking_reasons:
+        st.markdown("<div style='background:#3B1717; border-left:4px solid #B33A3A; padding:12px; border-radius:4px; margin-top:12px;'>", unsafe_allow_html=True)
+        st.markdown("<strong style='color:#FCA5A5;'>BLOCKING ISSUES (Publish Prohibited):</strong>", unsafe_allow_html=True)
+        for r in preflight.blocking_reasons:
+            st.markdown(f"- <span style='color:#FECACA;'>{html.escape(r)}</span>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if preflight.warnings:
+        st.markdown("<div style='background:#332914; border-left:4px solid #D7A21B; padding:12px; border-radius:4px; margin-top:12px;'>", unsafe_allow_html=True)
+        st.markdown("<strong style='color:#FDE68A;'>QA WARNINGS (Review Required):</strong>", unsafe_allow_html=True)
+        for w in preflight.warnings:
+            st.markdown(f"- <span style='color:#FEF3C7;'>{html.escape(w)}</span>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # --- COMPLETE TAKE-OFF PACK ---
+    st.markdown("<div class='pb-card'>", unsafe_allow_html=True)
     st.subheader("Complete take-off pack")
-    excel=excel_export_bytes(int(workspace["id"]))
-    package=zip_export_bytes(int(workspace["id"]))
-    st.download_button("Download subscription-style Excel take-off pack",excel,file_name=f"{safe_name(workspace.get('job_no'))}_paint_takeoff.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
-    st.download_button("Download complete plans + take-off + 3D package",package,file_name=f"{safe_name(workspace.get('job_no'))}_planreader_3d_package.zip",mime="application/zip",use_container_width=True)
-    st.markdown("</div>",unsafe_allow_html=True)
-    st.markdown("<div class='pb-card'>",unsafe_allow_html=True)
+    excel = excel_export_bytes(wid)
+    package = zip_export_bytes(wid)
+    st.download_button("Download subscription-style Excel take-off pack", excel, file_name=f"{safe_name(workspace.get('job_no'))}_paint_takeoff.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    st.download_button("Download complete plans + take-off + 3D package", package, file_name=f"{safe_name(workspace.get('job_no'))}_planreader_3d_package.zip", mime="application/zip", use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # --- SEND REVIEWED DRAFT TO JOBHUB ---
+    st.markdown("<div class='pb-card'>", unsafe_allow_html=True)
     st.subheader("Send reviewed draft to JobHub")
     if not bridge or not workspace.get("jobhub_job_id"):
         st.info("Link this workspace to a JobHub job to send an approved draft back.")
     else:
-        st.markdown("<div class='pb-warning'>This creates a new draft take-off package in JobHub. It does not overwrite previous packages. Review quantities and drawing revision first.</div>",unsafe_allow_html=True)
-        confirmed=st.checkbox("I have reviewed the take-off and source references")
-        if st.button("Create draft take-off package in JobHub",type="primary",disabled=not confirmed):
+        st.markdown("<div class='pb-warning'>This creates a new draft take-off package in JobHub. It does not overwrite previous packages. Review quantities and drawing revision first.</div>", unsafe_allow_html=True)
+        confirmed = st.checkbox("I have reviewed the take-off and source references")
+        if st.button("Create draft take-off package in JobHub", type="primary", disabled=not confirmed or preflight.draft_handoff_state == "UNAVAILABLE"):
             try:
-                package_id,line_count=push_takeoff_to_jobhub(int(workspace["id"]),bridge,str(user.get("username") or "PlanReader"))
+                package_id, line_count = push_takeoff_to_jobhub(wid, bridge, str(user.get("username") or "PlanReader"))
                 st.success(f"Created JobHub take-off package #{package_id} with {line_count} lines.")
             except Exception as exc:
                 st.exception(exc)
-    st.markdown("</div>",unsafe_allow_html=True)
-    st.markdown("<div class='pb-card'>",unsafe_allow_html=True)
-    st.subheader("One-file progress marker → JobHub")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # --- ONE-FILE PROGRESS MARKER ---
+    st.markdown("<div class='pb-card'>", unsafe_allow_html=True)
+    st.subheader("One-file progress marker -> JobHub")
     if not bridge or not workspace.get("jobhub_job_id"):
         st.info("Link this workspace to a JobHub job to send the progress marker (3D render + take-off + job documents in one file).")
     else:
-        st.markdown("<div class='pb-note'>Builds a single ZIP: the interactive 3D render, OBJ + geometry, the Excel take-off pack, take-off CSVs (including JobHub's shared format), scope registers, source plans and rendered page previews. The ZIP is stored on the job in JobHub as a <b>Progress Marker</b>, take-off rows are synced live into <code>job_takeoff_rows</code>, and a draft take-off package is created alongside.</div>",unsafe_allow_html=True)
-        confirmed=st.checkbox("I have reviewed the take-off, drawing revision and 3D geometry")
-        if st.button("Build & send progress marker to JobHub",type="primary",disabled=not confirmed):
+        st.markdown("<div class='pb-note'>Builds a single ZIP: the interactive 3D render, OBJ + geometry, the Excel take-off pack, take-off CSVs, scope registers, source plans and rendered page previews. Stored on the job in JobHub as a Progress Marker.</div>", unsafe_allow_html=True)
+        confirmed = st.checkbox("I have reviewed the take-off, drawing revision and 3D geometry")
+        if st.button("Build & send progress marker to JobHub", type="primary", disabled=not confirmed):
             try:
-                result=push_progress_marker_to_jobhub(int(workspace["id"]),bridge,str(user.get("username") or "PlanReader"))
-                st.success(f"Sent {result['file_name']} ({result['size_bytes']/1024:.0f} KB) to JobHub job #{result['job_id']} as a progress marker; {result['takeoff_rows_synced']} take-off rows synced live and draft package #{result['package_id']} created ({result['package_lines']} lines).")
+                result = push_progress_marker_to_jobhub(wid, bridge, str(user.get("username") or "PlanReader"))
+                st.success(f"Sent {result['file_name']} ({result['size_bytes']/1024:.0f} KB) to JobHub job #{result['job_id']} as a progress marker.")
             except Exception as exc:
                 st.exception(exc)
         st.markdown("#### Progress markers already on this job")
         try:
-            markers=list_jobhub_progress_markers(bridge,int(workspace.get("jobhub_job_id")))
+            markers = list_jobhub_progress_markers(bridge, int(workspace.get("jobhub_job_id")))
         except Exception:
-            markers=[]
+            markers = []
         if markers:
-            st.dataframe(pd.DataFrame(markers),use_container_width=True,hide_index=True)
+            st.dataframe(pd.DataFrame(markers), use_container_width=True, hide_index=True)
         else:
             st.caption("No progress markers sent yet for this job.")
-    st.markdown("</div>",unsafe_allow_html=True)
-    st.markdown("<div class='pb-card'>",unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # --- IMPORT TAKE-OFF FROM JOBHUB ---
+    st.markdown("<div class='pb-card'>", unsafe_allow_html=True)
     st.subheader("Import take-off from JobHub")
     if not bridge or not workspace.get("jobhub_job_id"):
         st.info("Link this workspace to a JobHub job to pull take-off rows already stored in JobHub.")
     else:
-        st.markdown("<div class='pb-note'>Pulls the job's take-off rows from the shared JobHub database. Imported rows are tagged and replaced on re-import; existing rows created here are kept.</div>",unsafe_allow_html=True)
-        if st.button("Pull take-off rows from JobHub",type="primary"):
+        st.markdown("<div class='pb-note'>Pulls the job's take-off rows from the shared JobHub database. Imported rows are tagged and replaced on re-import.</div>", unsafe_allow_html=True)
+        if st.button("Pull take-off rows from JobHub", type="primary"):
             try:
-                n=pull_takeoff_from_jobhub(int(workspace["id"]),bridge)
+                n = pull_takeoff_from_jobhub(wid, bridge)
                 st.success(f"Imported {n} take-off row(s) from JobHub." if n else "JobHub has no take-off rows for this job.")
                 st.rerun()
             except Exception as exc:
                 st.exception(exc)
-    st.markdown("</div>",unsafe_allow_html=True)
-    st.markdown("<div class='pb-card'>",unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # --- PUBLISH FINAL TAKE-OFF TO JOBHUB (PHASE 6D PREFLIGHT PROTECTED) ---
+    st.markdown("<div class='pb-card'>", unsafe_allow_html=True)
     st.subheader("Publish final take-off to JobHub")
     if not bridge or not workspace.get("jobhub_job_id"):
         st.info("Link this workspace to a JobHub job to publish the final take-off and quotation.")
+    elif preflight.final_publish_state == "BLOCKED":
+        st.error("Final publish is BLOCKED by preflight QA gate. Correct the blocker items above before publishing.")
+        st.button("Publish to JobHub", type="primary", disabled=True)
     else:
-        st.markdown("<div class='pb-warning'>Publishes the final take-off package (status <b>Published</b>), the priced Excel quotation and the progress package, syncs take-off rows live, and marks the shared JobHub job as <b>Published</b>. Only do this when quantities, drawing revision and pricing are final.</div>",unsafe_allow_html=True)
-        scale_issues=scale_gate_issues(int(workspace["id"]))
-        if scale_issues:
-            st.warning("**Scale gate:** " + ", ".join(f"`{i['page_label']}`" for i in scale_issues[:8]) + " has no calibrated scale — calibrate before publishing.")
-        publish_confirm=st.checkbox("I confirm this is the final, reviewed and priced take-off for the current drawing issue")
-        if st.button("Publish to JobHub",type="primary",disabled=not publish_confirm or bool(scale_issues)):
-            try:
-                result=publish_job_to_jobhub(int(workspace["id"]),bridge,str(user.get("username") or "PlanReader"))
-                st.success(f"Published job #{result['job_id']}: final package #{result['package_id']} ({result['package_lines']} lines), quotation '{result['quotation']}' and progress marker '{result['progress_marker']}' stored; {result['takeoff_rows_synced']} take-off rows synced. JobHub status: {result['job_status']}.")
-            except Exception as exc:
-                st.exception(exc)
-    st.markdown("</div>",unsafe_allow_html=True)
+        st.markdown("<div class='pb-warning'>Publishes final take-off package (status <b>Published</b>), priced Excel quotation and progress package, syncs take-off rows live, and marks shared JobHub job as <b>Published</b>. Only do this when quantities, drawing revision and pricing are final.</div>", unsafe_allow_html=True)
 
+        need_ack = (preflight.final_publish_state == "AVAILABLE_WITH_WARNING")
+        if need_ack:
+            st.warning("Preflight QA warnings present. Typed acknowledgement required before final publication.")
+            publish_confirm = st.checkbox(f"I confirm I have reviewed preflight fingerprint {preflight.preflight_fingerprint[:12]}... and approve final publication for drawing issue {html.escape(workspace.get('drawing_issue') or '')}")
+        else:
+            publish_confirm = st.checkbox("I confirm this is the final, reviewed and priced take-off for the current drawing issue")
+
+        if st.button("Publish to JobHub", type="primary", disabled=not publish_confirm):
+            try:
+                c2 = local_connect()
+                try:
+                    res = verify_toctou_and_publish_jobhub(
+                        c2, wid, bridge, str(user.get("username") or "PlanReader"),
+                        preflight.preflight_fingerprint, publish_confirm, publish_job_to_jobhub
+                    )
+                finally:
+                    c2.close()
+                st.success(f"Published job #{res['job_id']}: final package #{res['package_id']} ({res['package_lines']} lines), quotation '{res['quotation']}' and progress marker '{res['progress_marker']}' stored. JobHub status: {res.get('job_status', 'Published')}.")
+            except Exception as exc:
+                st.error(f"Publish Aborted: {exc}")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Offline Plan Reader (no AI)

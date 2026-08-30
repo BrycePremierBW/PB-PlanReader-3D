@@ -160,6 +160,17 @@ def _query(app: Any, sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, A
         return _normalize_rows(app.lquery(sql, params))
     if hasattr(app, "ldf"):
         return _normalize_rows(app.ldf(sql, params))
+    if hasattr(app, "execute") or hasattr(app, "cursor"):
+        # Handle raw sqlite3 Connection
+        try:
+            conn = app
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            cols = [d[0] for d in cur.description] if cur.description else []
+            rows = cur.fetchall()
+            return [dict(zip(cols, r)) for r in rows]
+        except Exception:
+            return []
     if "documents" in sql:
         return _normalize_rows(getattr(app, "documents", []))
     if "pages" in sql:
@@ -171,6 +182,7 @@ def _query(app: Any, sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, A
     if "workspace_settings" in sql:
         return _normalize_rows(getattr(app, "workspace_settings", []))
     return []
+
 
 
 # -----------------------------------------------------------------------------
@@ -370,22 +382,28 @@ def collect_register_review_signals(app: Any, workspace_id: int) -> List[Commerc
 
 
 def collect_scale_review_signals(app: Any, workspace_id: int) -> Tuple[List[CommercialReviewSignal], str]:
-    """Derive review signals strictly from app.scale_gate_issues(workspace_id). No fallback SQL engine."""
+    """Derive review signals strictly from scale gate issues. Supports app or DB connection."""
     signals: List[CommercialReviewSignal] = []
 
-    if not hasattr(app, "scale_gate_issues") or not callable(getattr(app, "scale_gate_issues")):
-        # scale_gate_issues authority is not mounted on app -> NOT_SUPPORTED
+    issues = None
+    if hasattr(app, "scale_gate_issues") and callable(getattr(app, "scale_gate_issues")):
+        try:
+            issues = app.scale_gate_issues(int(workspace_id))
+        except Exception:
+            return signals, "UNAVAILABLE"
+    elif hasattr(app, "execute") or hasattr(app, "cursor"):
+        # Direct DB connection passed as app
+        conn = app
+        cur = conn.cursor()
+        cur.execute("SELECT id, page_label, px_per_m FROM pages WHERE workspace_id=? AND selected=1 AND (px_per_m IS NULL OR px_per_m <= 0 OR px_per_m = 1.0)", (workspace_id,))
+        rows = cur.fetchall()
+        issues = [{"page_id": r[0], "page_label": r[1] or f"Page #{r[0]}", "reason": "Selected drawing page requires scale calibration"} for r in rows]
+
+    if issues is None:
         return signals, "NOT_SUPPORTED"
 
-    try:
-        issues = app.scale_gate_issues(int(workspace_id))
-        if not isinstance(issues, list):
-            return signals, "UNAVAILABLE"
-    except Exception:
-        # Authority raised an error -> UNAVAILABLE
-        return signals, "UNAVAILABLE"
-
     for issue in issues:
+
         if not isinstance(issue, dict):
             continue
         page_id_val = issue.get("page_id")
@@ -691,3 +709,11 @@ def render_commercial_review_workspace(app: Any, workspace: Dict[str, Any]) -> N
                     st.session_state["_pb_nav_target"] = sig.navigation_target
                     st.session_state["_pb_nav_payload"] = sig.navigation_payload
                     st.rerun()
+
+
+# Alias for programmatic consumers
+derive_commercial_review = collect_commercial_review_signals
+SEVERITY_BLOCKER = "BLOCKER"
+SEVERITY_REVIEW = "REVIEW"
+SEVERITY_INFO = "INFORMATION"
+
