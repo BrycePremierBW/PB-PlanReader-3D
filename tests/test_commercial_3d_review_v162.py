@@ -4,12 +4,20 @@ import pb_3d_workspace_integration as integration
 
 
 class FakeStreamlit:
-    def __init__(self, *, checkbox_value: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        checkbox_value: bool = False,
+        user: dict | None = None,
+    ) -> None:
         self.checkbox_value = checkbox_value
         self.markdowns: list[str] = []
         self.captions: list[str] = []
         self.warnings: list[str] = []
         self.checkbox_calls: list[dict] = []
+        self.session_state = {}
+        if user is not None:
+            self.session_state["planreader_user"] = dict(user)
 
     def markdown(self, text, **kwargs):
         self.markdowns.append(str(text))
@@ -57,10 +65,20 @@ def test_legacy_editor_feature_flag_accepts_only_explicit_truthy_values(monkeypa
         assert integration.legacy_editor_feature_enabled() is False
 
 
+def test_legacy_editor_user_authorization_is_fail_closed(monkeypatch):
+    for user in (None, {}, {"role": "estimator"}, {"role": "manager"}, {"role": ""}):
+        monkeypatch.setattr(integration, "st", FakeStreamlit(user=user))
+        assert integration.legacy_editor_user_authorized() is False
+
+    for role in ("admin", "ADMIN", " developer "):
+        monkeypatch.setattr(integration, "st", FakeStreamlit(user={"role": role}))
+        assert integration.legacy_editor_user_authorized() is True
+
+
 def test_default_commercial_3d_page_preserves_header_and_never_calls_legacy(monkeypatch):
     events: list[str] = []
     app = FakeApp(events)
-    fake_st = FakeStreamlit()
+    fake_st = FakeStreamlit(user={"role": "estimator"})
     monkeypatch.setattr(integration, "st", fake_st)
     monkeypatch.delenv(integration.LEGACY_EDITOR_ENV, raising=False)
     monkeypatch.setattr(
@@ -78,10 +96,30 @@ def test_default_commercial_3d_page_preserves_header_and_never_calls_legacy(monk
     assert fake_st.checkbox_calls == []
 
 
-def test_environment_flag_alone_is_not_enough_to_run_legacy_editor(monkeypatch):
+def test_environment_flag_does_not_expose_legacy_editor_to_non_privileged_user(monkeypatch):
     events: list[str] = []
     app = FakeApp(events)
-    fake_st = FakeStreamlit(checkbox_value=False)
+    fake_st = FakeStreamlit(checkbox_value=True, user={"role": "estimator"})
+    monkeypatch.setattr(integration, "st", fake_st)
+    monkeypatch.setenv(integration.LEGACY_EDITOR_ENV, "1")
+    monkeypatch.setattr(
+        integration,
+        "render_workspace_3d_canonical_view",
+        lambda app_arg, workspace_arg=None: events.append("canonical"),
+    )
+
+    integration.apply(app)
+    app.model_3d_page({"id": 201})
+
+    assert events == ["hero", "canonical"]
+    assert app.legacy_calls == 0
+    assert fake_st.checkbox_calls == []
+
+
+def test_privileged_environment_flag_alone_is_not_enough_to_run_legacy_editor(monkeypatch):
+    events: list[str] = []
+    app = FakeApp(events)
+    fake_st = FakeStreamlit(checkbox_value=False, user={"role": "admin"})
     monkeypatch.setattr(integration, "st", fake_st)
     monkeypatch.setenv(integration.LEGACY_EDITOR_ENV, "1")
     monkeypatch.setattr(
@@ -100,10 +138,10 @@ def test_environment_flag_alone_is_not_enough_to_run_legacy_editor(monkeypatch):
     assert fake_st.checkbox_calls[0]["key"] == "legacy_3d_editor_opt_in_202"
 
 
-def test_explicit_developer_opt_in_runs_legacy_only_after_header_and_canonical(monkeypatch):
+def test_explicit_privileged_developer_opt_in_runs_legacy_after_header_and_canonical(monkeypatch):
     events: list[str] = []
     app = FakeApp(events)
-    fake_st = FakeStreamlit(checkbox_value=True)
+    fake_st = FakeStreamlit(checkbox_value=True, user={"role": "admin"})
     monkeypatch.setattr(integration, "st", fake_st)
     monkeypatch.setenv(integration.LEGACY_EDITOR_ENV, "true")
     monkeypatch.setattr(
