@@ -44,7 +44,7 @@ from pb_planreader_3d_app import publish_job_to_jobhub, takeoff_work_rows
 
 
 def _create_mock_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
     cur = conn.cursor()
     cur.executescript(
         """
@@ -154,24 +154,38 @@ class MockJobHubBridge:
             raise RuntimeError("Mandatory job status update failed: Simulated job status failure")
 
         if "INSERT INTO painting_takeoff_packages" in sql:
+            if "WHERE NOT EXISTS" in sql:
+                takeoff_no_param = params[1]
+                fp_pattern = params[-1]
+                fp_clean = str(fp_pattern).strip("%") if isinstance(fp_pattern, str) else ""
+                for pkg in self.packages:
+                    st = str(pkg.get("status") or "")
+                    if st in ("Published", "Pending"):
+                        pkg_tno = str(pkg.get("takeoff_no") or "")
+                        pkg_notes = str(pkg.get("notes") or "")
+                        if pkg_tno == str(takeoff_no_param) or (fp_clean and fp_clean in pkg_notes):
+                            return None
             pkg_id = self.next_pkg_id
             self.next_pkg_id += 1
             self.packages.append({
                 "id": pkg_id,
                 "takeoff_no": params[1] if len(params)>1 else f"PR-PKG-{pkg_id}",
                 "status": params[3] if len(params)>3 else "Pending",
-                "notes": params[-1] if params else ""
+                "notes": params[15] if len(params)>15 else (params[-1] if params else "")
             })
+            return pkg_id
         elif "UPDATE painting_takeoff_packages SET status=" in sql or "UPDATE painting_takeoff_packages SET status=?" in sql:
+            if "cleanup_fail" in self.fail_on:
+                raise RuntimeError("Simulated status cleanup transition failure")
             pkg_id = params[-1] if len(params) > 0 else None
             for pkg in self.packages:
                 if pkg_id is None or pkg["id"] == pkg_id or pkg["status"] == "Pending":
                     if "SET status='Published'" in sql:
                         pkg["status"] = "Published"
                         pkg["notes"] = params[0] if params else ""
-                    elif "SET status='Failed'" in sql:
+                    elif "SET status='Failed'" in sql or (len(params) >= 2 and params[0] == "Failed"):
                         pkg["status"] = "Failed"
-                        pkg["notes"] = params[0] if params else ""
+                        pkg["notes"] = params[1] if len(params) >= 2 else (params[0] if params else "")
                     elif len(params) >= 2:
                         pkg["status"] = params[0]
                         pkg["notes"] = params[1]
@@ -182,6 +196,8 @@ class MockJobHubBridge:
         if "query_fail" in self.fail_on and "painting_takeoff_packages" in sql:
             raise sqlite3.OperationalError("Simulated JobHub package query failure")
         if "painting_takeoff_packages" in sql:
+            if "status='Pending'" in sql:
+                return [p for p in self.packages if p.get("status") == "Pending"]
             return self.packages
         return []
 
@@ -463,8 +479,15 @@ class Phase6DPreflightTests(unittest.TestCase):
             self.assertTrue(res["published"])
             self.assertEqual(res["job_status"], "Published")
 
+            # Cleanup transition failure test: ensure failure during Pending->Failed cleanup surfaces error honestly
+            cleanup_fail_bridge = MockJobHubBridge(fail_on={"package_lines", "cleanup_fail"})
+            with self.assertRaises(RuntimeError) as ctx_clean:
+                publish_job_to_jobhub(1, cleanup_fail_bridge, "TestUser", "fp_123", "hash_456")
+            self.assertIn("cleanup transition to Failed also failed", str(ctx_clean.exception))
+
     def test_20_concurrent_duplicate_submission_and_fail_closed(self):
-        """Interleaved same-fingerprint publish attempts prove max 1 can reach Published, and query error fails closed."""
+        """Genuine multi-threaded concurrent interleaving race test proving max 1 publish attempt can acquire atomic reservation."""
+        import threading
         res = derive_export_preflight(self.app, 1, bridge_available=True)
         bridge = MockJobHubBridge()
 
@@ -481,31 +504,41 @@ class Phase6DPreflightTests(unittest.TestCase):
                 payload_hash=payload_hash or res.payload_hash
             )
 
-        with patch("pb_planreader_3d_app.lquery", return_value=[{"id": 1, "job_no": "JOB-6D1", "job_name": "Test", "drawing_issue": "Rev A", "jobhub_job_id": 101, "file_name": "A-01.pdf"}]), \
-             patch("pb_planreader_3d_app.dataframe_for_takeoff", return_value=sample_takeoff), \
-             patch("pb_planreader_3d_app.quote_workbook_bytes", return_value=b"mock_excel"), \
-             patch("pb_planreader_3d_app.progress_package_bytes", return_value=b"mock_zip"):
+        results = []
+        errors = []
 
-            # First attempt publishes package successfully
-            res1 = verify_toctou_and_publish_jobhub(
-                self.app, 1, bridge=bridge, user_name="User1",
-                expected_fingerprint=res.preflight_fingerprint,
-                acknowledgement_confirmed=True, publish_fn=custom_publish_fn
-            )
-            self.assertTrue(res1["published"])
+        def worker_publish(user_name):
+            try:
+                with patch("pb_planreader_3d_app.lquery", return_value=[{"id": 1, "job_no": "JOB-6D1", "job_name": "Test", "drawing_issue": "Rev A", "jobhub_job_id": 101, "file_name": "A-01.pdf"}]), \
+                     patch("pb_planreader_3d_app.dataframe_for_takeoff", return_value=sample_takeoff), \
+                     patch("pb_planreader_3d_app.quote_workbook_bytes", return_value=b"mock_excel"), \
+                     patch("pb_planreader_3d_app.progress_package_bytes", return_value=b"mock_zip"):
+                    out = verify_toctou_and_publish_jobhub(
+                        self.app, 1, bridge=bridge, user_name=user_name,
+                        expected_fingerprint=res.preflight_fingerprint,
+                        acknowledgement_confirmed=True, publish_fn=custom_publish_fn
+                    )
+                    results.append(out)
+            except Exception as exc:
+                errors.append(exc)
 
-            # Concurrent/second attempt with same fingerprint is rejected
-            with self.assertRaises(RuntimeError) as ctx:
-                verify_toctou_and_publish_jobhub(
-                    self.app, 1, bridge=bridge, user_name="User2",
-                    expected_fingerprint=res.preflight_fingerprint,
-                    acknowledgement_confirmed=True, publish_fn=custom_publish_fn
-                )
-            self.assertIn("already", str(ctx.exception))
+        # Launch 2 concurrent threads simultaneously
+        t1 = threading.Thread(target=worker_publish, args=("User1",))
+        t2 = threading.Thread(target=worker_publish, args=("User2",))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
 
-            # Exactly 1 package reached Published status
-            published_pkgs = [p for p in bridge.packages if p["status"] == "Published"]
-            self.assertEqual(len(published_pkgs), 1)
+        # Exactly 1 thread succeeded and 1 thread failed with duplicate error
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0]["published"])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("already", str(errors[0]))
+
+        # Exactly 1 package reached Published status
+        published_pkgs = [p for p in bridge.packages if p["status"] == "Published"]
+        self.assertEqual(len(published_pkgs), 1)
 
         # Duplicate authority query failure fails closed
         failing_bridge = MockJobHubBridge(fail_on={"query_fail"})
