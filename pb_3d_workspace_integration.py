@@ -30,8 +30,14 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from pb_bim_viewer import generate_bim_viewer_html, project_to_viewer_payload
-from pb_canonical_persistence import load_workspace_canonical_model, save_workspace_canonical_model
-from pb_production_3d_adapter import planreader_workspace_to_canonical, require_workspace_id
+from pb_canonical_persistence import (
+    load_workspace_canonical_model,
+    save_workspace_canonical_model,
+)
+from pb_production_3d_adapter import (
+    planreader_workspace_to_canonical,
+    require_workspace_id,
+)
 
 VERSION = "1.6.2"
 MAX_SESSION_CACHE_ENTRIES = 10
@@ -105,7 +111,10 @@ def render_workspace_3d_canonical_view(app: Any, workspace: Any = None) -> None:
     )
 
     if project.is_synthetic_demo:
-        st.warning("SYNTHETIC VIEWER DEMONSTRATION FIXTURE — NOT BENCHMARK TRUTH / NOT TAKEOFF AUTHORITATIVE")
+        st.warning(
+            "SYNTHETIC VIEWER DEMONSTRATION FIXTURE — NOT BENCHMARK TRUTH / "
+            "NOT TAKEOFF AUTHORITATIVE"
+        )
 
     is_fresh, _saved_proj, status_msg, saved_payload = load_workspace_canonical_model(
         app, wid_int, current_snapshot=snapshot
@@ -116,7 +125,10 @@ def render_workspace_3d_canonical_view(app: Any, workspace: Any = None) -> None:
         st.caption("Initial canonical model snapshot saved for this workspace.")
     elif not is_fresh:
         st.warning(status_msg)
-        if st.button("Refresh 3D model from source evidence", key=f"refresh_3d_model_{wid_int}"):
+        if st.button(
+            "Refresh 3D model from source evidence",
+            key=f"refresh_3d_model_{wid_int}",
+        ):
             save_workspace_canonical_model(app, wid_int, project, snapshot=snapshot)
             st.success("Canonical model refreshed from current source evidence.")
             st.rerun()
@@ -127,7 +139,10 @@ def render_workspace_3d_canonical_view(app: Any, workspace: Any = None) -> None:
     c2.metric("Physical openings", qa.get("physical_openings", 0))
     c3.metric("Authorised deductions", qa.get("authorised_b5_deductions", 0))
     c4.metric("Calibrated floors", qa.get("calibrated_floors", 0))
-    st.caption(f"Source revision: `{snapshot_fp}` · Saved snapshot: {'current' if is_fresh else 'stale'}")
+    st.caption(
+        f"Source revision: `{snapshot_fp}` · "
+        f"Saved snapshot: {'current' if is_fresh else 'stale'}"
+    )
 
     if "_CANONICAL_MODEL_SESSION_CACHE" not in st.session_state:
         st.session_state["_CANONICAL_MODEL_SESSION_CACHE"] = {}
