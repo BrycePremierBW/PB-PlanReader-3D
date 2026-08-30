@@ -29,6 +29,12 @@ class FakeApp:
     def __init__(self, events: list[str] | None = None) -> None:
         self.events = events if events is not None else []
         self.legacy_calls = 0
+        self.hero_calls = 0
+
+    def hero(self, workspace=None, *args, **kwargs):
+        self.hero_calls += 1
+        self.events.append("hero")
+        return workspace
 
     def model_3d_page(self, workspace=None, *args, **kwargs):
         self.legacy_calls += 1
@@ -51,7 +57,7 @@ def test_legacy_editor_feature_flag_accepts_only_explicit_truthy_values(monkeypa
         assert integration.legacy_editor_feature_enabled() is False
 
 
-def test_default_commercial_3d_page_never_calls_legacy_editor(monkeypatch):
+def test_default_commercial_3d_page_preserves_header_and_never_calls_legacy(monkeypatch):
     events: list[str] = []
     app = FakeApp(events)
     fake_st = FakeStreamlit()
@@ -66,7 +72,8 @@ def test_default_commercial_3d_page_never_calls_legacy_editor(monkeypatch):
     integration.apply(app)
     app.model_3d_page({"id": 101})
 
-    assert events == ["canonical"]
+    assert events == ["hero", "canonical"]
+    assert app.hero_calls == 1
     assert app.legacy_calls == 0
     assert fake_st.checkbox_calls == []
 
@@ -86,13 +93,14 @@ def test_environment_flag_alone_is_not_enough_to_run_legacy_editor(monkeypatch):
     integration.apply(app)
     app.model_3d_page({"id": 202})
 
-    assert events == ["canonical"]
+    assert events == ["hero", "canonical"]
+    assert app.hero_calls == 1
     assert app.legacy_calls == 0
     assert len(fake_st.checkbox_calls) == 1
     assert fake_st.checkbox_calls[0]["key"] == "legacy_3d_editor_opt_in_202"
 
 
-def test_explicit_developer_opt_in_runs_legacy_only_after_canonical(monkeypatch):
+def test_explicit_developer_opt_in_runs_legacy_only_after_header_and_canonical(monkeypatch):
     events: list[str] = []
     app = FakeApp(events)
     fake_st = FakeStreamlit(checkbox_value=True)
@@ -107,7 +115,8 @@ def test_explicit_developer_opt_in_runs_legacy_only_after_canonical(monkeypatch)
     integration.apply(app)
     app.model_3d_page({"id": 303})
 
-    assert events == ["canonical", "legacy"]
+    assert events == ["hero", "canonical", "legacy"]
+    assert app.hero_calls == 1
     assert app.legacy_calls == 1
     warning_text = "\n".join(fake_st.warnings)
     assert "NON-CANONICAL" in warning_text
@@ -143,6 +152,13 @@ def test_apply_is_safe_when_app_has_no_legacy_model_page():
     integration.apply(app)
     assert not getattr(app, "_canonical_3d_extension_installed", False)
     assert not hasattr(app, "_legacy_model_3d_page")
+
+
+def test_shared_header_helper_is_safe_when_app_has_no_hero():
+    class AppWithoutHero:
+        pass
+
+    integration._render_shared_workspace_header(AppWithoutHero(), {"id": 10})
 
 
 def test_workspace_context_prefers_explicit_workspace_identity(monkeypatch):
