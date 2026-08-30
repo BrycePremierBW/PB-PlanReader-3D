@@ -31,6 +31,7 @@ class CommercialWorkspaceStatus:
     register_review: int = 0
     scale_review: int = 0
     review_total: int = 0
+    review_coverage_complete: bool = True
     canonical_model_saved: bool = False
     canonical_model_fingerprint: Optional[str] = None
     current_step: str = "Upload"
@@ -102,17 +103,11 @@ def _takeoff_ready(row: Dict[str, Any]) -> bool:
         return False
     if status in {"excluded", "not applicable"}:
         return True
-    # A measured zero can be a legitimate confirmed zero, but measured/allowance
-    # rows still require an explicitly present finite numeric quantity.
     return status in {"measured", "allowance"} and _quantity_present(row.get("quantity"))
 
 
 def _model_setting(app: Any, workspace_id: int) -> tuple[bool, Optional[str]]:
-    """Recognise only structurally valid persisted model snapshots.
-
-    This deliberately says only "saved", never "fresh": checking source staleness
-    requires the heavier canonical evidence snapshot and is left to the 3D page.
-    """
+    """Recognise only structurally valid persisted model snapshots."""
     if not hasattr(app, "workspace_setting"):
         return False, None
     try:
@@ -140,24 +135,24 @@ def _model_setting(app: Any, workspace_id: int) -> tuple[bool, Optional[str]]:
 
 def _workflow_state(
     *, documents_total: int, pages_total: int, takeoff_total: int,
-    review_total: int, canonical_model_saved: bool,
+    review_total: int, required_coverage_complete: bool, canonical_model_saved: bool,
 ) -> tuple[str, str]:
     if documents_total <= 0 or pages_total <= 0:
         return "Upload", "New"
     if takeoff_total <= 0:
         return "Scope & Read", "In progress"
+    if not required_coverage_complete:
+        return "Review", "Review status incomplete"
     if review_total > 0:
         return "Review", "Review required"
     if not canonical_model_saved:
         return "3D", "Take-off reviewed"
-    # "Available" is intentionally weaker than "ready": this lightweight shell
-    # does not recompute canonical source staleness on every Streamlit rerun.
     return "Export", "Export available"
 
 
 def derive_workspace_status(app: Any, workspace: Dict[str, Any]) -> CommercialWorkspaceStatus:
     """Derive commercial workflow status strictly from existing read-only evidence."""
-    workspace_id = int(workspace.get("id"))
+    workspace_id = int(workspace.get("id") or 0)
 
     documents = _query(
         app,
@@ -174,41 +169,29 @@ def derive_workspace_status(app: Any, workspace: Dict[str, Any]) -> CommercialWo
         "SELECT id,quantity,quantity_status,confidence,inclusion_status FROM takeoff_rows WHERE workspace_id=? ORDER BY id",
         (workspace_id,),
     )
-    registers = _query(
-        app,
-        "SELECT id,status FROM register_items WHERE workspace_id=? ORDER BY id",
-        (workspace_id,),
-    )
 
     pages_selected = sum(1 for row in pages if _selected(row.get("selected")))
     pages_calibrated = sum(
         1 for row in pages if _selected(row.get("selected")) and _positive(row.get("px_per_m"))
     )
-    takeoff_review = sum(1 for row in takeoff if _takeoff_needs_review(row))
     takeoff_ready = sum(1 for row in takeoff if _takeoff_ready(row))
-    register_review = sum(
-        1 for row in registers
-        if str(row.get("status") or "").strip().lower() in {"open", "to review"}
-    )
 
-    scale_review = 0
-    if hasattr(app, "scale_gate_issues"):
-        try:
-            scale_review = len(app.scale_gate_issues(workspace_id) or [])
-        except Exception:
-            # Optional scale diagnostics being unavailable must not hide the rest
-            # of the commercial status shell.
-            scale_review = 0
+    # Single derivation engine from Phase 6B normalized review signal collector
+    from pb_commercial_review_v161 import collect_commercial_review_signals
+    review_res = collect_commercial_review_signals(app, workspace)
+    takeoff_review = sum(1 for s in review_res.signals if s.source_family == "takeoff")
+    register_review = sum(1 for s in review_res.signals if s.source_family == "register")
+    scale_review = sum(1 for s in review_res.signals if s.source_family == "scale")
+    review_total = review_res.signal_count
+    required_coverage_complete = review_res.required_coverage_complete
 
-    # This is a count of independent review signals from existing sources, not a
-    # deduplicated issue ledger. The UI labels it accordingly.
-    review_total = takeoff_review + register_review + scale_review
     canonical_model_saved, fingerprint = _model_setting(app, workspace_id)
     current_step, overall_state = _workflow_state(
         documents_total=len(documents),
         pages_total=len(pages),
         takeoff_total=len(takeoff),
         review_total=review_total,
+        required_coverage_complete=required_coverage_complete,
         canonical_model_saved=canonical_model_saved,
     )
 
@@ -224,6 +207,7 @@ def derive_workspace_status(app: Any, workspace: Dict[str, Any]) -> CommercialWo
         register_review=register_review,
         scale_review=scale_review,
         review_total=review_total,
+        review_coverage_complete=required_coverage_complete,
         canonical_model_saved=canonical_model_saved,
         canonical_model_fingerprint=fingerprint,
         current_step=current_step,
@@ -243,9 +227,15 @@ def workflow_step_states(status: CommercialWorkspaceStatus) -> List[Dict[str, st
         elif index == current_index:
             state = "current"
 
-        if label == "Review" and status.review_total > 0:
-            state = "review" if current_index >= 2 else state
-            detail = f"{status.review_total} signal{'s' if status.review_total != 1 else ''}"
+        if label == "Review":
+            if not status.review_coverage_complete:
+                state = "review" if current_index >= 2 else state
+                detail = "coverage incomplete"
+            elif status.review_total > 0:
+                state = "review" if current_index >= 2 else state
+                detail = f"{status.review_total} signal{'s' if status.review_total != 1 else ''}"
+            else:
+                detail = "0 signals"
         elif label == "3D":
             detail = "saved snapshot" if status.canonical_model_saved else "not saved"
         elif label == "Upload":
@@ -282,8 +272,6 @@ def render_commercial_workspace_shell(app: Any, workspace: Dict[str, Any]) -> Co
         unsafe_allow_html=True,
     )
 
-    # Workspace values can originate outside this module (including JobHub), so
-    # escape them before interpolating into unsafe HTML.
     job_no = html.escape(str(workspace.get("job_no") or "").strip())
     job_name = html.escape(str(workspace.get("job_name") or "Untitled project").strip())
     drawing_issue = html.escape(str(workspace.get("drawing_issue") or "").strip())
@@ -303,10 +291,12 @@ def render_commercial_workspace_shell(app: Any, workspace: Dict[str, Any]) -> Co
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Drawings", status.pages_total, f"{status.pages_selected} selected")
     c2.metric("Take-off", status.takeoff_total, f"{status.takeoff_ready} reviewed")
+    
+    review_subtext = "coverage incomplete" if not status.review_coverage_complete else ("needs attention" if status.review_total else "none detected")
     c3.metric(
         "Review signals",
         status.review_total,
-        "needs attention" if status.review_total else "none detected",
+        review_subtext,
     )
     c4.metric("3D Model", "Saved snapshot" if status.canonical_model_saved else "Not saved")
     return status
@@ -327,9 +317,6 @@ def apply(app: Any) -> None:
             try:
                 render_commercial_workspace_shell(app, workspace)
             except Exception:
-                # Commercial status is presentation-only: an unavailable status
-                # query must never take down the underlying estimator page, and it
-                # must never be misrepresented as an empty/new workspace.
                 try:
                     app.st.caption("Project workflow status unavailable. Estimator tools remain available.")
                 except Exception:

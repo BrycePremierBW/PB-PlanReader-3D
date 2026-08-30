@@ -5188,6 +5188,9 @@ def project_documents_page(workspace: Dict[str, Any], bridge: Optional[JobHubBri
 
 def drawing_register_page(workspace: Dict[str, Any]) -> None:
     hero(workspace)
+    target_register_id = st.session_state.pop("active_register_item_id", None)
+    if target_register_id:
+        st.info(f"🎯 Target clarification register item #{target_register_id} selected from Review & QA workspace.")
     pages=ldf("""SELECT p.id,p.page_label,p.page_type,p.scale_text,p.px_per_m,p.page_no,p.selected,d.file_name,p.image_path FROM pages p JOIN documents d ON d.id=p.document_id WHERE p.workspace_id=? ORDER BY d.id,p.page_no""",(workspace["id"],))
     if pages.empty:
         st.info("Process documents first.")
@@ -5265,6 +5268,9 @@ def _run_with_progress(worker: Callable[[], Any], caption: str) -> Any:
 
 def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, ai_provider: str = "OpenAI") -> None:
     hero(workspace)
+    target_row_id = st.session_state.pop("active_takeoff_row_id", None)
+    if target_row_id:
+        st.info(f"🎯 Target take-off row #{target_row_id} selected from Review & QA workspace.")
     tabs=st.tabs(["AI plan read","Take-off schedule","Scope registers","Door schedule","Source & basis","AI vs drawn"])
     with tabs[0]:
         pages=ldf("SELECT id,page_label,page_type,image_path,selected FROM pages WHERE workspace_id=? ORDER BY id",(workspace["id"],))
@@ -5437,6 +5443,9 @@ def overlay_image(page:Dict[str,Any],zones:List[Dict[str,Any]]) -> Optional[Imag
 
 def plan_mapper_page(workspace:Dict[str,Any]) -> None:
     hero(workspace)
+    target_page_id = st.session_state.pop("active_page_id", None)
+    if target_page_id:
+        st.info(f"🎯 Target drawing page #{target_page_id} selected from Review & QA workspace.")
     pages=ldf("SELECT * FROM pages WHERE workspace_id=? ORDER BY id",(workspace["id"],))
     if pages.empty:
         st.info("Process drawings first.")
@@ -6408,17 +6417,77 @@ def main() -> None:
     if not workspace:
         st.session_state.pop("workspace_id",None)
         st.rerun()
-    menu=st.sidebar.radio("Menu",["Dashboard","Job & Documents","Drawing Register","Subscription Take-off","Plan Mapper","3D Building Model","Quantity Schedule","Offline Plan Reader","Export / JobHub","Settings"])
-    if menu=="Dashboard": dashboard_page(workspace)
-    elif menu=="Job & Documents": project_documents_page(workspace,bridge,user)
-    elif menu=="Drawing Register": drawing_register_page(workspace)
-    elif menu=="Subscription Take-off": subscription_takeoff_page(workspace,session_api_key,ai_provider)
-    elif menu=="Plan Mapper": plan_mapper_page(workspace)
-    elif menu=="3D Building Model": model_3d_page(workspace,session_api_key,ai_provider)
-    elif menu=="Quantity Schedule": quantity_schedule_page(workspace)
-    elif menu=="Offline Plan Reader": offline_plan_reader_page(workspace)
-    elif menu=="Export / JobHub": export_page(workspace,bridge,user)
-    else: settings_page(workspace,bridge,session_api_key,ai_provider)
+    menu_options = [
+        "Dashboard",
+        "Job & Documents",
+        "Drawing Register",
+        "Review & QA",
+        "Subscription Take-off",
+        "Plan Mapper",
+        "3D Building Model",
+        "Quantity Schedule",
+        "Offline Plan Reader",
+        "Export / JobHub",
+        "Settings",
+    ]
+    nav_target = st.session_state.get("_pb_nav_target")
+    nav_payload = st.session_state.get("_pb_nav_payload")
+
+    valid_nav_target = None
+    active_ws_id = int(workspace["id"]) if isinstance(workspace, dict) and workspace.get("id") else None
+
+    if nav_target and isinstance(nav_payload, dict):
+        payload_ws_id = nav_payload.get("workspace_id")
+        if payload_ws_id == active_ws_id:
+            valid_nav_target = nav_target
+            if nav_target == "takeoff":
+                if nav_payload.get("takeoff_row_id"):
+                    st.session_state["active_takeoff_row_id"] = nav_payload["takeoff_row_id"]
+            elif nav_target in ("drawing", "page"):
+                if nav_payload.get("page_id"):
+                    st.session_state["active_page_id"] = nav_payload["page_id"]
+            elif nav_target == "register":
+                if nav_payload.get("register_item_id"):
+                    st.session_state["active_register_item_id"] = nav_payload["register_item_id"]
+
+    # Pop consumed/rejected navigation signals cleanly
+    st.session_state.pop("_pb_nav_target", None)
+    st.session_state.pop("_pb_nav_payload", None)
+
+    default_index = 0
+    if valid_nav_target == "takeoff":
+        default_index = menu_options.index("Subscription Take-off")
+    elif valid_nav_target in ("drawing", "page"):
+        default_index = menu_options.index("Plan Mapper")
+    elif valid_nav_target == "register":
+        default_index = menu_options.index("Drawing Register")
+    elif valid_nav_target == "model":
+        default_index = menu_options.index("3D Building Model")
+    elif valid_nav_target == "review":
+        default_index = menu_options.index("Review & QA")
+    else:
+        saved_menu = st.session_state.get("_pb_current_menu")
+        if saved_menu in menu_options:
+            default_index = menu_options.index(saved_menu)
+
+    menu = st.sidebar.radio("Menu", menu_options, index=default_index)
+    st.session_state["_pb_current_menu"] = menu
+
+    if menu == "Dashboard": dashboard_page(workspace)
+    elif menu == "Job & Documents": project_documents_page(workspace, bridge, user)
+    elif menu == "Drawing Register": drawing_register_page(workspace)
+    elif menu == "Review & QA":
+        hero(workspace)
+        import sys
+        from pb_commercial_review_v161 import render_commercial_review_workspace
+        render_commercial_review_workspace(sys.modules[__name__], workspace)
+    elif menu == "Subscription Take-off": subscription_takeoff_page(workspace, session_api_key, ai_provider)
+    elif menu == "Plan Mapper": plan_mapper_page(workspace)
+    elif menu == "3D Building Model": model_3d_page(workspace, session_api_key, ai_provider)
+    elif menu == "Quantity Schedule": quantity_schedule_page(workspace)
+    elif menu == "Offline Plan Reader": offline_plan_reader_page(workspace)
+    elif menu == "Export / JobHub": export_page(workspace, bridge, user)
+    else: settings_page(workspace, bridge, session_api_key, ai_provider)
 
 
 if __name__ == "__main__":

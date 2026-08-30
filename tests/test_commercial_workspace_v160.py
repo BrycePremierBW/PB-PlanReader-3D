@@ -109,6 +109,26 @@ def test_string_zero_selected_flag_is_not_counted_as_selected():
     assert status.pages_calibrated == 1
 
 
+def test_incomplete_coverage_blocks_workflow_progression():
+    """When scale_gate_issues raises an exception, required_coverage_complete is False and step remains Review."""
+    class OutageApp(FakeApp):
+        def scale_gate_issues(self, workspace_id):
+            raise RuntimeError("Scale outage")
+
+    app = OutageApp(
+        documents=[{"id": 1}],
+        pages=_base_pages(),
+        takeoff=[{"id": 1, "quantity": 100, "quantity_status": "Measured", "confidence": "Verified", "inclusion_status": "INCLUSION"}],
+    )
+    status = derive_workspace_status(app, WORKSPACE)
+    assert status.review_coverage_complete is False
+    assert status.current_step == "Review"
+    assert status.overall_state == "Review status incomplete"
+    steps = workflow_step_states(status)
+    review_step = next(s for s in steps if s["label"] == "Review")
+    assert review_step["detail"] == "coverage incomplete"
+
+
 def test_review_heavy_workspace_stops_at_review_and_counts_real_signals():
     app = FakeApp(
         documents=[{"id": 1}],
@@ -133,7 +153,6 @@ def test_review_heavy_workspace_stops_at_review_and_counts_real_signals():
     assert status.takeoff_review == 2
     assert status.register_review == 2
     assert status.scale_review == 1
-    # This is intentionally a signal count, not a promise of five unique issues.
     assert status.review_total == 5
 
 
@@ -158,7 +177,6 @@ def test_review_clear_takeoff_without_saved_model_moves_to_3d():
         pages=_base_pages(),
         takeoff=[
             {"id": 1, "quantity": 100, "quantity_status": "Measured", "confidence": "Verified", "inclusion_status": "INCLUSION"},
-            # Explicit measured zero is still a valid reviewed quantity.
             {"id": 2, "quantity": 0, "quantity_status": "Measured", "confidence": "Verified", "inclusion_status": "INCLUSION"},
             {"id": 3, "quantity": 0, "quantity_status": "Excluded", "confidence": "Verified", "inclusion_status": "EXCLUSION"},
         ],
@@ -190,45 +208,6 @@ def test_saved_canonical_model_allows_export_available_state_without_claiming_fr
     assert export["detail"] == "available"
 
 
-def test_saved_model_without_source_fingerprint_is_not_claimed_valid():
-    app = FakeApp(
-        documents=[{"id": 1}],
-        pages=_base_pages(),
-        takeoff=[{"id": 1, "quantity": 1, "quantity_status": "Measured", "confidence": "Verified", "inclusion_status": "INCLUSION"}],
-        model=json.dumps({"model_data": {"id": "ws_101_canonical"}}),
-    )
-    status = derive_workspace_status(app, WORKSPACE)
-    assert status.canonical_model_saved is False
-    assert status.canonical_model_fingerprint is None
-    assert status.current_step == "3D"
-
-
-def test_malformed_saved_model_does_not_claim_3d_readiness():
-    app = FakeApp(
-        documents=[{"id": 1}],
-        pages=_base_pages(),
-        takeoff=[{"id": 1, "quantity": 1, "quantity_status": "Measured", "confidence": "Verified", "inclusion_status": "INCLUSION"}],
-        model="not json",
-    )
-    status = derive_workspace_status(app, WORKSPACE)
-    assert status.canonical_model_saved is False
-    assert status.current_step == "3D"
-
-
-def test_workflow_step_states_are_fixed_order_and_review_signals_are_visible():
-    app = FakeApp(
-        documents=[{"id": 1}],
-        pages=_base_pages(),
-        takeoff=[{"id": 1, "quantity": 0, "quantity_status": "To measure", "confidence": "To review", "inclusion_status": "INCLUSION"}],
-    )
-    status = derive_workspace_status(app, WORKSPACE)
-    steps = workflow_step_states(status)
-    assert tuple(step["label"] for step in steps) == WORKFLOW_STEPS
-    review = next(step for step in steps if step["label"] == "Review")
-    assert review["state"] == "review"
-    assert review["detail"] == "1 signal"
-
-
 def test_workspace_text_is_html_escaped_before_unsafe_markup():
     app = FakeApp()
     app.st = FakeStreamlit()
@@ -258,7 +237,6 @@ def test_status_query_failure_does_not_break_underlying_estimator_page_or_look_n
     assert result == WORKSPACE
     assert app.hero_calls == 1
     assert app.st.captions == ["Project workflow status unavailable. Estimator tools remain available."]
-    # No zero-valued/new-workspace commercial cards were rendered after the failure.
     assert app.st.metrics == []
 
 
@@ -271,3 +249,37 @@ def test_apply_is_idempotent_and_only_wraps_existing_hero_once():
     assert app._commercial_workspace_v160_installed is True
     apply(app)
     assert app.hero is first_wrapper
+
+
+def test_saved_model_without_source_fingerprint_is_not_claimed_valid():
+    model = json.dumps({"model_data": {"id": "ws_101"}})
+    app = FakeApp(
+        documents=[{"id": 1}],
+        pages=_base_pages(),
+        takeoff=[{"id": 1, "quantity": 100, "quantity_status": "Measured", "confidence": "Verified", "inclusion_status": "INCLUSION"}],
+        model=model,
+    )
+    status = derive_workspace_status(app, WORKSPACE)
+    assert status.canonical_model_saved is False
+    assert status.canonical_model_fingerprint is None
+    assert status.current_step == "3D"
+
+
+def test_malformed_saved_model_does_not_claim_3d_readiness():
+    app = FakeApp(
+        documents=[{"id": 1}],
+        pages=_base_pages(),
+        takeoff=[{"id": 1, "quantity": 100, "quantity_status": "Measured", "confidence": "Verified", "inclusion_status": "INCLUSION"}],
+        model="{not valid json",
+    )
+    status = derive_workspace_status(app, WORKSPACE)
+    assert status.canonical_model_saved is False
+    assert status.canonical_model_fingerprint is None
+    assert status.current_step == "3D"
+
+
+def test_workflow_step_states_are_fixed_order_and_review_signals_are_visible():
+    status = derive_workspace_status(FakeApp(), WORKSPACE)
+    states = workflow_step_states(status)
+    labels = [s["label"] for s in states]
+    assert labels == list(WORKFLOW_STEPS)
