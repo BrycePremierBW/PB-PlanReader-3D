@@ -8,8 +8,8 @@ escape hatch and is never executed during an ordinary production 3D render.
 Architecture guarantees:
 1. Uses the existing ``apply(app)`` extension pattern with an idempotency guard.
 2. Canonical 3D is the only default estimator-facing 3D surface.
-3. The legacy editor requires both an environment feature flag and an explicit
-   per-session opt-in before it is called.
+3. The legacy editor requires an environment feature flag, an authorised admin or
+   developer session, and an explicit per-session opt-in before it is called.
 4. The existing shared ``hero(workspace)`` hook still renders exactly once on the
    ordinary canonical page, preserving the Phase 6A commercial workspace shell.
 5. Workspace evidence is converted through ``planreader_workspace_to_canonical``.
@@ -33,11 +33,24 @@ VERSION = "1.6.2"
 MAX_SESSION_CACHE_ENTRIES = 10
 LEGACY_EDITOR_ENV = "PLANREADER_ENABLE_LEGACY_3D_EDITOR"
 _TRUTHY_ENV = {"1", "true", "yes", "on"}
+_LEGACY_EDITOR_ROLES = {"admin", "developer"}
 
 
 def legacy_editor_feature_enabled() -> bool:
-    """Return whether the developer-only legacy editor escape hatch is enabled."""
+    """Return whether the server-side legacy editor feature flag is enabled."""
     return str(os.environ.get(LEGACY_EDITOR_ENV, "")).strip().lower() in _TRUTHY_ENV
+
+
+def legacy_editor_user_authorized() -> bool:
+    """Require an explicit privileged PlanReader session for the legacy escape hatch."""
+    try:
+        user = st.session_state.get("planreader_user")
+    except Exception:
+        return False
+    if not isinstance(user, dict):
+        return False
+    role = str(user.get("role") or "").strip().lower()
+    return role in _LEGACY_EDITOR_ROLES
 
 
 def _workspace_id_from_context(app: Any, workspace: Any = None) -> int:
@@ -145,8 +158,12 @@ def _render_legacy_editor_opt_in(
     args: tuple,
     kwargs: dict,
 ) -> None:
-    """Expose the historical editor only behind a developer flag and session opt-in."""
-    if not legacy_editor_feature_enabled() or not callable(original_model_page):
+    """Expose the historical editor only after all three developer gates pass."""
+    if not legacy_editor_feature_enabled():
+        return
+    if not legacy_editor_user_authorized():
+        return
+    if not callable(original_model_page):
         return
 
     try:
@@ -155,7 +172,7 @@ def _render_legacy_editor_opt_in(
         wid_int = "unknown"
 
     st.markdown("---")
-    st.caption("Advanced developer tools are enabled for this environment.")
+    st.caption("Advanced developer tools are enabled for this privileged session.")
     enabled = st.checkbox(
         "Enable legacy manual 3D editor for this session",
         value=False,
@@ -187,11 +204,8 @@ def apply(app: Any) -> None:
     setattr(app, "_legacy_model_3d_page", original_model_3d)
 
     def model_3d_page_canonical_wrapper(workspace: Any = None, *args, **kwargs):
-        # Preserve the normal app/project header without executing the legacy 3D page.
         _render_shared_workspace_header(app, workspace)
-        # Canonical review is the only default production 3D path.
         render_workspace_3d_canonical_view(app, workspace)
-        # The old editor is never executed unless two explicit developer gates pass.
         _render_legacy_editor_opt_in(app, original_model_3d, workspace, args, kwargs)
 
     setattr(app, "model_3d_page", model_3d_page_canonical_wrapper)
