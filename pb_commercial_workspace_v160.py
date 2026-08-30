@@ -184,25 +184,16 @@ def derive_workspace_status(app: Any, workspace: Dict[str, Any]) -> CommercialWo
     pages_calibrated = sum(
         1 for row in pages if _selected(row.get("selected")) and _positive(row.get("px_per_m"))
     )
-    takeoff_review = sum(1 for row in takeoff if _takeoff_needs_review(row))
     takeoff_ready = sum(1 for row in takeoff if _takeoff_ready(row))
-    register_review = sum(
-        1 for row in registers
-        if str(row.get("status") or "").strip().lower() in {"open", "to review"}
-    )
 
-    scale_review = 0
-    if hasattr(app, "scale_gate_issues"):
-        try:
-            scale_review = len(app.scale_gate_issues(workspace_id) or [])
-        except Exception:
-            # Optional scale diagnostics being unavailable must not hide the rest
-            # of the commercial status shell.
-            scale_review = 0
+    # Single derivation engine from Phase 6B normalized review signal collector
+    from pb_commercial_review_v161 import collect_commercial_review_signals
+    review_res = collect_commercial_review_signals(app, workspace)
+    takeoff_review = sum(1 for s in review_res.signals if s.source_family == "takeoff")
+    register_review = sum(1 for s in review_res.signals if s.source_family == "register")
+    scale_review = sum(1 for s in review_res.signals if s.source_family == "scale")
+    review_total = review_res.signal_count
 
-    # This is a count of independent review signals from existing sources, not a
-    # deduplicated issue ledger. The UI labels it accordingly.
-    review_total = takeoff_review + register_review + scale_review
     canonical_model_saved, fingerprint = _model_setting(app, workspace_id)
     current_step, overall_state = _workflow_state(
         documents_total=len(documents),

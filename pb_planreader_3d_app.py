@@ -6408,17 +6408,54 @@ def main() -> None:
     if not workspace:
         st.session_state.pop("workspace_id",None)
         st.rerun()
-    menu=st.sidebar.radio("Menu",["Dashboard","Job & Documents","Drawing Register","Subscription Take-off","Plan Mapper","3D Building Model","Quantity Schedule","Offline Plan Reader","Export / JobHub","Settings"])
-    if menu=="Dashboard": dashboard_page(workspace)
-    elif menu=="Job & Documents": project_documents_page(workspace,bridge,user)
-    elif menu=="Drawing Register": drawing_register_page(workspace)
-    elif menu=="Subscription Take-off": subscription_takeoff_page(workspace,session_api_key,ai_provider)
-    elif menu=="Plan Mapper": plan_mapper_page(workspace)
-    elif menu=="3D Building Model": model_3d_page(workspace,session_api_key,ai_provider)
-    elif menu=="Quantity Schedule": quantity_schedule_page(workspace)
-    elif menu=="Offline Plan Reader": offline_plan_reader_page(workspace)
-    elif menu=="Export / JobHub": export_page(workspace,bridge,user)
-    else: settings_page(workspace,bridge,session_api_key,ai_provider)
+    menu_options = [
+        "Dashboard",
+        "Job & Documents",
+        "Drawing Register",
+        "Review & QA",
+        "Subscription Take-off",
+        "Plan Mapper",
+        "3D Building Model",
+        "Quantity Schedule",
+        "Offline Plan Reader",
+        "Export / JobHub",
+        "Settings",
+    ]
+    nav_target = st.session_state.pop("_pb_nav_target", None)
+    default_index = 0
+    if nav_target == "takeoff":
+        default_index = menu_options.index("Subscription Take-off")
+    elif nav_target in ("drawing", "page"):
+        default_index = menu_options.index("Plan Mapper")
+    elif nav_target == "register":
+        default_index = menu_options.index("Drawing Register")
+    elif nav_target == "model":
+        default_index = menu_options.index("3D Building Model")
+    elif nav_target == "review":
+        default_index = menu_options.index("Review & QA")
+
+    saved_menu = st.session_state.get("_pb_current_menu")
+    if saved_menu in menu_options and nav_target is None:
+        default_index = menu_options.index(saved_menu)
+
+    menu = st.sidebar.radio("Menu", menu_options, index=default_index)
+    st.session_state["_pb_current_menu"] = menu
+
+    if menu == "Dashboard": dashboard_page(workspace)
+    elif menu == "Job & Documents": project_documents_page(workspace, bridge, user)
+    elif menu == "Drawing Register": drawing_register_page(workspace)
+    elif menu == "Review & QA":
+        hero(workspace)
+        import sys
+        from pb_commercial_review_v161 import render_commercial_review_workspace
+        render_commercial_review_workspace(sys.modules[__name__], workspace)
+    elif menu == "Subscription Take-off": subscription_takeoff_page(workspace, session_api_key, ai_provider)
+    elif menu == "Plan Mapper": plan_mapper_page(workspace)
+    elif menu == "3D Building Model": model_3d_page(workspace, session_api_key, ai_provider)
+    elif menu == "Quantity Schedule": quantity_schedule_page(workspace)
+    elif menu == "Offline Plan Reader": offline_plan_reader_page(workspace)
+    elif menu == "Export / JobHub": export_page(workspace, bridge, user)
+    else: settings_page(workspace, bridge, session_api_key, ai_provider)
 
 
 if __name__ == "__main__":
