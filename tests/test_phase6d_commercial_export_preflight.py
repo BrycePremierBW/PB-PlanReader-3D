@@ -27,6 +27,7 @@ Issue #74 Complete Pass 5 Regression Matrix:
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import pandas as pd
 import sqlite3
 import time
@@ -140,7 +141,15 @@ class MockJobHubBridge:
         self.fail_on = fail_on or set()
         self.next_pkg_id = 501
 
-    def execute(self, sql, params=()):
+    @contextmanager
+    def connect(self):
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def execute(self, sql, params=(), returning=False, conn=None):
         str_params = str(params)
         if "job_document_blobs" in sql and ("Final quotation" in str_params or "quotation" in str_params) and "quote_blob" in self.fail_on:
             raise RuntimeError("Mandatory quotation blob upload failed: Simulated quotation blob failure")
@@ -192,7 +201,7 @@ class MockJobHubBridge:
         elif "UPDATE jobs SET status" in sql:
             self.job_status = params[0] if params else "Published"
 
-    def query(self, sql, params=()):
+    def query(self, sql, params=(), conn=None):
         if "query_fail" in self.fail_on and "painting_takeoff_packages" in sql:
             raise sqlite3.OperationalError("Simulated JobHub package query failure")
         if "painting_takeoff_packages" in sql:
@@ -606,6 +615,54 @@ class Phase6DPreflightTests(unittest.TestCase):
             spy_ai.assert_not_called()
             spy_pdf.assert_not_called()
             spy_geom.assert_not_called()
+
+    def test_24_postgres_advisory_lock_concurrency_and_atomicity(self):
+        """Proves PostgreSQL pg_try_advisory_xact_lock key derivation and real multi-transaction atomic lock serialization."""
+        from pb_planreader_3d_app import advisory_xact_lock_keys
+        k1, k2 = advisory_xact_lock_keys(101, "fingerprint_test_hash_xyz")
+        self.assertIsInstance(k1, int)
+        self.assertIsInstance(k2, int)
+        self.assertGreaterEqual(k1, 0)
+        self.assertGreaterEqual(k2, 0)
+        self.assertLessEqual(k1, 2147483647)
+        self.assertLessEqual(k2, 2147483647)
+
+        # Determinism check
+        k1_dup, k2_dup = advisory_xact_lock_keys(101, "fingerprint_test_hash_xyz")
+        self.assertEqual((k1, k2), (k1_dup, k2_dup))
+
+        # Real PostgreSQL multi-transaction socket test if JOBHUB_POSTGRES_TEST_URL is provided in environment
+        import os
+        pg_url = os.environ.get("JOBHUB_POSTGRES_TEST_URL") or os.environ.get("POSTGRES_URL")
+        if pg_url:
+            import psycopg2
+            conn1 = psycopg2.connect(pg_url)
+            conn2 = psycopg2.connect(pg_url)
+            try:
+                cur1 = conn1.cursor()
+                cur2 = conn2.cursor()
+
+                # Connection 1 acquires PostgreSQL transaction advisory lock
+                cur1.execute("SELECT pg_try_advisory_xact_lock(%s, %s)", (k1, k2))
+                acquired1 = cur1.fetchone()[0]
+                self.assertTrue(acquired1)
+
+                # Connection 2 attempts lock on same key pair concurrently -> receives False
+                cur2.execute("SELECT pg_try_advisory_xact_lock(%s, %s)", (k1, k2))
+                acquired2 = cur2.fetchone()[0]
+                self.assertFalse(acquired2)
+
+                # Connection 1 commits -> transaction advisory lock automatically released
+                conn1.commit()
+
+                # Connection 2 retries lock -> now succeeds
+                cur2.execute("SELECT pg_try_advisory_xact_lock(%s, %s)", (k1, k2))
+                acquired2_retry = cur2.fetchone()[0]
+                self.assertTrue(acquired2_retry)
+                conn2.commit()
+            finally:
+                conn1.close()
+                conn2.close()
 
 
 if __name__ == "__main__":

@@ -708,25 +708,31 @@ class JobHubBridge:
             cur.execute(f"PRAGMA table_info({safe})")
             return [str(r[1]) for r in cur.fetchall()]
 
-    def query(self, sql: str, params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
-        with self.connect() as conn:
+    def query(self, sql: str, params: Sequence[Any] = (), conn: Optional[Any] = None) -> List[Dict[str, Any]]:
+        if conn is not None:
             if self.kind == "postgres":
                 cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
                 cur.execute(sql.replace("?", "%s"), tuple(params))
                 return [dict(r) for r in cur.fetchall()]
             cur = conn.execute(sql, tuple(params))
-            return [dict(r) for r in cur.fetchall()]
+            cols = [d[0] for d in cur.description] if cur.description else []
+            return [dict(zip(cols, r)) if isinstance(r, (tuple, list)) else dict(r) for r in cur.fetchall()]
+        with self.connect() as conn_obj:
+            return self.query(sql, params, conn=conn_obj)
 
-    def execute(self, sql: str, params: Sequence[Any] = (), returning: bool = False) -> Any:
-        with self.connect() as conn:
+    def execute(self, sql: str, params: Sequence[Any] = (), returning: bool = False, conn: Optional[Any] = None) -> Any:
+        if conn is not None:
             cur = conn.cursor()
             cur.execute(sql.replace("?", "%s") if self.kind == "postgres" else sql, tuple(params))
             result = None
             if returning:
                 row = cur.fetchone()
                 result = row[0] if row else None
-            conn.commit()
             return result
+        with self.connect() as conn_obj:
+            res = self.execute(sql, params, returning=returning, conn=conn_obj)
+            conn_obj.commit()
+            return res
 
     def discover_documents_for_job(self, job_id: int) -> List[Dict[str, Any]]:
         """Scan the common JobHub document/attachment tables in a single connection.
@@ -4477,7 +4483,7 @@ def progress_package_bytes(workspace_id: int) -> bytes:
     return output.getvalue()
 
 
-def _sync_jobhub_takeoff_rows(bridge: JobHubBridge, job_id: int, takeoff: pd.DataFrame) -> int:
+def _sync_jobhub_takeoff_rows(bridge: JobHubBridge, job_id: int, takeoff: pd.DataFrame, conn: Optional[Any] = None) -> int:
     """Upsert the workspace take-off into the shared ``job_takeoff_rows`` table."""
     takeoff = takeoff_work_rows(takeoff)
     if takeoff.empty:
@@ -4522,6 +4528,7 @@ def _sync_jobhub_takeoff_rows(bridge: JobHubBridge, job_id: int, takeoff: pd.Dat
                 confidence=excluded.confidence, updated_at=excluded.updated_at
             """,
             payload,
+            conn=conn,
         )
     return len(payloads)
 
@@ -4582,21 +4589,16 @@ def push_progress_marker_to_jobhub(workspace_id: int, bridge: JobHubBridge, crea
     }
 
 
+def advisory_xact_lock_keys(job_id: int, preflight_fingerprint: str) -> Tuple[int, int]:
+    """Derive deterministic 32-bit positive signed integer key pair for PostgreSQL pg_try_advisory_xact_lock."""
+    key1 = int(job_id) & 0x7FFFFFFF
+    fp_hash = hashlib.md5(preflight_fingerprint.encode("utf-8")).hexdigest() if preflight_fingerprint else "0"
+    key2 = int(fp_hash[:8], 16) & 0x7FFFFFFF
+    return key1, key2
+
+
 def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: str, preflight_fingerprint: str = "", payload_hash: str = "") -> Dict[str, Any]:
-    """Publish the final take-off and quotation to the shared JobHub job with partial-safe lifecycle and strict receipt verification.
-
-    Mandatory Side Effects (All must succeed for Published=True):
-      1. Quotation blob stored in job_document_blobs
-      2. Progress marker ZIP stored in job_document_blobs
-      3. Live takeoff rows synced to job_takeoff_rows
-      4. Takeoff package header created in painting_takeoff_packages (initially 'Pending')
-      5. All takeoff lines created in painting_takeoff_lines
-      6. Shared job status updated to 'Published' in jobs
-      7. Takeoff package status transitioned to 'Published' with preflight fingerprint notes
-
-    Partial-Safe Guarantee: If any mandatory side effect fails, the package is marked 'Failed'
-    and will NOT block future retries as a published duplicate.
-    """
+    """Publish the final take-off and quotation to the shared JobHub job with partial-safe lifecycle and strict receipt verification."""
     workspace = lquery("SELECT * FROM workspaces WHERE id=?", (workspace_id,))[0]
     job_id = workspace.get("jobhub_job_id")
     if not job_id:
@@ -4638,8 +4640,35 @@ def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: s
     total_hours = float(takeoff["labour_hours"].fillna(0).sum())
     total_litres = float(takeoff["paint_litres"].fillna(0).sum())
 
-    # 2. Atomic Package Reservation (Single atomic INSERT ... SELECT WHERE NOT EXISTS)
-    try:
+    with bridge.connect() as conn:
+        cur = conn.cursor()
+
+        # 1. PostgreSQL Transaction-Scoped Advisory Lock (pg_try_advisory_xact_lock)
+        if bridge.kind == "postgres":
+            key1, key2 = advisory_xact_lock_keys(int(job_id), preflight_fingerprint)
+            cur.execute("SELECT pg_try_advisory_xact_lock(%s, %s)", (key1, key2))
+            lock_acquired = cur.fetchone()[0]
+            if not lock_acquired:
+                raise RuntimeError(
+                    f"Package for preflight fingerprint {preflight_fingerprint[:12]}... is currently being published by a concurrent transaction on JobHub for job #{job_id}."
+                )
+        elif bridge.kind == "sqlite":
+            try:
+                cur.execute("BEGIN IMMEDIATE")
+            except Exception:
+                pass
+
+        # 2. Duplicate Check within locked transaction
+        query_sql = "SELECT id, status, notes FROM painting_takeoff_packages WHERE job_id=? AND (takeoff_no=? OR notes LIKE ?) ORDER BY id DESC"
+        existing = bridge.query(query_sql, (job_id, takeoff_no, f"%{preflight_fingerprint}%"), conn=conn)
+        for pkg in existing:
+            st = str(pkg.get("status") or "")
+            if st in ("Published", "Pending"):
+                raise RuntimeError(
+                    f"Package for preflight fingerprint {preflight_fingerprint[:12]}... is already {st.lower()} on JobHub for job #{job_id} (Package #{pkg.get('id')})."
+                )
+
+        # 3. Atomic Package Reservation
         if bridge.kind == "postgres":
             package_id = bridge.execute(
                 """INSERT INTO painting_takeoff_packages(job_id,takeoff_no,takeoff_date,status,source_documents,interior_total_m2,exterior_total_m2,total_labour_hours,total_paint_litres,generated_method,assumptions,ai_notes,created_by,created_at,updated_at,notes)
@@ -4654,6 +4683,7 @@ def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: s
                  created_by, stamp, stamp, "Publish in progress...",
                  job_id, takeoff_no, fp_pattern),
                 returning=True,
+                conn=conn
             )
         else:
             bridge.execute(
@@ -4668,93 +4698,93 @@ def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: s
                  "Final quantities approved for pricing.", workspace.get("executive_summary", ""),
                  created_by, stamp, stamp, "Publish in progress...",
                  job_id, takeoff_no, fp_pattern),
+                conn=conn
             )
-            res = bridge.query("SELECT id FROM painting_takeoff_packages WHERE takeoff_no=? AND status='Pending'", (takeoff_no,))
+            res = bridge.query("SELECT id FROM painting_takeoff_packages WHERE takeoff_no=? AND status='Pending'", (takeoff_no,), conn=conn)
             package_id = res[0]["id"] if res else None
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(f"Duplicate verification failed closed: unable to execute atomic package reservation ({exc}).")
 
-    if not package_id:
-        raise RuntimeError(f"Package for preflight fingerprint {preflight_fingerprint[:12]}... is already in progress or published on JobHub for job #{job_id}.")
+        if not package_id:
+            raise RuntimeError(f"Package for preflight fingerprint {preflight_fingerprint[:12]}... is already in progress or published on JobHub for job #{job_id}.")
 
-    # Execute Consequential Operations with Cleanup on Failure
-    try:
-        # 3. Mandatory Quotation Blob Storage
-        bridge.execute(
-            """INSERT INTO job_document_blobs(job_id,file_name,mime_type,doc_type,notes,blob_data,created_at)
-               VALUES(?,?,?,?,?,?,?)
-               ON CONFLICT(job_id, file_name) DO UPDATE SET
-                   mime_type=excluded.mime_type, doc_type=excluded.doc_type, notes=excluded.notes,
-                   blob_data=excluded.blob_data, created_at=excluded.created_at""",
-            (int(job_id), quote_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-             "Final quotation",
-             f"Priced per-level quotation generated by PB PlanReader ({created_by}).",
-             base64.b64encode(quote_bytes).decode("ascii"), stamp),
-        )
-
-        # 4. Mandatory Progress Marker Storage
-        progress_name = f"progress_marker_{job_no}_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
-        progress_bytes = progress_package_bytes(workspace_id)
-        bridge.execute(
-            """INSERT INTO job_document_blobs(job_id,file_name,mime_type,doc_type,notes,blob_data,created_at)
-               VALUES(?,?,?,?,?,?,?)
-               ON CONFLICT(job_id, file_name) DO UPDATE SET
-                   mime_type=excluded.mime_type, doc_type=excluded.doc_type, notes=excluded.notes,
-                   blob_data=excluded.blob_data, created_at=excluded.created_at""",
-            (int(job_id), progress_name, "application/zip", "Progress Marker",
-             f"Published take-off + 3D render + documents ({created_by}).",
-             base64.b64encode(progress_bytes).decode("ascii"), stamp),
-        )
-
-        # 5. Mandatory Live Take-off Sync
-        synced = _sync_jobhub_takeoff_rows(bridge, int(job_id), takeoff)
-
-        # 6. Mandatory Take-off Lines Creation
-        line_count = 0
-        for _, row in takeoff.iterrows():
-            unit = str(row.get("unit") or "")
-            qty = to_float(row.get("quantity"))
-            m2 = qty if unit == "m²" else 0
-            lm = qty if unit == "lm" else 0
-            count = qty if unit in {"No.", "item"} else 0
-            bridge.execute(
-                """INSERT INTO painting_takeoff_lines(package_id,area_type,location_area,substrate,labour_category,m2,unit,quantity,coats,productivity_m2_per_hour,labour_hours,finish_type,element_count,lineal_metres,paint_litres,flags,notes,created_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (package_id, row.get("section", ""), row.get("location", ""), row.get("substrate", ""), row.get("element", ""),
-                 m2, unit, qty, row.get("coats", 0), row.get("productivity_m2_per_hour", 0), row.get("labour_hours", 0),
-                 row.get("finish_system", ""), count, lm, row.get("paint_litres", 0), row.get("confidence", ""),
-                 f"{row.get('notes', '')} | Source: {row.get('source_reference', '')}", stamp),
-            )
-            line_count += 1
-
-        # 7. Mandatory Job Status Update
-        bridge.execute(
-            "UPDATE jobs SET status=?, notes=COALESCE(notes, '') || ' | Published by PB PlanReader.' WHERE id=?",
-            ("Published", int(job_id)),
-        )
-
-        # 8. Transition Package Status to 'Published' with Final Notes
-        bridge.execute(
-            "UPDATE painting_takeoff_packages SET status='Published', notes=?, updated_at=? WHERE id=?",
-            (pkg_fp_note, stamp, package_id)
-        )
-
-    except Exception as exc:
-        # Partial Failure Safety: Transition package to 'Failed' so it never poisons retry as a Published duplicate
-        t_err = None
+        # Execute Consequential Operations within locked transaction connection
         try:
             bridge.execute(
-                "UPDATE painting_takeoff_packages SET status=?, notes=? WHERE id=?",
-                ("Failed", f"Failed publish attempt: {exc}", package_id)
+                """INSERT INTO job_document_blobs(job_id,file_name,mime_type,doc_type,notes,blob_data,created_at)
+                   VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(job_id, file_name) DO UPDATE SET
+                       mime_type=excluded.mime_type, doc_type=excluded.doc_type, notes=excluded.notes,
+                       blob_data=excluded.blob_data, created_at=excluded.created_at""",
+                (int(job_id), quote_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                 "Final quotation",
+                 f"Priced per-level quotation generated by PB PlanReader ({created_by}).",
+                 base64.b64encode(quote_bytes).decode("ascii"), stamp),
+                conn=conn
             )
-        except Exception as t_exc:
-            t_err = t_exc
 
-        if t_err:
-            raise RuntimeError(f"Mandatory publish side effect failed ({exc}) AND cleanup transition to Failed also failed ({t_err}).")
-        raise RuntimeError(f"Mandatory publish side effect failed: {exc}")
+            progress_name = f"progress_marker_{job_no}_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
+            progress_bytes = progress_package_bytes(workspace_id)
+            bridge.execute(
+                """INSERT INTO job_document_blobs(job_id,file_name,mime_type,doc_type,notes,blob_data,created_at)
+                   VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(job_id, file_name) DO UPDATE SET
+                       mime_type=excluded.mime_type, doc_type=excluded.doc_type, notes=excluded.notes,
+                       blob_data=excluded.blob_data, created_at=excluded.created_at""",
+                (int(job_id), progress_name, "application/zip", "Progress Marker",
+                 f"Published take-off + 3D render + documents ({created_by}).",
+                 base64.b64encode(progress_bytes).decode("ascii"), stamp),
+                conn=conn
+            )
+
+            synced = _sync_jobhub_takeoff_rows(bridge, int(job_id), takeoff, conn=conn)
+
+            line_count = 0
+            for _, row in takeoff.iterrows():
+                unit = str(row.get("unit") or "")
+                qty = to_float(row.get("quantity"))
+                m2 = qty if unit == "m²" else 0
+                lm = qty if unit == "lm" else 0
+                count = qty if unit in {"No.", "item"} else 0
+                bridge.execute(
+                    """INSERT INTO painting_takeoff_lines(package_id,area_type,location_area,substrate,labour_category,m2,unit,quantity,coats,productivity_m2_per_hour,labour_hours,finish_type,element_count,lineal_metres,paint_litres,flags,notes,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (package_id, row.get("section", ""), row.get("location", ""), row.get("substrate", ""), row.get("element", ""),
+                     m2, unit, qty, row.get("coats", 0), row.get("productivity_m2_per_hour", 0), row.get("labour_hours", 0),
+                     row.get("finish_system", ""), count, lm, row.get("paint_litres", 0), row.get("confidence", ""),
+                     f"{row.get('notes', '')} | Source: {row.get('source_reference', '')}", stamp),
+                    conn=conn
+                )
+                line_count += 1
+
+            bridge.execute(
+                "UPDATE jobs SET status=?, notes=COALESCE(notes, '') || ' | Published by PB PlanReader.' WHERE id=?",
+                ("Published", int(job_id)),
+                conn=conn
+            )
+
+            bridge.execute(
+                "UPDATE painting_takeoff_packages SET status='Published', notes=?, updated_at=? WHERE id=?",
+                (pkg_fp_note, stamp, package_id),
+                conn=conn
+            )
+
+            conn.commit()
+
+        except Exception as exc:
+            # Partial Failure Safety: Transition package to 'Failed'
+            t_err = None
+            try:
+                bridge.execute(
+                    "UPDATE painting_takeoff_packages SET status=?, notes=? WHERE id=?",
+                    ("Failed", f"Failed publish attempt: {exc}", package_id),
+                    conn=conn
+                )
+                conn.commit()
+            except Exception as t_exc:
+                t_err = t_exc
+
+            if t_err:
+                raise RuntimeError(f"Mandatory publish side effect failed ({exc}) AND cleanup transition to Failed also failed ({t_err}).")
+            raise RuntimeError(f"Mandatory publish side effect failed: {exc}")
 
     # Optional Best-Effort Metadata Document Registration
     try:
