@@ -1,4 +1,6 @@
 from __future__ import annotations
+import html
+from pb_commercial_export_preflight_v163 import derive_export_preflight, verify_toctou_and_publish_jobhub
 
 import base64
 import csv
@@ -706,25 +708,31 @@ class JobHubBridge:
             cur.execute(f"PRAGMA table_info({safe})")
             return [str(r[1]) for r in cur.fetchall()]
 
-    def query(self, sql: str, params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
-        with self.connect() as conn:
+    def query(self, sql: str, params: Sequence[Any] = (), conn: Optional[Any] = None) -> List[Dict[str, Any]]:
+        if conn is not None:
             if self.kind == "postgres":
                 cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
                 cur.execute(sql.replace("?", "%s"), tuple(params))
                 return [dict(r) for r in cur.fetchall()]
             cur = conn.execute(sql, tuple(params))
-            return [dict(r) for r in cur.fetchall()]
+            cols = [d[0] for d in cur.description] if cur.description else []
+            return [dict(zip(cols, r)) if isinstance(r, (tuple, list)) else dict(r) for r in cur.fetchall()]
+        with self.connect() as conn_obj:
+            return self.query(sql, params, conn=conn_obj)
 
-    def execute(self, sql: str, params: Sequence[Any] = (), returning: bool = False) -> Any:
-        with self.connect() as conn:
+    def execute(self, sql: str, params: Sequence[Any] = (), returning: bool = False, conn: Optional[Any] = None) -> Any:
+        if conn is not None:
             cur = conn.cursor()
             cur.execute(sql.replace("?", "%s") if self.kind == "postgres" else sql, tuple(params))
             result = None
             if returning:
                 row = cur.fetchone()
                 result = row[0] if row else None
-            conn.commit()
             return result
+        with self.connect() as conn_obj:
+            res = self.execute(sql, params, returning=returning, conn=conn_obj)
+            conn_obj.commit()
+            return res
 
     def discover_documents_for_job(self, job_id: int) -> List[Dict[str, Any]]:
         """Scan the common JobHub document/attachment tables in a single connection.
@@ -4475,7 +4483,7 @@ def progress_package_bytes(workspace_id: int) -> bytes:
     return output.getvalue()
 
 
-def _sync_jobhub_takeoff_rows(bridge: JobHubBridge, job_id: int, takeoff: pd.DataFrame) -> int:
+def _sync_jobhub_takeoff_rows(bridge: JobHubBridge, job_id: int, takeoff: pd.DataFrame, conn: Optional[Any] = None) -> int:
     """Upsert the workspace take-off into the shared ``job_takeoff_rows`` table."""
     takeoff = takeoff_work_rows(takeoff)
     if takeoff.empty:
@@ -4520,6 +4528,7 @@ def _sync_jobhub_takeoff_rows(bridge: JobHubBridge, job_id: int, takeoff: pd.Dat
                 confidence=excluded.confidence, updated_at=excluded.updated_at
             """,
             payload,
+            conn=conn,
         )
     return len(payloads)
 
@@ -4580,13 +4589,16 @@ def push_progress_marker_to_jobhub(workspace_id: int, bridge: JobHubBridge, crea
     }
 
 
-def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: str) -> Dict[str, Any]:
-    """Publish the final take-off and quotation to the shared JobHub job.
+def advisory_xact_lock_keys(job_id: int, preflight_fingerprint: str) -> Tuple[int, int]:
+    """Derive deterministic 32-bit positive signed integer key pair for PostgreSQL pg_try_advisory_xact_lock."""
+    key1 = int(job_id) & 0x7FFFFFFF
+    fp_hash = hashlib.md5(preflight_fingerprint.encode("utf-8")).hexdigest() if preflight_fingerprint else "0"
+    key2 = int(fp_hash[:8], 16) & 0x7FFFFFFF
+    return key1, key2
 
-    Creates a final take-off package marked ``Published``, writes the priced
-    Excel quotation as a ``Final quotation`` document blob, stores the one-file
-    progress package, and updates the shared ``jobs.status`` to ``Published``.
-    """
+
+def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: str, preflight_fingerprint: str = "", payload_hash: str = "") -> Dict[str, Any]:
+    """Publish the final take-off and quotation to the shared JobHub job with partial-safe lifecycle and strict receipt verification."""
     workspace = lquery("SELECT * FROM workspaces WHERE id=?", (workspace_id,))[0]
     job_id = workspace.get("jobhub_job_id")
     if not job_id:
@@ -4601,36 +4613,24 @@ def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: s
     job_no = safe_name(workspace.get("job_no"))
     quote_name = f"quotation_{job_no}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
     quote_bytes = quote_workbook_bytes(workspace_id)
-    try:
-        bridge.execute(
-            """INSERT INTO job_document_blobs(job_id,file_name,mime_type,doc_type,notes,blob_data,created_at)
-               VALUES(?,?,?,?,?,?,?)
-               ON CONFLICT(job_id, file_name) DO UPDATE SET
-                   mime_type=excluded.mime_type, doc_type=excluded.doc_type, notes=excluded.notes,
-                   blob_data=excluded.blob_data, created_at=excluded.created_at""",
-            (int(job_id), quote_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-             "Final quotation",
-             f"Priced per-level quotation generated by PB PlanReader ({created_by}).",
-             base64.b64encode(quote_bytes).decode("ascii"), stamp),
-        )
-    except Exception:
-        pass
-    progress_name = f"progress_marker_{job_no}_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
-    progress_bytes = progress_package_bytes(workspace_id)
-    try:
-        bridge.execute(
-            """INSERT INTO job_document_blobs(job_id,file_name,mime_type,doc_type,notes,blob_data,created_at)
-               VALUES(?,?,?,?,?,?,?)
-               ON CONFLICT(job_id, file_name) DO UPDATE SET
-                   mime_type=excluded.mime_type, doc_type=excluded.doc_type, notes=excluded.notes,
-                   blob_data=excluded.blob_data, created_at=excluded.created_at""",
-            (int(job_id), progress_name, "application/zip", "Progress Marker",
-             f"Published take-off + 3D render + documents ({created_by}).",
-             base64.b64encode(progress_bytes).decode("ascii"), stamp),
-        )
-    except Exception:
-        pass
-    synced = _sync_jobhub_takeoff_rows(bridge, int(job_id), takeoff)
+
+    # 1. Fail-Closed Fingerprint Persistence Handling
+    if not preflight_fingerprint or not payload_hash:
+        c_meta = local_connect()
+        try:
+            from pb_commercial_export_preflight_v163 import derive_export_preflight
+            pf_res = derive_export_preflight(c_meta, workspace_id, bridge_available=True)
+            preflight_fingerprint = pf_res.preflight_fingerprint
+            payload_hash = pf_res.payload_hash
+        except Exception as exc:
+            raise RuntimeError(f"Unable to derive preflight fingerprint for publish package notes: {exc}")
+        finally:
+            c_meta.close()
+
+    takeoff_no = f"PR-{workspace.get('job_no')}-PUB-{preflight_fingerprint[:12]}"
+    pkg_fp_note = f"Published by PB PlanReader. Preflight Fingerprint: {preflight_fingerprint} | Payload Hash: {payload_hash}"
+    fp_pattern = f"%{preflight_fingerprint}%"
+
     docs = ", ".join(d["file_name"] for d in lquery("SELECT file_name FROM documents WHERE workspace_id=? ORDER BY id", (workspace_id,)))
     internal_mask = takeoff["section"].astype(str).str.lower().str.contains("internal|ceiling|door|joinery")
     external_mask = takeoff["section"].astype(str).str.lower().str.contains("external|facade|elevation|soffit|canopy")
@@ -4639,50 +4639,154 @@ def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: s
     exterior = float(takeoff.loc[external_mask & m2_mask, "quantity"].fillna(0).sum())
     total_hours = float(takeoff["labour_hours"].fillna(0).sum())
     total_litres = float(takeoff["paint_litres"].fillna(0).sum())
-    takeoff_no = f"PR-{workspace.get('job_no')}-PUB-{datetime.now().strftime('%Y%m%d-%H%M')}"
-    if bridge.kind == "postgres":
-        package_id = bridge.execute(
-            """INSERT INTO painting_takeoff_packages(job_id,takeoff_no,takeoff_date,status,source_documents,interior_total_m2,exterior_total_m2,total_labour_hours,total_paint_litres,generated_method,assumptions,ai_notes,created_by,created_at,updated_at,notes)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id""",
-            (job_id, takeoff_no, datetime.now().date().isoformat(), "Published", docs, interior, exterior,
-             total_hours, total_litres, "PB PlanReader subscription method",
-             "Final quantities approved for pricing.", workspace.get("executive_summary", ""),
-             created_by, stamp, stamp, "Published by PB PlanReader."),
-            returning=True,
-        )
-    else:
-        bridge.execute(
-            """INSERT INTO painting_takeoff_packages(job_id,takeoff_no,takeoff_date,status,source_documents,interior_total_m2,exterior_total_m2,total_labour_hours,total_paint_litres,generated_method,assumptions,ai_notes,created_by,created_at,updated_at,notes)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (job_id, takeoff_no, datetime.now().date().isoformat(), "Published", docs, interior, exterior,
-             total_hours, total_litres, "PB PlanReader subscription method",
-             "Final quantities approved for pricing.", workspace.get("executive_summary", ""),
-             created_by, stamp, stamp, "Published by PB PlanReader."),
-        )
-        package_id = bridge.query("SELECT id FROM painting_takeoff_packages WHERE takeoff_no=?", (takeoff_no,))[0]["id"]
-    line_count = 0
-    for _, row in takeoff.iterrows():
-        unit = str(row.get("unit") or "")
-        qty = to_float(row.get("quantity"))
-        m2 = qty if unit == "m²" else 0
-        lm = qty if unit == "lm" else 0
-        count = qty if unit in {"No.", "item"} else 0
-        bridge.execute(
-            """INSERT INTO painting_takeoff_lines(package_id,area_type,location_area,substrate,labour_category,m2,unit,quantity,coats,productivity_m2_per_hour,labour_hours,finish_type,element_count,lineal_metres,paint_litres,flags,notes,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (package_id, row.get("section", ""), row.get("location", ""), row.get("substrate", ""), row.get("element", ""),
-             m2, unit, qty, row.get("coats", 0), row.get("productivity_m2_per_hour", 0), row.get("labour_hours", 0),
-             row.get("finish_system", ""), count, lm, row.get("paint_litres", 0), row.get("confidence", ""),
-             f"{row.get('notes', '')} | Source: {row.get('source_reference', '')}", stamp),
-        )
-        line_count += 1
-    try:
-        bridge.execute(
-            "UPDATE jobs SET status=?, notes=COALESCE(notes, '') || ' | Published by PB PlanReader.' WHERE id=?",
-            ("Published", int(job_id)),
-        )
-    except Exception:
-        pass
+
+    with bridge.connect() as conn:
+        cur = conn.cursor()
+
+        # 1. PostgreSQL Transaction-Scoped Advisory Lock (pg_try_advisory_xact_lock)
+        if bridge.kind == "postgres":
+            key1, key2 = advisory_xact_lock_keys(int(job_id), preflight_fingerprint)
+            cur.execute("SELECT pg_try_advisory_xact_lock(%s, %s)", (key1, key2))
+            lock_acquired = cur.fetchone()[0]
+            if not lock_acquired:
+                raise RuntimeError(
+                    f"Package for preflight fingerprint {preflight_fingerprint[:12]}... is currently being published by a concurrent transaction on JobHub for job #{job_id}."
+                )
+        elif bridge.kind == "sqlite":
+            try:
+                cur.execute("BEGIN IMMEDIATE")
+            except Exception:
+                pass
+
+        # 2. Duplicate Check within locked transaction
+        query_sql = "SELECT id, status, notes FROM painting_takeoff_packages WHERE job_id=? AND (takeoff_no=? OR notes LIKE ?) ORDER BY id DESC"
+        existing = bridge.query(query_sql, (job_id, takeoff_no, f"%{preflight_fingerprint}%"), conn=conn)
+        for pkg in existing:
+            st = str(pkg.get("status") or "")
+            if st in ("Published", "Pending"):
+                raise RuntimeError(
+                    f"Package for preflight fingerprint {preflight_fingerprint[:12]}... is already {st.lower()} on JobHub for job #{job_id} (Package #{pkg.get('id')})."
+                )
+
+        # 3. Atomic Package Reservation
+        if bridge.kind == "postgres":
+            package_id = bridge.execute(
+                """INSERT INTO painting_takeoff_packages(job_id,takeoff_no,takeoff_date,status,source_documents,interior_total_m2,exterior_total_m2,total_labour_hours,total_paint_litres,generated_method,assumptions,ai_notes,created_by,created_at,updated_at,notes)
+                   SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM painting_takeoff_packages
+                       WHERE job_id=? AND (takeoff_no=? OR notes LIKE ?) AND status IN ('Published', 'Pending')
+                   ) RETURNING id""",
+                (job_id, takeoff_no, datetime.now().date().isoformat(), "Pending", docs, interior, exterior,
+                 total_hours, total_litres, "PB PlanReader subscription method",
+                 "Final quantities approved for pricing.", workspace.get("executive_summary", ""),
+                 created_by, stamp, stamp, "Publish in progress...",
+                 job_id, takeoff_no, fp_pattern),
+                returning=True,
+                conn=conn
+            )
+        else:
+            bridge.execute(
+                """INSERT INTO painting_takeoff_packages(job_id,takeoff_no,takeoff_date,status,source_documents,interior_total_m2,exterior_total_m2,total_labour_hours,total_paint_litres,generated_method,assumptions,ai_notes,created_by,created_at,updated_at,notes)
+                   SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM painting_takeoff_packages
+                       WHERE job_id=? AND (takeoff_no=? OR notes LIKE ?) AND status IN ('Published', 'Pending')
+                   )""",
+                (job_id, takeoff_no, datetime.now().date().isoformat(), "Pending", docs, interior, exterior,
+                 total_hours, total_litres, "PB PlanReader subscription method",
+                 "Final quantities approved for pricing.", workspace.get("executive_summary", ""),
+                 created_by, stamp, stamp, "Publish in progress...",
+                 job_id, takeoff_no, fp_pattern),
+                conn=conn
+            )
+            res = bridge.query("SELECT id FROM painting_takeoff_packages WHERE takeoff_no=? AND status='Pending'", (takeoff_no,), conn=conn)
+            package_id = res[0]["id"] if res else None
+
+        if not package_id:
+            raise RuntimeError(f"Package for preflight fingerprint {preflight_fingerprint[:12]}... is already in progress or published on JobHub for job #{job_id}.")
+
+        # Execute Consequential Operations within locked transaction connection
+        try:
+            bridge.execute(
+                """INSERT INTO job_document_blobs(job_id,file_name,mime_type,doc_type,notes,blob_data,created_at)
+                   VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(job_id, file_name) DO UPDATE SET
+                       mime_type=excluded.mime_type, doc_type=excluded.doc_type, notes=excluded.notes,
+                       blob_data=excluded.blob_data, created_at=excluded.created_at""",
+                (int(job_id), quote_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                 "Final quotation",
+                 f"Priced per-level quotation generated by PB PlanReader ({created_by}).",
+                 base64.b64encode(quote_bytes).decode("ascii"), stamp),
+                conn=conn
+            )
+
+            progress_name = f"progress_marker_{job_no}_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
+            progress_bytes = progress_package_bytes(workspace_id)
+            bridge.execute(
+                """INSERT INTO job_document_blobs(job_id,file_name,mime_type,doc_type,notes,blob_data,created_at)
+                   VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(job_id, file_name) DO UPDATE SET
+                       mime_type=excluded.mime_type, doc_type=excluded.doc_type, notes=excluded.notes,
+                       blob_data=excluded.blob_data, created_at=excluded.created_at""",
+                (int(job_id), progress_name, "application/zip", "Progress Marker",
+                 f"Published take-off + 3D render + documents ({created_by}).",
+                 base64.b64encode(progress_bytes).decode("ascii"), stamp),
+                conn=conn
+            )
+
+            synced = _sync_jobhub_takeoff_rows(bridge, int(job_id), takeoff, conn=conn)
+
+            line_count = 0
+            for _, row in takeoff.iterrows():
+                unit = str(row.get("unit") or "")
+                qty = to_float(row.get("quantity"))
+                m2 = qty if unit == "m²" else 0
+                lm = qty if unit == "lm" else 0
+                count = qty if unit in {"No.", "item"} else 0
+                bridge.execute(
+                    """INSERT INTO painting_takeoff_lines(package_id,area_type,location_area,substrate,labour_category,m2,unit,quantity,coats,productivity_m2_per_hour,labour_hours,finish_type,element_count,lineal_metres,paint_litres,flags,notes,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (package_id, row.get("section", ""), row.get("location", ""), row.get("substrate", ""), row.get("element", ""),
+                     m2, unit, qty, row.get("coats", 0), row.get("productivity_m2_per_hour", 0), row.get("labour_hours", 0),
+                     row.get("finish_system", ""), count, lm, row.get("paint_litres", 0), row.get("confidence", ""),
+                     f"{row.get('notes', '')} | Source: {row.get('source_reference', '')}", stamp),
+                    conn=conn
+                )
+                line_count += 1
+
+            bridge.execute(
+                "UPDATE jobs SET status=?, notes=COALESCE(notes, '') || ' | Published by PB PlanReader.' WHERE id=?",
+                ("Published", int(job_id)),
+                conn=conn
+            )
+
+            bridge.execute(
+                "UPDATE painting_takeoff_packages SET status='Published', notes=?, updated_at=? WHERE id=?",
+                (pkg_fp_note, stamp, package_id),
+                conn=conn
+            )
+
+            conn.commit()
+
+        except Exception as exc:
+            # Partial Failure Safety: Transition package to 'Failed'
+            t_err = None
+            try:
+                bridge.execute(
+                    "UPDATE painting_takeoff_packages SET status=?, notes=? WHERE id=?",
+                    ("Failed", f"Failed publish attempt: {exc}", package_id),
+                    conn=conn
+                )
+                conn.commit()
+            except Exception as t_exc:
+                t_err = t_exc
+
+            if t_err:
+                raise RuntimeError(f"Mandatory publish side effect failed ({exc}) AND cleanup transition to Failed also failed ({t_err}).")
+            raise RuntimeError(f"Mandatory publish side effect failed: {exc}")
+
+    # Optional Best-Effort Metadata Document Registration
     try:
         ensure_planreader_document_table(bridge)
         bridge.execute(
@@ -4692,6 +4796,7 @@ def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: s
         )
     except Exception:
         pass
+
     return {
         "package_id": int(package_id),
         "package_lines": int(line_count),
@@ -4700,6 +4805,14 @@ def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: s
         "progress_marker": progress_name,
         "takeoff_rows_synced": synced,
         "job_status": "Published",
+        "published": True,
+        "side_effects": {
+            "quote_blob": True,
+            "progress_blob": True,
+            "takeoff_sync": True,
+            "package_lines": line_count == len(takeoff),
+            "job_status": True,
+        }
     }
 
 
@@ -5837,82 +5950,166 @@ def quantity_schedule_page(workspace:Dict[str,Any]) -> None:
 
 def export_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],user:Dict[str,Any]) -> None:
     hero(workspace)
-    st.markdown("<div class='pb-card'>",unsafe_allow_html=True)
+    wid = int(workspace["id"])
+    conn = local_connect()
+    try:
+        preflight = derive_export_preflight(conn, wid, bridge_available=bool(bridge and workspace.get("jobhub_job_id")))
+    finally:
+        conn.close()
+
+    # Workspace switch / Fingerprint invalidation check for acknowledgement state
+    if st.session_state.get("_pb_ack_workspace_id") != wid or st.session_state.get("_pb_ack_fp") != preflight.preflight_fingerprint:
+        st.session_state["_pb_ack_workspace_id"] = wid
+        st.session_state["_pb_ack_fp"] = preflight.preflight_fingerprint
+        st.session_state["_pb_ack_confirmed"] = False
+
+    # --- PHASE 6D COMMERCIAL EXPORT PREFLIGHT CARD ---
+    st.markdown("<div class='pb-card'>", unsafe_allow_html=True)
+    st.subheader("Commercial Export Preflight & QA Integrity (Phase 6D)")
+
+    status_colors = {
+        "AVAILABLE": "#2E8B57",
+        "AVAILABLE_WITH_WARNING": "#D7A21B",
+        "BLOCKED": "#B33A3A",
+        "UNAVAILABLE": "#737373",
+    }
+    badge_color = status_colors.get(preflight.preflight_status, "#737373")
+
+    st.markdown(
+        f"<div style='display:flex; justify-content:space-between; align-items:center; background:#262626; padding:12px 16px; border-radius:6px; margin-bottom:16px;'>"
+        f"<div><span style='font-size:0.85rem; color:#A3A3A3;'>PREFLIGHT STATUS</span><br/>"
+        f"<strong style='font-size:1.2rem; color:{badge_color};'>{html.escape(preflight.preflight_status)}</strong></div>"
+        f"<div style='text-align:right;'><span style='font-size:0.85rem; color:#A3A3A3;'>PREFLIGHT FINGERPRINT</span><br/>"
+        f"<code style='color:#F7F2E8;'>{preflight.preflight_fingerprint[:12]}...</code></div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Blockers", preflight.blocker_count)
+    c2.metric("Warnings", preflight.warning_count)
+    c3.metric("Publishable Rows", preflight.publishable_takeoff_rows)
+    c4.metric("Excluded / Floor Rows", preflight.excluded_takeoff_rows + preflight.floor_reference_rows)
+
+    if preflight.blocking_reasons:
+        st.markdown("<div style='background:#3B1717; border-left:4px solid #B33A3A; padding:12px; border-radius:4px; margin-top:12px;'>", unsafe_allow_html=True)
+        st.markdown("<strong style='color:#FCA5A5;'>BLOCKING ISSUES (Publish Prohibited):</strong>", unsafe_allow_html=True)
+        for r in preflight.blocking_reasons:
+            st.markdown(f"- <span style='color:#FECACA;'>{html.escape(r)}</span>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if preflight.warnings:
+        st.markdown("<div style='background:#332914; border-left:4px solid #D7A21B; padding:12px; border-radius:4px; margin-top:12px;'>", unsafe_allow_html=True)
+        st.markdown("<strong style='color:#FDE68A;'>QA WARNINGS (Review Required):</strong>", unsafe_allow_html=True)
+        for w in preflight.warnings:
+            st.markdown(f"- <span style='color:#FEF3C7;'>{html.escape(w)}</span>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # --- COMPLETE TAKE-OFF PACK ---
+    st.markdown("<div class='pb-card'>", unsafe_allow_html=True)
     st.subheader("Complete take-off pack")
-    excel=excel_export_bytes(int(workspace["id"]))
-    package=zip_export_bytes(int(workspace["id"]))
-    st.download_button("Download subscription-style Excel take-off pack",excel,file_name=f"{safe_name(workspace.get('job_no'))}_paint_takeoff.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
-    st.download_button("Download complete plans + take-off + 3D package",package,file_name=f"{safe_name(workspace.get('job_no'))}_planreader_3d_package.zip",mime="application/zip",use_container_width=True)
-    st.markdown("</div>",unsafe_allow_html=True)
-    st.markdown("<div class='pb-card'>",unsafe_allow_html=True)
+    excel = excel_export_bytes(wid)
+    package = zip_export_bytes(wid)
+    st.download_button("Download subscription-style Excel take-off pack", excel, file_name=f"{safe_name(workspace.get('job_no'))}_paint_takeoff.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    st.download_button("Download complete plans + take-off + 3D package", package, file_name=f"{safe_name(workspace.get('job_no'))}_planreader_3d_package.zip", mime="application/zip", use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # --- SEND REVIEWED DRAFT TO JOBHUB ---
+    st.markdown("<div class='pb-card'>", unsafe_allow_html=True)
     st.subheader("Send reviewed draft to JobHub")
     if not bridge or not workspace.get("jobhub_job_id"):
         st.info("Link this workspace to a JobHub job to send an approved draft back.")
     else:
-        st.markdown("<div class='pb-warning'>This creates a new draft take-off package in JobHub. It does not overwrite previous packages. Review quantities and drawing revision first.</div>",unsafe_allow_html=True)
-        confirmed=st.checkbox("I have reviewed the take-off and source references")
-        if st.button("Create draft take-off package in JobHub",type="primary",disabled=not confirmed):
+        st.markdown("<div class='pb-warning'>This creates a new draft take-off package in JobHub. It does not overwrite previous packages. Review quantities and drawing revision first.</div>", unsafe_allow_html=True)
+        confirmed = st.checkbox("I have reviewed the take-off and source references")
+        if st.button("Create draft take-off package in JobHub", type="primary", disabled=not confirmed or preflight.draft_handoff_state == "UNAVAILABLE"):
             try:
-                package_id,line_count=push_takeoff_to_jobhub(int(workspace["id"]),bridge,str(user.get("username") or "PlanReader"))
+                package_id, line_count = push_takeoff_to_jobhub(wid, bridge, str(user.get("username") or "PlanReader"))
                 st.success(f"Created JobHub take-off package #{package_id} with {line_count} lines.")
             except Exception as exc:
                 st.exception(exc)
-    st.markdown("</div>",unsafe_allow_html=True)
-    st.markdown("<div class='pb-card'>",unsafe_allow_html=True)
-    st.subheader("One-file progress marker → JobHub")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # --- ONE-FILE PROGRESS MARKER ---
+    st.markdown("<div class='pb-card'>", unsafe_allow_html=True)
+    st.subheader("One-file progress marker -> JobHub")
     if not bridge or not workspace.get("jobhub_job_id"):
         st.info("Link this workspace to a JobHub job to send the progress marker (3D render + take-off + job documents in one file).")
     else:
-        st.markdown("<div class='pb-note'>Builds a single ZIP: the interactive 3D render, OBJ + geometry, the Excel take-off pack, take-off CSVs (including JobHub's shared format), scope registers, source plans and rendered page previews. The ZIP is stored on the job in JobHub as a <b>Progress Marker</b>, take-off rows are synced live into <code>job_takeoff_rows</code>, and a draft take-off package is created alongside.</div>",unsafe_allow_html=True)
-        confirmed=st.checkbox("I have reviewed the take-off, drawing revision and 3D geometry")
-        if st.button("Build & send progress marker to JobHub",type="primary",disabled=not confirmed):
+        st.markdown("<div class='pb-note'>Builds a single ZIP: the interactive 3D render, OBJ + geometry, the Excel take-off pack, take-off CSVs, scope registers, source plans and rendered page previews. Stored on the job in JobHub as a Progress Marker.</div>", unsafe_allow_html=True)
+        confirmed = st.checkbox("I have reviewed the take-off, drawing revision and 3D geometry")
+        if st.button("Build & send progress marker to JobHub", type="primary", disabled=not confirmed):
             try:
-                result=push_progress_marker_to_jobhub(int(workspace["id"]),bridge,str(user.get("username") or "PlanReader"))
-                st.success(f"Sent {result['file_name']} ({result['size_bytes']/1024:.0f} KB) to JobHub job #{result['job_id']} as a progress marker; {result['takeoff_rows_synced']} take-off rows synced live and draft package #{result['package_id']} created ({result['package_lines']} lines).")
+                result = push_progress_marker_to_jobhub(wid, bridge, str(user.get("username") or "PlanReader"))
+                st.success(f"Sent {result['file_name']} ({result['size_bytes']/1024:.0f} KB) to JobHub job #{result['job_id']} as a progress marker.")
             except Exception as exc:
                 st.exception(exc)
         st.markdown("#### Progress markers already on this job")
         try:
-            markers=list_jobhub_progress_markers(bridge,int(workspace.get("jobhub_job_id")))
+            markers = list_jobhub_progress_markers(bridge, int(workspace.get("jobhub_job_id")))
         except Exception:
-            markers=[]
+            markers = []
         if markers:
-            st.dataframe(pd.DataFrame(markers),use_container_width=True,hide_index=True)
+            st.dataframe(pd.DataFrame(markers), use_container_width=True, hide_index=True)
         else:
             st.caption("No progress markers sent yet for this job.")
-    st.markdown("</div>",unsafe_allow_html=True)
-    st.markdown("<div class='pb-card'>",unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # --- IMPORT TAKE-OFF FROM JOBHUB ---
+    st.markdown("<div class='pb-card'>", unsafe_allow_html=True)
     st.subheader("Import take-off from JobHub")
     if not bridge or not workspace.get("jobhub_job_id"):
         st.info("Link this workspace to a JobHub job to pull take-off rows already stored in JobHub.")
     else:
-        st.markdown("<div class='pb-note'>Pulls the job's take-off rows from the shared JobHub database. Imported rows are tagged and replaced on re-import; existing rows created here are kept.</div>",unsafe_allow_html=True)
-        if st.button("Pull take-off rows from JobHub",type="primary"):
+        st.markdown("<div class='pb-note'>Pulls the job's take-off rows from the shared JobHub database. Imported rows are tagged and replaced on re-import.</div>", unsafe_allow_html=True)
+        if st.button("Pull take-off rows from JobHub", type="primary"):
             try:
-                n=pull_takeoff_from_jobhub(int(workspace["id"]),bridge)
+                n = pull_takeoff_from_jobhub(wid, bridge)
                 st.success(f"Imported {n} take-off row(s) from JobHub." if n else "JobHub has no take-off rows for this job.")
                 st.rerun()
             except Exception as exc:
                 st.exception(exc)
-    st.markdown("</div>",unsafe_allow_html=True)
-    st.markdown("<div class='pb-card'>",unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # --- PUBLISH FINAL TAKE-OFF TO JOBHUB (PHASE 6D PREFLIGHT PROTECTED) ---
+    st.markdown("<div class='pb-card'>", unsafe_allow_html=True)
     st.subheader("Publish final take-off to JobHub")
     if not bridge or not workspace.get("jobhub_job_id"):
         st.info("Link this workspace to a JobHub job to publish the final take-off and quotation.")
+    elif preflight.final_publish_state == "BLOCKED":
+        st.error("Final publish is BLOCKED by preflight QA gate. Correct the blocker items above before publishing.")
+        st.button("Publish to JobHub", type="primary", disabled=True)
+    elif st.session_state.get("_pb_last_published_fp") == preflight.preflight_fingerprint:
+        # Duplicate submission protection
+        st.info(f"Package for preflight fingerprint {preflight.preflight_fingerprint[:12]}... has already been published to JobHub.")
+        st.button("Publish to JobHub", type="primary", disabled=True)
     else:
-        st.markdown("<div class='pb-warning'>Publishes the final take-off package (status <b>Published</b>), the priced Excel quotation and the progress package, syncs take-off rows live, and marks the shared JobHub job as <b>Published</b>. Only do this when quantities, drawing revision and pricing are final.</div>",unsafe_allow_html=True)
-        scale_issues=scale_gate_issues(int(workspace["id"]))
-        if scale_issues:
-            st.warning("**Scale gate:** " + ", ".join(f"`{i['page_label']}`" for i in scale_issues[:8]) + " has no calibrated scale — calibrate before publishing.")
-        publish_confirm=st.checkbox("I confirm this is the final, reviewed and priced take-off for the current drawing issue")
-        if st.button("Publish to JobHub",type="primary",disabled=not publish_confirm or bool(scale_issues)):
-            try:
-                result=publish_job_to_jobhub(int(workspace["id"]),bridge,str(user.get("username") or "PlanReader"))
-                st.success(f"Published job #{result['job_id']}: final package #{result['package_id']} ({result['package_lines']} lines), quotation '{result['quotation']}' and progress marker '{result['progress_marker']}' stored; {result['takeoff_rows_synced']} take-off rows synced. JobHub status: {result['job_status']}.")
-            except Exception as exc:
-                st.exception(exc)
-    st.markdown("</div>",unsafe_allow_html=True)
+        st.markdown("<div class='pb-warning'>Publishes final take-off package (status <b>Published</b>), priced Excel quotation and progress package, syncs take-off rows live, and marks shared JobHub job as <b>Published</b>. Only do this when quantities, drawing revision and pricing are final.</div>", unsafe_allow_html=True)
 
+        need_ack = (preflight.final_publish_state == "AVAILABLE_WITH_WARNING")
+        if need_ack:
+            st.warning("Preflight QA warnings present. Typed acknowledgement required before final publication.")
+            publish_confirm = st.checkbox(f"I confirm I have reviewed preflight fingerprint {preflight.preflight_fingerprint[:12]}... and approve final publication for drawing issue {html.escape(workspace.get('drawing_issue') or '')}")
+        else:
+            publish_confirm = st.checkbox("I confirm this is the final, reviewed and priced take-off for the current drawing issue")
+
+        if st.button("Publish to JobHub", type="primary", disabled=not publish_confirm):
+            try:
+                c2 = local_connect()
+                try:
+                    res = verify_toctou_and_publish_jobhub(
+                        c2, wid, bridge, str(user.get("username") or "PlanReader"),
+                        preflight.preflight_fingerprint, publish_confirm, publish_job_to_jobhub
+                    )
+                finally:
+                    c2.close()
+                st.session_state["_pb_last_published_fp"] = res["preflight_fingerprint"]
+                st.success(f"Published job #{res['job_id']}: final package #{res['package_id']} ({res['package_lines']} lines), quotation '{res['quotation']}' and progress marker '{res['progress_marker']}' stored. JobHub status: {res.get('job_status', 'Published')}.")
+            except Exception as exc:
+                st.error(f"Publish Aborted: {exc}")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Offline Plan Reader (no AI)
