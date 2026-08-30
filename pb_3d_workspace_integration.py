@@ -15,6 +15,10 @@ Architecture guarantees:
 5. Workspace evidence is converted through ``planreader_workspace_to_canonical``.
 6. Canonical HTML caching is bounded to 10 entries per Streamlit session.
 7. Canonical persistence, staleness checks and Phase 5 diagnostics remain intact.
+
+The retained legacy callable is intentionally not a source of quantity, geometry,
+calibration, opening or deduction authority. Its presence is for controlled
+privileged diagnostics only; ordinary estimators cannot expose it.
 """
 
 from __future__ import annotations
