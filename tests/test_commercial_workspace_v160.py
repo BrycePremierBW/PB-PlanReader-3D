@@ -249,3 +249,37 @@ def test_apply_is_idempotent_and_only_wraps_existing_hero_once():
     assert app._commercial_workspace_v160_installed is True
     apply(app)
     assert app.hero is first_wrapper
+
+
+def test_saved_model_without_source_fingerprint_is_not_claimed_valid():
+    model = json.dumps({"model_data": {"id": "ws_101"}})
+    app = FakeApp(
+        documents=[{"id": 1}],
+        pages=_base_pages(),
+        takeoff=[{"id": 1, "quantity": 100, "quantity_status": "Measured", "confidence": "Verified", "inclusion_status": "INCLUSION"}],
+        model=model,
+    )
+    status = derive_workspace_status(app, WORKSPACE)
+    assert status.canonical_model_saved is False
+    assert status.canonical_model_fingerprint is None
+    assert status.current_step == "3D"
+
+
+def test_malformed_saved_model_does_not_claim_3d_readiness():
+    app = FakeApp(
+        documents=[{"id": 1}],
+        pages=_base_pages(),
+        takeoff=[{"id": 1, "quantity": 100, "quantity_status": "Measured", "confidence": "Verified", "inclusion_status": "INCLUSION"}],
+        model="{not valid json",
+    )
+    status = derive_workspace_status(app, WORKSPACE)
+    assert status.canonical_model_saved is False
+    assert status.canonical_model_fingerprint is None
+    assert status.current_step == "3D"
+
+
+def test_workflow_step_states_are_fixed_order_and_review_signals_are_visible():
+    status = derive_workspace_status(FakeApp(), WORKSPACE)
+    states = workflow_step_states(status)
+    labels = [s["label"] for s in states]
+    assert labels == list(WORKFLOW_STEPS)

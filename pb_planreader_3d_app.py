@@ -5188,6 +5188,9 @@ def project_documents_page(workspace: Dict[str, Any], bridge: Optional[JobHubBri
 
 def drawing_register_page(workspace: Dict[str, Any]) -> None:
     hero(workspace)
+    target_register_id = st.session_state.pop("active_register_item_id", None)
+    if target_register_id:
+        st.info(f"🎯 Target clarification register item #{target_register_id} selected from Review & QA workspace.")
     pages=ldf("""SELECT p.id,p.page_label,p.page_type,p.scale_text,p.px_per_m,p.page_no,p.selected,d.file_name,p.image_path FROM pages p JOIN documents d ON d.id=p.document_id WHERE p.workspace_id=? ORDER BY d.id,p.page_no""",(workspace["id"],))
     if pages.empty:
         st.info("Process documents first.")
@@ -5265,6 +5268,9 @@ def _run_with_progress(worker: Callable[[], Any], caption: str) -> Any:
 
 def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, ai_provider: str = "OpenAI") -> None:
     hero(workspace)
+    target_row_id = st.session_state.pop("active_takeoff_row_id", None)
+    if target_row_id:
+        st.info(f"🎯 Target take-off row #{target_row_id} selected from Review & QA workspace.")
     tabs=st.tabs(["AI plan read","Take-off schedule","Scope registers","Door schedule","Source & basis","AI vs drawn"])
     with tabs[0]:
         pages=ldf("SELECT id,page_label,page_type,image_path,selected FROM pages WHERE workspace_id=? ORDER BY id",(workspace["id"],))
@@ -5437,6 +5443,9 @@ def overlay_image(page:Dict[str,Any],zones:List[Dict[str,Any]]) -> Optional[Imag
 
 def plan_mapper_page(workspace:Dict[str,Any]) -> None:
     hero(workspace)
+    target_page_id = st.session_state.pop("active_page_id", None)
+    if target_page_id:
+        st.info(f"🎯 Target drawing page #{target_page_id} selected from Review & QA workspace.")
     pages=ldf("SELECT * FROM pages WHERE workspace_id=? ORDER BY id",(workspace["id"],))
     if pages.empty:
         st.info("Process drawings first.")
@@ -6387,6 +6396,12 @@ def settings_page(workspace:Dict[str,Any],bridge:Optional[JobHubBridge],session_
 
 def main() -> None:
     st.set_page_config(page_title=APP_NAME,page_icon="🏗️",layout="wide")
+    if "reset" in st.query_params:
+        st.query_params.clear()
+        user = st.session_state.get("planreader_user") or {"username": "Estimator", "role": "Estimator"}
+        st.session_state.clear()
+        st.session_state["planreader_user"] = user
+        st.session_state["workspace_id"] = 1
     app_css()
     init_local_db()
     bridge=get_jobhub_bridge()
@@ -6421,35 +6436,45 @@ def main() -> None:
         "Export / JobHub",
         "Settings",
     ]
-    nav_target = st.session_state.pop("_pb_nav_target", None)
-    nav_payload = st.session_state.pop("_pb_nav_payload", None)
+    nav_target = st.session_state.get("_pb_nav_target")
+    nav_payload = st.session_state.get("_pb_nav_payload")
 
-    default_index = 0
+    valid_nav_target = None
     active_ws_id = int(workspace["id"]) if isinstance(workspace, dict) and workspace.get("id") else None
 
     if nav_target and isinstance(nav_payload, dict):
         payload_ws_id = nav_payload.get("workspace_id")
         if payload_ws_id == active_ws_id:
+            valid_nav_target = nav_target
             if nav_target == "takeoff":
-                default_index = menu_options.index("Subscription Take-off")
                 if nav_payload.get("takeoff_row_id"):
                     st.session_state["active_takeoff_row_id"] = nav_payload["takeoff_row_id"]
             elif nav_target in ("drawing", "page"):
-                default_index = menu_options.index("Plan Mapper")
                 if nav_payload.get("page_id"):
                     st.session_state["active_page_id"] = nav_payload["page_id"]
             elif nav_target == "register":
-                default_index = menu_options.index("Drawing Register")
                 if nav_payload.get("register_item_id"):
                     st.session_state["active_register_item_id"] = nav_payload["register_item_id"]
-            elif nav_target == "model":
-                default_index = menu_options.index("3D Building Model")
-            elif nav_target == "review":
-                default_index = menu_options.index("Review & QA")
 
-    saved_menu = st.session_state.get("_pb_current_menu")
-    if saved_menu in menu_options and nav_target is None:
-        default_index = menu_options.index(saved_menu)
+    # Pop consumed/rejected navigation signals cleanly
+    st.session_state.pop("_pb_nav_target", None)
+    st.session_state.pop("_pb_nav_payload", None)
+
+    default_index = 0
+    if valid_nav_target == "takeoff":
+        default_index = menu_options.index("Subscription Take-off")
+    elif valid_nav_target in ("drawing", "page"):
+        default_index = menu_options.index("Plan Mapper")
+    elif valid_nav_target == "register":
+        default_index = menu_options.index("Drawing Register")
+    elif valid_nav_target == "model":
+        default_index = menu_options.index("3D Building Model")
+    elif valid_nav_target == "review":
+        default_index = menu_options.index("Review & QA")
+    else:
+        saved_menu = st.session_state.get("_pb_current_menu")
+        if saved_menu in menu_options:
+            default_index = menu_options.index(saved_menu)
 
     menu = st.sidebar.radio("Menu", menu_options, index=default_index)
     st.session_state["_pb_current_menu"] = menu

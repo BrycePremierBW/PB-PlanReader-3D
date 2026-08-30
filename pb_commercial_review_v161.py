@@ -112,12 +112,12 @@ class CommercialReviewResult:
 
     @property
     def required_coverage_complete(self) -> bool:
-        """Required coverage is complete if workspace_id > 0 and all REQUIRED_FAMILIES are AVAILABLE or NOT_SUPPORTED."""
+        """Required coverage is complete if workspace_id > 0 and all REQUIRED_FAMILIES are AVAILABLE."""
         if not self.workspace_id or self.workspace_id <= 0:
             return False
         for fam in REQUIRED_FAMILIES:
             status = self.source_coverage.get(fam, "UNAVAILABLE")
-            if status not in ("AVAILABLE", "NOT_SUPPORTED"):
+            if status != "AVAILABLE":
                 return False
         return True
 

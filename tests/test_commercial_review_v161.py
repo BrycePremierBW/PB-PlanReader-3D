@@ -176,27 +176,24 @@ def test_excluded_rows_without_issues_produce_no_signal(test_db):
     assert res.signal_count == 0
 
 
-def test_malformed_takeoff_row_id_quarantines_item(test_db):
-    """Missing or non-numeric row ID must be quarantined without killing entire family."""
-    app = MockApp(test_db)
-    conn = sqlite3.connect(test_db)
-    cur = conn.cursor()
-    cur.execute("INSERT INTO workspaces VALUES (101, 'JOB-101', 'Test Job', 'Issue A')")
-    # Row 1 valid
-    cur.execute(
-        "INSERT INTO takeoff_rows VALUES (1, 101, 10, 1, 'Valid Row 1', 'Notes', 'L1', 'm2', NULL, 'To measure', 'low', 'included', 'A-101')"
-    )
-    # Row 2 valid
-    cur.execute(
-        "INSERT INTO takeoff_rows VALUES (2, 101, 10, 1, 'Valid Row 2', 'Notes', 'L1', 'm2', NULL, 'To measure', 'low', 'included', 'A-101')"
-    )
-    conn.commit()
-    conn.close()
+def test_malformed_takeoff_row_id_quarantines_item():
+    """Missing or non-numeric row ID must be quarantined without destroying valid items or marking family UNAVAILABLE."""
+    class MalformedApp:
+        def lquery(self, sql, params=()):
+            return [
+                {"id": 1, "workspace_id": 101, "element": "Valid Row 1", "quantity_status": "To measure"},
+                {"id": None, "workspace_id": 101, "element": "Malformed Row None", "quantity_status": "To measure"},
+                {"id": "abc_invalid", "workspace_id": 101, "element": "Malformed Row String", "quantity_status": "To measure"},
+                {"id": 3, "workspace_id": 101, "element": "Valid Row 3", "quantity_status": "To measure"},
+            ]
 
-    signals = collect_takeoff_review_signals(app, 101)
+    signals = collect_takeoff_review_signals(MalformedApp(), 101)
+    # The two malformed rows (None and "abc_invalid") are quarantined (skipped).
     assert len(signals) == 2
+    assert signals[0].takeoff_row_id == 1
+    assert signals[1].takeoff_row_id == 3
     assert signals[0].source_id == "1"
-    assert signals[1].source_id == "2"
+    assert signals[1].source_id == "3"
 
 
 def test_register_priority_and_status_contract(test_db):
@@ -238,7 +235,7 @@ def test_register_priority_and_status_contract(test_db):
 
 
 def test_scale_authority_missing_and_exception(test_db):
-    """No scale_gate_issues method -> NOT_SUPPORTED. Method raises exception -> UNAVAILABLE."""
+    """No scale_gate_issues method -> NOT_SUPPORTED (coverage incomplete). Method raises exception -> UNAVAILABLE."""
     # Case 1: app has no scale_gate_issues
     class BareApp:
         def lquery(self, sql, params=()):
@@ -246,7 +243,7 @@ def test_scale_authority_missing_and_exception(test_db):
 
     res1 = collect_commercial_review_signals(BareApp(), {"id": 101})
     assert res1.source_coverage["scale"] == "NOT_SUPPORTED"
-    assert res1.required_coverage_complete is True
+    assert res1.required_coverage_complete is False
 
     # Case 2: scale_gate_issues raises Exception
     class ExceptionApp:
@@ -301,51 +298,62 @@ def test_partial_source_outage_with_valid_signals(test_db):
     assert res.signals[0].source_family == "takeoff"
 
 
-def test_deterministic_reordering(test_db):
-    """Same source data in different query order produces identical signal IDs and ordering."""
-    app = MockApp(test_db)
-    conn = sqlite3.connect(test_db)
-    cur = conn.cursor()
-    cur.execute("INSERT INTO workspaces VALUES (101, 'JOB-101', 'Test Job', 'Issue A')")
-    cur.execute(
-        "INSERT INTO takeoff_rows VALUES (1, 101, 10, 1, 'Wall A', 'Notes', 'L1', 'm2', NULL, 'To measure', 'low', 'included', 'A-101')"
-    )
-    cur.execute(
-        "INSERT INTO takeoff_rows VALUES (2, 101, 10, 1, 'Wall B', 'Notes', 'L1', 'm2', 10.0, 'Provisional measured', 'Derived', 'included', 'A-101')"
-    )
-    conn.commit()
-    conn.close()
+def test_deterministic_reordering():
+    """Different input row ordering yields identical, deterministically sorted signal IDs and ordering."""
+    rows_order_A = [
+        {"id": 2, "workspace_id": 101, "element": "Wall B", "quantity_status": "Provisional measured", "confidence": "Derived"},
+        {"id": 1, "workspace_id": 101, "element": "Wall A", "quantity_status": "To measure", "confidence": "low"},
+    ]
+    rows_order_B = [
+        {"id": 1, "workspace_id": 101, "element": "Wall A", "quantity_status": "To measure", "confidence": "low"},
+        {"id": 2, "workspace_id": 101, "element": "Wall B", "quantity_status": "Provisional measured", "confidence": "Derived"},
+    ]
 
-    res1 = collect_commercial_review_signals(app, {"id": 101})
-    res2 = collect_commercial_review_signals(app, {"id": 101})
+    class MockAppA:
+        def lquery(self, sql, params=()):
+            if "takeoff_rows" in sql:
+                return rows_order_A
+            return []
+        def scale_gate_issues(self, wid):
+            return []
 
+    class MockAppB:
+        def lquery(self, sql, params=()):
+            if "takeoff_rows" in sql:
+                return rows_order_B
+            return []
+        def scale_gate_issues(self, wid):
+            return []
+
+    res1 = collect_commercial_review_signals(MockAppA(), {"id": 101})
+    res2 = collect_commercial_review_signals(MockAppB(), {"id": 101})
+
+    assert len(res1.signals) == 2
+    assert len(res2.signals) == 2
     assert [s.signal_id for s in res1.signals] == [s.signal_id for s in res2.signals]
     assert [s.severity for s in res1.signals] == [s.severity for s in res2.signals]
+    assert res1.signals[0].severity == "BLOCKER"
+    assert res1.signals[1].severity == "REVIEW"
 
 
-def test_same_source_id_different_workspaces(test_db):
-    """Same item ID in workspace 101 vs workspace 202 must produce different signal IDs."""
-    app = MockApp(test_db)
-    conn = sqlite3.connect(test_db)
-    cur = conn.cursor()
-    cur.execute("INSERT INTO workspaces VALUES (101, 'JOB-101', 'WS 101', 'Issue A')")
-    cur.execute("INSERT INTO workspaces VALUES (202, 'JOB-202', 'WS 202', 'Issue A')")
-    cur.execute(
-        "INSERT INTO takeoff_rows VALUES (1, 101, 10, 1, 'Wall Paint', 'Notes', 'L1', 'm2', NULL, 'To measure', 'low', 'included', 'A-101')"
-    )
-    cur.execute(
-        "INSERT INTO takeoff_rows VALUES (2, 202, 10, 1, 'Wall Paint', 'Notes', 'L1', 'm2', NULL, 'To measure', 'low', 'included', 'A-101')"
-    )
-    conn.commit()
-    conn.close()
+def test_same_source_id_different_workspaces():
+    """Identical source item ID (e.g. id=1) across workspaces must produce distinct signal IDs."""
+    class MockAppWS:
+        def __init__(self, ws_id):
+            self.ws_id = ws_id
+        def lquery(self, sql, params=()):
+            if "takeoff_rows" in sql:
+                return [{"id": 1, "workspace_id": self.ws_id, "element": "Wall Paint", "quantity_status": "To measure"}]
+            return []
+        def scale_gate_issues(self, wid):
+            return []
 
-    res1 = collect_commercial_review_signals(app, {"id": 101})
-    res2 = collect_commercial_review_signals(app, {"id": 202})
+    res1 = collect_commercial_review_signals(MockAppWS(101), {"id": 101})
+    res2 = collect_commercial_review_signals(MockAppWS(202), {"id": 202})
 
     assert res1.signals[0].signal_id == "review:101:takeoff:1:Measurement"
-    assert res2.signals[0].signal_id == "review:202:takeoff:2:Measurement"
-    assert "review:101:" in res1.signals[0].signal_id
-    assert "review:202:" in res2.signals[0].signal_id
+    assert res2.signals[0].signal_id == "review:202:takeoff:1:Measurement"
+    assert res1.signals[0].signal_id != res2.signals[0].signal_id
 
 
 def test_performance_benchmark(test_db):
