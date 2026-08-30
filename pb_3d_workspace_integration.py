@@ -10,9 +10,11 @@ Architecture guarantees:
 2. Canonical 3D is the only default estimator-facing 3D surface.
 3. The legacy editor requires both an environment feature flag and an explicit
    per-session opt-in before it is called.
-4. Workspace evidence is converted through ``planreader_workspace_to_canonical``.
-5. Canonical HTML caching is bounded to 10 entries per Streamlit session.
-6. Canonical persistence, staleness checks and Phase 5 diagnostics remain intact.
+4. The existing shared ``hero(workspace)`` hook still renders exactly once on the
+   ordinary canonical page, preserving the Phase 6A commercial workspace shell.
+5. Workspace evidence is converted through ``planreader_workspace_to_canonical``.
+6. Canonical HTML caching is bounded to 10 entries per Streamlit session.
+7. Canonical persistence, staleness checks and Phase 5 diagnostics remain intact.
 """
 
 from __future__ import annotations
@@ -23,7 +25,6 @@ from typing import Any
 import streamlit as st
 import streamlit.components.v1 as components
 
-from pb_3d_diagnostics import generate_production_diagnostics_report  # noqa: F401
 from pb_bim_viewer import generate_bim_viewer_html, project_to_viewer_payload
 from pb_canonical_persistence import load_workspace_canonical_model, save_workspace_canonical_model
 from pb_production_3d_adapter import planreader_workspace_to_canonical, require_workspace_id
@@ -55,6 +56,13 @@ def _workspace_id_from_context(app: Any, workspace: Any = None) -> int:
     return require_workspace_id(workspace_id)
 
 
+def _render_shared_workspace_header(app: Any, workspace: Any = None) -> None:
+    """Preserve the normal shared hero/commercial shell without invoking legacy 3D."""
+    hero = getattr(app, "hero", None)
+    if callable(hero):
+        hero(workspace)
+
+
 def render_workspace_3d_canonical_view(app: Any, workspace: Any = None) -> None:
     """Render the reviewed canonical 3D BIM model for the active workspace."""
     try:
@@ -74,7 +82,10 @@ def render_workspace_3d_canonical_view(app: Any, workspace: Any = None) -> None:
         return
 
     st.markdown("### Canonical 3D Model")
-    st.caption("Built from the reviewed PlanReader source-evidence pipeline. Unknown geometry remains unresolved rather than being filled with convenience defaults.")
+    st.caption(
+        "Built from the reviewed PlanReader source-evidence pipeline. Unknown geometry "
+        "remains unresolved rather than being filled with convenience defaults."
+    )
 
     if project.is_synthetic_demo:
         st.warning("SYNTHETIC VIEWER DEMONSTRATION FIXTURE — NOT BENCHMARK TRUTH / NOT TAKEOFF AUTHORITATIVE")
@@ -176,7 +187,9 @@ def apply(app: Any) -> None:
     setattr(app, "_legacy_model_3d_page", original_model_3d)
 
     def model_3d_page_canonical_wrapper(workspace: Any = None, *args, **kwargs):
-        # Canonical review is always first and is the only default production path.
+        # Preserve the normal app/project header without executing the legacy 3D page.
+        _render_shared_workspace_header(app, workspace)
+        # Canonical review is the only default production 3D path.
         render_workspace_3d_canonical_view(app, workspace)
         # The old editor is never executed unless two explicit developer gates pass.
         _render_legacy_editor_opt_in(app, original_model_3d, workspace, args, kwargs)
