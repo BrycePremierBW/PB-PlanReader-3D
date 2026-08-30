@@ -4582,16 +4582,20 @@ def push_progress_marker_to_jobhub(workspace_id: int, bridge: JobHubBridge, crea
     }
 
 
-def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: str) -> Dict[str, Any]:
-    """Publish the final take-off and quotation to the shared JobHub job with strict mandatory side-effect verification.
+def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: str, preflight_fingerprint: str = "", payload_hash: str = "") -> Dict[str, Any]:
+    """Publish the final take-off and quotation to the shared JobHub job with partial-safe lifecycle and strict receipt verification.
 
     Mandatory Side Effects (All must succeed for Published=True):
       1. Quotation blob stored in job_document_blobs
       2. Progress marker ZIP stored in job_document_blobs
       3. Live takeoff rows synced to job_takeoff_rows
-      4. Takeoff package header created in painting_takeoff_packages
+      4. Takeoff package header created in painting_takeoff_packages (initially 'Pending')
       5. All takeoff lines created in painting_takeoff_lines
       6. Shared job status updated to 'Published' in jobs
+      7. Takeoff package status transitioned to 'Published' with preflight fingerprint notes
+
+    Partial-Safe Guarantee: If any mandatory side effect fails, the package is marked 'Failed'
+    and will NOT block future retries as a published duplicate.
     """
     workspace = lquery("SELECT * FROM workspaces WHERE id=?", (workspace_id,))[0]
     job_id = workspace.get("jobhub_job_id")
@@ -4608,8 +4612,72 @@ def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: s
     quote_name = f"quotation_{job_no}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
     quote_bytes = quote_workbook_bytes(workspace_id)
 
-    # 1. Mandatory Quotation Blob Storage
+    # 1. Fail-Closed Fingerprint Persistence Handling
+    if not preflight_fingerprint or not payload_hash:
+        c_meta = local_connect()
+        try:
+            from pb_commercial_export_preflight_v163 import derive_export_preflight
+            pf_res = derive_export_preflight(c_meta, workspace_id, bridge_available=True)
+            preflight_fingerprint = pf_res.preflight_fingerprint
+            payload_hash = pf_res.payload_hash
+        except Exception as exc:
+            raise RuntimeError(f"Unable to derive preflight fingerprint for publish package notes: {exc}")
+        finally:
+            c_meta.close()
+
+    takeoff_no = f"PR-{workspace.get('job_no')}-PUB-{preflight_fingerprint[:12]}"
+    pkg_fp_note = f"Published by PB PlanReader. Preflight Fingerprint: {preflight_fingerprint} | Payload Hash: {payload_hash}"
+
+    # 2. Concurrency & Duplicate Check before Header Creation
     try:
+        query_sql = "SELECT id, status, notes FROM painting_takeoff_packages WHERE job_id=? AND (takeoff_no=? OR notes LIKE ?) ORDER BY id DESC"
+        existing = bridge.query(query_sql, (job_id, takeoff_no, f"%{preflight_fingerprint}%"))
+        for pkg in existing:
+            st = str(pkg.get("status") or "")
+            if st in ("Published", "Pending"):
+                raise RuntimeError(f"Package for preflight fingerprint {preflight_fingerprint[:12]}... is already {st.lower()} on JobHub for job #{job_id} (Package #{pkg.get('id')}).")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Duplicate verification failed closed: unable to query existing JobHub packages ({exc}).")
+
+    docs = ", ".join(d["file_name"] for d in lquery("SELECT file_name FROM documents WHERE workspace_id=? ORDER BY id", (workspace_id,)))
+    internal_mask = takeoff["section"].astype(str).str.lower().str.contains("internal|ceiling|door|joinery")
+    external_mask = takeoff["section"].astype(str).str.lower().str.contains("external|facade|elevation|soffit|canopy")
+    m2_mask = takeoff["unit"].astype(str).eq("m²")
+    interior = float(takeoff.loc[internal_mask & m2_mask, "quantity"].fillna(0).sum())
+    exterior = float(takeoff.loc[external_mask & m2_mask, "quantity"].fillna(0).sum())
+    total_hours = float(takeoff["labour_hours"].fillna(0).sum())
+    total_litres = float(takeoff["paint_litres"].fillna(0).sum())
+
+    # 3. Create Package Header in 'Pending' State
+    try:
+        if bridge.kind == "postgres":
+            package_id = bridge.execute(
+                """INSERT INTO painting_takeoff_packages(job_id,takeoff_no,takeoff_date,status,source_documents,interior_total_m2,exterior_total_m2,total_labour_hours,total_paint_litres,generated_method,assumptions,ai_notes,created_by,created_at,updated_at,notes)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id""",
+                (job_id, takeoff_no, datetime.now().date().isoformat(), "Pending", docs, interior, exterior,
+                 total_hours, total_litres, "PB PlanReader subscription method",
+                 "Final quantities approved for pricing.", workspace.get("executive_summary", ""),
+                 created_by, stamp, stamp, "Publish in progress..."),
+                returning=True,
+            )
+        else:
+            bridge.execute(
+                """INSERT INTO painting_takeoff_packages(job_id,takeoff_no,takeoff_date,status,source_documents,interior_total_m2,exterior_total_m2,total_labour_hours,total_paint_litres,generated_method,assumptions,ai_notes,created_by,created_at,updated_at,notes)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (job_id, takeoff_no, datetime.now().date().isoformat(), "Pending", docs, interior, exterior,
+                 total_hours, total_litres, "PB PlanReader subscription method",
+                 "Final quantities approved for pricing.", workspace.get("executive_summary", ""),
+                 created_by, stamp, stamp, "Publish in progress..."),
+            )
+            package_id = bridge.query("SELECT id FROM painting_takeoff_packages WHERE takeoff_no=?", (takeoff_no,))[0]["id"]
+    except Exception as exc:
+        raise RuntimeError(f"Mandatory takeoff package creation failed: {exc}")
+
+    # Execute Consequential Operations with Cleanup on Failure
+    try:
+        # 4. Mandatory Quotation Blob Storage
         bridge.execute(
             """INSERT INTO job_document_blobs(job_id,file_name,mime_type,doc_type,notes,blob_data,created_at)
                VALUES(?,?,?,?,?,?,?)
@@ -4621,13 +4689,10 @@ def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: s
              f"Priced per-level quotation generated by PB PlanReader ({created_by}).",
              base64.b64encode(quote_bytes).decode("ascii"), stamp),
         )
-    except Exception as exc:
-        raise RuntimeError(f"Mandatory quotation blob upload failed: {exc}")
 
-    # 2. Mandatory Progress Marker Storage
-    progress_name = f"progress_marker_{job_no}_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
-    progress_bytes = progress_package_bytes(workspace_id)
-    try:
+        # 5. Mandatory Progress Marker Storage
+        progress_name = f"progress_marker_{job_no}_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
+        progress_bytes = progress_package_bytes(workspace_id)
         bridge.execute(
             """INSERT INTO job_document_blobs(job_id,file_name,mime_type,doc_type,notes,blob_data,created_at)
                VALUES(?,?,?,?,?,?,?)
@@ -4638,64 +4703,12 @@ def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: s
              f"Published take-off + 3D render + documents ({created_by}).",
              base64.b64encode(progress_bytes).decode("ascii"), stamp),
         )
-    except Exception as exc:
-        raise RuntimeError(f"Mandatory progress marker upload failed: {exc}")
 
-    # 3. Mandatory Live Take-off Sync
-    try:
+        # 6. Mandatory Live Take-off Sync
         synced = _sync_jobhub_takeoff_rows(bridge, int(job_id), takeoff)
-    except Exception as exc:
-        raise RuntimeError(f"Mandatory live takeoff sync failed: {exc}")
 
-    docs = ", ".join(d["file_name"] for d in lquery("SELECT file_name FROM documents WHERE workspace_id=? ORDER BY id", (workspace_id,)))
-    internal_mask = takeoff["section"].astype(str).str.lower().str.contains("internal|ceiling|door|joinery")
-    external_mask = takeoff["section"].astype(str).str.lower().str.contains("external|facade|elevation|soffit|canopy")
-    m2_mask = takeoff["unit"].astype(str).eq("m²")
-    interior = float(takeoff.loc[internal_mask & m2_mask, "quantity"].fillna(0).sum())
-    exterior = float(takeoff.loc[external_mask & m2_mask, "quantity"].fillna(0).sum())
-    total_hours = float(takeoff["labour_hours"].fillna(0).sum())
-    total_litres = float(takeoff["paint_litres"].fillna(0).sum())
-    takeoff_no = f"PR-{workspace.get('job_no')}-PUB-{datetime.now().strftime('%Y%m%d-%H%M')}"
-    
-    # Compute preflight fingerprint to record in package notes for server-level duplicate prevention
-    c_meta = local_connect()
-    try:
-        from pb_commercial_export_preflight_v163 import derive_export_preflight
-        pf_res = derive_export_preflight(c_meta, workspace_id, bridge_available=True)
-        pkg_fp_note = f"Published by PB PlanReader. Preflight Fingerprint: {pf_res.preflight_fingerprint} | Payload Hash: {pf_res.payload_hash}"
-    except Exception:
-        pkg_fp_note = f"Published by PB PlanReader ({created_by})."
-    finally:
-        c_meta.close()
-
-    # 4. Mandatory Take-off Package Header Creation
-    try:
-        if bridge.kind == "postgres":
-            package_id = bridge.execute(
-                """INSERT INTO painting_takeoff_packages(job_id,takeoff_no,takeoff_date,status,source_documents,interior_total_m2,exterior_total_m2,total_labour_hours,total_paint_litres,generated_method,assumptions,ai_notes,created_by,created_at,updated_at,notes)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id""",
-                (job_id, takeoff_no, datetime.now().date().isoformat(), "Published", docs, interior, exterior,
-                 total_hours, total_litres, "PB PlanReader subscription method",
-                 "Final quantities approved for pricing.", workspace.get("executive_summary", ""),
-                 created_by, stamp, stamp, pkg_fp_note),
-                returning=True,
-            )
-        else:
-            bridge.execute(
-                """INSERT INTO painting_takeoff_packages(job_id,takeoff_no,takeoff_date,status,source_documents,interior_total_m2,exterior_total_m2,total_labour_hours,total_paint_litres,generated_method,assumptions,ai_notes,created_by,created_at,updated_at,notes)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (job_id, takeoff_no, datetime.now().date().isoformat(), "Published", docs, interior, exterior,
-                 total_hours, total_litres, "PB PlanReader subscription method",
-                 "Final quantities approved for pricing.", workspace.get("executive_summary", ""),
-                 created_by, stamp, stamp, pkg_fp_note),
-            )
-            package_id = bridge.query("SELECT id FROM painting_takeoff_packages WHERE takeoff_no=?", (takeoff_no,))[0]["id"]
-    except Exception as exc:
-        raise RuntimeError(f"Mandatory takeoff package creation failed: {exc}")
-
-    # 5. Mandatory Take-off Lines Creation
-    line_count = 0
-    try:
+        # 7. Mandatory Take-off Lines Creation
+        line_count = 0
         for _, row in takeoff.iterrows():
             unit = str(row.get("unit") or "")
             qty = to_float(row.get("quantity"))
@@ -4711,17 +4724,29 @@ def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: s
                  f"{row.get('notes', '')} | Source: {row.get('source_reference', '')}", stamp),
             )
             line_count += 1
-    except Exception as exc:
-        raise RuntimeError(f"Mandatory takeoff line creation failed at line {line_count + 1}: {exc}")
 
-    # 6. Mandatory Job Status Update
-    try:
+        # 8. Mandatory Job Status Update
         bridge.execute(
             "UPDATE jobs SET status=?, notes=COALESCE(notes, '') || ' | Published by PB PlanReader.' WHERE id=?",
             ("Published", int(job_id)),
         )
+
+        # 9. Transition Package Status to 'Published' with Final Notes
+        bridge.execute(
+            "UPDATE painting_takeoff_packages SET status='Published', notes=?, updated_at=? WHERE id=?",
+            (pkg_fp_note, stamp, package_id)
+        )
+
     except Exception as exc:
-        raise RuntimeError(f"Mandatory job status update failed: {exc}")
+        # Partial Failure Safety: Transition package to 'Failed' so it never poisons retry as a Published duplicate
+        try:
+            bridge.execute(
+                "UPDATE painting_takeoff_packages SET status=?, notes=? WHERE id=?",
+                ("Failed", f"Failed publish attempt: {exc}", package_id)
+            )
+        except Exception:
+            pass
+        raise RuntimeError(f"Mandatory publish side effect failed: {exc}")
 
     # Optional Best-Effort Metadata Document Registration
     try:

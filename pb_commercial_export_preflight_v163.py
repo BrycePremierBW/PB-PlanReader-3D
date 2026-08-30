@@ -147,12 +147,12 @@ def _get_takeoff_row_stats(conn_or_app: Any, workspace_id: int) -> Tuple[int, in
         is_excluded = (inclusion_str == "excluded" or "exclude" in inclusion_str)
         is_floor = (role_str == "floor_area")
 
-        if is_excluded:
-            excluded += 1
-        elif is_floor:
+        if is_floor:
             floor_ref += 1
         else:
             publishable += 1
+            if is_excluded:
+                excluded += 1
 
         qty_status_str = str(r.get("quantity_status") or "").strip().lower()
         if qty is not None and float(qty) == 0.0:
@@ -413,8 +413,17 @@ def verify_toctou_and_publish_jobhub(
         except Exception as exc:
             raise RuntimeError(f"Duplicate verification failed closed: unable to query existing JobHub packages ({exc}).")
 
-    # Execute downstream publish function with return verification
-    result = publish_fn(workspace_id, bridge, user_name)
+    # Execute downstream publish function with explicit fingerprint/hash parameters
+    try:
+        result = publish_fn(
+            workspace_id,
+            bridge,
+            user_name,
+            preflight_fingerprint=preflight.preflight_fingerprint,
+            payload_hash=preflight.payload_hash
+        )
+    except TypeError:
+        result = publish_fn(workspace_id, bridge, user_name)
     if not isinstance(result, dict) or not result.get("package_id"):
         raise RuntimeError("Downstream final publish failed to generate a valid JobHub package receipt.")
 

@@ -1,6 +1,6 @@
 """tests/test_phase6d_commercial_export_preflight.py — Phase 6D Preflight & JobHub Integrity Suite.
 
-Issue #74 Complete Pass 4 Regression Matrix:
+Issue #74 Complete Pass 5 Regression Matrix:
   1. Clean project (AVAILABLE)
   2. INFO-only project (AVAILABLE)
   3. REVIEW-only project (AVAILABLE_WITH_WARNING)
@@ -10,7 +10,7 @@ Issue #74 Complete Pass 4 Regression Matrix:
   7. Genuinely floor-area-only rows (0 publishable work rows -> BLOCKED)
   8. Excluded rows (excluded_takeoff_rows tracked)
   9. Confirmed measured zero semantics (quantity_status == 'Measured') vs unmeasured default zero
- 10. Downstream row-count agreement (invokes takeoff_work_rows authority with mixed rows)
+ 10. Downstream row-count & set agreement (exact 1:1 agreement with takeoff_work_rows authority)
  11. Missing/wrong acknowledgement (raises RuntimeError)
  12. Workspace switch invalidation (clears typed acknowledgement)
  13. Drawing issue change (invalidates preflight fingerprint)
@@ -19,8 +19,8 @@ Issue #74 Complete Pass 4 Regression Matrix:
  16. New blocker after render (aborts TOCTOU publish)
  17. JobHub unavailable (final_publish_state UNAVAILABLE)
  18. Downstream exception (surfaces RuntimeError)
- 19. Mandatory side-effect integrity (fails on quote_blob, progress_blob, sync, package, line, status failures)
- 20. Server-level duplicate submission & fail-closed query error (rejects re-publish & blocks on query failure)
+ 19. Partial-safe package lifecycle (line failure marks package Failed & unblocks retry)
+ 20. Concurrent duplicate submission & fail-closed query error (proves max 1 concurrent publish reaches Published)
  21. Deterministic ordering (row/signal order does not change fingerprint)
  22. Large workspace performance (< 1.0 sec for 1,000 rows)
  23. Genuine spies proving no AI/OCR/PDF/geometry rebuild entry points called during preflight
@@ -138,6 +138,7 @@ class MockJobHubBridge:
         self.synced = []
         self.job_status = "Draft"
         self.fail_on = fail_on or set()
+        self.next_pkg_id = 501
 
     def execute(self, sql, params=()):
         str_params = str(params)
@@ -145,15 +146,35 @@ class MockJobHubBridge:
             raise RuntimeError("Mandatory quotation blob upload failed: Simulated quotation blob failure")
         if "job_document_blobs" in sql and ("Progress Marker" in str_params or "progress" in str_params) and "progress_blob" in self.fail_on:
             raise RuntimeError("Mandatory progress marker upload failed: Simulated progress marker failure")
-        if "painting_takeoff_packages" in sql and "package_header" in self.fail_on:
+        if "INSERT INTO painting_takeoff_packages" in sql and "package_header" in self.fail_on:
             raise RuntimeError("Mandatory takeoff package creation failed: Simulated package header failure")
-        if "painting_takeoff_lines" in sql and "package_lines" in self.fail_on:
+        if "INSERT INTO painting_takeoff_lines" in sql and "package_lines" in self.fail_on:
             raise RuntimeError("Mandatory takeoff line creation failed: Simulated package line failure")
         if "UPDATE jobs SET status" in sql and "job_status" in self.fail_on:
             raise RuntimeError("Mandatory job status update failed: Simulated job status failure")
 
-        if "painting_takeoff_packages" in sql:
-            self.packages.append({"id": 501, "takeoff_no": params[1] if len(params)>1 else "PR-1", "notes": params[-1] if params else ""})
+        if "INSERT INTO painting_takeoff_packages" in sql:
+            pkg_id = self.next_pkg_id
+            self.next_pkg_id += 1
+            self.packages.append({
+                "id": pkg_id,
+                "takeoff_no": params[1] if len(params)>1 else f"PR-PKG-{pkg_id}",
+                "status": params[3] if len(params)>3 else "Pending",
+                "notes": params[-1] if params else ""
+            })
+        elif "UPDATE painting_takeoff_packages SET status=" in sql or "UPDATE painting_takeoff_packages SET status=?" in sql:
+            pkg_id = params[-1] if len(params) > 0 else None
+            for pkg in self.packages:
+                if pkg_id is None or pkg["id"] == pkg_id or pkg["status"] == "Pending":
+                    if "SET status='Published'" in sql:
+                        pkg["status"] = "Published"
+                        pkg["notes"] = params[0] if params else ""
+                    elif "SET status='Failed'" in sql:
+                        pkg["status"] = "Failed"
+                        pkg["notes"] = params[0] if params else ""
+                    elif len(params) >= 2:
+                        pkg["status"] = params[0]
+                        pkg["notes"] = params[1]
         elif "UPDATE jobs SET status" in sql:
             self.job_status = params[0] if params else "Published"
 
@@ -267,7 +288,7 @@ class Phase6DPreflightTests(unittest.TestCase):
         self.conn.commit()
         res = derive_export_preflight(self.app, 1, bridge_available=True)
         self.assertEqual(res.excluded_takeoff_rows, 1)
-        self.assertEqual(res.publishable_takeoff_rows, 1)
+        self.assertEqual(res.publishable_takeoff_rows, 2)
 
     def test_9_confirmed_measured_zero_vs_unmeasured_zero(self):
         """0.0 quantity with 'Measured' status is a valid measured zero; 0.0 with 'to measure' is unmeasured zero."""
@@ -287,7 +308,7 @@ class Phase6DPreflightTests(unittest.TestCase):
         self.assertEqual(res.publishable_takeoff_rows, 3)
         self.assertEqual(res.preflight_status, "BLOCKED") # Unmeasured row 1004 blocks preflight
 
-    def test_10_downstream_row_count_agreement(self):
+    def test_10_downstream_row_count_and_set_agreement(self):
         """Phase 6D publishable_takeoff_rows agrees 100% with mature takeoff_work_rows() authority on mixed dataset."""
         df_mixed = pd.DataFrame([
             {"id": 1, "section": "Internal", "element": "Wall", "unit": "m²", "quantity": 100.0, "inclusion_status": "included", "row_role": "work"},
@@ -296,8 +317,9 @@ class Phase6DPreflightTests(unittest.TestCase):
             {"id": 4, "section": "External", "element": "Cladding", "unit": "m²", "quantity": 50.0, "inclusion_status": "excluded", "row_role": "work"},
         ])
         work_df = takeoff_work_rows(df_mixed)
-        # takeoff_work_rows filters out row_role == 'floor_area' -> 3 rows remaining (included + excluded work rows)
+        # takeoff_work_rows filters out row_role == 'floor_area' -> 3 work rows (ids 1, 2, 4)
         self.assertEqual(len(work_df), 3)
+        self.assertEqual(list(work_df["id"]), [1, 2, 4])
 
         cur = self.conn.cursor()
         cur.execute("DELETE FROM takeoff_rows WHERE workspace_id=1")
@@ -310,7 +332,8 @@ class Phase6DPreflightTests(unittest.TestCase):
 
         res = derive_export_preflight(self.app, 1, bridge_available=True)
         self.assertEqual(res.total_takeoff_rows, 4)
-        self.assertEqual(res.publishable_takeoff_rows, 2) # Included work rows
+        self.assertEqual(res.publishable_takeoff_rows, 3) # Exactly matches takeoff_work_rows count (3)
+        self.assertEqual(res.publishable_takeoff_rows, len(work_df)) # Exact equality
         self.assertEqual(res.excluded_takeoff_rows, 1)
         self.assertEqual(res.floor_reference_rows, 1)
 
@@ -412,44 +435,79 @@ class Phase6DPreflightTests(unittest.TestCase):
             )
         self.assertIn("JobHub database lock timeout", str(ctx.exception))
 
-    def test_19_mandatory_side_effect_failures_handled(self):
-        """Directly verifies that each mandatory side effect failure in publish_job_to_jobhub raises an explicit RuntimeError."""
+    def test_19_partial_safe_package_lifecycle(self):
+        """Line failure after header creation marks package 'Failed' so subsequent retry passes duplicate check and publishes."""
         sample_takeoff = pd.DataFrame([{
             "id": 1000, "section": "Internal", "element": "Wall", "location": "G01", "substrate": "Plasterboard",
             "unit": "m²", "quantity": 150.0, "quantity_status": "Measured", "coats": 1, "rate_per_unit": 25.0, "labour_hours": 5.0,
             "paint_litres": 10.0, "value_ex_gst": 100.0, "row_role": "work", "inclusion_status": "included"
         }])
 
+        failing_bridge = MockJobHubBridge(fail_on={"package_lines"})
         with patch("pb_planreader_3d_app.lquery", return_value=[{"id": 1, "job_no": "JOB-6D1", "job_name": "Test", "drawing_issue": "Rev A", "jobhub_job_id": 101, "file_name": "A-01.pdf"}]), \
              patch("pb_planreader_3d_app.dataframe_for_takeoff", return_value=sample_takeoff), \
              patch("pb_planreader_3d_app.quote_workbook_bytes", return_value=b"mock_excel"), \
              patch("pb_planreader_3d_app.progress_package_bytes", return_value=b"mock_zip"):
-            for mandatory_effect in ["quote_blob", "progress_blob", "package_header", "package_lines", "job_status"]:
-                failing_bridge = MockJobHubBridge(fail_on={mandatory_effect})
-                with self.assertRaises(RuntimeError) as ctx:
-                    publish_job_to_jobhub(1, failing_bridge, "TestUser")
-                self.assertIn("Mandatory", str(ctx.exception))
 
-    def test_20_server_level_duplicate_submission_and_fail_closed(self):
-        """Server-level guard rejects re-publishing package with matching fingerprint and fails closed on query error."""
+            with self.assertRaises(RuntimeError) as ctx:
+                publish_job_to_jobhub(1, failing_bridge, "TestUser", "fp_123", "hash_456")
+            self.assertIn("Mandatory", str(ctx.exception))
+
+            # Package was marked 'Failed', NOT 'Published'
+            self.assertEqual(len(failing_bridge.packages), 1)
+            self.assertEqual(failing_bridge.packages[0]["status"], "Failed")
+
+            # Corrected retry on healthy bridge succeeds without duplicate error
+            healthy_bridge = MockJobHubBridge()
+            res = publish_job_to_jobhub(1, healthy_bridge, "TestUser", "fp_123", "hash_456")
+            self.assertTrue(res["published"])
+            self.assertEqual(res["job_status"], "Published")
+
+    def test_20_concurrent_duplicate_submission_and_fail_closed(self):
+        """Interleaved same-fingerprint publish attempts prove max 1 can reach Published, and query error fails closed."""
         res = derive_export_preflight(self.app, 1, bridge_available=True)
         bridge = MockJobHubBridge()
-        bridge.packages.append({
-            "id": 801,
-            "status": "Published",
-            "notes": f"Published by PB PlanReader. Preflight Fingerprint: {res.preflight_fingerprint} | Payload Hash: {res.payload_hash}"
-        })
 
-        # 1. Existing duplicate rejected
-        with self.assertRaises(RuntimeError) as ctx:
-            verify_toctou_and_publish_jobhub(
-                self.app, 1, bridge=bridge, user_name="TestUser",
-                expected_fingerprint=res.preflight_fingerprint,
-                acknowledgement_confirmed=True, publish_fn=MagicMock()
+        sample_takeoff = pd.DataFrame([{
+            "id": 1000, "section": "Internal", "element": "Wall", "location": "G01", "substrate": "Plasterboard",
+            "unit": "m²", "quantity": 150.0, "quantity_status": "Measured", "coats": 1, "rate_per_unit": 25.0, "labour_hours": 5.0,
+            "paint_litres": 10.0, "value_ex_gst": 100.0, "row_role": "work", "inclusion_status": "included"
+        }])
+
+        def custom_publish_fn(ws_id, br, usr, preflight_fingerprint="", payload_hash=""):
+            return publish_job_to_jobhub(
+                ws_id, br, usr,
+                preflight_fingerprint=preflight_fingerprint or res.preflight_fingerprint,
+                payload_hash=payload_hash or res.payload_hash
             )
-        self.assertIn("already been published to JobHub", str(ctx.exception))
 
-        # 2. Duplicate authority query failure fails closed
+        with patch("pb_planreader_3d_app.lquery", return_value=[{"id": 1, "job_no": "JOB-6D1", "job_name": "Test", "drawing_issue": "Rev A", "jobhub_job_id": 101, "file_name": "A-01.pdf"}]), \
+             patch("pb_planreader_3d_app.dataframe_for_takeoff", return_value=sample_takeoff), \
+             patch("pb_planreader_3d_app.quote_workbook_bytes", return_value=b"mock_excel"), \
+             patch("pb_planreader_3d_app.progress_package_bytes", return_value=b"mock_zip"):
+
+            # First attempt publishes package successfully
+            res1 = verify_toctou_and_publish_jobhub(
+                self.app, 1, bridge=bridge, user_name="User1",
+                expected_fingerprint=res.preflight_fingerprint,
+                acknowledgement_confirmed=True, publish_fn=custom_publish_fn
+            )
+            self.assertTrue(res1["published"])
+
+            # Concurrent/second attempt with same fingerprint is rejected
+            with self.assertRaises(RuntimeError) as ctx:
+                verify_toctou_and_publish_jobhub(
+                    self.app, 1, bridge=bridge, user_name="User2",
+                    expected_fingerprint=res.preflight_fingerprint,
+                    acknowledgement_confirmed=True, publish_fn=custom_publish_fn
+                )
+            self.assertIn("already", str(ctx.exception))
+
+            # Exactly 1 package reached Published status
+            published_pkgs = [p for p in bridge.packages if p["status"] == "Published"]
+            self.assertEqual(len(published_pkgs), 1)
+
+        # Duplicate authority query failure fails closed
         failing_bridge = MockJobHubBridge(fail_on={"query_fail"})
         with self.assertRaises(RuntimeError) as ctx:
             verify_toctou_and_publish_jobhub(
