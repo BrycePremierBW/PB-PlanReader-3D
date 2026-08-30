@@ -112,6 +112,7 @@ def test_environment_flag_does_not_expose_legacy_editor_to_non_privileged_user(m
     app.model_3d_page({"id": 201})
 
     assert events == ["hero", "canonical"]
+    assert app.hero_calls == 1
     assert app.legacy_calls == 0
     assert fake_st.checkbox_calls == []
 
@@ -190,6 +191,14 @@ def test_apply_is_safe_when_app_has_no_legacy_model_page():
     integration.apply(app)
     assert not getattr(app, "_canonical_3d_extension_installed", False)
     assert not hasattr(app, "_legacy_model_3d_page")
+
+
+def test_shared_header_helper_calls_existing_hero_once():
+    app = FakeApp()
+    workspace = {"id": 10}
+    integration._render_shared_workspace_header(app, workspace)
+    assert app.hero_calls == 1
+    assert app.events == ["hero"]
 
 
 def test_shared_header_helper_is_safe_when_app_has_no_hero():
