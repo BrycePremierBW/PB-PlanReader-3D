@@ -391,8 +391,8 @@ def collect_scale_review_signals(app: Any, workspace_id: int) -> Tuple[List[Comm
             return signals, "UNAVAILABLE"
     elif hasattr(app, "execute") or hasattr(app, "cursor") or app is None:
         try:
-            from pb_planreader_3d_app import scale_gate_issues as _authoritative_scale_gate
-            issues = _authoritative_scale_gate(int(workspace_id))
+            c_arg = app if (hasattr(app, "cursor") or hasattr(app, "execute")) else None
+            issues = _authoritative_scale_gate(int(workspace_id), conn=c_arg)
         except Exception:
             return signals, "NOT_SUPPORTED"
     else:

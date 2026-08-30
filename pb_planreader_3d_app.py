@@ -1192,36 +1192,41 @@ def auto_detect_scale(page: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return {"ratio": ratio, "px_per_m": round(px_per_m, 3), "source": match.group(0).strip()}
 
 
-def scale_gate_issues(workspace_id: int) -> List[Dict[str, Any]]:
+def scale_gate_issues(workspace_id: int, conn: Optional[Any] = None) -> List[Dict[str, Any]]:
     """Pages that feed the take-off but do not have a calibrated scale yet.
 
-    The scale gate protects measured quantities: a row is only trustworthy when
-    every drawing page it was measured from has a confirmed ``px_per_m``. This
-    lists every selected page that is referenced by take-off rows or mapped
-    zones while still lacking a scale.
+    Delegates to the authoritative MultiPageScaleRegistry (pb_multi_page_scale_v170)
+    to protect measured quantities across multi-page drawing sets.
     """
-    row_sources: set = set()
-    rows = ldf("SELECT DISTINCT source_page FROM takeoff_rows WHERE workspace_id=?", (workspace_id,))
-    if not rows.empty:
-        row_sources = {str(x).strip() for x in rows["source_page"].tolist() if str(x).strip()}
-    zone_page_ids: set = set()
-    zones = ldf("SELECT DISTINCT page_id FROM mapped_zones WHERE workspace_id=?", (workspace_id,))
-    if not zones.empty:
-        zone_page_ids = {int(x) for x in zones["page_id"].tolist()}
-    issues: List[Dict[str, Any]] = []
-    pages = ldf("SELECT id,page_label,page_type,px_per_m FROM pages WHERE workspace_id=? AND selected=1", (workspace_id,))
-    for p in pages.itertuples():
-        if to_float(p.px_per_m) > 0:
-            continue
-        label = str(p.page_label or "")
-        if label.strip() in row_sources or int(p.id) in zone_page_ids:
-            issues.append({
-                "page_id": int(p.id),
-                "page_label": label,
-                "page_type": str(p.page_type or ""),
-                "px_per_m": to_float(p.px_per_m),
-            })
-    return issues
+    c = conn or local_connect()
+    try:
+        from pb_multi_page_scale_v170 import derive_workspace_scale_authority
+        registry = derive_workspace_scale_authority(c, workspace_id)
+        return registry.get_issues()
+    except Exception:
+        row_sources: set = set()
+        cur = c.cursor()
+        cur.execute("SELECT DISTINCT source_page FROM takeoff_rows WHERE workspace_id=?", (workspace_id,))
+        row_sources = {str(x[0]).strip() for x in cur.fetchall() if x[0] and str(x[0]).strip()}
+        cur.execute("SELECT DISTINCT page_id FROM mapped_zones WHERE workspace_id=?", (workspace_id,))
+        zone_page_ids = {int(x[0]) for x in cur.fetchall() if x[0] is not None}
+        issues: List[Dict[str, Any]] = []
+        cur.execute("SELECT id,page_label,page_type,px_per_m FROM pages WHERE workspace_id=? AND selected=1", (workspace_id,))
+        for p_id, p_label, p_type, p_px in cur.fetchall():
+            if to_float(p_px) > 0:
+                continue
+            label = str(p_label or "")
+            if label.strip() in row_sources or int(p_id) in zone_page_ids:
+                issues.append({
+                    "page_id": int(p_id),
+                    "page_label": label,
+                    "page_type": str(p_type or ""),
+                    "px_per_m": to_float(p_px),
+                })
+        return issues
+    finally:
+        if conn is None:
+            c.close()
 
 
 def scale_gate_blocked(workspace_id: int) -> bool:
