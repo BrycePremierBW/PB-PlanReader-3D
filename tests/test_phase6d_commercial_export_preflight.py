@@ -497,7 +497,6 @@ class Phase6DPreflightTests(unittest.TestCase):
     def test_20_concurrent_duplicate_submission_and_fail_closed(self):
         """Genuine multi-threaded concurrent interleaving race test proving max 1 publish attempt can acquire atomic reservation."""
         import threading
-        res = derive_export_preflight(self.app, 1, bridge_available=True)
         bridge = MockJobHubBridge()
 
         sample_takeoff = pd.DataFrame([{
@@ -506,32 +505,34 @@ class Phase6DPreflightTests(unittest.TestCase):
             "paint_litres": 10.0, "value_ex_gst": 100.0, "row_role": "work", "inclusion_status": "included"
         }])
 
-        def custom_publish_fn(ws_id, br, usr, preflight_fingerprint="", payload_hash=""):
-            return publish_job_to_jobhub(
-                ws_id, br, usr,
-                preflight_fingerprint=preflight_fingerprint or res.preflight_fingerprint,
-                payload_hash=payload_hash or res.payload_hash
-            )
-
-        results = []
-        errors = []
-
-        def worker_publish(user_name):
-            try:
-                out = verify_toctou_and_publish_jobhub(
-                    self.app, 1, bridge=bridge, user_name=user_name,
-                    expected_fingerprint=res.preflight_fingerprint,
-                    acknowledgement_confirmed=True, publish_fn=custom_publish_fn
-                )
-                results.append(out)
-            except Exception as exc:
-                errors.append(exc)
-
         # Launch 2 concurrent threads simultaneously inside active patch context
         with patch("pb_planreader_3d_app.lquery", return_value=[{"id": 1, "job_no": "JOB-6D1", "job_name": "Test", "drawing_issue": "Rev A", "jobhub_job_id": 101, "file_name": "A-01.pdf"}]), \
              patch("pb_planreader_3d_app.dataframe_for_takeoff", return_value=sample_takeoff), \
              patch("pb_planreader_3d_app.quote_workbook_bytes", return_value=b"mock_excel"), \
              patch("pb_planreader_3d_app.progress_package_bytes", return_value=b"mock_zip"):
+
+            res = derive_export_preflight(self.app, 1, bridge_available=True)
+
+            def custom_publish_fn(ws_id, br, usr, preflight_fingerprint="", payload_hash=""):
+                return publish_job_to_jobhub(
+                    ws_id, br, usr,
+                    preflight_fingerprint=preflight_fingerprint or res.preflight_fingerprint,
+                    payload_hash=payload_hash or res.payload_hash
+                )
+
+            results = []
+            errors = []
+
+            def worker_publish(user_name):
+                try:
+                    out = verify_toctou_and_publish_jobhub(
+                        self.app, 1, bridge=bridge, user_name=user_name,
+                        expected_fingerprint=res.preflight_fingerprint,
+                        acknowledgement_confirmed=True, publish_fn=custom_publish_fn
+                    )
+                    results.append(out)
+                except Exception as exc:
+                    errors.append(exc)
 
             t1 = threading.Thread(target=worker_publish, args=("User1",))
             t2 = threading.Thread(target=worker_publish, args=("User2",))
