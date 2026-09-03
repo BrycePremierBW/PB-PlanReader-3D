@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pb_bim_viewer import project_to_viewer_payload
 from pb_canonical_building import CanonicalProject, parse_strict_bool
+from pb_geometry_services import validate_opening_geometry
 
 
 Vector3 = Tuple[float, float, float]
@@ -104,12 +105,14 @@ class SceneProvenanceGraph:
         workspace_id: Optional[str],
         source_status: str,
         duplicate_id_conflicts: Optional[List[str]] = None,
+        rejected_elements: Optional[List[Dict[str, Any]]] = None,
     ):
         self.nodes = list(nodes)
         self.project_id = project_id
         self.workspace_id = workspace_id
         self.source_status = source_status
         self.duplicate_id_conflicts = duplicate_id_conflicts or []
+        self.rejected_elements = deepcopy(rejected_elements) if rejected_elements else []
         self._by_element_id = {node.element_id: node for node in self.nodes}
 
     @classmethod
@@ -120,6 +123,7 @@ class SceneProvenanceGraph:
             workspace_id=None,
             source_status=status,
             duplicate_id_conflicts=[],
+            rejected_elements=[],
         )
 
     @classmethod
@@ -146,8 +150,10 @@ class SceneProvenanceGraph:
                 project_id=project_id,
                 workspace_id=workspace_id,
                 source_status="CANONICAL_SCENE_UNAVAILABLE",
+                rejected_elements=[],
             )
 
+        rejected_elements = _canonical_rejected_openings(project)
         raw_objects = [obj for obj in scene.get("objects", []) if isinstance(obj, dict)]
         candidate_ids = [
             obj.get("id")
@@ -168,7 +174,7 @@ class SceneProvenanceGraph:
             if isinstance(level, dict) and isinstance(level.get("id"), str)
         }
 
-        # Track duplicate ID conflicts for observability
+        # Track duplicate ID conflicts for observability.
         duplicate_id_conflicts = [
             element_id
             for element_id, count in id_counts.items()
@@ -217,6 +223,7 @@ class SceneProvenanceGraph:
             workspace_id=workspace_id,
             source_status="CANONICAL_SCENE",
             duplicate_id_conflicts=duplicate_id_conflicts if duplicate_id_conflicts else [],
+            rejected_elements=rejected_elements,
         )
 
     def lookup_by_element_id(self, element_id: str) -> Optional[SpatialProvenanceNode]:
@@ -229,7 +236,58 @@ class SceneProvenanceGraph:
             "source_status": self.source_status,
             "nodes": [node.to_dict() for node in self.nodes],
             "duplicate_id_conflicts": list(self.duplicate_id_conflicts) if self.duplicate_id_conflicts else [],
+            "rejected_elements": deepcopy(self.rejected_elements),
         }
+
+
+def _canonical_rejected_openings(project: CanonicalProject) -> List[Dict[str, Any]]:
+    """Preserve canonical opening rejection evidence without deriving geometry.
+
+    The established canonical geometry validator remains the sole source of the
+    rejection decision. A10 records only canonical identity, host relation,
+    validator reason, and canonical provenance; no 3D bounds are synthesized.
+    """
+    rejected: List[Dict[str, Any]] = []
+    for building in project.buildings:
+        for level in building.levels:
+            for wall in level.walls:
+                for opening in wall.openings:
+                    valid, reason = validate_opening_geometry(opening, wall)
+                    if valid:
+                        continue
+                    element_id = getattr(opening, "id", None)
+                    if not isinstance(element_id, str) or not element_id:
+                        # Never invent a semantic identity for rejected evidence.
+                        continue
+                    object_type = getattr(opening, "object_type", None)
+                    element_type = getattr(object_type, "value", None)
+                    if not isinstance(element_type, str) or not element_type:
+                        element_type = str(object_type) if object_type is not None else None
+                    wall_id = getattr(opening, "wall_id", None)
+                    parent_element_id = wall_id if isinstance(wall_id, str) and wall_id else None
+                    raw_provenance = getattr(opening, "provenance", None)
+                    provenance = (
+                        deepcopy(raw_provenance.to_dict())
+                        if raw_provenance is not None and hasattr(raw_provenance, "to_dict")
+                        else {}
+                    )
+                    rejected.append(
+                        {
+                            "element_id": element_id,
+                            "element_type": element_type,
+                            "parent_element_id": parent_element_id,
+                            "reason": str(reason),
+                            "provenance": provenance,
+                        }
+                    )
+    return sorted(
+        rejected,
+        key=lambda item: (
+            item["element_id"],
+            item.get("parent_element_id") or "",
+            item["reason"],
+        ),
+    )
 
 
 def _parent_element_id(obj: Dict[str, Any]) -> Optional[str]:
