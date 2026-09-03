@@ -4,7 +4,10 @@ from __future__ import annotations
 import sqlite3
 import unittest
 
-from pb_3d_spatial_provenance_v179 import derive_3d_scene_provenance
+from pb_3d_spatial_provenance_v179 import (
+    derive_3d_scene_provenance,
+    _opening_geometry,
+)
 from pb_canonical_building import (
     CanonicalBuilding,
     CanonicalLevel,
@@ -270,6 +273,186 @@ class WorkstreamA10ProvenanceTests(unittest.TestCase):
             graph.source_status,
             "SYNTHETIC_CANONICAL_PROJECT_REJECTED",
         )
+
+    def test_legacy_non_canonical_caller_fails_explicitly(self):
+        """Non-canonical inputs must fail with explicit unambiguous status."""
+        # Test with various non-canonical inputs
+        non_canonical_inputs = [
+            None,
+            "string_input",
+            123,
+            {"dict": "input"},
+            sqlite3.connect(":memory:"),
+        ]
+
+        for input_obj in non_canonical_inputs:
+            graph = derive_3d_scene_provenance(input_obj)
+            # Must not be mistaken for a successful empty canonical project
+            self.assertEqual(graph.nodes, [])
+            self.assertEqual(graph.source_status, "CANONICAL_PROJECT_REQUIRED")
+            self.assertIsNone(graph.project_id)
+            self.assertIsNone(graph.workspace_id)
+            # No duplicate conflicts tracking for non-canonical inputs
+            self.assertEqual(graph.duplicate_id_conflicts, [])
+
+        # Verify the status is distinguishable from successful empty canonical project
+        empty_canonical = _canonical_project(_wall(id="wall-1"))
+        # Remove the wall to create an empty but valid canonical project
+        empty_canonical.buildings[0].levels[0].walls = []
+        empty_graph = derive_3d_scene_provenance(empty_canonical)
+        
+        # Empty canonical project should have CANONICAL_SCENE status
+        self.assertEqual(empty_graph.source_status, "CANONICAL_SCENE")
+        self.assertNotEqual(empty_graph.source_status, "CANONICAL_PROJECT_REQUIRED")
+        # Empty canonical project has no duplicate conflicts
+        self.assertEqual(empty_graph.duplicate_id_conflicts, [])
+
+    def test_opening_outside_host_geometry_fails_closed(self):
+        """Opening physically outside host wall must not receive valid geometry."""
+        # Test horizontal overflow - opening extends beyond host wall (via internal helper)
+        wall_obj = {
+            "type": "WALL",
+            "id": "wall-host-1",
+            "start_point": {"x": 0.0, "y": 0.0},
+            "end_point": {"x": 10.0, "y": 0.0},
+            "height_m": 3.0,
+            "thickness_m": 0.2,
+        }
+        
+        opening_outside = {
+            "type": "DOOR",
+            "id": "opening-outside-1",
+            "wall_id": "wall-host-1",
+            "is_host_attached": True,
+            "offset_along_wall_m": 12.0,  # Beyond wall length of 10
+            "sill_height_m": 0.0,
+            "width_m": 1.0,
+            "height_m": 2.0,
+        }
+        
+        objects_by_id = {"wall-host-1": wall_obj}
+        geometry_valid, position, dimensions, error = _opening_geometry(
+            opening_outside, 0.0, objects_by_id
+        )
+        
+        self.assertFalse(geometry_valid)
+        self.assertIsNone(position)
+        self.assertIsNone(dimensions)
+        self.assertIn("extends beyond", error.lower())
+        
+        # Test vertical overflow - opening taller than host wall (via internal helper)
+        opening_overflow = {
+            "type": "WINDOW",
+            "id": "opening-overflow-1",
+            "wall_id": "wall-host-1",
+            "is_host_attached": True,
+            "offset_along_wall_m": 2.0,
+            "sill_height_m": 0.0,
+            "width_m": 1.0,
+            "height_m": 5.0,  # Taller than wall height of 3.0
+        }
+        
+        geometry_valid_overflow, position_overflow, dimensions_overflow, error_overflow = _opening_geometry(
+            opening_overflow, 0.0, objects_by_id
+        )
+        
+        self.assertFalse(geometry_valid_overflow)
+        self.assertIsNone(position_overflow)
+        self.assertIsNone(dimensions_overflow)
+        self.assertIn("height", error_overflow.lower())
+        
+        # Test end-to-end with a CanonicalProject that has missing required geometry
+        # to ensure A10's own geometry validation works through the full path
+        wall_missing_thickness = _wall(
+            id="wall-missing-thickness",
+            start_point=Vector2D(x=0.0, y=0.0),
+            end_point=Vector2D(x=10.0, y=0.0),
+            height_m=3.0,
+            thickness_m=None,  # Missing required thickness
+        )
+        
+        graph_missing = derive_3d_scene_provenance(_canonical_project(wall_missing_thickness))
+        node_missing = graph_missing.lookup_by_element_id("wall-missing-thickness")
+        
+        # The wall should be present but marked as invalid geometry
+        self.assertIsNotNone(node_missing)
+        self.assertFalse(node_missing.geometry_valid)
+        self.assertIsNone(node_missing.position_3d)
+        self.assertIsNone(node_missing.dimensions_3d)
+        self.assertIn("thickness", node_missing.geometry_error.lower())
+
+    def test_duplicate_canonical_ids_are_explicitly_excluded(self):
+        """Duplicate canonical IDs must not create ambiguous mappings."""
+        # Create two walls with the same ID
+        wall1 = _wall(
+            id="duplicate-wall-id",
+            start_point=Vector2D(x=0.0, y=0.0),
+            end_point=Vector2D(x=5.0, y=0.0),
+        )
+        wall2 = _wall(
+            id="duplicate-wall-id",  # Same ID
+            start_point=Vector2D(x=10.0, y=0.0),
+            end_point=Vector2D(x=15.0, y=0.0),
+        )
+        
+        # Create a level with both walls (same ID)
+        level = CanonicalLevel(
+            id="level-dup-test",
+            name="Level Dup Test",
+            elevation_m=0.0,
+            height_m=3.0,
+            walls=[wall1, wall2],
+        )
+        building = CanonicalBuilding(id="building-dup", name="Building Dup", levels=[level])
+        project = CanonicalProject(
+            id="project-dup",
+            name="Duplicate ID Project",
+            buildings=[building],
+            provenance=Provenance(workspace_id="workspace-dup"),
+        )
+        
+        graph = derive_3d_scene_provenance(project)
+        
+        # The duplicate ID should not be in the graph (excluded by id_counts check)
+        duplicate_node = graph.lookup_by_element_id("duplicate-wall-id")
+        self.assertIsNone(duplicate_node)
+        
+        # The graph should still be valid (not an error state)
+        self.assertEqual(graph.source_status, "CANONICAL_SCENE")
+        
+        # CRITICAL: The duplicate conflict must be explicitly observable
+        self.assertIsNotNone(graph.duplicate_id_conflicts)
+        self.assertIn("duplicate-wall-id", graph.duplicate_id_conflicts)
+        
+        # Verify that other valid elements still work
+        # Add a wall with unique ID to ensure the graph isn't completely broken
+        wall_unique = _wall(
+            id="unique-wall-id",
+            start_point=Vector2D(x=20.0, y=0.0),
+            end_point=Vector2D(x=25.0, y=0.0),
+        )
+        level_unique = CanonicalLevel(
+            id="level-unique",
+            name="Level Unique",
+            elevation_m=0.0,
+            height_m=3.0,
+            walls=[wall_unique],
+        )
+        building_unique = CanonicalBuilding(id="building-unique", name="Building Unique", levels=[level_unique])
+        project_unique = CanonicalProject(
+            id="project-unique",
+            name="Unique ID Project",
+            buildings=[building_unique],
+            provenance=Provenance(workspace_id="workspace-unique"),
+        )
+        
+        graph_unique = derive_3d_scene_provenance(project_unique)
+        unique_node = graph_unique.lookup_by_element_id("unique-wall-id")
+        
+        self.assertIsNotNone(unique_node)
+        self.assertTrue(unique_node.geometry_valid)
+        # Unique ID project should have no duplicate conflicts
+        self.assertEqual(graph_unique.duplicate_id_conflicts, [])
 
 
 if __name__ == "__main__":

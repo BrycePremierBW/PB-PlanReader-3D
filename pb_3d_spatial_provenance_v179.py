@@ -103,11 +103,13 @@ class SceneProvenanceGraph:
         project_id: Optional[str],
         workspace_id: Optional[str],
         source_status: str,
+        duplicate_id_conflicts: Optional[List[str]] = None,
     ):
         self.nodes = list(nodes)
         self.project_id = project_id
         self.workspace_id = workspace_id
         self.source_status = source_status
+        self.duplicate_id_conflicts = duplicate_id_conflicts or []
         self._by_element_id = {node.element_id: node for node in self.nodes}
 
     @classmethod
@@ -117,6 +119,7 @@ class SceneProvenanceGraph:
             project_id=None,
             workspace_id=None,
             source_status=status,
+            duplicate_id_conflicts=[],
         )
 
     @classmethod
@@ -165,6 +168,13 @@ class SceneProvenanceGraph:
             if isinstance(level, dict) and isinstance(level.get("id"), str)
         }
 
+        # Track duplicate ID conflicts for observability
+        duplicate_id_conflicts = [
+            element_id
+            for element_id, count in id_counts.items()
+            if count > 1
+        ]
+
         nodes: List[SpatialProvenanceNode] = []
         for obj in raw_objects:
             element_id = obj.get("id")
@@ -206,6 +216,7 @@ class SceneProvenanceGraph:
             project_id=project_id,
             workspace_id=workspace_id,
             source_status="CANONICAL_SCENE",
+            duplicate_id_conflicts=duplicate_id_conflicts if duplicate_id_conflicts else [],
         )
 
     def lookup_by_element_id(self, element_id: str) -> Optional[SpatialProvenanceNode]:
@@ -217,6 +228,7 @@ class SceneProvenanceGraph:
             "workspace_id": self.workspace_id,
             "source_status": self.source_status,
             "nodes": [node.to_dict() for node in self.nodes],
+            "duplicate_id_conflicts": list(self.duplicate_id_conflicts) if self.duplicate_id_conflicts else [],
         }
 
 
