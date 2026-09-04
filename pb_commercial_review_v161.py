@@ -441,13 +441,17 @@ def collect_scale_review_signals(app: Any, workspace_id: int) -> Tuple[List[Comm
             # Malformed issue item in canonical collection must fail closed to UNAVAILABLE
             return [], "UNAVAILABLE"
         page_id_val = issue.get("page_id")
-        page_id_str = str(page_id_val or issue.get("page_label") or "unknown")
+        page_id_str = str(page_id_val if page_id_val is not None else (issue.get("page_label") or "unknown"))
         reason_text = _safe_str(
             issue.get("reason")
             or issue.get("description")
             or "Selected drawing page requires scale calibration"
         ).strip()
         label_text = _safe_str(issue.get("page_label") or f"Page #{page_id_str}").strip()
+        issue_title = _safe_str(issue.get("title") or f"Uncalibrated Scale — {label_text}").strip()
+        issue_severity = str(issue.get("severity") or "BLOCKER").upper()
+        if issue_severity not in ("BLOCKER", "REVIEW", "INFORMATION"):
+            issue_severity = "BLOCKER"
 
         signals.append(
             CommercialReviewSignal(
@@ -457,8 +461,8 @@ def collect_scale_review_signals(app: Any, workspace_id: int) -> Tuple[List[Comm
                 source_type="page_scale",
                 source_id=page_id_str,
                 category="Scale & calibration",
-                severity="BLOCKER",
-                title=f"Uncalibrated Scale — {label_text}",
+                severity=issue_severity,
+                title=issue_title,
                 summary=reason_text,
                 reasons=(reason_text,),
                 status="Uncalibrated",
@@ -467,7 +471,7 @@ def collect_scale_review_signals(app: Any, workspace_id: int) -> Tuple[List[Comm
                 recommended_action="Open drawing in Plan Mapper to calibrate scale (px/m) before trusting quantities.",
                 navigation_target="drawing",
                 navigation_payload={"workspace_id": int(workspace_id), "page_id": _safe_int(page_id_val)},
-                metadata={"page_label": label_text, "source": "scale_gate_issues"},
+                metadata={"page_label": label_text, "source": "scale_gate_issues", "issue_type": issue.get("issue_type")},
             )
         )
 

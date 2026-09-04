@@ -75,14 +75,55 @@ def calculate_m_per_pt_from_px_per_m(px_per_m: float, render_zoom: float = 2.0) 
 class MultiPageScaleRegistry:
     """Manages multi-page scale authority across all pages in a workspace."""
 
-    def __init__(self, records: List[PageScaleRecord]):
+    def __init__(self, records: List[PageScaleRecord], schema_errors: Optional[List[str]] = None):
         self.records = records
         self._by_id = {r.page_id: r for r in records}
+        self.schema_errors = list(schema_errors or [])
 
     @classmethod
     def derive_for_workspace(cls, conn: sqlite3.Connection, workspace_id: int) -> "MultiPageScaleRegistry":
         """Build scale authority for all selected pages in a workspace."""
         cur = conn.cursor()
+
+        # Check existing tables in DB
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        existing_tables = {row[0] for row in cur.fetchall()}
+
+        if "pages" not in existing_tables:
+            raise sqlite3.OperationalError("no such table: pages")
+
+        schema_errors: List[str] = []
+        has_measurement_lines = "measurement_lines" in existing_tables
+        has_takeoff_rows = "takeoff_rows" in existing_tables
+
+        if not has_measurement_lines:
+            schema_errors.append("measurement_lines")
+        if not has_takeoff_rows:
+            schema_errors.append("takeoff_rows")
+
+        # Query page IDs that have measurement lines if table present
+        measured_page_ids = set()
+        if has_measurement_lines:
+            try:
+                cur.execute(
+                    "SELECT DISTINCT page_id FROM measurement_lines WHERE workspace_id=? AND page_id IS NOT NULL",
+                    (workspace_id,)
+                )
+                measured_page_ids = {r[0] for r in cur.fetchall() if r[0] is not None}
+            except sqlite3.OperationalError:
+                schema_errors.append("measurement_lines")
+
+        # Query page IDs associated with takeoff rows if table present
+        takeoff_page_refs = set()
+        if has_takeoff_rows:
+            try:
+                cur.execute(
+                    "SELECT DISTINCT source_page FROM takeoff_rows WHERE workspace_id=? AND source_page IS NOT NULL",
+                    (workspace_id,)
+                )
+                takeoff_page_refs = {str(r[0]).strip() for r in cur.fetchall() if r[0] is not None}
+            except sqlite3.OperationalError:
+                schema_errors.append("takeoff_rows")
 
         # Inspect table info to support canonical page_no as well as legacy page_number
         cur.execute("PRAGMA table_info(pages)")
@@ -98,7 +139,7 @@ class MultiPageScaleRegistry:
             """
         else:
             query = """
-            SELECT p.id, p.page_label, p.page_type, p.px_per_m, p.scale_text, p.selected, p.id AS page_no
+            SELECT p.id, p.page_label, p.page_type, p.px_per_m, p.scale_text, p.selected, NULL AS page_no
             FROM pages p
             WHERE p.workspace_id=? AND COALESCE(p.selected, 1)=1
             ORDER BY p.id ASC
@@ -107,26 +148,6 @@ class MultiPageScaleRegistry:
         cur.execute(query, (workspace_id,))
         pages_data = [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()]
 
-        # Query page IDs that have measurement lines (safe if table not present in minimal DB)
-        try:
-            cur.execute(
-                "SELECT DISTINCT page_id FROM measurement_lines WHERE workspace_id=? AND page_id IS NOT NULL",
-                (workspace_id,)
-            )
-            measured_page_ids = {r[0] for r in cur.fetchall() if r[0] is not None}
-        except sqlite3.OperationalError:
-            measured_page_ids = set()
-
-        # Query page IDs associated with takeoff rows (safe if table not present in minimal DB)
-        try:
-            cur.execute(
-                "SELECT DISTINCT source_page FROM takeoff_rows WHERE workspace_id=? AND source_page IS NOT NULL",
-                (workspace_id,)
-            )
-            takeoff_page_refs = {str(r[0]).strip() for r in cur.fetchall() if r[0] is not None}
-        except sqlite3.OperationalError:
-            takeoff_page_refs = set()
-
         records = []
         primary_calibrated_ratio: Optional[int] = None
         primary_px_per_m: float = 0.0
@@ -134,10 +155,14 @@ class MultiPageScaleRegistry:
         # First pass: evaluate direct calibration per page
         for p in pages_data:
             pid = int(p["id"])
-            page_seq = p.get("page_no") if p.get("page_no") is not None else p.get("page_number", pid)
-            plabel = str(p.get("page_label") or f"Page {page_seq}")
+            page_seq = p.get("page_no") if p.get("page_no") is not None else p.get("page_number")
+            plabel = str(p.get("page_label") or (f"Page {page_seq}" if page_seq is not None else f"Page [ID:{pid}]"))
             ptype = str(p.get("page_type") or "Plan").lower()
-            px_m = float(p.get("px_per_m") or 0.0)
+            raw_px_m = p.get("px_per_m")
+            try:
+                px_m = float(raw_px_m) if raw_px_m is not None else 0.0
+            except (ValueError, TypeError):
+                px_m = 0.0
             stext = str(p.get("scale_text") or "")
 
             has_m = pid in measured_page_ids
@@ -207,30 +232,106 @@ class MultiPageScaleRegistry:
                     rec.confidence = 0.60
                     rec.source_note = f"Inherited workspace primary scale context (1:{primary_calibrated_ratio or '100'})"
 
-        return cls(records)
+        return cls(records, schema_errors=schema_errors)
 
     def get_issues(self) -> List[Dict[str, Any]]:
         """Return scale-gate issue descriptors for review and preflight blocking."""
         issues = []
+
+        # 1. Schema integrity checks: missing required evidence tables fail closed
+        for missing_table in self.schema_errors:
+            issues.append({
+                "page_id": None,
+                "page_label": "Workspace Schema",
+                "page_type": "schema",
+                "px_per_m": 0.0,
+                "scale_status": "UNAVAILABLE",
+                "issue_type": "MISSING_REQUIRED_SCHEMA",
+                "severity": "Critical",
+                "title": f"Missing Required Schema ({missing_table})",
+                "description": f"Required database table '{missing_table}' is missing. Scale authority cannot verify workspace evidence without required schema.",
+            })
+
+        # 2. Page-level scale authority checks
         for r in self.records:
-            # Block if page has measurements or takeoff rows or is UNCALIBRATED (px_per_m <= 0 or non-finite)
-            is_uncalibrated_px = not (isinstance(r.px_per_m, (int, float)) and math.isfinite(r.px_per_m) and r.px_per_m > 0)
-            if (r.has_measurement_lines or r.has_takeoff_rows or r.scale_status == "UNCALIBRATED") and is_uncalibrated_px:
-                issues.append({
-                    "page_id": r.page_id,
-                    "page_label": r.page_label,
-                    "page_type": r.page_type,
-                    "px_per_m": r.px_per_m,
-                    "scale_status": r.scale_status,
-                    "issue_type": "UNCALIBRATED_SCALE",
-                    "severity": "Critical",
-                    "title": f"Uncalibrated Scale on {r.page_label}",
-                    "description": f"Page '{r.page_label}' has referenced measurements or work items but lacks authoritative scale calibration.",
-                })
+            if r.scale_status == "NOT_REQUIRED":
+                # Cover/legend pages without measurement/takeoff do not create blockers
+                continue
+
+            is_valid_px = isinstance(r.px_per_m, (int, float)) and math.isfinite(r.px_per_m) and r.px_per_m > 0
+
+            if r.scale_status == "CALIBRATED":
+                if not is_valid_px:
+                    issues.append({
+                        "page_id": r.page_id,
+                        "page_label": r.page_label,
+                        "page_type": r.page_type,
+                        "px_per_m": r.px_per_m,
+                        "scale_status": "UNCALIBRATED",
+                        "issue_type": "UNCALIBRATED_SCALE",
+                        "severity": "Critical",
+                        "title": f"Invalid Calibration on {r.page_label}",
+                        "description": f"Page '{r.page_label}' is marked calibrated but has invalid or non-finite scale ({r.px_per_m}).",
+                    })
+                continue
+
+            if r.scale_status == "PROVISIONAL_AUTO":
+                method = getattr(r, "calibration_method", "")
+                if method == "TITLE_BLOCK_TEXT":
+                    issues.append({
+                        "page_id": r.page_id,
+                        "page_label": r.page_label,
+                        "page_type": r.page_type,
+                        "px_per_m": r.px_per_m,
+                        "scale_status": r.scale_status,
+                        "issue_type": "PROVISIONAL_TITLE_BLOCK_SCALE",
+                        "severity": "Critical",
+                        "title": f"Provisional Title-Block Scale on {r.page_label}",
+                        "description": f"Page '{r.page_label}' has provisional scale derived from title-block text (1:{r.scale_ratio or '?'}) and requires explicit calibration before commercial release.",
+                    })
+                elif method == "INHERITED":
+                    issues.append({
+                        "page_id": r.page_id,
+                        "page_label": r.page_label,
+                        "page_type": r.page_type,
+                        "px_per_m": r.px_per_m,
+                        "scale_status": r.scale_status,
+                        "issue_type": "PROVISIONAL_INHERITED_SCALE",
+                        "severity": "Critical",
+                        "title": f"Provisional Inherited Scale on {r.page_label}",
+                        "description": f"Page '{r.page_label}' relies on provisional inherited scale context and requires explicit calibration before commercial release.",
+                    })
+                else:
+                    issues.append({
+                        "page_id": r.page_id,
+                        "page_label": r.page_label,
+                        "page_type": r.page_type,
+                        "px_per_m": r.px_per_m,
+                        "scale_status": r.scale_status,
+                        "issue_type": "PROVISIONAL_SCALE",
+                        "severity": "Critical",
+                        "title": f"Provisional Scale on {r.page_label}",
+                        "description": f"Page '{r.page_label}' has provisional scale and requires explicit calibration before commercial release.",
+                    })
+                continue
+
+            # r.scale_status == "UNCALIBRATED"
+            issues.append({
+                "page_id": r.page_id,
+                "page_label": r.page_label,
+                "page_type": r.page_type,
+                "px_per_m": r.px_per_m,
+                "scale_status": "UNCALIBRATED",
+                "issue_type": "UNCALIBRATED_SCALE",
+                "severity": "Critical",
+                "title": f"Uncalibrated Scale on {r.page_label}",
+                "description": f"Page '{r.page_label}' lacks authoritative scale calibration.",
+            })
+
         return issues
 
     def is_blocked(self) -> bool:
-        """Returns True if any referenced drawing page has uncalibrated scale (px_per_m <= 0)."""
+        """Returns True if any scale-gate or schema blocker issue exists."""
         return len(self.get_issues()) > 0
 
 
