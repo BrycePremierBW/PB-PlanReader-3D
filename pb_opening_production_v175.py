@@ -41,9 +41,62 @@ def _num(value: Any, default: float = 0.0) -> float:
         return default
 
 
+_SENTINEL_STRINGS = frozenset({
+    "", "none", "nan", "null", "undefined", "unknown", "unassigned",
+    "unassigned wall", "0", "-", "- ", "n/a", "na", "false", "true",
+})
+
+
+def _clean_str_id(value: Any) -> str:
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, float) and not math.isfinite(value):
+        return ""
+    s = str(value).strip()
+    if s.lower() in _SENTINEL_STRINGS:
+        return ""
+    return s
+
+
+def _is_valid_positive_int(value: Any) -> bool:
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, int):
+        return value > 0
+    if isinstance(value, float):
+        return math.isfinite(value) and value.is_integer() and int(value) > 0
+    if isinstance(value, str):
+        s = value.strip()
+        if s.lower() in _SENTINEL_STRINGS:
+            return False
+        try:
+            val = int(s)
+            return val > 0
+        except (ValueError, TypeError):
+            return False
+    return False
+
+
+def _clean_confidence(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        val = float(value)
+        if math.isfinite(val) and 0.0 <= val <= 1.0:
+            return val
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
 def _assigned_wall(raw: Dict[str, Any]) -> str:
-    value = str(raw.get("resolved_wall_ref") or raw.get("wall_ref") or "").strip()
-    if value.lower() in {"", "unassigned", "unassigned wall", "unknown", "none"}:
+    raw_val = raw.get("resolved_wall_ref") or raw.get("wall_ref")
+    if isinstance(raw_val, bool) or raw_val is None:
+        return ""
+    if isinstance(raw_val, float) and not math.isfinite(raw_val):
+        return ""
+    value = str(raw_val).strip()
+    if value.lower() in _SENTINEL_STRINGS:
         return ""
     return value
 
@@ -55,7 +108,11 @@ def is_authorised_deduction(raw: Dict[str, Any]) -> bool:
         return False
     if not _assigned_wall(raw):
         return False
-    if _num(raw.get("width_m")) <= 0 or _num(raw.get("height_m")) <= 0:
+    w = raw.get("width_m")
+    h = raw.get("height_m")
+    if isinstance(w, bool) or isinstance(h, bool):
+        return False
+    if _num(w) <= 0 or _num(h) <= 0:
         return False
 
     # A descriptive confidence label is not proof that an estimator actually
@@ -64,23 +121,7 @@ def is_authorised_deduction(raw: Dict[str, Any]) -> bool:
     if parse_strict_bool(raw.get("manual_override_confirmed", False)):
         return True
 
-    if not parse_strict_bool(raw.get("reconciliation_complete", False)):
-        return False
-    if str(raw.get("deduction_status") or "") not in {
-        DEDUCTION_AUTO_ELIGIBLE,
-        DEDUCTION_DERIVED_ELIGIBLE,
-    }:
-        return False
-    if str(raw.get("deduction_decision") or "") != DEDUCTION_DEDUCTED:
-        return False
-    if str(raw.get("dimension_basis") or "") != DIMENSION_BASIS_ROUGH_OPENING:
-        return False
-    minimum = min(
-        _num(raw.get("geometry_confidence")),
-        _num(raw.get("dimension_confidence")),
-        _num(raw.get("association_confidence")),
-    )
-    return minimum >= MIN_DEDUCTION_CONFIDENCE
+    return _is_authorised_b5_automatic(raw)
 
 
 def _safe_legacy_normaliser(original_normalise):
@@ -426,18 +467,29 @@ def _is_authorised_b5_automatic(row: Dict[str, Any]) -> bool:
     the wall/net-area consumer as a deduction:
       - assigned wall;
       - positive width/height;
-      - ``reconciliation_complete`` True;
+      - ``reconciliation_complete`` strict bool True;
+      - ``deduct`` strict bool True (if present);
       - eligible deduction status (auto/derived);
       - ``deduction_decision == "deducted"``;
       - ``dimension_basis == "rough_opening"``;
-      - min confidence at the deduction floor.
+      - min confidence at the deduction floor (finite in [0.0, 1.0]);
+      - valid opening_instance_id if present;
+      - valid workspace_id if present (positive integer);
+      - valid page_no / page_id if present (positive integer);
+      - valid source / dimension_source if present (non-sentinel).
     """
     raw = dict(row or {})
     if not _assigned_wall(raw):
         return False
-    if _num(raw.get("width_m")) <= 0 or _num(raw.get("height_m")) <= 0:
+    w = raw.get("width_m")
+    h = raw.get("height_m")
+    if isinstance(w, bool) or isinstance(h, bool):
+        return False
+    if _num(w) <= 0 or _num(h) <= 0:
         return False
     if not parse_strict_bool(raw.get("reconciliation_complete")):
+        return False
+    if "deduct" in raw and not parse_strict_bool(raw.get("deduct")):
         return False
     if str(raw.get("deduction_status") or "") not in {
         DEDUCTION_AUTO_ELIGIBLE,
@@ -448,12 +500,42 @@ def _is_authorised_b5_automatic(row: Dict[str, Any]) -> bool:
         return False
     if str(raw.get("dimension_basis") or "") != DIMENSION_BASIS_ROUGH_OPENING:
         return False
-    minimum = min(
-        _num(raw.get("geometry_confidence")),
-        _num(raw.get("dimension_confidence")),
-        _num(raw.get("association_confidence")),
-    )
-    return minimum >= MIN_DEDUCTION_CONFIDENCE
+
+    conf_g = _clean_confidence(raw.get("geometry_confidence"))
+    conf_d = _clean_confidence(raw.get("dimension_confidence"))
+    conf_a = _clean_confidence(raw.get("association_confidence"))
+    if conf_g is None or conf_d is None or conf_a is None:
+        return False
+    if min(conf_g, conf_d, conf_a) < MIN_DEDUCTION_CONFIDENCE:
+        return False
+
+    # Identity validation if present
+    if "opening_instance_id" in raw:
+        if not _clean_str_id(raw.get("opening_instance_id")):
+            return False
+
+    # Workspace validation if present
+    if "workspace_id" in raw:
+        if not _is_valid_positive_int(raw.get("workspace_id")):
+            return False
+
+    # Page validation if present
+    if "page_no" in raw:
+        if not _is_valid_positive_int(raw.get("page_no")):
+            return False
+    if "page_id" in raw:
+        if not _is_valid_positive_int(raw.get("page_id")):
+            return False
+
+    # Source validation if present
+    if "dimension_source" in raw:
+        if not _clean_str_id(raw.get("dimension_source")):
+            return False
+    if "source" in raw:
+        if not _clean_str_id(raw.get("source")):
+            return False
+
+    return True
 
 
 PAGES_INDEX_KEY = "opening_evidence_v175_pages"
@@ -467,6 +549,8 @@ def _verify_b5_page(app: Any, workspace_id: int, page_id: int, payload: Dict[str
     identity agrees.  Orphaned / deleted / re-homed / mismatched evidence is
     rejected so stale persisted B5 deductions never keep reducing wall area.
     """
+    if not _is_valid_positive_int(workspace_id) or not _is_valid_positive_int(page_id):
+        return False
     query = getattr(app, "lquery", None)
     if not callable(query):
         return False  # cannot verify current page existence -> fail closed
@@ -480,19 +564,26 @@ def _verify_b5_page(app: Any, workspace_id: int, page_id: int, payload: Dict[str
     if int(_num(live.get("workspace_id"), -1)) != int(workspace_id):
         return False  # page has been moved to another workspace
     pl = dict(payload or {})
-    if "page_id" in pl and _num(pl.get("page_id")) != int(page_id):
-        return False
-    if "workspace_id" in pl and _num(pl.get("workspace_id")) != int(workspace_id):
-        return False
+    if "page_id" in pl:
+        if not _is_valid_positive_int(pl.get("page_id")) or int(pl.get("page_id")) != int(page_id):
+            return False
+    if "workspace_id" in pl:
+        if not _is_valid_positive_int(pl.get("workspace_id")) or int(pl.get("workspace_id")) != int(workspace_id):
+            return False
     return True
 
 
 def _row_identity_agrees(row: Dict[str, Any], workspace_id: int, page_id: int) -> bool:
     """Where a row carries its own page/workspace identity, require it to agree."""
-    if "page_id" in row and _num(row.get("page_id")) != int(page_id):
-        return False
-    if "workspace_id" in row and _num(row.get("workspace_id")) != int(workspace_id):
-        return False
+    if "page_id" in row:
+        if not _is_valid_positive_int(row.get("page_id")) or int(row.get("page_id")) != int(page_id):
+            return False
+    if "workspace_id" in row:
+        if not _is_valid_positive_int(row.get("workspace_id")) or int(row.get("workspace_id")) != int(workspace_id):
+            return False
+    if "page_no" in row:
+        if not _is_valid_positive_int(row.get("page_no")):
+            return False
     return True
 
 
@@ -508,6 +599,8 @@ def _b5_authoritative_instances(app: Any, workspace_id: int) -> List[Dict[str, A
     to still exist in the current workspace (fail closed otherwise) and its own
     page/workspace identity agrees.
     """
+    if not _is_valid_positive_int(workspace_id):
+        return []
     out: List[Dict[str, Any]] = []
     try:
         index = json.loads(
@@ -518,6 +611,8 @@ def _b5_authoritative_instances(app: Any, workspace_id: int) -> List[Dict[str, A
     if not isinstance(index, list):
         index = []
     for page_id in index:
+        if not _is_valid_positive_int(page_id):
+            continue
         try:
             payload = json.loads(str(
                 app.workspace_setting(
@@ -596,10 +691,12 @@ def merge_b5_authoritative(
         added.add(inst_key)
         rec = dict(row)
         rec.setdefault("resolved_wall_ref", rec.get("wall_ref") or "")
-        rec.setdefault("area_m2", round(
+        area = round(
             _num(rec.get("width_m")) * _num(rec.get("height_m"))
-            * max(1, int(_num(rec.get("quantity"), 1))), 4))
+            * max(1, int(_num(rec.get("quantity"), 1))), 4)
+        rec["area_m2"] = area
         rec["deduct"] = True
+        rec["deduction_decision"] = DEDUCTION_DEDUCTED
         result.append(rec)
     return result
 
