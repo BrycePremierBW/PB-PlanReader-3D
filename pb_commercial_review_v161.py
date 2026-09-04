@@ -16,6 +16,7 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+from pb_multi_page_scale_v170 import derive_workspace_scale_authority
 from pb_takeoff_authority_v164 import (
     is_excluded_takeoff_row,
     is_model_surface_row,
@@ -415,12 +416,18 @@ def collect_scale_review_signals(app: Any, workspace_id: int) -> Tuple[List[Comm
                 return signals, "UNAVAILABLE"
         except Exception:
             return signals, "UNAVAILABLE"
-    elif hasattr(app, "execute") or hasattr(app, "cursor") or app is None:
+    elif (callable(getattr(app, "execute", None)) or callable(getattr(app, "cursor", None))):
         try:
-            c_arg = app if (hasattr(app, "cursor") or hasattr(app, "execute")) else None
-            issues = _authoritative_scale_gate(int(workspace_id), conn=c_arg)
+            ws_id = int(workspace_id)
+            if ws_id <= 0:
+                return signals, "UNAVAILABLE"
+            issues = derive_workspace_scale_authority(
+                app, ws_id
+            ).get_issues()
         except Exception:
-            return signals, "NOT_SUPPORTED"
+            return signals, "UNAVAILABLE"
+    elif app is None:
+        return signals, "NOT_SUPPORTED"
     else:
         return signals, "NOT_SUPPORTED"
 

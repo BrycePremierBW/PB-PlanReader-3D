@@ -473,3 +473,40 @@ def test_performance_benchmark(test_db):
     elapsed_ms = (t1 - t0) * 1000
     assert res.signal_count == 500
     assert elapsed_ms < 200.0
+
+
+def test_scale_authority_boundary_regressions():
+    import sqlite3
+    from pb_commercial_review_v161 import collect_scale_review_signals
+
+    # A. app is None -> NOT_SUPPORTED
+    sigs, cov = collect_scale_review_signals(None, 1)
+    assert sigs == []
+    assert cov == "NOT_SUPPORTED"
+
+    # B. Plain unsupported object -> NOT_SUPPORTED
+    class DummyObj:
+        pass
+    sigs, cov = collect_scale_review_signals(DummyObj(), 1)
+    assert sigs == []
+    assert cov == "NOT_SUPPORTED"
+
+    # C. Non-callable execute or cursor -> NOT_SUPPORTED
+    class NonCallableDB:
+        execute = None
+        cursor = None
+    sigs, cov = collect_scale_review_signals(NonCallableDB(), 1)
+    assert sigs == []
+    assert cov == "NOT_SUPPORTED"
+
+    # D. SQLite memory connection without tables -> UNAVAILABLE
+    conn = sqlite3.connect(":memory:")
+    sigs, cov = collect_scale_review_signals(conn, 1)
+    assert cov == "UNAVAILABLE"
+
+    # E. Non-positive workspace IDs -> UNAVAILABLE
+    sigs, cov = collect_scale_review_signals(conn, 0)
+    assert cov == "UNAVAILABLE"
+    sigs, cov = collect_scale_review_signals(conn, -1)
+    assert cov == "UNAVAILABLE"
+    conn.close()
