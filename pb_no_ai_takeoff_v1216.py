@@ -291,7 +291,8 @@ def save_schedule_batched(app: Any, workspace_id: int, rows: Iterable[Dict[str, 
                 AUTHORITY_FINGERPRINT_FIELD: prior.get(AUTHORITY_FINGERPRINT_FIELD, ""),
             }
             candidate = {**row, "workspace_id": int(workspace_id), **authority}
-            if role == "model_surface" and authority[AUTHORITY_STATUS_FIELD] == AUTHORITY_APPROVED:
+            status_norm = str(authority.get(AUTHORITY_STATUS_FIELD) or "").strip().upper()
+            if role == "model_surface" and status_norm == AUTHORITY_APPROVED:
                 approval_still_matches, _ = model_surface_authority(candidate)
                 if not approval_still_matches:
                     authority[AUTHORITY_STATUS_FIELD] = AUTHORITY_REVIEW_REQUIRED
