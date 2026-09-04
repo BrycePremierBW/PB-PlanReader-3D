@@ -9,6 +9,7 @@ import pb_drawing_reading_v1226 as reading
 import pb_elevation_regions_v1226 as elevation
 import pb_selected_evidence_floor_v1226 as selected
 import pb_takeoff_review_v1226 as review
+from pb_takeoff_authority_v164 import AUTHORITY_STATUS_FIELD, model_surface_authority
 
 
 class _EvidenceApp:
@@ -135,7 +136,9 @@ def _make_db(path: Path):
             substrate TEXT, finish_system TEXT, quantity REAL, unit TEXT, quantity_status TEXT, source_page TEXT,
             source_reference TEXT, inclusion_status TEXT, coats REAL, coverage_m2_per_litre REAL,
             productivity_m2_per_hour REAL, rate_per_unit REAL, confidence TEXT, notes TEXT, row_role TEXT,
-            created_at TEXT, updated_at TEXT
+            created_at TEXT, updated_at TEXT, commercial_authority_status TEXT DEFAULT '',
+            commercial_authority_source TEXT DEFAULT '', commercial_authority_reviewed_by TEXT DEFAULT '',
+            commercial_authority_reviewed_at TEXT DEFAULT '', commercial_authority_fingerprint TEXT DEFAULT ''
         );
         CREATE TABLE measurement_lines(id INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id INTEGER, takeoff_row_id INTEGER);
         CREATE TABLE pages(id INTEGER PRIMARY KEY, workspace_id INTEGER, page_label TEXT, page_type TEXT, image_path TEXT,
@@ -168,6 +171,38 @@ def test_merge_rows_sums_quantity_and_relinks_measurements():
         assert {row["takeoff_row_id"] for row in links} == {new_id}
         provenance = json.loads(app.workspace_setting(1, selected.PROVENANCE_SETTING_KEY, "{}"))
         assert provenance[rows[0]["source_reference"]]["merged_refs"] == ["ref-1", "ref-2"]
+
+
+def test_merge_with_model_surface_cannot_launder_3d_authority():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "test.sqlite"
+        _make_db(path)
+        app = _DBApp(path)
+        app.lexecute(
+            """UPDATE takeoff_rows
+                  SET row_role='model_surface',
+                      source_reference='PB 3D Surface Editor v1.2.12 · mass:1:front'
+                WHERE id=1"""
+        )
+
+        new_id = review.merge_rows(
+            app,
+            1,
+            [1, 2],
+            {
+                "section": "External",
+                "element": "Walls",
+                "location": "Merged",
+                "substrate": "Render",
+                "finish_system": "Exterior",
+                "row_role": "",
+            },
+        )
+        merged = app.lquery("SELECT * FROM takeoff_rows WHERE id=?", (new_id,))[0]
+
+        assert merged["row_role"] == "model_surface"
+        assert merged[AUTHORITY_STATUS_FIELD] == "REVIEW_REQUIRED"
+        assert model_surface_authority(merged)[0] is False
 
 
 def test_manual_polygon_recalculates_m2_and_becomes_authoritative():

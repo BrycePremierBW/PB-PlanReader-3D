@@ -77,7 +77,12 @@ def _create_takeoff_table(conn: sqlite3.Connection) -> None:
             quantity_status TEXT, source_page TEXT, source_reference TEXT,
             inclusion_status TEXT, coats REAL, coverage_m2_per_litre REAL,
             productivity_m2_per_hour REAL, rate_per_unit REAL, confidence TEXT,
-            notes TEXT, row_role TEXT, created_at TEXT, updated_at TEXT
+            notes TEXT, row_role TEXT, created_at TEXT, updated_at TEXT,
+            commercial_authority_status TEXT DEFAULT '',
+            commercial_authority_source TEXT DEFAULT '',
+            commercial_authority_reviewed_by TEXT DEFAULT '',
+            commercial_authority_reviewed_at TEXT DEFAULT '',
+            commercial_authority_fingerprint TEXT DEFAULT ''
         )"""
     )
     conn.commit()
@@ -192,8 +197,24 @@ class PerformanceV1215Tests(unittest.TestCase):
             conn.close()
             app = _DBApp(db)
             rows = [
-                _sample_takeoff_row(f"{surface_v1212.SOURCE_PREFIX} · mass:1:front"),
-                _sample_takeoff_row(f"{surface_v1212.SOURCE_PREFIX} · mass:1:rear"),
+                {
+                    **_sample_takeoff_row(f"{surface_v1212.SOURCE_PREFIX} · mass:1:front"),
+                    "row_role": "model_surface",
+                    "commercial_authority_status": "REVIEW_REQUIRED",
+                    "commercial_authority_source": "model_masses:1",
+                    "commercial_authority_reviewed_by": "",
+                    "commercial_authority_reviewed_at": "",
+                    "commercial_authority_fingerprint": "",
+                },
+                {
+                    **_sample_takeoff_row(f"{surface_v1212.SOURCE_PREFIX} · mass:1:rear"),
+                    "row_role": "model_surface",
+                    "commercial_authority_status": "REVIEW_REQUIRED",
+                    "commercial_authority_source": "model_masses:1",
+                    "commercial_authority_reviewed_by": "",
+                    "commercial_authority_reviewed_at": "",
+                    "commercial_authority_fingerprint": "",
+                },
             ]
 
             perf.replace_surface_rows_batched(app, 7, rows)
@@ -202,6 +223,18 @@ class PerformanceV1215Tests(unittest.TestCase):
             check = sqlite3.connect(db)
             try:
                 self.assertEqual(check.execute("SELECT COUNT(*) FROM takeoff_rows").fetchone()[0], 2)
+                saved = check.execute(
+                    """SELECT row_role,commercial_authority_status,
+                              commercial_authority_source
+                         FROM takeoff_rows ORDER BY source_reference"""
+                ).fetchall()
+                self.assertEqual(
+                    saved,
+                    [
+                        ("model_surface", "REVIEW_REQUIRED", "model_masses:1"),
+                        ("model_surface", "REVIEW_REQUIRED", "model_masses:1"),
+                    ],
+                )
             finally:
                 check.close()
 

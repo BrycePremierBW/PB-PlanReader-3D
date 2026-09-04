@@ -5531,7 +5531,12 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
                     AUTHORITY_REVIEWED_AT_FIELD: prior.get(AUTHORITY_REVIEWED_AT_FIELD, ""),
                     AUTHORITY_FINGERPRINT_FIELD: prior.get(AUTHORITY_FINGERPRINT_FIELD, ""),
                 }
-                candidate={**{col: row.get(col, "") for col in TAKEOFF_COLUMNS}, "row_role": row_role, **authority}
+                candidate={
+                    **{col: row.get(col, "") for col in TAKEOFF_COLUMNS},
+                    "workspace_id": int(workspace["id"]),
+                    "row_role": row_role,
+                    **authority,
+                }
                 if row_role == "model_surface" and authority.get(AUTHORITY_STATUS_FIELD) == AUTHORITY_APPROVED:
                     approval_still_matches, _ = model_surface_authority(candidate)
                     if not approval_still_matches:

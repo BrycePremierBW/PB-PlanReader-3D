@@ -362,7 +362,7 @@ class Phase6DPreflightTests(unittest.TestCase):
             {"id": 4, "section": "External", "element": "Cladding", "unit": "m²", "quantity": 50.0, "inclusion_status": "excluded", "row_role": "work"},
             {"id": 5, "section": "External", "element": "3D Front", "unit": "m²", "quantity": 20.0, "inclusion_status": "included", "row_role": "model_surface", "commercial_authority_status": "REVIEW_REQUIRED"},
             approve_model_surface_row(
-                {"id": 6, "section": "External", "element": "Reviewed 3D Rear", "unit": "m²", "quantity": 20.0, "inclusion_status": "included", "row_role": "model_surface"},
+                {"id": 6, "workspace_id": 1, "section": "External", "element": "Reviewed 3D Rear", "unit": "m²", "quantity": 20.0, "inclusion_status": "included", "row_role": "model_surface"},
                 source="A-401", reviewed_by="Estimator", reviewed_at="2026-09-04T10:00:00+10:00",
             ),
         ])

@@ -11,6 +11,8 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import plotly.graph_objects as go
 
+from pb_opening_production_v175 import is_authorised_deduction
+
 VERSION="1.3.9"
 
 
@@ -75,7 +77,10 @@ def build_registered_walls(app:Any,workspace_id:int)->List[Dict[str,Any]]:
     for wall in walls:
         attached=by_ref.get(str(wall.get("wall_ref")),[])
         gross=_num(wall.get("length_m"))*_num(wall.get("height_m"))
-        deducted=sum(_num(o.get("area_m2")) for o in attached if bool(o.get("deduct",True)))
+        # Re-check authority at the commercial consumer.  The viewer may show
+        # every observed opening, but only an explicit estimator action or a
+        # complete B5 proof may reduce the take-off quantity.
+        deducted=sum(_num(o.get("area_m2")) for o in attached if is_authorised_deduction(o))
         wall["gross_m2"]=round(gross,3); wall["opening_deduction_m2"]=round(deducted,3); wall["net_m2"]=round(max(0.0,gross-deducted),3); wall["openings"]=attached
     return walls
 

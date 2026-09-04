@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pb_no_ai_takeoff_v1216 as no_ai
+from pb_takeoff_authority_v164 import approve_model_surface_row, model_surface_authority
 
 
 class _QueryApp:
@@ -45,7 +46,12 @@ def _create_takeoff_table(conn: sqlite3.Connection) -> None:
             quantity_status TEXT, source_page TEXT, source_reference TEXT,
             inclusion_status TEXT, coats REAL, coverage_m2_per_litre REAL,
             productivity_m2_per_hour REAL, rate_per_unit REAL, confidence TEXT,
-            notes TEXT, row_role TEXT, created_at TEXT, updated_at TEXT
+            notes TEXT, row_role TEXT, created_at TEXT, updated_at TEXT,
+            commercial_authority_status TEXT DEFAULT '',
+            commercial_authority_source TEXT DEFAULT '',
+            commercial_authority_reviewed_by TEXT DEFAULT '',
+            commercial_authority_reviewed_at TEXT DEFAULT '',
+            commercial_authority_fingerprint TEXT DEFAULT ''
         )"""
     )
     conn.commit()
@@ -231,6 +237,69 @@ class NoAITakeoffTests(unittest.TestCase):
             self.assertEqual(rate, 0)
             self.assertEqual(finish, "To be confirmed")
             self.assertEqual(coats, 0)
+
+    def test_schedule_save_cannot_launder_or_silently_retain_changed_model_authority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "planreader.db"
+            conn = sqlite3.connect(db)
+            _create_takeoff_table(conn)
+            approved = approve_model_surface_row(
+                {
+                    "workspace_id": 5,
+                    "section": "External",
+                    "element": "3D front",
+                    "location": "Block A",
+                    "substrate": "Render",
+                    "finish_system": "To be confirmed",
+                    "quantity": 12.3,
+                    "unit": "m²",
+                    "quantity_status": "Provisional measured",
+                    "source_page": "",
+                    "source_reference": "PB 3D Surface Editor v1.2.12 · mass:1:front",
+                    "inclusion_status": "INCLUSION",
+                    "coats": 0,
+                    "coverage_m2_per_litre": 0,
+                    "productivity_m2_per_hour": 0,
+                    "rate_per_unit": 0,
+                    "confidence": "Derived",
+                    "notes": "test",
+                    "row_role": "model_surface",
+                },
+                source="A-401 / M-22",
+                reviewed_by="Senior Estimator",
+                reviewed_at="2026-09-04T10:00:00+10:00",
+            )
+            conn.execute(
+                no_ai._TAKEOFF_INSERT_SQL,
+                no_ai._takeoff_values(5, approved, "2026-09-04T10:00:00+10:00"),
+            )
+            row_id = conn.execute("SELECT id FROM takeoff_rows").fetchone()[0]
+            conn.commit()
+            conn.close()
+            app = _DBApp(db)
+
+            unchanged = {**approved, "id": row_id}
+            no_ai.save_schedule_batched(app, 5, [unchanged])
+            check = sqlite3.connect(db)
+            check.row_factory = sqlite3.Row
+            saved = dict(check.execute("SELECT * FROM takeoff_rows").fetchone())
+            self.assertEqual(model_surface_authority(saved), (True, "APPROVED"))
+
+            changed = {
+                **saved,
+                "row_role": "",
+                "source_reference": "manual",
+                "quantity": 999.0,
+            }
+            no_ai.save_schedule_batched(app, 5, [changed])
+            saved_changed = dict(check.execute("SELECT * FROM takeoff_rows").fetchone())
+            check.close()
+
+            self.assertEqual(saved_changed["row_role"], "model_surface")
+            self.assertEqual(saved_changed["commercial_authority_status"], "REVIEW_REQUIRED")
+            self.assertEqual(saved_changed["commercial_authority_reviewed_by"], "")
+            self.assertEqual(saved_changed["commercial_authority_fingerprint"], "")
+            self.assertFalse(model_surface_authority(saved_changed)[0])
 
     def test_apply_wraps_subscription_page_once(self):
         def base_page(*_args, **_kwargs):

@@ -43,8 +43,10 @@ _TAKEOFF_INSERT_SQL = """INSERT INTO takeoff_rows(
     workspace_id,section,element,location,substrate,finish_system,quantity,unit,
     quantity_status,source_page,source_reference,inclusion_status,coats,
     coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,
-    notes,row_role,created_at,updated_at
-) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+    notes,row_role,commercial_authority_status,commercial_authority_source,
+    commercial_authority_reviewed_by,commercial_authority_reviewed_at,
+    commercial_authority_fingerprint,created_at,updated_at
+) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
 
 _MODEL_MASS_INSERT_SQL = """INSERT INTO model_masses(
     workspace_id,label,level_name,x,y,z,width,depth,height,finish,
@@ -127,6 +129,11 @@ def _takeoff_values(workspace_id: int, row: Dict[str, Any], stamp: str) -> Tuple
         row["confidence"],
         row["notes"],
         row["row_role"],
+        row.get("commercial_authority_status", ""),
+        row.get("commercial_authority_source", ""),
+        row.get("commercial_authority_reviewed_by", ""),
+        row.get("commercial_authority_reviewed_at", ""),
+        row.get("commercial_authority_fingerprint", ""),
         stamp,
         stamp,
     )

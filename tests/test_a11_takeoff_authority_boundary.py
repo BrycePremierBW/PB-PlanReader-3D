@@ -9,6 +9,7 @@ from pb_takeoff_authority_v164 import (
 
 def _approved_surface(**changes):
     row = {
+        "workspace_id": 101,
         "row_role": "model_surface",
         "inclusion_status": "INCLUSION",
         "quantity": 12.5,
@@ -58,6 +59,37 @@ def test_approval_fingerprint_invalidates_any_consequential_change():
         allowed, reason = model_surface_authority(changed)
         assert allowed is False, field
         assert "no longer matches" in reason
+
+
+def test_approval_cannot_be_replayed_into_another_workspace():
+    approved = _approved_surface()
+    replayed = {**approved, "workspace_id": 202}
+
+    allowed, reason = model_surface_authority(replayed)
+
+    assert allowed is False
+    assert "no longer matches" in reason
+
+
+def test_approval_requires_a_positive_workspace_identity():
+    for workspace_id in (None, "", 0, -1, True, "not-an-id"):
+        row = {
+            "workspace_id": workspace_id,
+            "row_role": "model_surface",
+            "quantity": 12.5,
+            "unit": "m²",
+        }
+        try:
+            approve_model_surface_row(
+                row,
+                source="A-401 / M-22",
+                reviewed_by="Senior Estimator",
+                reviewed_at="2026-09-04T10:00:00+10:00",
+            )
+        except ValueError as exc:
+            assert "workspace identity" in str(exc)
+        else:
+            raise AssertionError(f"workspace_id={workspace_id!r} was accepted")
 
 
 def test_surface_source_prefix_cannot_be_laundered_by_erasing_role():

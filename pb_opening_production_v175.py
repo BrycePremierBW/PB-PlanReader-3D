@@ -58,8 +58,10 @@ def is_authorised_deduction(raw: Dict[str, Any]) -> bool:
     if _num(raw.get("width_m")) <= 0 or _num(raw.get("height_m")) <= 0:
         return False
 
-    confidence_label = str(raw.get("confidence") or "").strip().lower()
-    if parse_strict_bool(raw.get("manual_override_confirmed", False)) or confidence_label == "manual estimator entry":
+    # A descriptive confidence label is not proof that an estimator actually
+    # performed the explicit include/exclude action.  Only the action-scoped
+    # flag stamped by ``_safe_legacy_save`` can grant manual authority.
+    if parse_strict_bool(raw.get("manual_override_confirmed", False)):
         return True
 
     if not parse_strict_bool(raw.get("reconciliation_complete", False)):

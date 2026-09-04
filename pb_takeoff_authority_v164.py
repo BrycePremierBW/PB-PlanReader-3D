@@ -56,6 +56,7 @@ def is_excluded_takeoff_row(row: Mapping[str, Any]) -> bool:
 
 
 _AUTHORITY_BOUND_FIELDS = (
+    "workspace_id",
     "section",
     "element",
     "location",
@@ -106,12 +107,22 @@ def approve_model_surface_row(
     """Create a complete approval record for the current immutable row state."""
     if not is_model_surface_row(row):
         raise ValueError("Only a 3D model-surface row can receive model authority.")
+    workspace_id = row.get("workspace_id")
+    if isinstance(workspace_id, bool):
+        raise ValueError("A positive workspace identity is required for model authority.")
+    try:
+        valid_workspace_id = int(workspace_id) > 0
+    except (TypeError, ValueError, OverflowError):
+        valid_workspace_id = False
+    if not valid_workspace_id:
+        raise ValueError("A positive workspace identity is required for model authority.")
     source_text = _text(source)
     reviewer_text = _text(reviewed_by)
     reviewed_at_text = _text(reviewed_at)
     if not source_text or not reviewer_text or not reviewed_at_text:
         raise ValueError("Source evidence, reviewer identity, and review timestamp are required.")
     approved = dict(row)
+    approved["workspace_id"] = int(workspace_id)
     approved[AUTHORITY_STATUS_FIELD] = AUTHORITY_APPROVED
     approved[AUTHORITY_SOURCE_FIELD] = source_text
     approved[AUTHORITY_REVIEWED_BY_FIELD] = reviewer_text
