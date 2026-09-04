@@ -897,55 +897,52 @@ class Phase6DPreflightTests(unittest.TestCase):
                 conn2.close()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
     def test_25_internal_typeerror_never_invokes_publisher_twice(self):
-        """Finding B: Internal TypeError inside publish_fn must not trigger double invocation."""
+        """Finding B / P2: Internal TypeError inside modern publish_fn must not trigger double invocation."""
         call_records = []
 
         def broken_publisher(workspace_id, bridge, user_name, preflight_fingerprint="", payload_hash=""):
             call_records.append("called")
-            # Raise an internal TypeError during execution
-            raise TypeError("simulated internal bug inside publisher")
+            raise TypeError("simulated internal bug inside modern publisher")
 
-        # Create valid preflight test environment
-        conn = self._create_db()
-        cur = conn.cursor()
-        cur.execute("INSERT INTO workspaces (id, job_no, job_name) VALUES (1, 'JOB-TB', 'TypeError Test')")
-        cur.execute("INSERT INTO documents (id, workspace_id, file_name) VALUES (10, 1, 'Doc.pdf')")
-        cur.execute("INSERT INTO pages (id, workspace_id, document_id, page_no, page_label, selected, px_per_m) VALUES (101, 1, 10, 1, 'P1', 1, 100.0)")
-        cur.execute("""
-            INSERT INTO takeoff_rows (
-                id, workspace_id, section, element, quantity, unit,
-                rate, value_ex_gst, inclusion_status, authority_source, review_status, approval_status
-            ) VALUES (1, 1, 'Wall', 'Paint', 10.0, 'm2', 25.0, 250.0, 'included', 'manual_takeoff', 'VERIFIED', 'APPROVED')
-        """)
-        conn.commit()
-
-        mock_bridge = MagicMock()
-        mock_bridge.query.return_value = []
-
-        preflight = derive_export_preflight(conn, 1, bridge_available=True)
-        self.assertEqual(preflight.final_publish_state, "AVAILABLE")
+        res = derive_export_preflight(self.app, 1, bridge_available=True)
+        self.assertEqual(res.final_publish_state, "AVAILABLE")
 
         with self.assertRaises(TypeError) as ctx:
             verify_toctou_and_publish_jobhub(
-                conn_or_app=conn,
-                workspace_id=1,
-                bridge=mock_bridge,
-                user_name="Tester",
-                expected_fingerprint=preflight.preflight_fingerprint,
+                self.app, 1, bridge=MockJobHubBridge(), user_name="Tester",
+                expected_fingerprint=res.preflight_fingerprint,
                 acknowledgement_confirmed=True,
                 publish_fn=broken_publisher
             )
 
-        self.assertIn("simulated internal bug inside publisher", str(ctx.exception))
-        # MUST be invoked exactly once, never twice!
+        self.assertIn("simulated internal bug inside modern publisher", str(ctx.exception))
+        self.assertEqual(len(call_records), 1)
+
+    def test_25b_legacy_publisher_internal_typeerror_never_invoked_twice(self):
+        """Finding B / P2: Internal TypeError inside legacy publish_fn must not trigger double invocation."""
+        call_records = []
+
+        def broken_legacy_publisher(workspace_id, bridge, user_name):
+            call_records.append("called")
+            raise TypeError("simulated internal bug inside legacy publisher")
+
+        res = derive_export_preflight(self.app, 1, bridge_available=True)
+        self.assertEqual(res.final_publish_state, "AVAILABLE")
+
+        with self.assertRaises(TypeError) as ctx:
+            verify_toctou_and_publish_jobhub(
+                self.app, 1, bridge=MockJobHubBridge(), user_name="TesterLegacy",
+                expected_fingerprint=res.preflight_fingerprint,
+                acknowledgement_confirmed=True,
+                publish_fn=broken_legacy_publisher
+            )
+
+        self.assertIn("simulated internal bug inside legacy publisher", str(ctx.exception))
         self.assertEqual(len(call_records), 1)
 
     def test_26_legacy_three_arg_publisher_supported_and_invoked_once(self):
-        """Finding B: Legacy three-argument publisher receives legacy signature exactly once."""
+        """Finding B / P2: Legacy three-argument publisher receives legacy signature exactly once."""
         call_records = []
 
         def legacy_publisher(workspace_id, bridge, user_name):
@@ -953,39 +950,118 @@ if __name__ == "__main__":
             return {
                 "published": True,
                 "package_id": 123,
-                "job_id": 1,
+                "job_id": 101,
                 "package_lines": 5,
                 "quotation": "Q-1",
                 "progress_marker": "PM-1"
             }
 
-        conn = self._create_db()
-        cur = conn.cursor()
-        cur.execute("INSERT INTO workspaces (id, job_no, job_name) VALUES (2, 'JOB-LEG', 'Legacy Test')")
-        cur.execute("INSERT INTO documents (id, workspace_id, file_name) VALUES (20, 2, 'Doc.pdf')")
-        cur.execute("INSERT INTO pages (id, workspace_id, document_id, page_no, page_label, selected, px_per_m) VALUES (201, 2, 20, 1, 'P1', 1, 100.0)")
-        cur.execute("""
-            INSERT INTO takeoff_rows (
-                id, workspace_id, section, element, quantity, unit,
-                rate, value_ex_gst, inclusion_status, authority_source, review_status, approval_status
-            ) VALUES (2, 2, 'Wall', 'Paint', 10.0, 'm2', 25.0, 250.0, 'included', 'manual_takeoff', 'VERIFIED', 'APPROVED')
-        """)
-        conn.commit()
-
-        mock_bridge = MagicMock()
-        mock_bridge.query.return_value = []
-
-        preflight = derive_export_preflight(conn, 2, bridge_available=True)
-        res = verify_toctou_and_publish_jobhub(
-            conn_or_app=conn,
-            workspace_id=2,
-            bridge=mock_bridge,
-            user_name="LegacyUser",
-            expected_fingerprint=preflight.preflight_fingerprint,
+        res = derive_export_preflight(self.app, 1, bridge_available=True)
+        out = verify_toctou_and_publish_jobhub(
+            self.app, 1, bridge=MockJobHubBridge(), user_name="LegacyUser",
+            expected_fingerprint=res.preflight_fingerprint,
             acknowledgement_confirmed=True,
             publish_fn=legacy_publisher
         )
 
         self.assertEqual(len(call_records), 1)
-        self.assertEqual(call_records[0], (2, "LegacyUser"))
-        self.assertEqual(res["package_id"], 123)
+        self.assertEqual(call_records[0], (1, "LegacyUser"))
+        self.assertEqual(out["package_id"], 123)
+
+    def test_27_internal_runtimeerror_invoked_exactly_once(self):
+        """P2: Internal RuntimeError inside publisher is never retried."""
+        call_records = []
+
+        def failing_publisher(workspace_id, bridge, user_name, preflight_fingerprint="", payload_hash=""):
+            call_records.append("called")
+            raise RuntimeError("publisher database connection dropped mid-transaction")
+
+        res = derive_export_preflight(self.app, 1, bridge_available=True)
+        with self.assertRaises(RuntimeError) as ctx:
+            verify_toctou_and_publish_jobhub(
+                self.app, 1, bridge=MockJobHubBridge(), user_name="TesterRT",
+                expected_fingerprint=res.preflight_fingerprint,
+                acknowledgement_confirmed=True,
+                publish_fn=failing_publisher
+            )
+
+        self.assertIn("connection dropped mid-transaction", str(ctx.exception))
+        self.assertEqual(len(call_records), 1)
+
+    def test_28_internal_valueerror_invoked_exactly_once(self):
+        """P2: Internal ValueError inside publisher is never retried."""
+        call_records = []
+
+        def failing_publisher(workspace_id, bridge, user_name, preflight_fingerprint="", payload_hash=""):
+            call_records.append("called")
+            raise ValueError("invalid financial code inside downstream publisher")
+
+        res = derive_export_preflight(self.app, 1, bridge_available=True)
+        with self.assertRaises(ValueError) as ctx:
+            verify_toctou_and_publish_jobhub(
+                self.app, 1, bridge=MockJobHubBridge(), user_name="TesterVal",
+                expected_fingerprint=res.preflight_fingerprint,
+                acknowledgement_confirmed=True,
+                publish_fn=failing_publisher
+            )
+
+        self.assertIn("invalid financial code", str(ctx.exception))
+        self.assertEqual(len(call_records), 1)
+
+    def test_29_side_effect_then_typeerror_invoked_exactly_once(self):
+        """P2: Publisher with side effects that raises TypeError is never retried."""
+        consequential_side_effects = []
+
+        def side_effect_publisher(workspace_id, bridge, user_name, preflight_fingerprint="", payload_hash=""):
+            consequential_side_effects.append(f"package_created_for_{workspace_id}")
+            raise TypeError("unsupported operand type(s) for +: 'int' and 'str'")
+
+        res = derive_export_preflight(self.app, 1, bridge_available=True)
+        with self.assertRaises(TypeError):
+            verify_toctou_and_publish_jobhub(
+                self.app, 1, bridge=MockJobHubBridge(), user_name="TesterSide",
+                expected_fingerprint=res.preflight_fingerprint,
+                acknowledgement_confirmed=True,
+                publish_fn=side_effect_publisher
+            )
+
+        self.assertEqual(len(consequential_side_effects), 1)
+
+    def test_30_modern_publisher_invoked_exactly_once_with_all_params(self):
+        """P2: Modern publisher receives all kwargs and returns package receipt."""
+        invocations = []
+
+        def modern_publisher(workspace_id, bridge, user_name, preflight_fingerprint="", payload_hash=""):
+            invocations.append({
+                "workspace_id": workspace_id,
+                "user_name": user_name,
+                "fingerprint": preflight_fingerprint,
+                "hash": payload_hash,
+            })
+            return {
+                "published": True,
+                "package_id": 999,
+                "job_id": 101,
+                "package_lines": 3,
+                "preflight_fingerprint": preflight_fingerprint,
+                "payload_hash": payload_hash,
+            }
+
+        res = derive_export_preflight(self.app, 1, bridge_available=True)
+        out = verify_toctou_and_publish_jobhub(
+            self.app, 1, bridge=MockJobHubBridge(), user_name="ModernUser",
+            expected_fingerprint=res.preflight_fingerprint,
+            acknowledgement_confirmed=True,
+            publish_fn=modern_publisher
+        )
+
+        self.assertEqual(len(invocations), 1)
+        self.assertEqual(invocations[0]["workspace_id"], 1)
+        self.assertEqual(invocations[0]["user_name"], "ModernUser")
+        self.assertEqual(invocations[0]["fingerprint"], res.preflight_fingerprint)
+        self.assertEqual(invocations[0]["hash"], res.payload_hash)
+        self.assertEqual(out["package_id"], 999)
+
+
+if __name__ == "__main__":
+    unittest.main()
