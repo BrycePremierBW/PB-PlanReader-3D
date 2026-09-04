@@ -64,7 +64,7 @@ def extract_scale_ratio_from_text(text: str) -> Optional[int]:
 
 def calculate_m_per_pt_from_px_per_m(px_per_m: float, render_zoom: float = 2.0) -> float:
     """Convert screen render pixels per metre (at render_zoom) to PDF native points per metre."""
-    if px_per_m <= 0:
+    if not (isinstance(px_per_m, (int, float)) and math.isfinite(px_per_m)) or px_per_m <= 0:
         return 0.0
     # PDF native resolution is 72 pt/inch. Standard render zoom 2.0 is 144 DPI (72 * 2).
     # px_per_pt = 72 * render_zoom / 72 = render_zoom.
@@ -84,31 +84,48 @@ class MultiPageScaleRegistry:
         """Build scale authority for all selected pages in a workspace."""
         cur = conn.cursor()
 
-        # Query all selected pages for workspace
-        cur.execute(
-            """
-            SELECT p.id, p.page_label, p.page_type, p.px_per_m, p.scale_text, p.selected, p.page_number
+        # Inspect table info to support canonical page_no as well as legacy page_number
+        cur.execute("PRAGMA table_info(pages)")
+        existing_cols = {row[1] for row in cur.fetchall()}
+        page_num_col = "page_no" if "page_no" in existing_cols else ("page_number" if "page_number" in existing_cols else None)
+
+        if page_num_col:
+            query = f"""
+            SELECT p.id, p.page_label, p.page_type, p.px_per_m, p.scale_text, p.selected, p.{page_num_col} AS page_no
             FROM pages p
             WHERE p.workspace_id=? AND COALESCE(p.selected, 1)=1
-            ORDER BY p.page_number ASC, p.id ASC
-            """,
-            (workspace_id,)
-        )
+            ORDER BY p.{page_num_col} ASC, p.id ASC
+            """
+        else:
+            query = """
+            SELECT p.id, p.page_label, p.page_type, p.px_per_m, p.scale_text, p.selected, p.id AS page_no
+            FROM pages p
+            WHERE p.workspace_id=? AND COALESCE(p.selected, 1)=1
+            ORDER BY p.id ASC
+            """
+
+        cur.execute(query, (workspace_id,))
         pages_data = [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()]
 
-        # Query page IDs that have measurement lines
-        cur.execute(
-            "SELECT DISTINCT page_id FROM measurement_lines WHERE workspace_id=? AND page_id IS NOT NULL",
-            (workspace_id,)
-        )
-        measured_page_ids = {r[0] for r in cur.fetchall() if r[0] is not None}
+        # Query page IDs that have measurement lines (safe if table not present in minimal DB)
+        try:
+            cur.execute(
+                "SELECT DISTINCT page_id FROM measurement_lines WHERE workspace_id=? AND page_id IS NOT NULL",
+                (workspace_id,)
+            )
+            measured_page_ids = {r[0] for r in cur.fetchall() if r[0] is not None}
+        except sqlite3.OperationalError:
+            measured_page_ids = set()
 
-        # Query page IDs associated with takeoff rows
-        cur.execute(
-            "SELECT DISTINCT source_page FROM takeoff_rows WHERE workspace_id=? AND source_page IS NOT NULL",
-            (workspace_id,)
-        )
-        takeoff_page_refs = {str(r[0]).strip() for r in cur.fetchall() if r[0] is not None}
+        # Query page IDs associated with takeoff rows (safe if table not present in minimal DB)
+        try:
+            cur.execute(
+                "SELECT DISTINCT source_page FROM takeoff_rows WHERE workspace_id=? AND source_page IS NOT NULL",
+                (workspace_id,)
+            )
+            takeoff_page_refs = {str(r[0]).strip() for r in cur.fetchall() if r[0] is not None}
+        except sqlite3.OperationalError:
+            takeoff_page_refs = set()
 
         records = []
         primary_calibrated_ratio: Optional[int] = None
@@ -117,7 +134,8 @@ class MultiPageScaleRegistry:
         # First pass: evaluate direct calibration per page
         for p in pages_data:
             pid = int(p["id"])
-            plabel = str(p.get("page_label") or f"Page {p.get('page_number', pid)}")
+            page_seq = p.get("page_no") if p.get("page_no") is not None else p.get("page_number", pid)
+            plabel = str(p.get("page_label") or f"Page {page_seq}")
             ptype = str(p.get("page_type") or "Plan").lower()
             px_m = float(p.get("px_per_m") or 0.0)
             stext = str(p.get("scale_text") or "")
@@ -131,7 +149,7 @@ class MultiPageScaleRegistry:
 
             ratio = extract_scale_ratio_from_text(stext)
 
-            if px_m > 0:
+            if math.isfinite(px_m) and px_m > 0:
                 status = "CALIBRATED"
                 method = "MANUAL"
                 conf = 1.0
@@ -157,6 +175,8 @@ class MultiPageScaleRegistry:
                 conf = 0.0
                 note = "Uncalibrated drawing page"
 
+            if not (math.isfinite(px_m) and px_m > 0):
+                px_m = 0.0
             m_pt = calculate_m_per_pt_from_px_per_m(px_m)
 
             records.append(PageScaleRecord(
@@ -193,8 +213,9 @@ class MultiPageScaleRegistry:
         """Return scale-gate issue descriptors for review and preflight blocking."""
         issues = []
         for r in self.records:
-            # Block if page has measurements or takeoff rows but is UNCALIBRATED (px_per_m <= 0)
-            if (r.has_measurement_lines or r.has_takeoff_rows or r.scale_status == "UNCALIBRATED") and r.px_per_m <= 0:
+            # Block if page has measurements or takeoff rows or is UNCALIBRATED (px_per_m <= 0 or non-finite)
+            is_uncalibrated_px = not (isinstance(r.px_per_m, (int, float)) and math.isfinite(r.px_per_m) and r.px_per_m > 0)
+            if (r.has_measurement_lines or r.has_takeoff_rows or r.scale_status == "UNCALIBRATED") and is_uncalibrated_px:
                 issues.append({
                     "page_id": r.page_id,
                     "page_label": r.page_label,
@@ -219,6 +240,8 @@ def derive_workspace_scale_authority(conn: sqlite3.Connection, workspace_id: int
 
 def recompute_page_scale_geometry(conn: sqlite3.Connection, workspace_id: int, page_id: int, old_px_per_m: float, new_px_per_m: float) -> int:
     """Server-side recomputation of saved measurement_lines geometry when page scale is updated."""
+    if not (isinstance(old_px_per_m, (int, float)) and math.isfinite(old_px_per_m) and isinstance(new_px_per_m, (int, float)) and math.isfinite(new_px_per_m)):
+        return 0
     if new_px_per_m <= 0 or old_px_per_m <= 0 or math.isclose(old_px_per_m, new_px_per_m):
         return 0
 

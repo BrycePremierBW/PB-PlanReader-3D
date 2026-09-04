@@ -421,9 +421,10 @@ def collect_scale_review_signals(app: Any, workspace_id: int) -> Tuple[List[Comm
             ws_id = int(workspace_id)
             if ws_id <= 0:
                 return signals, "UNAVAILABLE"
-            issues = derive_workspace_scale_authority(
-                app, ws_id
-            ).get_issues()
+            authority = derive_workspace_scale_authority(app, ws_id)
+            issues = authority.get_issues()
+            if not isinstance(issues, list):
+                return signals, "UNAVAILABLE"
         except Exception:
             return signals, "UNAVAILABLE"
     elif app is None:
@@ -431,15 +432,21 @@ def collect_scale_review_signals(app: Any, workspace_id: int) -> Tuple[List[Comm
     else:
         return signals, "NOT_SUPPORTED"
 
+    # Strict fail-closed validation of issue collection structure
+    if not isinstance(issues, list):
+        return signals, "UNAVAILABLE"
+
     for issue in issues:
-
-
-
         if not isinstance(issue, dict):
-            continue
+            # Malformed issue item in canonical collection must fail closed to UNAVAILABLE
+            return [], "UNAVAILABLE"
         page_id_val = issue.get("page_id")
         page_id_str = str(page_id_val or issue.get("page_label") or "unknown")
-        reason_text = _safe_str(issue.get("reason") or "Selected drawing page requires scale calibration").strip()
+        reason_text = _safe_str(
+            issue.get("reason")
+            or issue.get("description")
+            or "Selected drawing page requires scale calibration"
+        ).strip()
         label_text = _safe_str(issue.get("page_label") or f"Page #{page_id_str}").strip()
 
         signals.append(
