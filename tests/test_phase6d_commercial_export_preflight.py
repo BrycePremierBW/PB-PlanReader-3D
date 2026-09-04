@@ -41,7 +41,12 @@ from pb_commercial_export_preflight_v163 import (
     verify_toctou_and_publish_jobhub,
 )
 from pb_commercial_review_v161 import CommercialReviewResult, CommercialReviewSignal
-from pb_planreader_3d_app import publish_job_to_jobhub, takeoff_work_rows
+from pb_planreader_3d_app import (
+    _ensure_takeoff_columns,
+    publish_job_to_jobhub,
+    takeoff_work_rows,
+)
+from pb_takeoff_authority_v164 import approve_model_surface_row
 
 
 def _create_mock_db() -> sqlite3.Connection:
@@ -229,6 +234,21 @@ class Phase6DPreflightTests(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
+    def test_0_takeoff_authority_schema_migration_is_idempotent(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE takeoff_rows (id INTEGER PRIMARY KEY, row_role TEXT)")
+        _ensure_takeoff_columns(conn)
+        _ensure_takeoff_columns(conn)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(takeoff_rows)")}
+        self.assertTrue({
+            "commercial_authority_status",
+            "commercial_authority_source",
+            "commercial_authority_reviewed_by",
+            "commercial_authority_reviewed_at",
+            "commercial_authority_fingerprint",
+        }.issubset(columns))
+        conn.close()
+
     def test_1_clean_project_preflight_available(self):
         res = derive_export_preflight(self.app, 1, bridge_available=True)
         self.assertEqual(res.preflight_status, "AVAILABLE")
@@ -313,7 +333,7 @@ class Phase6DPreflightTests(unittest.TestCase):
         self.conn.commit()
         res = derive_export_preflight(self.app, 1, bridge_available=True)
         self.assertEqual(res.excluded_takeoff_rows, 1)
-        self.assertEqual(res.publishable_takeoff_rows, 2)
+        self.assertEqual(res.publishable_takeoff_rows, 1)
 
     def test_9_confirmed_measured_zero_vs_unmeasured_zero(self):
         """0.0 quantity with 'Measured' status is a valid measured zero; 0.0 with 'to measure' is unmeasured zero."""
@@ -340,27 +360,136 @@ class Phase6DPreflightTests(unittest.TestCase):
             {"id": 2, "section": "Internal", "element": "Ceiling", "unit": "m²", "quantity": 80.0, "inclusion_status": "included", "row_role": "work"},
             {"id": 3, "section": "Internal", "element": "Floor", "unit": "m²", "quantity": 80.0, "inclusion_status": "included", "row_role": "floor_area"},
             {"id": 4, "section": "External", "element": "Cladding", "unit": "m²", "quantity": 50.0, "inclusion_status": "excluded", "row_role": "work"},
+            {"id": 5, "section": "External", "element": "3D Front", "unit": "m²", "quantity": 20.0, "inclusion_status": "included", "row_role": "model_surface", "commercial_authority_status": "REVIEW_REQUIRED"},
+            approve_model_surface_row(
+                {"id": 6, "section": "External", "element": "Reviewed 3D Rear", "unit": "m²", "quantity": 20.0, "inclusion_status": "included", "row_role": "model_surface"},
+                source="A-401", reviewed_by="Estimator", reviewed_at="2026-09-04T10:00:00+10:00",
+            ),
         ])
         work_df = takeoff_work_rows(df_mixed)
-        # takeoff_work_rows filters out row_role == 'floor_area' -> 3 work rows (ids 1, 2, 4)
+        # Floor references, exclusions, and unapproved model surfaces are all non-publishable.
         self.assertEqual(len(work_df), 3)
-        self.assertEqual(list(work_df["id"]), [1, 2, 4])
+        self.assertEqual(list(work_df["id"]), [1, 2, 6])
 
         cur = self.conn.cursor()
         cur.execute("DELETE FROM takeoff_rows WHERE workspace_id=1")
+        for ddl in (
+            "commercial_authority_status TEXT DEFAULT ''",
+            "commercial_authority_source TEXT DEFAULT ''",
+            "commercial_authority_reviewed_by TEXT DEFAULT ''",
+            "commercial_authority_reviewed_at TEXT DEFAULT ''",
+            "commercial_authority_fingerprint TEXT DEFAULT ''",
+        ):
+            cur.execute(f"ALTER TABLE takeoff_rows ADD COLUMN {ddl}")
         for r in df_mixed.to_dict("records"):
             cur.execute(
-                "INSERT INTO takeoff_rows (id, workspace_id, section, element, unit, quantity, inclusion_status, row_role, quantity_status) VALUES (?,1,?,?,?,?,?,?,'Measured')",
-                (r["id"], r["section"], r["element"], r["unit"], r["quantity"], r["inclusion_status"], r["row_role"])
+                """INSERT INTO takeoff_rows (
+                    id, workspace_id, section, element, unit, quantity,
+                    inclusion_status, row_role, quantity_status,
+                    commercial_authority_status, commercial_authority_source,
+                    commercial_authority_reviewed_by, commercial_authority_reviewed_at,
+                    commercial_authority_fingerprint
+                ) VALUES (?,1,?,?,?,?,?,?,'Measured',?,?,?,?,?)""",
+                (
+                    r["id"], r["section"], r["element"], r["unit"], r["quantity"],
+                    r["inclusion_status"], r["row_role"],
+                    r.get("commercial_authority_status", ""),
+                    r.get("commercial_authority_source", ""),
+                    r.get("commercial_authority_reviewed_by", ""),
+                    r.get("commercial_authority_reviewed_at", ""),
+                    r.get("commercial_authority_fingerprint", ""),
+                )
             )
+        self.conn.row_factory = sqlite3.Row
+        persisted_model = dict(self.conn.execute("SELECT * FROM takeoff_rows WHERE id=6").fetchone())
+        persisted_approval = approve_model_surface_row(
+            persisted_model,
+            source="A-401",
+            reviewed_by="Estimator",
+            reviewed_at="2026-09-04T10:00:00+10:00",
+        )
+        cur.execute(
+            """UPDATE takeoff_rows SET
+                commercial_authority_status=?,commercial_authority_source=?,
+                commercial_authority_reviewed_by=?,commercial_authority_reviewed_at=?,
+                commercial_authority_fingerprint=? WHERE id=6""",
+            (
+                persisted_approval["commercial_authority_status"],
+                persisted_approval["commercial_authority_source"],
+                persisted_approval["commercial_authority_reviewed_by"],
+                persisted_approval["commercial_authority_reviewed_at"],
+                persisted_approval["commercial_authority_fingerprint"],
+            ),
+        )
         self.conn.commit()
 
         res = derive_export_preflight(self.app, 1, bridge_available=True)
-        self.assertEqual(res.total_takeoff_rows, 4)
-        self.assertEqual(res.publishable_takeoff_rows, 3) # Exactly matches takeoff_work_rows count (3)
+        self.assertEqual(res.total_takeoff_rows, 6)
+        self.assertEqual(res.publishable_takeoff_rows, 3)
         self.assertEqual(res.publishable_takeoff_rows, len(work_df)) # Exact equality
         self.assertEqual(res.excluded_takeoff_rows, 1)
         self.assertEqual(res.floor_reference_rows, 1)
+        self.assertEqual(res.preflight_status, "BLOCKED")
+        self.assertTrue(any("3D model surface" in reason for reason in res.blocking_reasons))
+
+    def test_10b_model_surface_cannot_publish_without_complete_approval(self):
+        cur = self.conn.cursor()
+        for ddl in (
+            "commercial_authority_status TEXT DEFAULT ''",
+            "commercial_authority_source TEXT DEFAULT ''",
+            "commercial_authority_reviewed_by TEXT DEFAULT ''",
+            "commercial_authority_reviewed_at TEXT DEFAULT ''",
+            "commercial_authority_fingerprint TEXT DEFAULT ''",
+        ):
+            cur.execute(f"ALTER TABLE takeoff_rows ADD COLUMN {ddl}")
+        cur.execute("DELETE FROM takeoff_rows WHERE workspace_id=1")
+        cur.execute(
+            """INSERT INTO takeoff_rows (
+                id, workspace_id, section, element, location, unit, quantity,
+                quantity_status, confidence, inclusion_status, row_role,
+                commercial_authority_status, commercial_authority_source
+            ) VALUES (1010,1,'External','3D Front','Block A','m²',10.0,
+                'Measured','Measured','INCLUSION','model_surface','REVIEW_REQUIRED','A-401')"""
+        )
+        self.conn.commit()
+
+        blocked = derive_export_preflight(self.app, 1, bridge_available=True)
+        self.assertEqual(blocked.publishable_takeoff_rows, 0)
+        self.assertEqual(blocked.preflight_status, "BLOCKED")
+        self.assertEqual(blocked.final_publish_state, "BLOCKED")
+
+        self.conn.row_factory = sqlite3.Row
+        current = dict(self.conn.execute("SELECT * FROM takeoff_rows WHERE id=1010").fetchone())
+        approved_row = approve_model_surface_row(
+            current,
+            source="A-401 / estimator measurement M-22",
+            reviewed_by="Senior Estimator",
+            reviewed_at="2026-09-04T10:00:00+10:00",
+        )
+        cur.execute(
+            """UPDATE takeoff_rows SET
+                commercial_authority_status=?,commercial_authority_source=?,
+                commercial_authority_reviewed_by=?,commercial_authority_reviewed_at=?,
+                commercial_authority_fingerprint=? WHERE id=1010""",
+            (
+                approved_row["commercial_authority_status"],
+                approved_row["commercial_authority_source"],
+                approved_row["commercial_authority_reviewed_by"],
+                approved_row["commercial_authority_reviewed_at"],
+                approved_row["commercial_authority_fingerprint"],
+            ),
+        )
+        self.conn.commit()
+        approved = derive_export_preflight(self.app, 1, bridge_available=True)
+        self.assertEqual(approved.publishable_takeoff_rows, 1)
+        self.assertEqual(approved.preflight_status, "AVAILABLE")
+        self.assertEqual(approved.final_publish_state, "AVAILABLE")
+
+        cur.execute("UPDATE takeoff_rows SET quantity=11.0 WHERE id=1010")
+        self.conn.commit()
+        tampered = derive_export_preflight(self.app, 1, bridge_available=True)
+        self.assertEqual(tampered.publishable_takeoff_rows, 0)
+        self.assertEqual(tampered.final_publish_state, "BLOCKED")
 
     def test_11_missing_wrong_acknowledgement_fails(self):
         cur = self.conn.cursor()

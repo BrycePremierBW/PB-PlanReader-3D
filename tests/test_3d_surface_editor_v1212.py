@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import unittest
 
 from pb_3d_surface_editor_v1212 import (
@@ -11,6 +12,7 @@ from pb_3d_surface_editor_v1212 import (
     normalise_override,
     selected_surface_from_event,
     surface_records,
+    _replace_rows,
 )
 
 
@@ -81,7 +83,7 @@ class SurfaceEditorTests(unittest.TestCase):
         self.assertEqual(result["total_m2"], expected_total)
         self.assertEqual(result["completed_m2"], 5.0)
 
-    def test_measured_mass_surface_sync_is_unpriced(self):
+    def test_measured_mass_surface_sync_remains_provisional_and_unapproved(self):
         surface = derive_mass_surfaces(self.mass())[0]
         record = surface_records(
             [surface],
@@ -89,13 +91,20 @@ class SurfaceEditorTests(unittest.TestCase):
         )[0]
         row = build_surface_takeoff_rows([record])[0]
         self.assertEqual(row["quantity"], 10.0)
-        self.assertEqual(row["quantity_status"], "Measured")
-        self.assertEqual(row["confidence"], "Measured")
+        self.assertEqual(row["quantity_status"], "Provisional measured")
+        self.assertEqual(row["confidence"], "Derived")
         self.assertEqual(row["inclusion_status"], "INCLUSION")
         self.assertEqual(row["rate_per_unit"], 0)
         self.assertEqual(row["coats"], 0)
         self.assertEqual(row["productivity_m2_per_hour"], 0)
         self.assertEqual(row["row_role"], "model_surface")
+        self.assertEqual(row["commercial_authority_status"], "REVIEW_REQUIRED")
+        self.assertEqual(row["commercial_authority_source"], "A-401")
+        self.assertEqual(row["commercial_authority_reviewed_by"], "")
+        self.assertEqual(row["commercial_authority_reviewed_at"], "")
+        self.assertEqual(row["commercial_authority_fingerprint"], "")
+        self.assertIn("Source model confidence: Measured", row["notes"])
+        self.assertIn("Commercial estimator review is required", row["notes"])
         self.assertIn("Progress 65%", row["notes"])
 
     def test_assumed_mass_surface_remains_provisional(self):
@@ -104,7 +113,68 @@ class SurfaceEditorTests(unittest.TestCase):
         row = build_surface_takeoff_rows([record])[0]
         self.assertEqual(row["quantity_status"], "Provisional measured")
         self.assertEqual(row["confidence"], "Derived")
-        self.assertIn("not marked Measured/Verified", row["notes"])
+        self.assertEqual(row["commercial_authority_status"], "REVIEW_REQUIRED")
+        self.assertIn("Source model confidence: Assumed", row["notes"])
+
+    def test_verified_mass_without_source_cannot_manufacture_authority(self):
+        surface = derive_mass_surfaces(
+            self.mass(confidence="Verified", source_reference="")
+        )[0]
+        record = surface_records(
+            [surface], {surface["surface_id"]: {"status": "Paint Included"}}
+        )[0]
+        row = build_surface_takeoff_rows([record])[0]
+        self.assertEqual(row["quantity_status"], "Provisional measured")
+        self.assertEqual(row["confidence"], "Derived")
+        self.assertEqual(row["commercial_authority_status"], "REVIEW_REQUIRED")
+        self.assertEqual(row["commercial_authority_source"], "")
+
+    def test_replace_rows_persists_fail_closed_authority_metadata(self):
+        class DbApp:
+            def __init__(self):
+                self.conn = sqlite3.connect(":memory:")
+                self.conn.execute(
+                    """CREATE TABLE takeoff_rows (
+                        workspace_id INTEGER, section TEXT, element TEXT, location TEXT,
+                        substrate TEXT, finish_system TEXT, quantity REAL, unit TEXT,
+                        quantity_status TEXT, source_page TEXT, source_reference TEXT,
+                        inclusion_status TEXT, coats REAL, coverage_m2_per_litre REAL,
+                        productivity_m2_per_hour REAL, rate_per_unit REAL, confidence TEXT,
+                        notes TEXT, row_role TEXT, commercial_authority_status TEXT,
+                        commercial_authority_source TEXT, commercial_authority_reviewed_by TEXT,
+                        commercial_authority_reviewed_at TEXT, commercial_authority_fingerprint TEXT,
+                        created_at TEXT, updated_at TEXT
+                    )"""
+                )
+
+            def lexecute(self, sql, params=()):
+                self.conn.execute(sql, params)
+                self.conn.commit()
+
+            def now_stamp(self):
+                return "2026-09-04T10:00:00+10:00"
+
+        surface = derive_mass_surfaces(self.mass())[0]
+        record = surface_records(
+            [surface], {surface["surface_id"]: {"status": "Paint Included"}}
+        )[0]
+        app = DbApp()
+        _replace_rows(app, 101, build_surface_takeoff_rows([record]))
+        saved = app.conn.execute(
+            """SELECT quantity_status, confidence, row_role,
+                      commercial_authority_status, commercial_authority_source,
+                      commercial_authority_reviewed_by, commercial_authority_reviewed_at,
+                      commercial_authority_fingerprint
+                 FROM takeoff_rows"""
+        ).fetchone()
+        self.assertEqual(
+            saved,
+            (
+                "Provisional measured", "Derived", "model_surface",
+                "REVIEW_REQUIRED", "A-401", "", "", "",
+            ),
+        )
+        app.conn.close()
 
     def test_event_selection_prefers_customdata_then_curve_number(self):
         trace_ids = ["mass:7:front", "mass:7:rear"]

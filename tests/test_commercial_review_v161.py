@@ -6,6 +6,8 @@ import sqlite3
 import time
 import pytest
 
+from pb_takeoff_authority_v164 import approve_model_surface_row
+
 from pb_commercial_review_v161 import (
     MODULE_VERSION,
     REQUIRED_FAMILIES,
@@ -174,6 +176,100 @@ def test_excluded_rows_without_issues_produce_no_signal(test_db):
 
     res = collect_commercial_review_signals(app, {"id": 101})
     assert res.signal_count == 0
+
+
+def test_unapproved_model_surface_is_a_commercial_blocker():
+    class SurfaceApp:
+        def lquery(self, sql, params=()):
+            return [{
+                "id": 77,
+                "workspace_id": 101,
+                "element": "3D Front",
+                "location": "Block A",
+                "unit": "m²",
+                "quantity": 10.0,
+                "quantity_status": "Measured",
+                "confidence": "Measured",
+                "inclusion_status": "INCLUSION",
+                "source_reference": "PB 3D Surface Editor v1.2.12 · mass:7:front",
+                "row_role": "model_surface",
+                "commercial_authority_status": "REVIEW_REQUIRED",
+                "commercial_authority_source": "A-401",
+                "commercial_authority_reviewed_by": "",
+                "commercial_authority_reviewed_at": "",
+            }]
+
+    signals = collect_takeoff_review_signals(SurfaceApp(), 101)
+    assert len(signals) == 1
+    assert signals[0].severity == "BLOCKER"
+    assert signals[0].category == "3D model authority"
+    assert signals[0].source_type == "model_surface_row"
+    assert "has not received commercial approval" in signals[0].summary
+
+
+def test_model_surface_requires_complete_attributable_approval():
+    unapproved = {
+        "id": 78,
+        "workspace_id": 101,
+        "element": "3D Front",
+        "unit": "m²",
+        "quantity": 10.0,
+        "quantity_status": "Measured",
+        "confidence": "Verified",
+        "inclusion_status": "included",
+        "row_role": "model_surface",
+    }
+    base = approve_model_surface_row(
+        unapproved,
+        source="A-401 / estimator measurement M-22",
+        reviewed_by="Senior Estimator",
+        reviewed_at="2026-09-04T10:00:00+10:00",
+    )
+
+    class CompleteApprovalApp:
+        def lquery(self, sql, params=()):
+            return [base]
+
+    assert collect_takeoff_review_signals(CompleteApprovalApp(), 101) == []
+
+    for missing_field in (
+        "commercial_authority_source",
+        "commercial_authority_reviewed_by",
+        "commercial_authority_reviewed_at",
+    ):
+        class IncompleteApprovalApp:
+            def lquery(self, sql, params=()):
+                return [{**base, missing_field: ""}]
+
+        signals = collect_takeoff_review_signals(IncompleteApprovalApp(), 101)
+        assert len(signals) == 1, missing_field
+        assert signals[0].severity == "BLOCKER", missing_field
+
+    class TamperedApprovalApp:
+        def lquery(self, sql, params=()):
+            return [{**base, "quantity": 999.0}]
+
+    signals = collect_takeoff_review_signals(TamperedApprovalApp(), 101)
+    assert len(signals) == 1
+    assert signals[0].severity == "BLOCKER"
+    assert "no longer matches" in signals[0].summary
+
+
+def test_explicitly_excluded_model_surface_has_no_commercial_signal():
+    class ExcludedSurfaceApp:
+        def lquery(self, sql, params=()):
+            return [{
+                "id": 79,
+                "workspace_id": 101,
+                "element": "3D Underside",
+                "quantity": 10.0,
+                "quantity_status": "Measured",
+                "confidence": "Measured",
+                "inclusion_status": "EXCLUSION",
+                "row_role": "model_surface",
+            }]
+
+    assert collect_takeoff_review_signals(ExcludedSurfaceApp(), 101) == []
 
 
 def test_malformed_takeoff_row_id_quarantines_item():
