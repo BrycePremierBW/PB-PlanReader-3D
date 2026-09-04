@@ -45,10 +45,14 @@ def _safe_int(val: Any) -> Optional[int]:
     """Parse integer safely without treating bools or floats as invalid int."""
     if val is None or isinstance(val, bool):
         return None
+    if isinstance(val, float):
+        if not math.isfinite(val) or not val.is_integer():
+            return None
+        return int(val)
     try:
         ival = int(val)
         return ival
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return None
 
 
@@ -119,8 +123,12 @@ class CommercialReviewResult:
 
     @property
     def required_coverage_complete(self) -> bool:
-        """Required coverage is complete if workspace_id > 0 and all REQUIRED_FAMILIES are AVAILABLE."""
-        if not self.workspace_id or self.workspace_id <= 0:
+        """Required coverage is complete if workspace_id > 0, no errors, and all REQUIRED_FAMILIES are AVAILABLE."""
+        if isinstance(self.workspace_id, bool) or not isinstance(self.workspace_id, int) or self.workspace_id <= 0:
+            return False
+        if not isinstance(self.source_coverage, dict):
+            return False
+        if bool(self.errors):
             return False
         for fam in REQUIRED_FAMILIES:
             status = self.source_coverage.get(fam, "UNAVAILABLE")
@@ -151,23 +159,54 @@ def _safe_float(val: Any) -> Optional[float]:
         return None
 
 
-def _normalize_rows(raw: Any) -> List[Dict[str, Any]]:
+def _family_from_sql(sql: str) -> str:
+    sql_lower = sql.lower()
+    if "takeoff_rows" in sql_lower:
+        return "takeoff"
+    if "register_items" in sql_lower:
+        return "register"
+    if "pages" in sql_lower:
+        return "scale"
+    return "evidence"
+
+
+def _normalize_rows(raw: Any, family: str = "evidence") -> List[Dict[str, Any]]:
     if raw is None:
-        return []
-    if isinstance(raw, list):
-        return [dict(r) for r in raw if isinstance(r, dict)]
-    if hasattr(raw, "to_dict"):
-        return [dict(r) for r in raw.to_dict("records")]
-    return []
+        raise ValueError(f"Raw {family} data is None; expected list of row dicts or DataFrame.")
+    if hasattr(raw, "to_dict") and callable(getattr(raw, "to_dict")):
+        try:
+            records = raw.to_dict("records")
+            if not isinstance(records, list):
+                raise ValueError(f"Malformed {family} DataFrame: to_dict did not return list.")
+            raw = records
+        except Exception as exc:
+            raise ValueError(f"Malformed {family} DataFrame: {exc}") from exc
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(f"Malformed {family} collection: expected list or DataFrame, got {type(raw).__name__}")
+
+    normalized: List[Dict[str, Any]] = []
+    for idx, r in enumerate(raw):
+        if isinstance(r, dict):
+            normalized.append(dict(r))
+        elif hasattr(r, "keys") and callable(getattr(r, "keys")):
+            normalized.append(dict(r))
+        else:
+            raise ValueError(f"Malformed {family} row at index {idx}: expected mapping/dict, got {type(r).__name__}")
+    return normalized
 
 
 def _query(app: Any, sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
     """Execute workspace SQL query using available DB helper or FakeApp attributes."""
-    if hasattr(app, "lquery"):
-        return _normalize_rows(app.lquery(sql, params))
-    if hasattr(app, "ldf"):
-        return _normalize_rows(app.ldf(sql, params))
-    if hasattr(app, "execute") or hasattr(app, "cursor"):
+    if app is None:
+        raise ValueError("Application/database source is None")
+
+    family = _family_from_sql(sql)
+
+    if hasattr(app, "lquery") and callable(getattr(app, "lquery")):
+        return _normalize_rows(app.lquery(sql, params), family=family)
+    if hasattr(app, "ldf") and callable(getattr(app, "ldf")):
+        return _normalize_rows(app.ldf(sql, params), family=family)
+    if callable(getattr(app, "execute", None)) or callable(getattr(app, "cursor", None)):
         # Handle raw sqlite3 Connection — allow query exceptions to propagate so collector marks family UNAVAILABLE
         conn = app
         cur = conn.cursor()
@@ -175,17 +214,33 @@ def _query(app: Any, sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, A
         cols = [d[0] for d in cur.description] if cur.description else []
         rows = cur.fetchall()
         return [dict(zip(cols, r)) for r in rows]
-    if "documents" in sql:
-        return _normalize_rows(getattr(app, "documents", []))
-    if "pages" in sql:
-        return _normalize_rows(getattr(app, "pages", []))
+
+    # Mock / container objects with explicit table attributes
     if "takeoff_rows" in sql:
-        return _normalize_rows(getattr(app, "takeoff", []))
+        if hasattr(app, "takeoff"):
+            return _normalize_rows(getattr(app, "takeoff"), family="takeoff")
+        if hasattr(app, "takeoff_rows"):
+            return _normalize_rows(getattr(app, "takeoff_rows"), family="takeoff")
+        raise RuntimeError("Required evidence family 'takeoff' is missing from application source.")
     if "register_items" in sql:
-        return _normalize_rows(getattr(app, "registers", []))
+        if hasattr(app, "registers"):
+            return _normalize_rows(getattr(app, "registers"), family="register")
+        if hasattr(app, "register_items"):
+            return _normalize_rows(getattr(app, "register_items"), family="register")
+        raise RuntimeError("Required evidence family 'register' is missing from application source.")
+    if "documents" in sql:
+        if hasattr(app, "documents"):
+            return _normalize_rows(getattr(app, "documents"), family="documents")
+        return []
+    if "pages" in sql:
+        if hasattr(app, "pages"):
+            return _normalize_rows(getattr(app, "pages"), family="pages")
+        return []
     if "workspace_settings" in sql:
-        return _normalize_rows(getattr(app, "workspace_settings", []))
-    return []
+        if hasattr(app, "workspace_settings"):
+            return _normalize_rows(getattr(app, "workspace_settings"), family="workspace_settings")
+        return []
+    raise RuntimeError(f"Unsupported application source or query target: {sql}")
 
 
 
@@ -195,11 +250,23 @@ def _query(app: Any, sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, A
 
 def collect_takeoff_review_signals(app: Any, workspace_id: int) -> List[CommercialReviewSignal]:
     """Derive deduplicated review signals from takeoff_rows table with per-row quarantine."""
+    if isinstance(workspace_id, bool) or not isinstance(workspace_id, (int, str)):
+        raise ValueError("workspace_id must be a valid positive integer")
+    try:
+        ws_id = int(workspace_id)
+        if ws_id <= 0:
+            raise ValueError("workspace_id must be a valid positive integer")
+    except (ValueError, TypeError, OverflowError):
+        raise ValueError("workspace_id must be a valid positive integer")
+
+    if app is None:
+        raise ValueError("Application source is None for take-off evidence.")
+
     signals: List[CommercialReviewSignal] = []
     rows = _query(
         app,
         "SELECT * FROM takeoff_rows WHERE workspace_id=? ORDER BY id",
-        (int(workspace_id),),
+        (ws_id,),
     )
 
     for row in rows:
@@ -333,11 +400,23 @@ def collect_takeoff_review_signals(app: Any, workspace_id: int) -> List[Commerci
 
 def collect_register_review_signals(app: Any, workspace_id: int) -> List[CommercialReviewSignal]:
     """Derive review signals from register_items table with explicit status allowlist."""
+    if isinstance(workspace_id, bool) or not isinstance(workspace_id, (int, str)):
+        raise ValueError("workspace_id must be a valid positive integer")
+    try:
+        ws_id = int(workspace_id)
+        if ws_id <= 0:
+            raise ValueError("workspace_id must be a valid positive integer")
+    except (ValueError, TypeError, OverflowError):
+        raise ValueError("workspace_id must be a valid positive integer")
+
+    if app is None:
+        raise ValueError("Application source is None for register evidence.")
+
     signals: List[CommercialReviewSignal] = []
     items = _query(
         app,
         "SELECT * FROM register_items WHERE workspace_id=? ORDER BY id",
-        (int(workspace_id),),
+        (ws_id,),
     )
 
     RESOLVED_STATUSES = {"accepted", "closed", "resolved", "approved"}
@@ -408,19 +487,24 @@ def collect_register_review_signals(app: Any, workspace_id: int) -> List[Commerc
 def collect_scale_review_signals(app: Any, workspace_id: int) -> Tuple[List[CommercialReviewSignal], str]:
     """Derive review signals strictly from scale gate issues."""
     signals: List[CommercialReviewSignal] = []
+    if isinstance(workspace_id, bool) or not isinstance(workspace_id, (int, str)):
+        return signals, "UNAVAILABLE"
+    try:
+        ws_id = int(workspace_id)
+        if ws_id <= 0:
+            return signals, "UNAVAILABLE"
+    except (ValueError, TypeError, OverflowError):
+        return signals, "UNAVAILABLE"
 
     if hasattr(app, "scale_gate_issues") and callable(getattr(app, "scale_gate_issues")):
         try:
-            issues = app.scale_gate_issues(int(workspace_id))
+            issues = app.scale_gate_issues(ws_id)
             if not isinstance(issues, list):
                 return signals, "UNAVAILABLE"
         except Exception:
             return signals, "UNAVAILABLE"
     elif (callable(getattr(app, "execute", None)) or callable(getattr(app, "cursor", None))):
         try:
-            ws_id = int(workspace_id)
-            if ws_id <= 0:
-                return signals, "UNAVAILABLE"
             authority = derive_workspace_scale_authority(app, ws_id)
             issues = authority.get_issues()
             if not isinstance(issues, list):
@@ -502,6 +586,14 @@ def collect_commercial_review_signals(app: Any, workspace: Dict[str, Any]) -> Co
         return res
 
     result = CommercialReviewResult(workspace_id=workspace_id)
+
+    if app is None:
+        for fam in REQUIRED_FAMILIES:
+            result.source_coverage[fam] = "NOT_SUPPORTED"
+        for fam in OPTIONAL_FAMILIES:
+            result.source_coverage[fam] = "NOT_SUPPORTED"
+        result.errors.append("Application source is None for commercial review.")
+        return result
 
     # 1. Collect Take-off Signals (Required)
     try:

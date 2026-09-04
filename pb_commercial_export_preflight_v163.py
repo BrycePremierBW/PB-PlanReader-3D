@@ -310,12 +310,21 @@ def derive_export_preflight(conn_or_app: Any, workspace_id: int, bridge_availabl
 
     # Internal Downloads (Excel/ZIP) availability
     if total_rows > 0:
-        internal_download_state = "AVAILABLE_WITH_WARNING" if (blocker_count > 0 or warning_count > 0) else "AVAILABLE"
+        if preflight_status == "BLOCKED" or not required_coverage_complete or blocker_count > 0 or warning_count > 0:
+            internal_download_state = "AVAILABLE_WITH_WARNING"
+        else:
+            internal_download_state = "AVAILABLE"
     else:
         internal_download_state = "UNAVAILABLE"
 
-    # JobHub Draft Handoff availability
-    if bridge_available and meta["jobhub_job_id"] and pub_rows > 0:
+    # JobHub Draft Handoff availability: requires bridge, job ID, publishable rows, complete coverage, and unblocked preflight
+    if (
+        bridge_available
+        and meta["jobhub_job_id"]
+        and pub_rows > 0
+        and required_coverage_complete
+        and preflight_status != "BLOCKED"
+    ):
         draft_handoff_state = "AVAILABLE_WITH_WARNING" if (blocker_count > 0 or warning_count > 0) else "AVAILABLE"
     else:
         draft_handoff_state = "UNAVAILABLE"
