@@ -34,10 +34,81 @@ def _positive_number(value: Any) -> bool:
     return _finite_number(value) and float(value) > 0.0
 
 
-def _point_2d(value: Any) -> Optional[Tuple[float, float]]:
-    if not isinstance(value, dict):
+def _clean_str(val: Any) -> Optional[str]:
+    if val is None or isinstance(val, bool):
         return None
-    x, y = value.get("x"), value.get("y")
+    s = str(val).strip()
+    if not s or s.lower() in {"nan", "none", "null", "undefined"}:
+        return None
+    return s
+
+
+def _clean_workspace_id(val: Any) -> Optional[str]:
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return str(val) if val > 0 else None
+    if isinstance(val, float):
+        if math.isfinite(val) and val.is_integer() and int(val) > 0:
+            return str(int(val))
+        return None
+    s = str(val).strip()
+    if not s or s.lower() in {"nan", "none", "null", "undefined"}:
+        return None
+    if s.isdigit():
+        return s if int(s) > 0 else None
+    return s
+
+
+def _valid_page_number(val: Any) -> bool:
+    """Page numbers must be positive finite integers (booleans and sentinels excluded)."""
+    if val is None:
+        return True
+    if isinstance(val, bool):
+        return False
+    if isinstance(val, (int, float)):
+        if not math.isfinite(float(val)):
+            return False
+        return float(val) > 0.0 and float(val).is_integer()
+    if isinstance(val, str):
+        s = val.strip()
+        if s.isdigit():
+            return int(s) > 0
+        return False
+    return False
+
+
+def _is_superseded_or_stale(
+    provenance: Dict[str, Any],
+    obj: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, Optional[str]]:
+    if parse_strict_bool(provenance.get("is_superseded", False)):
+        return True, "Canonical drawing revision is superseded or unapproved"
+    if str(provenance.get("revision_status", "")).strip().upper() == "SUPERSEDED":
+        return True, "Canonical drawing revision is superseded or unapproved"
+    if str(provenance.get("status", "")).strip().upper() == "SUPERSEDED":
+        return True, "Canonical drawing revision is superseded or unapproved"
+    if any("SUPERSEDED" in str(ev).upper() for ev in provenance.get("contributing_evidence", [])):
+        return True, "Canonical drawing revision is superseded or unapproved"
+    if parse_strict_bool(provenance.get("is_stale", False)):
+        return True, "Canonical drawing revision is stale"
+    if obj:
+        if str(obj.get("review_state", "")).strip().upper() in {"SUPERSEDED", "STALE"}:
+            return True, "Canonical drawing revision is superseded or unapproved"
+        if parse_strict_bool(obj.get("is_superseded", False)):
+            return True, "Canonical drawing revision is superseded or unapproved"
+        if parse_strict_bool(obj.get("is_stale", False)):
+            return True, "Canonical drawing revision is stale"
+    return False, None
+
+
+def _point_2d(value: Any) -> Optional[Tuple[float, float]]:
+    if isinstance(value, dict):
+        x, y = value.get("x"), value.get("y")
+    elif isinstance(value, (list, tuple)) and len(value) >= 2:
+        x, y = value[0], value[1]
+    else:
+        return None
     if not (_finite_number(x) and _finite_number(y)):
         return None
     return float(x), float(y)
@@ -127,20 +198,40 @@ class SceneProvenanceGraph:
         )
 
     @classmethod
-    def derive_from_canonical_project(cls, project: Any) -> "SceneProvenanceGraph":
+    def derive_from_canonical_project(
+        cls,
+        project: Any,
+        expected_workspace_id: Any = None,
+    ) -> "SceneProvenanceGraph":
         if not isinstance(project, CanonicalProject):
             return cls.unavailable("CANONICAL_PROJECT_REQUIRED")
         if parse_strict_bool(getattr(project, "is_synthetic_demo", False)):
             return cls.unavailable("SYNTHETIC_CANONICAL_PROJECT_REJECTED")
 
-        project_id = project.id if isinstance(project.id, str) and project.id else None
+        # Stale scene detection (P6)
+        if parse_strict_bool(getattr(project, "is_stale", False)):
+            return cls.unavailable("STALE_CANONICAL_SCENE_REJECTED")
+        if getattr(project, "source_status", None) in {"STALE", "STALE_SCENE"}:
+            return cls.unavailable("STALE_CANONICAL_SCENE_REJECTED")
+        if str(getattr(project, "review_state", "")).strip().upper() in {"STALE", "SUPERSEDED"}:
+            return cls.unavailable("STALE_CANONICAL_SCENE_REJECTED")
         project_provenance = getattr(project, "provenance", None)
-        canonical_workspace_id = getattr(project_provenance, "workspace_id", None)
-        workspace_id = (
-            canonical_workspace_id
-            if isinstance(canonical_workspace_id, str) and canonical_workspace_id
-            else None
-        )
+        if project_provenance and parse_strict_bool(getattr(project_provenance, "is_stale", False)):
+            return cls.unavailable("STALE_CANONICAL_SCENE_REJECTED")
+
+        project_id = project.id if isinstance(project.id, str) and project.id else None
+        canonical_workspace_id = _clean_workspace_id(getattr(project_provenance, "workspace_id", None))
+        workspace_id = canonical_workspace_id
+
+        # Workspace binding validation against expected workspace (P6)
+        if expected_workspace_id is not None:
+            clean_expected = _clean_workspace_id(expected_workspace_id)
+            if clean_expected is None:
+                return cls.unavailable("WORKSPACE_MISMATCH")
+            norm_expected = clean_expected.lstrip("workspace-")
+            norm_canonical = (canonical_workspace_id or "").lstrip("workspace-")
+            if canonical_workspace_id is None or (clean_expected != canonical_workspace_id and norm_expected != norm_canonical):
+                return cls.unavailable("WORKSPACE_MISMATCH")
 
         try:
             scene = project_to_viewer_payload(project)
@@ -200,6 +291,7 @@ class SceneProvenanceGraph:
                 obj,
                 level_elevations.get(level_id),
                 objects_by_id,
+                canonical_workspace_id=canonical_workspace_id,
             )
             raw_provenance = obj.get("provenance")
             provenance = deepcopy(raw_provenance) if isinstance(raw_provenance, dict) else {}
@@ -216,6 +308,46 @@ class SceneProvenanceGraph:
                     geometry_error=geometry_error,
                 )
             )
+
+        # Detect duplicate/copied spatial geometry on the same level (P6)
+        spatial_signatures: Dict[Tuple, List[str]] = {}
+        for node in nodes:
+            if node.geometry_valid and node.position_3d is not None and node.dimensions_3d is not None:
+                sig = (
+                    node.level_id,
+                    node.element_type,
+                    tuple(round(c, 3) for c in node.position_3d),
+                    tuple(round(d, 3) for d in node.dimensions_3d),
+                )
+                spatial_signatures.setdefault(sig, []).append(node.element_id)
+
+        duplicate_spatial_ids = {
+            eid
+            for elem_ids in spatial_signatures.values()
+            if len(elem_ids) > 1
+            for eid in elem_ids
+        }
+
+        if duplicate_spatial_ids:
+            hardened_nodes: List[SpatialProvenanceNode] = []
+            for node in nodes:
+                if node.element_id in duplicate_spatial_ids:
+                    hardened_nodes.append(
+                        SpatialProvenanceNode(
+                            element_id=node.element_id,
+                            element_type=node.element_type,
+                            level_id=node.level_id,
+                            parent_element_id=node.parent_element_id,
+                            geometry_valid=False,
+                            position_3d=None,
+                            dimensions_3d=None,
+                            provenance=node.provenance,
+                            geometry_error="Duplicate/copied spatial geometry detected at identical coordinates",
+                        )
+                    )
+                else:
+                    hardened_nodes.append(node)
+            nodes = hardened_nodes
 
         return cls(
             nodes,
@@ -302,7 +434,34 @@ def _spatial_geometry(
     obj: Dict[str, Any],
     level_elevation: Any,
     objects_by_id: Dict[str, Dict[str, Any]],
+    canonical_workspace_id: Optional[str] = None,
 ) -> Tuple[bool, Optional[Vector3], Optional[Vector3], Optional[str]]:
+    raw_provenance = obj.get("provenance")
+    if isinstance(raw_provenance, dict):
+        # 1. Element workspace check: if element has workspace_id, it must match project's canonical workspace
+        elem_ws = _clean_workspace_id(raw_provenance.get("workspace_id"))
+        if elem_ws and canonical_workspace_id:
+            norm_elem = elem_ws.lstrip("workspace-")
+            norm_proj = canonical_workspace_id.lstrip("workspace-")
+            if elem_ws != canonical_workspace_id and norm_elem != norm_proj:
+                return False, None, None, "Canonical element workspace does not match project workspace"
+
+        # 2. Page reference validation: page_number must be positive finite integer
+        raw_page = raw_provenance.get("page_number")
+        if not _valid_page_number(raw_page):
+            return False, None, None, "Canonical element page reference is invalid, non-finite, or non-positive"
+
+        # 3. Sentinel checks on page_id and drawing_id
+        for key in ("page_id", "drawing_id"):
+            val = raw_provenance.get(key)
+            if val is not None and isinstance(val, str) and val.strip().lower() in {"nan", "none", "null"}:
+                return False, None, None, f"Canonical {key} contains invalid sentinel"
+
+        # 4. Revision superseded or stale check
+        is_super, super_reason = _is_superseded_or_stale(raw_provenance, obj)
+        if is_super:
+            return False, None, None, super_reason
+
     element_type = obj.get("type")
     if not _finite_number(level_elevation):
         return False, None, None, "Canonical level elevation is unavailable or non-finite"
@@ -354,6 +513,12 @@ def _opening_geometry(
     wall = objects_by_id.get(wall_id)
     if wall is None or wall.get("type") != "WALL":
         return False, None, None, "Canonical host wall is unavailable or ambiguous"
+
+    # Level consistency check (P6)
+    opening_level = obj.get("level_id")
+    wall_level = wall.get("level_id")
+    if opening_level and wall_level and opening_level != wall_level:
+        return False, None, None, "Canonical opening level does not match host-wall level"
 
     line = _line_geometry(wall.get("start_point"), wall.get("end_point"))
     if line is None:
@@ -463,9 +628,12 @@ def derive_3d_scene_provenance(
 ) -> SceneProvenanceGraph:
     """Derive A10 only from a real CanonicalProject.
 
-    workspace_id remains accepted solely so legacy callers fail closed instead
-    of crashing. It is never used as provenance; workspace identity is read
-    only from project.provenance.workspace_id.
+    When workspace_id is provided, validates that project.provenance.workspace_id
+    matches the requested workspace to prevent cross-workspace geometry authorization.
     """
-    del workspace_id
-    return SceneProvenanceGraph.derive_from_canonical_project(project)
+    if not isinstance(project, CanonicalProject):
+        return SceneProvenanceGraph.unavailable("CANONICAL_PROJECT_REQUIRED")
+    return SceneProvenanceGraph.derive_from_canonical_project(
+        project,
+        expected_workspace_id=workspace_id,
+    )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+from typing import Any
 import unittest
 
 from pb_3d_spatial_provenance_v179 import (
@@ -20,23 +21,25 @@ from pb_canonical_building import (
 
 
 def _canonical_project(
-    wall: CanonicalWall,
+    wall: CanonicalWall | list[CanonicalWall],
     *,
     elevation_m: float | None = 4.0,
+    workspace_id: Any = "workspace-real-7",
 ) -> CanonicalProject:
+    walls = [wall] if isinstance(wall, CanonicalWall) else list(wall)
     level = CanonicalLevel(
         id="level-real-1",
         name="Level 1",
         elevation_m=elevation_m,
         height_m=3.0,
-        walls=[wall],
+        walls=walls,
     )
     building = CanonicalBuilding(id="building-real-1", name="Building", levels=[level])
     return CanonicalProject(
         id="project-real-1",
         name="Canonical project",
         buildings=[building],
-        provenance=Provenance(workspace_id="workspace-real-7"),
+        provenance=Provenance(workspace_id=workspace_id),
     )
 
 
@@ -453,6 +456,221 @@ class WorkstreamA10ProvenanceTests(unittest.TestCase):
         self.assertTrue(unique_node.geometry_valid)
         # Unique ID project should have no duplicate conflicts
         self.assertEqual(graph_unique.duplicate_id_conflicts, [])
+
+    def test_p6_workspace_identity_and_binding_matrix(self):
+        """P6 Audit: Workspace binding validation across caller, project, and elements."""
+        wall = _wall()
+        proj = _canonical_project(wall, workspace_id="workspace-real-7")
+
+        # 1. Caller provides mismatching workspace -> fails closed with WORKSPACE_MISMATCH
+        mismatch_graph = derive_3d_scene_provenance(proj, workspace_id="workspace-other-99")
+        self.assertEqual(mismatch_graph.nodes, [])
+        self.assertEqual(mismatch_graph.source_status, "WORKSPACE_MISMATCH")
+
+        # 2. Positive int workspace_id is normalized to string representation
+        proj_int = _canonical_project(wall, workspace_id=7)
+        int_graph = derive_3d_scene_provenance(proj_int)
+        self.assertEqual(int_graph.workspace_id, "7")
+        self.assertEqual(int_graph.source_status, "CANONICAL_SCENE")
+
+        # 3. Non-positive and boolean workspace identities are rejected
+        for bad_ws in [0, -1, True, False, "nan", "none", "null", "   "]:
+            proj_bad = _canonical_project(wall, workspace_id=bad_ws)
+            bad_graph = derive_3d_scene_provenance(proj_bad)
+            self.assertIsNone(bad_graph.workspace_id)
+
+        # 4. Caller matching integer workspace passes
+        matching_graph = derive_3d_scene_provenance(proj_int, workspace_id=7)
+        self.assertEqual(matching_graph.workspace_id, "7")
+        self.assertEqual(matching_graph.source_status, "CANONICAL_SCENE")
+
+        # 5. Element provenance containing a conflicting workspace ID must fail closed
+        wall_cross = _wall(
+            id="wall-cross-ws",
+            provenance=Provenance(
+                workspace_id="workspace-hacked-99",
+                source_pdf="architectural.pdf",
+                page_number=5,
+                drawing_id="A-105",
+            ),
+        )
+        cross_proj = _canonical_project(wall_cross, workspace_id="workspace-real-7")
+        cross_graph = derive_3d_scene_provenance(cross_proj)
+        cross_node = cross_graph.lookup_by_element_id("wall-cross-ws")
+        self.assertIsNotNone(cross_node)
+        self.assertFalse(cross_node.geometry_valid)
+        self.assertIsNone(cross_node.position_3d)
+        self.assertIsNone(cross_node.dimensions_3d)
+        self.assertIn("workspace", cross_node.geometry_error.lower())
+
+    def test_p6_page_reference_validation_matrix(self):
+        """P6 Audit: Invalid, non-finite, negative, or sentinel page references fail closed."""
+        invalid_pages = [-1, 0, float("nan"), float("inf"), float("-inf"), True, False, "nan", "none", "null"]
+        for bad_page in invalid_pages:
+            wall = _wall(
+                id=f"wall-bad-page-{bad_page}",
+                provenance=Provenance(
+                    source_pdf="architectural.pdf",
+                    page_number=bad_page,
+                    drawing_id="A-105",
+                ),
+            )
+            graph = derive_3d_scene_provenance(_canonical_project(wall))
+            node = graph.lookup_by_element_id(wall.id)
+            self.assertIsNotNone(node)
+            self.assertFalse(node.geometry_valid, f"Page value {bad_page!r} should be invalid")
+            self.assertIsNone(node.position_3d)
+            self.assertIsNone(node.dimensions_3d)
+            self.assertIn("page", node.geometry_error.lower())
+
+        # Sentinel page_id fails closed
+        wall_sent_page_id = _wall(
+            id="wall-sent-page-id",
+            provenance=Provenance(
+                source_pdf="architectural.pdf",
+                page_number=5,
+                page_id="nan",
+                drawing_id="A-105",
+            ),
+        )
+        graph_sent = derive_3d_scene_provenance(_canonical_project(wall_sent_page_id))
+        node_sent = graph_sent.lookup_by_element_id(wall_sent_page_id.id)
+        self.assertIsNotNone(node_sent)
+        self.assertFalse(node_sent.geometry_valid)
+        self.assertIn("sentinel", node_sent.geometry_error.lower())
+
+    def test_p6_drawing_revision_superseded_rejected(self):
+        """P6 Audit: Superseded or unapproved drawing revisions fail closed."""
+        # 1. Explicitly superseded revision via metadata / provenance
+        wall_super = _wall(
+            id="wall-superseded",
+            provenance=Provenance(
+                source_pdf="architectural.pdf",
+                page_number=5,
+                drawing_id="A-105",
+            ),
+        )
+        # Provenance marking as superseded
+        setattr(wall_super.provenance, "is_superseded", True)
+        graph = derive_3d_scene_provenance(_canonical_project(wall_super))
+        node = graph.lookup_by_element_id("wall-superseded")
+        self.assertIsNotNone(node)
+        self.assertFalse(node.geometry_valid)
+        self.assertIn("superseded", node.geometry_error.lower())
+
+        # 2. Sentinel drawing_id
+        wall_sent_drawing = _wall(
+            id="wall-sent-drawing",
+            provenance=Provenance(
+                source_pdf="architectural.pdf",
+                page_number=5,
+                drawing_id="none",
+            ),
+        )
+        graph_sent = derive_3d_scene_provenance(_canonical_project(wall_sent_drawing))
+        node_sent = graph_sent.lookup_by_element_id(wall_sent_drawing.id)
+        self.assertIsNotNone(node_sent)
+        self.assertFalse(node_sent.geometry_valid)
+        self.assertIn("sentinel", node_sent.geometry_error.lower())
+
+    def test_p6_parent_relationship_level_and_geometry_consistency(self):
+        """P6 Audit: Cross-level opening attachment and invalid host wall fail closed."""
+        # Opening level_id does not match host wall level_id
+        wall_obj = {
+            "type": "WALL",
+            "id": "wall-host-p6",
+            "level_id": "level-1",
+            "start_point": {"x": 0.0, "y": 0.0},
+            "end_point": {"x": 10.0, "y": 0.0},
+            "height_m": 3.0,
+            "thickness_m": 0.2,
+        }
+        op_cross_level = {
+            "type": "DOOR",
+            "id": "opening-cross-level",
+            "level_id": "level-2",  # Mismatch with wall-host-p6 (level-1)
+            "wall_id": "wall-host-p6",
+            "is_host_attached": True,
+            "offset_along_wall_m": 1.0,
+            "sill_height_m": 0.0,
+            "width_m": 1.0,
+            "height_m": 2.0,
+        }
+        objects_by_id = {"wall-host-p6": wall_obj}
+        valid, pos, dims, err = _opening_geometry(op_cross_level, 4.0, objects_by_id)
+        self.assertFalse(valid)
+        self.assertIsNone(pos)
+        self.assertIsNone(dims)
+        self.assertIn("level", err.lower())
+
+    def test_p6_copied_and_duplicate_spatial_geometry(self):
+        """P6 Audit: Cloned/copied spatial geometry on same level fails closed to prevent double counting."""
+        wall_orig = _wall(
+            id="wall-orig-1",
+            start_point=Vector2D(x=0.0, y=0.0),
+            end_point=Vector2D(x=6.0, y=0.0),
+        )
+        wall_clone = _wall(
+            id="wall-clone-2",
+            start_point=Vector2D(x=0.0, y=0.0),
+            end_point=Vector2D(x=6.0, y=0.0),
+        )
+        level = CanonicalLevel(
+            id="level-dup-geom",
+            name="Level Dup Geom",
+            elevation_m=0.0,
+            height_m=3.0,
+            walls=[wall_orig, wall_clone],
+        )
+        building = CanonicalBuilding(id="bld-dup-geom", name="Bld", levels=[level])
+        project = CanonicalProject(
+            id="proj-dup-geom",
+            name="Duplicate Geometry Project",
+            buildings=[building],
+            provenance=Provenance(workspace_id="workspace-dup-geom"),
+        )
+        graph = derive_3d_scene_provenance(project)
+        # Both walls with identical spatial coordinates should have invalid geometry to prevent double counting
+        node_orig = graph.lookup_by_element_id("wall-orig-1")
+        node_clone = graph.lookup_by_element_id("wall-clone-2")
+        self.assertIsNotNone(node_orig)
+        self.assertIsNotNone(node_clone)
+        self.assertFalse(node_orig.geometry_valid)
+        self.assertFalse(node_clone.geometry_valid)
+        self.assertIn("duplicate", node_orig.geometry_error.lower())
+        self.assertIn("duplicate", node_clone.geometry_error.lower())
+
+    def test_p6_stale_scene_fail_closed(self):
+        """P6 Audit: Stale canonical projects or revisions fail closed with 0 valid nodes."""
+        wall = _wall()
+
+        # 1. Project with is_stale=True
+        proj_stale = _canonical_project(wall)
+        proj_stale.is_stale = True
+        g1 = derive_3d_scene_provenance(proj_stale)
+        self.assertEqual(g1.nodes, [])
+        self.assertEqual(g1.source_status, "STALE_CANONICAL_SCENE_REJECTED")
+
+        # 2. Project provenance with is_stale=True
+        proj_prov_stale = _canonical_project(wall)
+        setattr(proj_prov_stale.provenance, "is_stale", True)
+        g2 = derive_3d_scene_provenance(proj_prov_stale)
+        self.assertEqual(g2.nodes, [])
+        self.assertEqual(g2.source_status, "STALE_CANONICAL_SCENE_REJECTED")
+
+        # 3. Project with source_status='STALE'
+        proj_status_stale = _canonical_project(wall)
+        setattr(proj_status_stale, "source_status", "STALE")
+        g3 = derive_3d_scene_provenance(proj_status_stale)
+        self.assertEqual(g3.nodes, [])
+        self.assertEqual(g3.source_status, "STALE_CANONICAL_SCENE_REJECTED")
+
+        # 4. Project with review_state='SUPERSEDED'
+        proj_super = _canonical_project(wall)
+        setattr(proj_super, "review_state", "SUPERSEDED")
+        g4 = derive_3d_scene_provenance(proj_super)
+        self.assertEqual(g4.nodes, [])
+        self.assertEqual(g4.source_status, "STALE_CANONICAL_SCENE_REJECTED")
 
 
 if __name__ == "__main__":
