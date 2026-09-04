@@ -703,7 +703,7 @@ class Phase6DPreflightTests(unittest.TestCase):
         from pathlib import Path
         from pb_planreader_3d_app import JobHubBridge, ensure_shared_jobhub_schema, ensure_jobhub_takeoff_tables
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db_path = Path(tmpdir) / "jobhub_real.db"
 
             # 1. Initialize real schema on shared on-disk SQLite DB
@@ -713,7 +713,7 @@ class Phase6DPreflightTests(unittest.TestCase):
 
             # Insert seed job
             init_bridge.execute(
-                "INSERT INTO jobs (id, job_no, name, status) VALUES (?, ?, ?, ?)",
+                "INSERT INTO jobs (id, job_no, job_name, status) VALUES (?, ?, ?, ?)",
                 (201, "JOB-REAL-1", "Real Concurrency Project", "Draft")
             )
 
@@ -785,7 +785,7 @@ class Phase6DPreflightTests(unittest.TestCase):
             cur.execute("SELECT unit, m2 FROM painting_takeoff_lines WHERE package_id = ?", (pkgs[0][0],))
             lines = cur.fetchall()
             self.assertTrue(len(lines) >= 1)
-            self.assertEqual(lines[0][0], "m?")
+            self.assertEqual(lines[0][0], "m²")
             verify_conn.close()
 
     def test_21_deterministic_ordering_fingerprint(self):
