@@ -13,6 +13,15 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import plotly.graph_objects as go
 
+from pb_takeoff_authority_v164 import (
+    AUTHORITY_REVIEW_REQUIRED,
+    AUTHORITY_FINGERPRINT_FIELD,
+    AUTHORITY_REVIEWED_AT_FIELD,
+    AUTHORITY_REVIEWED_BY_FIELD,
+    AUTHORITY_SOURCE_FIELD,
+    AUTHORITY_STATUS_FIELD,
+)
+
 try:
     import pb_takeoff_studio_v1211 as studio_v1211
 except Exception:  # pragma: no cover
@@ -204,18 +213,20 @@ def build_surface_takeoff_rows(records: Iterable[Dict[str, Any]]) -> List[Dict[s
             "Provisional": "PROVISIONAL",
             "Excluded": "EXCLUSION",
         }.get(status, "PROVISIONAL")
-        confidence_text = str(item.get("confidence") or "").strip().lower()
-        measured = confidence_text in {"measured", "verified"}
-        quantity_status = "Measured" if measured and area > 0 else ("Provisional measured" if area > 0 else "To measure")
-        confidence = "Measured" if measured else "Derived"
+        source_confidence = str(item.get("confidence") or "").strip() or "Unrecorded"
+        # A mass confidence label describes the model input; it is not commercial
+        # measurement or publication authority for a derived face area.
+        quantity_status = "Provisional measured" if area > 0 else "To measure"
+        confidence = "Derived"
         substrate = str(item.get("substrate") or "OTHER")
         progress = _clamp(item.get("progress_pct"), 0.0, 100.0)
         notes = [
             "3D face quantity derived from current PlanReader model dimensions; recheck if model geometry changes.",
             f"Progress {progress:.0f}%.",
         ]
-        if not measured:
-            notes.append("Model mass is not marked Measured/Verified, so this surface remains provisional.")
+        notes.append(
+            f"Source model confidence: {source_confidence}. Commercial estimator review is required."
+        )
         if item.get("notes"):
             notes.append(str(item.get("notes")))
         rows.append({
@@ -237,6 +248,11 @@ def build_surface_takeoff_rows(records: Iterable[Dict[str, Any]]) -> List[Dict[s
             "confidence": confidence,
             "notes": " ".join(notes),
             "row_role": "model_surface",
+            AUTHORITY_STATUS_FIELD: AUTHORITY_REVIEW_REQUIRED,
+            AUTHORITY_SOURCE_FIELD: str(item.get("source_reference") or "").strip(),
+            AUTHORITY_REVIEWED_BY_FIELD: "",
+            AUTHORITY_REVIEWED_AT_FIELD: "",
+            AUTHORITY_FINGERPRINT_FIELD: "",
         })
     return rows
 
@@ -380,14 +396,20 @@ def _replace_rows(app: Any, workspace_id: int, rows: Sequence[Dict[str, Any]]) -
         workspace_id,section,element,location,substrate,finish_system,quantity,unit,
         quantity_status,source_page,source_reference,inclusion_status,coats,
         coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,
-        notes,row_role,created_at,updated_at
-    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+        notes,row_role,commercial_authority_status,commercial_authority_source,
+        commercial_authority_reviewed_by,commercial_authority_reviewed_at,
+        commercial_authority_fingerprint,created_at,updated_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
     for row in rows:
         app.lexecute(sql, (
             workspace_id, row["section"], row["element"], row["location"], row["substrate"], row["finish_system"],
             row["quantity"], row["unit"], row["quantity_status"], row["source_page"], row["source_reference"],
             row["inclusion_status"], row["coats"], row["coverage_m2_per_litre"], row["productivity_m2_per_hour"],
-            row["rate_per_unit"], row["confidence"], row["notes"], row["row_role"], app.now_stamp(), app.now_stamp(),
+            row["rate_per_unit"], row["confidence"], row["notes"], row["row_role"],
+            row[AUTHORITY_STATUS_FIELD], row[AUTHORITY_SOURCE_FIELD],
+            row[AUTHORITY_REVIEWED_BY_FIELD], row[AUTHORITY_REVIEWED_AT_FIELD],
+            row[AUTHORITY_FINGERPRINT_FIELD],
+            app.now_stamp(), app.now_stamp(),
         ))
 
 
@@ -493,13 +515,19 @@ def surface_editor_panel(app: Any, workspace: Dict[str, Any]) -> None:
     m3.metric("Completed", f"{summary['completed_m2']:.2f} m² ({summary['completed_pct']:.1f}%)")
     m4.metric("Remaining", f"{summary['remaining_m2']:.2f} m²")
 
-    app.st.caption("Face m² is derived from the current 3D mass dimensions. Surfaces from masses not marked Measured/Verified stay provisional when synced to the take-off.")
+    app.st.caption(
+        "Face m² is derived from current 3D mass dimensions. Every synced surface "
+        "remains provisional and non-publishable until an attributable commercial review is recorded."
+    )
     sync1, sync2 = app.st.columns([1.4, 1.0])
-    if sync1.button("Save + sync all 3D surfaces to take-off", type="primary", use_container_width=True, key=f"v1212_sync_{workspace_id}"):
+    if sync1.button("Save provisional 3D surfaces for take-off review", type="primary", use_container_width=True, key=f"v1212_sync_{workspace_id}"):
         latest = surface_records(surfaces, _load_overrides(app, workspace_id))
         rows = build_surface_takeoff_rows(latest)
         _replace_rows(app, workspace_id, rows)
-        app.st.success(f"Synced {len(rows)} model-surface rows. Rates, coats and productivity remain zero until reviewed.")
+        app.st.success(
+            f"Synced {len(rows)} provisional model-surface rows. They cannot be priced or published "
+            "until source evidence and estimator review are recorded."
+        )
         app.st.rerun()
     report = app.pd.DataFrame([
         {

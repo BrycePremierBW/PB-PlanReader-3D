@@ -1,6 +1,20 @@
 from __future__ import annotations
 import html
 from pb_commercial_export_preflight_v163 import derive_export_preflight, verify_toctou_and_publish_jobhub
+from pb_takeoff_authority_v164 import (
+    AUTHORITY_APPROVED,
+    AUTHORITY_FINGERPRINT_FIELD,
+    AUTHORITY_REVIEW_REQUIRED,
+    AUTHORITY_REVIEWED_AT_FIELD,
+    AUTHORITY_REVIEWED_BY_FIELD,
+    AUTHORITY_SOURCE_FIELD,
+    AUTHORITY_STATUS_FIELD,
+    approve_model_surface_row,
+    is_floor_reference_row,
+    is_model_surface_row,
+    model_surface_authority,
+    takeoff_row_publishability,
+)
 
 import base64
 import csv
@@ -436,6 +450,11 @@ def init_local_db() -> None:
             confidence TEXT,
             notes TEXT,
             row_role TEXT DEFAULT '',
+            commercial_authority_status TEXT DEFAULT '',
+            commercial_authority_source TEXT DEFAULT '',
+            commercial_authority_reviewed_by TEXT DEFAULT '',
+            commercial_authority_reviewed_at TEXT DEFAULT '',
+            commercial_authority_fingerprint TEXT DEFAULT '',
             created_at TEXT,
             updated_at TEXT,
             FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
@@ -582,14 +601,23 @@ def _ensure_measurement_columns(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_takeoff_columns(conn: sqlite3.Connection) -> None:
-    """Migrate existing ``takeoff_rows`` tables to carry the row role column.
+    """Migrate take-off rows to carry role and commercial-authority evidence.
 
     ``row_role`` marks measurement rows such as per-level internal floor areas
     (``floor_area``) that drive floor-m² pricing but are not themselves priced.
     """
     existing = {row[1] for row in conn.execute("PRAGMA table_info(takeoff_rows)").fetchall()}
-    if "row_role" not in existing:
-        conn.execute("ALTER TABLE takeoff_rows ADD COLUMN row_role TEXT DEFAULT ''")
+    wanted = {
+        "row_role": "TEXT DEFAULT ''",
+        "commercial_authority_status": "TEXT DEFAULT ''",
+        "commercial_authority_source": "TEXT DEFAULT ''",
+        "commercial_authority_reviewed_by": "TEXT DEFAULT ''",
+        "commercial_authority_reviewed_at": "TEXT DEFAULT ''",
+        "commercial_authority_fingerprint": "TEXT DEFAULT ''",
+    }
+    for name, ddl in wanted.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE takeoff_rows ADD COLUMN {name} {ddl}")
 
 
 def _ensure_pages_columns(conn: sqlite3.Connection) -> None:
@@ -3271,15 +3299,34 @@ def pricing_basis_label(basis: Any) -> str:
 
 
 def takeoff_work_rows(takeoff: pd.DataFrame) -> pd.DataFrame:
-    """Take-off rows that represent priced work (excludes floor-area measurement rows).
+    """Return only rows authorised for pricing, export, and JobHub publication.
 
     Floor-area rows are per-level measurement rows used to drive floor-m² pricing;
     they carry real m² but are never painted quantities, so they are filtered out
-    of painted-area totals and JobHub line pushes.
+    of painted-area totals and JobHub line pushes. Explicit exclusions and 3D
+    surfaces without complete commercial review evidence are also filtered here,
+    using the same policy as Phase 6D preflight.
     """
-    if takeoff.empty or "row_role" not in takeoff.columns:
+    if takeoff.empty:
         return takeoff
-    return takeoff.loc[takeoff["row_role"].fillna("").ne("floor_area")]
+    mask = takeoff.apply(
+        lambda row: takeoff_row_publishability(row.to_dict())[0], axis=1
+    )
+    return takeoff.loc[mask]
+
+
+def commercial_takeoff_rows(takeoff: pd.DataFrame) -> pd.DataFrame:
+    """Keep publishable work plus non-priced floor references for calculations."""
+    if takeoff.empty:
+        return takeoff
+    mask = takeoff.apply(
+        lambda row: (
+            is_floor_reference_row(row.to_dict())
+            or takeoff_row_publishability(row.to_dict())[0]
+        ),
+        axis=1,
+    )
+    return takeoff.loc[mask]
 
 
 def is_internal_wall_row(section: Any, element: Any) -> bool:
@@ -3574,6 +3621,12 @@ def reconcile_ai_vs_drawn(workspace_id: int) -> pd.DataFrame:
 
 def dataframe_for_takeoff(workspace_id: int) -> pd.DataFrame:
     df = ldf("SELECT * FROM takeoff_rows WHERE workspace_id=? ORDER BY id", (workspace_id,))
+    if df.empty:
+        return df
+    # Exclusions and unapproved model-derived surfaces must never influence
+    # pricing, quotation detail, progress packages, or JobHub payloads. Floor
+    # references remain available for the optional floor-m² pricing basis.
+    df = commercial_takeoff_rows(df).copy()
     if df.empty:
         return df
     basis = str(workspace_setting(workspace_id, "internal_pricing_basis", "wall_m2") or "wall_m2").strip().lower()
@@ -4612,6 +4665,8 @@ def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: s
     if takeoff.empty:
         raise RuntimeError("There are no take-off rows to publish.")
     takeoff = takeoff_work_rows(takeoff)
+    if takeoff.empty:
+        raise RuntimeError("There are no commercially authorised take-off rows to publish.")
     ensure_shared_jobhub_schema(bridge)
     ensure_jobhub_takeoff_tables(bridge)
     stamp = now_stamp()
@@ -5427,6 +5482,12 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
         if scale_issues:
             st.warning("**Scale gate:** these page(s) feed the take-off but have no calibrated scale yet — calibrate them in the **Plan Mapper → Scale** tab before treating quantities as measured: " + ", ".join(f"`{i['page_label']}`" for i in scale_issues[:8]))
         takeoff=ldf("SELECT * FROM takeoff_rows WHERE workspace_id=? ORDER BY id",(workspace["id"],))
+        authority_by_id={}
+        for existing_row in takeoff.to_dict("records") if not takeoff.empty else []:
+            try:
+                authority_by_id[int(existing_row.get("id"))]=existing_row
+            except (TypeError, ValueError):
+                pass
         editor_cols=["id"]+TAKEOFF_COLUMNS+["row_role"]
         if takeoff.empty:
             takeoff=pd.DataFrame(columns=editor_cols)
@@ -5437,9 +5498,9 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
             "unit":st.column_config.SelectboxColumn(options=UNIT_OPTIONS),
             "quantity_status":st.column_config.SelectboxColumn(options=STATUS_OPTIONS),
             "inclusion_status":st.column_config.SelectboxColumn(options=INCLUSION_OPTIONS),
-            "row_role":st.column_config.SelectboxColumn(options=["", "floor_area"],required=False,help="Mark a row as floor_area to record a per-level internal floor area (m²) measurement that drives floor-m² pricing. Floor-area rows are not priced themselves."),
+            "row_role":st.column_config.SelectboxColumn(options=["", "floor_area", "model_surface"],required=False,help="floor_area rows are references only. model_surface rows remain non-publishable until the separate commercial-authority review is completed."),
         },height=560,key="takeoff_editor")
-        st.caption("Rows marked **floor_area** hold each level's internal floor area (m²) — they appear in the schedule for reference and drive floor-m² pricing, but are not priced themselves. Set the pricing basis in **Settings → Project-level settings**.")
+        st.caption("Rows marked **floor_area** hold each level's internal floor area (m²) and are not priced themselves. Rows marked **model_surface** are derived from 3D masses and cannot be priced or published until the separate commercial-authority review is completed.")
         gate_confirmed=not scale_issues
         if scale_issues:
             gate_confirmed=st.checkbox("I will calibrate the affected page scales before using these quantities",key=f"scale_gate_{int(workspace['id'])}")
@@ -5451,11 +5512,50 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
                     continue
                 if not to_float(row.get("rate_per_unit")):
                     row["rate_per_unit"] = default_rate_for(row.get("substrate"),row.get("element"),row.get("finish_system"),row.get("unit"))
+                try:
+                    prior=authority_by_id.get(int(row.get("id"))) or {}
+                except (TypeError, ValueError):
+                    prior={}
                 row_role=str(row.get("row_role") or "").strip()
-                if row_role not in {"", "floor_area"}:
+                if is_model_surface_row(prior) or is_model_surface_row(row):
+                    # A model-derived row cannot be laundered into an ordinary
+                    # take-off row by changing/removing its role in the editor.
+                    row_role="model_surface"
+                elif row_role not in {"", "floor_area"}:
                     row_role=""
                 values=[row.get(col,"") for col in TAKEOFF_COLUMNS]
-                lexecute("""INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,row_role,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(workspace["id"],*values,row_role,now_stamp(),now_stamp()))
+                authority={
+                    AUTHORITY_STATUS_FIELD: prior.get(AUTHORITY_STATUS_FIELD, AUTHORITY_REVIEW_REQUIRED if row_role == "model_surface" else ""),
+                    AUTHORITY_SOURCE_FIELD: prior.get(AUTHORITY_SOURCE_FIELD, ""),
+                    AUTHORITY_REVIEWED_BY_FIELD: prior.get(AUTHORITY_REVIEWED_BY_FIELD, ""),
+                    AUTHORITY_REVIEWED_AT_FIELD: prior.get(AUTHORITY_REVIEWED_AT_FIELD, ""),
+                    AUTHORITY_FINGERPRINT_FIELD: prior.get(AUTHORITY_FINGERPRINT_FIELD, ""),
+                }
+                candidate={
+                    **{col: row.get(col, "") for col in TAKEOFF_COLUMNS},
+                    "workspace_id": int(workspace["id"]),
+                    "row_role": row_role,
+                    **authority,
+                }
+                if row_role == "model_surface" and authority.get(AUTHORITY_STATUS_FIELD) == AUTHORITY_APPROVED:
+                    approval_still_matches, _ = model_surface_authority(candidate)
+                    if not approval_still_matches:
+                        authority[AUTHORITY_STATUS_FIELD]=AUTHORITY_REVIEW_REQUIRED
+                        authority[AUTHORITY_REVIEWED_BY_FIELD]=""
+                        authority[AUTHORITY_REVIEWED_AT_FIELD]=""
+                        authority[AUTHORITY_FINGERPRINT_FIELD]=""
+                lexecute("""INSERT INTO takeoff_rows(
+                    workspace_id,section,element,location,substrate,finish_system,quantity,unit,
+                    quantity_status,source_page,source_reference,inclusion_status,coats,
+                    coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,notes,
+                    row_role,commercial_authority_status,commercial_authority_source,
+                    commercial_authority_reviewed_by,commercial_authority_reviewed_at,
+                    commercial_authority_fingerprint,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(
+                    workspace["id"],*values,row_role,
+                    authority[AUTHORITY_STATUS_FIELD],authority[AUTHORITY_SOURCE_FIELD],
+                    authority[AUTHORITY_REVIEWED_BY_FIELD],authority[AUTHORITY_REVIEWED_AT_FIELD],
+                    authority[AUTHORITY_FINGERPRINT_FIELD],now_stamp(),now_stamp()))
             st.success("Take-off schedule saved.")
             st.rerun()
         if c2.button("Apply default rates to all rows",use_container_width=True):
@@ -5467,6 +5567,76 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
                 lexecute("UPDATE takeoff_rows SET rate_per_unit=?,updated_at=? WHERE id=?",(rate,now_stamp(),r.id))
             st.success("Default rates applied. Values are editable in the schedule.")
             st.rerun()
+        model_surface_rows=[row for row in takeoff.to_dict("records") if is_model_surface_row(row)] if not takeoff.empty else []
+        with st.expander("3D surface commercial authority",expanded=bool(model_surface_rows)):
+            st.caption("Approve only after checking the current surface quantity against identified drawing or measurement evidence. Any later change to a consequential row field invalidates this approval.")
+            if not model_surface_rows:
+                st.info("No 3D model-surface rows are waiting for review.")
+            else:
+                authority_options={f"#{int(row['id'])} · {row.get('element','')} · {row.get('location','')}":row for row in model_surface_rows}
+                selected_authority_label=st.selectbox("3D surface row",list(authority_options),key=f"model_surface_authority_row_{int(workspace['id'])}")
+                selected_authority_row=authority_options[selected_authority_label]
+                authority_ok,authority_reason=model_surface_authority(selected_authority_row)
+                if authority_ok:
+                    st.success(f"Approved by {selected_authority_row.get(AUTHORITY_REVIEWED_BY_FIELD)} at {selected_authority_row.get(AUTHORITY_REVIEWED_AT_FIELD)}.")
+                else:
+                    st.warning(authority_reason)
+                source_evidence=st.text_input(
+                    "Approved source evidence",
+                    value=str(selected_authority_row.get(AUTHORITY_SOURCE_FIELD) or ""),
+                    help="Drawing, calibrated measurement, or reviewed source reference that supports this exact surface quantity.",
+                    key=f"model_surface_authority_source_{int(workspace['id'])}_{int(selected_authority_row['id'])}",
+                )
+                session_reviewer=dict(st.session_state.get("planreader_user") or {})
+                reviewer_username=str(session_reviewer.get("username") or "").strip()
+                reviewer_role=str(session_reviewer.get("role") or "").strip()
+                reviewer_authorised=reviewer_role.lower() in {
+                    "admin", "developer", "estimator", "senior estimator"
+                }
+                reviewer_name=(
+                    f"{reviewer_username} ({reviewer_role})"
+                    if reviewer_username and reviewer_role else reviewer_username
+                )
+                st.text_input(
+                    "Reviewing estimator",
+                    value=reviewer_name,
+                    disabled=True,
+                    help="Reviewer identity is taken from the authenticated PlanReader session.",
+                    key=f"model_surface_authority_reviewer_{int(workspace['id'])}_{int(selected_authority_row['id'])}",
+                )
+                if not reviewer_authorised:
+                    st.error("Commercial 3D approval requires an authenticated estimator, senior estimator, admin, or developer role.")
+                approval_confirmed=st.checkbox(
+                    "I checked this exact row quantity and scope against the source evidence above",
+                    key=f"model_surface_authority_confirm_{int(workspace['id'])}_{int(selected_authority_row['id'])}",
+                )
+                if st.button(
+                    "Approve selected 3D surface for commercial use",
+                    type="primary",
+                    disabled=not (approval_confirmed and source_evidence.strip() and reviewer_name.strip() and reviewer_authorised),
+                    key=f"model_surface_authority_approve_{int(workspace['id'])}_{int(selected_authority_row['id'])}",
+                ):
+                    approved=approve_model_surface_row(
+                        selected_authority_row,
+                        source=source_evidence,
+                        reviewed_by=reviewer_name,
+                        reviewed_at=now_stamp(),
+                    )
+                    lexecute(
+                        """UPDATE takeoff_rows SET
+                            commercial_authority_status=?,commercial_authority_source=?,
+                            commercial_authority_reviewed_by=?,commercial_authority_reviewed_at=?,
+                            commercial_authority_fingerprint=?,updated_at=?
+                           WHERE id=? AND workspace_id=? AND row_role='model_surface'""",
+                        (
+                            approved[AUTHORITY_STATUS_FIELD],approved[AUTHORITY_SOURCE_FIELD],
+                            approved[AUTHORITY_REVIEWED_BY_FIELD],approved[AUTHORITY_REVIEWED_AT_FIELD],
+                            approved[AUTHORITY_FINGERPRINT_FIELD],now_stamp(),
+                            int(selected_authority_row["id"]),int(workspace["id"]),
+                        ),
+                    )
+                    st.success("Commercial authority recorded for the current row state.")
+                    st.rerun()
         if c2.button("Add standard empty scope rows",use_container_width=True):
             seeds=[
                 ("Internal","Walls","All internal areas","Plasterboard","Low sheen wall system",0,"m²","To measure","","","INCLUSION",3,12,8,default_rate_for("Plasterboard","Walls","Low sheen wall system","m²"),"To review","Net of tiles, glazing and joinery.",""),

@@ -26,6 +26,7 @@ from pb_opening_evidence_v170 import (
 )
 from pb_opening_deduction_v174 import run_opening_pipeline
 from pb_plan_opening_detection_v171 import Segment, TextWord
+from pb_canonical_building import parse_strict_bool
 
 VERSION = "1.7.5"
 SETTING_PREFIX = "opening_evidence_v175_page_"
@@ -50,18 +51,20 @@ def _assigned_wall(raw: Dict[str, Any]) -> str:
 def is_authorised_deduction(raw: Dict[str, Any]) -> bool:
     """True only for an explicit manual decision or a proven B5 decision."""
     raw = dict(raw or {})
-    if not bool(raw.get("deduct", False)):
+    if not parse_strict_bool(raw.get("deduct", False)):
         return False
     if not _assigned_wall(raw):
         return False
     if _num(raw.get("width_m")) <= 0 or _num(raw.get("height_m")) <= 0:
         return False
 
-    confidence_label = str(raw.get("confidence") or "").strip().lower()
-    if bool(raw.get("manual_override_confirmed", False)) or confidence_label == "manual estimator entry":
+    # A descriptive confidence label is not proof that an estimator actually
+    # performed the explicit include/exclude action.  Only the action-scoped
+    # flag stamped by ``_safe_legacy_save`` can grant manual authority.
+    if parse_strict_bool(raw.get("manual_override_confirmed", False)):
         return True
 
-    if not bool(raw.get("reconciliation_complete", False)):
+    if not parse_strict_bool(raw.get("reconciliation_complete", False)):
         return False
     if str(raw.get("deduction_status") or "") not in {
         DEDUCTION_AUTO_ELIGIBLE,
@@ -114,8 +117,8 @@ def _safe_legacy_save(original_save, safe_normalise):
             # Confirmation is ACTION-scoped: only rows the estimator explicitly
             # acted on are promoted, and every other row keeps its prior state
             # (never cleared, never blanket-promoted).
-            prior = bool(row.get("manual_override_confirmed", False))
-            explicitly_confirmed = bool(confirm_all) or (str(row.get("id")) in confirm)
+            prior = parse_strict_bool(row.get("manual_override_confirmed", False))
+            explicitly_confirmed = parse_strict_bool(confirm_all) or (str(row.get("id")) in confirm)
             row["manual_override_confirmed"] = prior or explicitly_confirmed
             payload.append(safe_normalise(row))
         original_save(app, int(workspace_id), payload)
@@ -434,7 +437,7 @@ def _is_authorised_b5_automatic(row: Dict[str, Any]) -> bool:
         return False
     if _num(raw.get("width_m")) <= 0 or _num(raw.get("height_m")) <= 0:
         return False
-    if not bool(raw.get("reconciliation_complete")):
+    if not parse_strict_bool(raw.get("reconciliation_complete")):
         return False
     if str(raw.get("deduction_status") or "") not in {
         DEDUCTION_AUTO_ELIGIBLE,
@@ -582,7 +585,7 @@ def merge_b5_authoritative(
         return result
     # Preserve explicit estimator decisions: only suppress a B5 row against a
     # legacy manual record that is the same physical opening (strong evidence).
-    manual_rows = [r for r in result if bool(r.get("manual_override_confirmed"))]
+    manual_rows = [r for r in result if parse_strict_bool(r.get("manual_override_confirmed"))]
     added = set()
     for row in b5_list:
         if any(_same_opening(row, m) for m in manual_rows):
@@ -725,7 +728,7 @@ def run_p5_native_payload(
         "deducted_area_m2": float(pipeline.get("deducted_area_m2") or 0.0),
         "pipeline_notes": list(pipeline.get("pipeline_notes") or []),
         "candidate_count": len(instances),
-        "deducted_count": sum(1 for row in instances if bool(row.get("deduct"))),
+        "deducted_count": sum(1 for row in instances if parse_strict_bool(row.get("deduct"))),
         "review_count": sum(1 for row in instances if str(row.get("deduction_status")) == "review"),
         "elevation_openings": elevation_openings_payload,
         "elevation_diagnostics": elevation_diagnostics_payload,

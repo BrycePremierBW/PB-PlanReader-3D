@@ -24,6 +24,11 @@ import pb_no_ai_takeoff_v1216 as noai
 import pb_premier_takeoff_v1225 as premier
 import pb_selected_evidence_floor_v1226 as selected
 import pb_takeoff_studio_v1211 as studio
+from pb_takeoff_authority_v164 import (
+    AUTHORITY_REVIEW_REQUIRED,
+    MODEL_SURFACE_ROLE,
+    is_model_surface_row,
+)
 
 try:
     from planreader_takeoff_studio import takeoff_studio_editor
@@ -305,13 +310,22 @@ def merge_rows(app: Any, workspace_id: int, row_ids: Sequence[int], final: Dict[
     confidence = "Measured" if all_measured else "Derived"
     notes = " | ".join(_unique(row.get("notes") for row in rows))
     notes = (notes + " | " if notes else "") + f"Merged from take-off rows {', '.join(str(i) for i in ids)}; all source pages/geometry retained in provenance."
+    contains_model_surface = any(is_model_surface_row(row) for row in rows)
+    merged_role = (
+        MODEL_SURFACE_ROLE
+        if contains_model_surface
+        else str(final.get("row_role") or rows[0].get("row_role") or "")
+    )
 
     conn = app.local_connect()
     try:
         cur = conn.execute(
             """INSERT INTO takeoff_rows(workspace_id,section,element,location,substrate,finish_system,quantity,unit,quantity_status,
                source_page,source_reference,inclusion_status,coats,coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,
-               confidence,notes,row_role,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               confidence,notes,row_role,commercial_authority_status,commercial_authority_source,
+               commercial_authority_reviewed_by,commercial_authority_reviewed_at,
+               commercial_authority_fingerprint,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 int(workspace_id), str(final.get("section") or rows[0].get("section") or ""),
                 str(final.get("element") or rows[0].get("element") or ""), str(final.get("location") or rows[0].get("location") or ""),
@@ -321,7 +335,9 @@ def merge_rows(app: Any, workspace_id: int, row_ids: Sequence[int], final: Dict[
                 _num(final.get("coats"), _num(rows[0].get("coats"))), _num(final.get("coverage_m2_per_litre"), _num(rows[0].get("coverage_m2_per_litre"))),
                 _num(final.get("productivity_m2_per_hour"), _num(rows[0].get("productivity_m2_per_hour"))),
                 _num(final.get("rate_per_unit"), _num(rows[0].get("rate_per_unit"))), confidence, notes,
-                str(final.get("row_role") or rows[0].get("row_role") or ""), app.now_stamp(), app.now_stamp(),
+                merged_role,
+                AUTHORITY_REVIEW_REQUIRED if contains_model_surface else "", "", "", "", "",
+                app.now_stamp(), app.now_stamp(),
             ),
         )
         new_id = int(cur.lastrowid)

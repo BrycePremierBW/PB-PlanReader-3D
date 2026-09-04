@@ -16,6 +16,12 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+from pb_takeoff_authority_v164 import (
+    is_excluded_takeoff_row,
+    is_model_surface_row,
+    model_surface_authority,
+)
+
 MODULE_VERSION = "1.6.1"
 
 REQUIRED_FAMILIES = ("takeoff", "register", "scale")
@@ -208,6 +214,12 @@ def collect_takeoff_review_signals(app: Any, workspace_id: int) -> List[Commerci
         parsed_qty = _safe_float(qty_raw)
         conf = _safe_str(row.get("confidence")).strip().lower()
         incl = _safe_str(row.get("inclusion_status")).strip().lower()
+
+        # Rows explicitly outside scope have no commercial consequence and must
+        # not create review blockers. They are also excluded by Phase 6D and all
+        # downstream pricing/publication consumers.
+        if is_excluded_takeoff_row(row):
+            continue
         
         qty_str = _safe_str(qty_raw).strip() if qty_raw is not None else ""
         is_nonfinite = False
@@ -220,6 +232,13 @@ def collect_takeoff_review_signals(app: Any, workspace_id: int) -> List[Commerci
         reasons: List[str] = []
         primary_severity = "REVIEW"
         primary_category = "Measurement"
+
+        if is_model_surface_row(row):
+            authority_ok, authority_reason = model_surface_authority(row)
+            if not authority_ok:
+                reasons.append(authority_reason)
+                primary_severity = "BLOCKER"
+                primary_category = "3D model authority"
 
         # Rule 1: Quantity status signals
         if not qty_status or qty_status.lower() in ("to measure", "provisional measured", "provisional"):
@@ -256,7 +275,7 @@ def collect_takeoff_review_signals(app: Any, workspace_id: int) -> List[Commerci
             if primary_category == "Measurement" and not any("Quantity" in r or "Measured" in r for r in reasons):
                 primary_category = "Scope / inclusion"
 
-        # Excluded / Not applicable filter
+        # Not-applicable quantity-status filter
         if qty_status.lower() in ("excluded", "not applicable", "n/a"):
             if not any("Confidence" in r or "Scope inclusion" in r for r in reasons):
                 continue
@@ -275,7 +294,7 @@ def collect_takeoff_review_signals(app: Any, workspace_id: int) -> List[Commerci
                 signal_id=signal_id,
                 workspace_id=int(workspace_id),
                 source_family="takeoff",
-                source_type="takeoff_row",
+                source_type="model_surface_row" if is_model_surface_row(row) else "takeoff_row",
                 source_id=row_id_str,
                 category=primary_category,
                 severity=primary_severity,
@@ -297,7 +316,14 @@ def collect_takeoff_review_signals(app: Any, workspace_id: int) -> List[Commerci
                 recommended_action="Open take-off row to confirm quantity, status, and measurement evidence.",
                 navigation_target="takeoff",
                 navigation_payload={"workspace_id": int(workspace_id), "takeoff_row_id": parsed_id},
-                metadata={"row_id": parsed_id},
+                metadata={
+                    "row_id": parsed_id,
+                    "commercial_authority_status": _safe_str(row.get("commercial_authority_status")),
+                    "commercial_authority_source": _safe_str(row.get("commercial_authority_source")),
+                    "commercial_authority_reviewed_by": _safe_str(row.get("commercial_authority_reviewed_by")),
+                    "commercial_authority_reviewed_at": _safe_str(row.get("commercial_authority_reviewed_at")),
+                    "commercial_authority_fingerprint": _safe_str(row.get("commercial_authority_fingerprint")),
+                },
             )
         )
 

@@ -237,6 +237,21 @@ def test_section_m_automatic_b5_opening_authority_and_field_failures():
     bad_confidence = {**valid_b5_op, "geometry_confidence": 0.30}
     assert revalidate_b5_opening(bad_confidence) is False
 
+    # Authority booleans are type-strict. Truthy strings/integers from malformed
+    # persisted JSON must never cross the B5 commercial deduction boundary.
+    assert revalidate_b5_opening({**valid_b5_op, "deduct": "true"}) is False
+    assert revalidate_b5_opening({**valid_b5_op, "deduct": "false"}) is False
+    assert revalidate_b5_opening({
+        **valid_b5_op,
+        "manual_override_confirmed": "true",
+        "reconciliation_complete": False,
+    }) is False
+    assert revalidate_b5_opening({
+        **valid_b5_op,
+        "manual_override_confirmed": False,
+        "reconciliation_complete": "true",
+    }) is False
+
 
 def _e2e_b5_payload(**op_overrides):
     """Builds a single-wall, single-opening canonical payload with FULL automatic B5 fields."""
@@ -313,6 +328,10 @@ def test_section_f_e2e_automatic_b5_canonical_deduction_and_field_failure():
         "missing width":                 {"width_m": None},
         "non-positive height":           {"height_m": 0},
         "reconciliation incomplete":     {"reconciliation_complete": False},
+        "truthy-string deduct":          {"deduct": "true"},
+        "false-string deduct":           {"deduct": "false"},
+        "truthy-string reconciliation": {"reconciliation_complete": "true"},
+        "false-string reconciliation":  {"reconciliation_complete": "false"},
         "bad deduction_status":          {"deduction_status": "ineligible"},
         "bad deduction_decision":        {"deduction_decision": "rejected"},
         "bad dimension_basis":           {"dimension_basis": "guess"},

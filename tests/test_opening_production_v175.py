@@ -48,16 +48,57 @@ def test_legacy_true_default_is_not_authority():
     assert prod.is_authorised_deduction(_unsafe_opening()) is False
 
 
-def test_manual_estimator_entry_is_authorised():
+def test_manual_estimator_confidence_text_is_not_authority():
     assert prod.is_authorised_deduction(
         _unsafe_opening(confidence="Manual estimator entry")
-    ) is True
+    ) is False
 
 
 def test_explicit_manual_override_is_authorised():
     assert prod.is_authorised_deduction(
         _unsafe_opening(manual_override_confirmed=True)
     ) is True
+
+
+def test_unified_wall_consumer_rechecks_opening_authority_without_wrapper():
+    from pb_unified_building_v139 import build_registered_walls
+
+    opening = _unsafe_opening(area_m2=2.0, resolved_wall_ref="W01")
+    app = SimpleNamespace(
+        register_elevations_v135=lambda _wid: {"facades": {}},
+        registered_wall_records_v135=lambda _wid: [
+            {"wall_ref": "W01", "side": "North", "length_m": 5.0, "height_m": 3.0}
+        ],
+        attach_openings_v137=lambda _wid, _walls: [opening],
+    )
+
+    wall = build_registered_walls(app, 7)[0]
+
+    assert wall["gross_m2"] == 15.0
+    assert wall["opening_deduction_m2"] == 0.0
+    assert wall["net_m2"] == 15.0
+
+
+def test_unified_wall_consumer_accepts_explicit_manual_opening_authority():
+    from pb_unified_building_v139 import build_registered_walls
+
+    opening = _unsafe_opening(
+        area_m2=2.0,
+        resolved_wall_ref="W01",
+        manual_override_confirmed=True,
+    )
+    app = SimpleNamespace(
+        register_elevations_v135=lambda _wid: {"facades": {}},
+        registered_wall_records_v135=lambda _wid: [
+            {"wall_ref": "W01", "side": "North", "length_m": 5.0, "height_m": 3.0}
+        ],
+        attach_openings_v137=lambda _wid, _walls: [opening],
+    )
+
+    wall = build_registered_walls(app, 7)[0]
+
+    assert wall["opening_deduction_m2"] == 2.0
+    assert wall["net_m2"] == 13.0
 
 
 def test_p5_complete_proof_is_authorised():
@@ -116,8 +157,12 @@ def test_legacy_normaliser_fails_old_true_default_closed():
         prod.install_legacy_safety_fence(app)
         old_auto = legacy_v134.normalise_opening(_unsafe_opening())
         assert old_auto["deduct"] is False
-        manual = legacy_v134.normalise_opening(
+        labelled_only = legacy_v134.normalise_opening(
             _unsafe_opening(confidence="Manual estimator entry")
+        )
+        assert labelled_only["deduct"] is False
+        manual = legacy_v134.normalise_opening(
+            _unsafe_opening(manual_override_confirmed=True)
         )
         assert manual["deduct"] is True
     finally:

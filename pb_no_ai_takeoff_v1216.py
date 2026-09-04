@@ -9,14 +9,28 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
+from pb_takeoff_authority_v164 import (
+    AUTHORITY_APPROVED,
+    AUTHORITY_FINGERPRINT_FIELD,
+    AUTHORITY_REVIEWED_AT_FIELD,
+    AUTHORITY_REVIEWED_BY_FIELD,
+    AUTHORITY_REVIEW_REQUIRED,
+    AUTHORITY_SOURCE_FIELD,
+    AUTHORITY_STATUS_FIELD,
+    is_model_surface_row,
+    model_surface_authority,
+)
+
 SOURCE_PREFIX = "PB No-AI v1.2.16"
 
 _TAKEOFF_INSERT_SQL = """INSERT INTO takeoff_rows(
     workspace_id,section,element,location,substrate,finish_system,quantity,unit,
     quantity_status,source_page,source_reference,inclusion_status,coats,
     coverage_m2_per_litre,productivity_m2_per_hour,rate_per_unit,confidence,
-    notes,row_role,created_at,updated_at
-) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+    notes,row_role,commercial_authority_status,commercial_authority_source,
+    commercial_authority_reviewed_by,commercial_authority_reviewed_at,
+    commercial_authority_fingerprint,created_at,updated_at
+) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -202,6 +216,9 @@ def _takeoff_values(workspace_id: int, row: Dict[str, Any], stamp: str) -> Tuple
         _num(row.get("coats")), _num(row.get("coverage_m2_per_litre")),
         _num(row.get("productivity_m2_per_hour")), _num(row.get("rate_per_unit")),
         row.get("confidence", "To review"), row.get("notes", ""), row.get("row_role", ""),
+        row.get(AUTHORITY_STATUS_FIELD, ""), row.get(AUTHORITY_SOURCE_FIELD, ""),
+        row.get(AUTHORITY_REVIEWED_BY_FIELD, ""), row.get(AUTHORITY_REVIEWED_AT_FIELD, ""),
+        row.get(AUTHORITY_FINGERPRINT_FIELD, ""),
         stamp, stamp,
     )
 
@@ -229,17 +246,61 @@ def replace_no_ai_rows(app: Any, workspace_id: int, rows: Sequence[Dict[str, Any
 
 def save_schedule_batched(app: Any, workspace_id: int, rows: Iterable[Dict[str, Any]]) -> int:
     """Save the edited take-off schedule without inventing default rates or paint systems."""
-    cleaned: List[Dict[str, Any]] = []
-    for raw in rows:
-        row = dict(raw)
-        if not any(str(row.get(key) or "").strip() for key in ("section", "element", "location", "source_reference")):
-            continue
-        role = str(row.get("row_role") or "").strip()
-        row["row_role"] = role if role in {"", "floor_area", "studio_area", "model_surface"} else ""
-        cleaned.append(row)
-
     conn = app.local_connect()
     try:
+        cursor = conn.execute(
+            """SELECT id,workspace_id,section,element,location,substrate,finish_system,
+                      quantity,unit,quantity_status,source_page,source_reference,
+                      inclusion_status,coats,coverage_m2_per_litre,
+                      productivity_m2_per_hour,rate_per_unit,confidence,notes,row_role,
+                      commercial_authority_status,commercial_authority_source,
+                      commercial_authority_reviewed_by,commercial_authority_reviewed_at,
+                      commercial_authority_fingerprint
+                 FROM takeoff_rows WHERE workspace_id=?""",
+            (int(workspace_id),),
+        )
+        columns = [item[0] for item in cursor.description]
+        prior_by_id = {
+            int(record[0]): dict(zip(columns, record))
+            for record in cursor.fetchall()
+            if record[0] is not None
+        }
+        cleaned: List[Dict[str, Any]] = []
+        for raw in rows:
+            row = dict(raw)
+            if not any(str(row.get(key) or "").strip() for key in ("section", "element", "location", "source_reference")):
+                continue
+            try:
+                prior = prior_by_id.get(int(row.get("id"))) or {}
+            except (TypeError, ValueError):
+                prior = {}
+            role = str(row.get("row_role") or "").strip()
+            if is_model_surface_row(prior) or is_model_surface_row(row):
+                role = "model_surface"
+            elif role not in {"", "floor_area", "studio_area"}:
+                role = ""
+            row["row_role"] = role
+            authority = {
+                AUTHORITY_STATUS_FIELD: prior.get(
+                    AUTHORITY_STATUS_FIELD,
+                    AUTHORITY_REVIEW_REQUIRED if role == "model_surface" else "",
+                ),
+                AUTHORITY_SOURCE_FIELD: prior.get(AUTHORITY_SOURCE_FIELD, ""),
+                AUTHORITY_REVIEWED_BY_FIELD: prior.get(AUTHORITY_REVIEWED_BY_FIELD, ""),
+                AUTHORITY_REVIEWED_AT_FIELD: prior.get(AUTHORITY_REVIEWED_AT_FIELD, ""),
+                AUTHORITY_FINGERPRINT_FIELD: prior.get(AUTHORITY_FINGERPRINT_FIELD, ""),
+            }
+            candidate = {**row, "workspace_id": int(workspace_id), **authority}
+            if role == "model_surface" and authority[AUTHORITY_STATUS_FIELD] == AUTHORITY_APPROVED:
+                approval_still_matches, _ = model_surface_authority(candidate)
+                if not approval_still_matches:
+                    authority[AUTHORITY_STATUS_FIELD] = AUTHORITY_REVIEW_REQUIRED
+                    authority[AUTHORITY_REVIEWED_BY_FIELD] = ""
+                    authority[AUTHORITY_REVIEWED_AT_FIELD] = ""
+                    authority[AUTHORITY_FINGERPRINT_FIELD] = ""
+            row.update(authority)
+            cleaned.append(row)
+
         conn.execute("DELETE FROM takeoff_rows WHERE workspace_id=?", (workspace_id,))
         stamp = app.now_stamp()
         conn.executemany(

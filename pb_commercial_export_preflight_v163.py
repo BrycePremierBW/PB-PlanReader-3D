@@ -31,6 +31,11 @@ from pb_commercial_review_v161 import (
     SEVERITY_REVIEW,
     collect_commercial_review_signals,
 )
+from pb_takeoff_authority_v164 import (
+    is_excluded_takeoff_row,
+    is_floor_reference_row,
+    takeoff_row_publishability,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -126,7 +131,7 @@ def _get_takeoff_row_stats(conn_or_app: Any, workspace_id: int) -> Tuple[int, in
     """Retrieves row statistics and payload fingerprint for a workspace across all consequential publish fields."""
     rows = _db_query(
         conn_or_app,
-        "SELECT id, section, element, location, substrate, unit, quantity, quantity_status, coats, rate_per_unit, labour_hours, paint_litres, value_ex_gst, finish_system, coverage_m2_per_litre, productivity_m2_per_hour, inclusion_status, row_role, notes, confidence, source_reference FROM takeoff_rows WHERE workspace_id=? ORDER BY id",
+        "SELECT * FROM takeoff_rows WHERE workspace_id=? ORDER BY id",
         (workspace_id,)
     )
     total = len(rows)
@@ -144,15 +149,16 @@ def _get_takeoff_row_stats(conn_or_app: Any, workspace_id: int) -> Tuple[int, in
         inclusion_str = str(r.get("inclusion_status") or "").lower()
         role_str = str(r.get("row_role") or "").lower()
 
-        is_excluded = (inclusion_str == "excluded" or "exclude" in inclusion_str)
-        is_floor = (role_str == "floor_area")
+        is_excluded = is_excluded_takeoff_row(r)
+        is_floor = is_floor_reference_row(r)
+        is_publishable, _ = takeoff_row_publishability(r)
 
         if is_floor:
             floor_ref += 1
-        else:
+        elif is_excluded:
+            excluded += 1
+        if is_publishable:
             publishable += 1
-            if is_excluded:
-                excluded += 1
 
         qty_status_str = str(r.get("quantity_status") or "").strip().lower()
         if qty is not None and float(qty) == 0.0:
@@ -181,6 +187,11 @@ def _get_takeoff_row_stats(conn_or_app: Any, workspace_id: int) -> Tuple[int, in
             "notes": str(r.get("notes") or ""),
             "confidence": str(r.get("confidence") or ""),
             "source_reference": str(r.get("source_reference") or ""),
+            "commercial_authority_status": str(r.get("commercial_authority_status") or ""),
+            "commercial_authority_source": str(r.get("commercial_authority_source") or ""),
+            "commercial_authority_reviewed_by": str(r.get("commercial_authority_reviewed_by") or ""),
+            "commercial_authority_reviewed_at": str(r.get("commercial_authority_reviewed_at") or ""),
+            "commercial_authority_fingerprint": str(r.get("commercial_authority_fingerprint") or ""),
         })
 
     # Sort payload deterministically by row ID
