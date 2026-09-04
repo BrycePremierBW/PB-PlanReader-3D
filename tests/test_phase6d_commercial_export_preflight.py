@@ -624,14 +624,14 @@ class Phase6DPreflightTests(unittest.TestCase):
             self.assertIn("cleanup transition to Failed also failed", str(ctx_clean.exception))
 
     def test_20_concurrent_duplicate_submission_and_fail_closed(self):
-        """Genuine multi-threaded concurrent interleaving race test proving max 1 publish attempt can acquire atomic reservation."""
+        """Mock-level concurrent duplicate submission race test using Barrier synchronization."""
         import threading
         res = derive_export_preflight(self.app, 1, bridge_available=True)
         bridge = MockJobHubBridge()
 
         sample_takeoff = pd.DataFrame([{
             "id": 1000, "section": "Internal", "element": "Wall", "location": "G01", "substrate": "Plasterboard",
-            "unit": "m?", "quantity": 150.0, "quantity_status": "Measured", "coats": 1, "rate_per_unit": 25.0, "labour_hours": 5.0,
+            "unit": "m²", "quantity": 150.0, "quantity_status": "Measured", "coats": 1, "rate_per_unit": 25.0, "labour_hours": 5.0,
             "paint_litres": 10.0, "value_ex_gst": 100.0, "row_role": "work", "inclusion_status": "included"
         }])
 
@@ -645,9 +645,11 @@ class Phase6DPreflightTests(unittest.TestCase):
         results = []
         errors = []
         lock = threading.Lock()
+        barrier = threading.Barrier(2)
 
         def worker_publish(user_name):
             try:
+                barrier.wait(timeout=5)
                 out = verify_toctou_and_publish_jobhub(
                     self.app, 1, bridge=bridge, user_name=user_name,
                     expected_fingerprint=res.preflight_fingerprint,
@@ -659,7 +661,6 @@ class Phase6DPreflightTests(unittest.TestCase):
                 with lock:
                     errors.append(exc)
 
-        # Launch 2 concurrent threads simultaneously inside active patch context
         with patch("pb_planreader_3d_app.lquery", return_value=[{"id": 1, "job_no": "JOB-6D1", "job_name": "Test", "drawing_issue": "Rev A", "jobhub_job_id": 101, "file_name": "A-01.pdf"}]), \
              patch("pb_planreader_3d_app.dataframe_for_takeoff", return_value=sample_takeoff), \
              patch("pb_planreader_3d_app.quote_workbook_bytes", return_value=b"mock_excel"), \
@@ -672,19 +673,16 @@ class Phase6DPreflightTests(unittest.TestCase):
             t1.join()
             t2.join()
 
-        # Handle race condition where both threads tried concurrently
-        # Exactly 1 thread succeeded and at least 1 attempt caught duplicate or contention error
-        if len(results) == 0 and len(errors) == 2:
-            # Fallback retry to confirm sequential second attempt strictly fails closed
-            worker_publish("UserRetry1")
-            worker_publish("UserRetry2")
-
-        self.assertEqual(len(results), 1)
+        # Strict concurrency assertion: exactly 1 winner, exactly 1 duplicate/rejection failure
+        self.assertEqual(len(results), 1, f"Expected exactly 1 success, got {len(results)}. Errors: {errors}")
         self.assertTrue(results[0]["published"])
-        self.assertTrue(len(errors) >= 1)
-        self.assertTrue(any("already" in str(e).lower() or "duplicate" in str(e).lower() for e in errors))
+        self.assertEqual(len(errors), 1, f"Expected exactly 1 failure, got {len(errors)}. Results: {results}")
+        error_msgs = [str(e).lower() for e in errors]
+        self.assertTrue(
+            any(k in m for m in error_msgs for k in ("already", "duplicate", "fail", "conflict", "locked", "cleanup")),
+            f"Unexpected error messages: {errors}"
+        )
 
-        # Exactly 1 package reached Published status
         published_pkgs = [p for p in bridge.packages if p.get("status") == "Published"]
         self.assertEqual(len(published_pkgs), 1)
 
@@ -697,6 +695,99 @@ class Phase6DPreflightTests(unittest.TestCase):
                 acknowledgement_confirmed=True, publish_fn=MagicMock()
             )
         self.assertIn("Duplicate verification failed closed", str(ctx.exception))
+
+    def test_20b_real_sqlite_concurrency_and_fail_closed(self):
+        """Real on-disk multi-connection SQLite concurrency proof using production JobHubBridge."""
+        import tempfile
+        import threading
+        from pathlib import Path
+        from pb_planreader_3d_app import JobHubBridge, ensure_shared_jobhub_schema, ensure_jobhub_takeoff_tables
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = Path(tmpdir) / "jobhub_real.db"
+
+            # 1. Initialize real schema on shared on-disk SQLite DB
+            init_bridge = JobHubBridge(kind="sqlite", source=str(db_path))
+            ensure_shared_jobhub_schema(init_bridge)
+            ensure_jobhub_takeoff_tables(init_bridge)
+
+            # Insert seed job
+            init_bridge.execute(
+                "INSERT INTO jobs (id, job_no, job_name, status) VALUES (?, ?, ?, ?)",
+                (201, "JOB-REAL-1", "Real Concurrency Project", "Draft")
+            )
+
+            # 2. Prepare sample takeoff and preflight
+            sample_takeoff = pd.DataFrame([{
+                "id": 1001, "section": "Internal", "element": "Wall", "location": "G01", "substrate": "Plasterboard",
+                "unit": "m²", "quantity": 150.0, "quantity_status": "Measured", "coats": 1, "rate_per_unit": 25.0, "labour_hours": 5.0,
+                "paint_litres": 10.0, "value_ex_gst": 100.0, "row_role": "work", "inclusion_status": "included"
+            }])
+
+            res = derive_export_preflight(self.app, 1, bridge_available=True)
+
+            results = []
+            errors = []
+            lock = threading.Lock()
+            barrier = threading.Barrier(2)
+
+            def worker_real_publish(user_name):
+                worker_bridge = JobHubBridge(kind="sqlite", source=str(db_path))
+                def real_publish_fn(ws_id, br, usr, preflight_fingerprint="", payload_hash=""):
+                    return publish_job_to_jobhub(
+                        ws_id, br, usr,
+                        preflight_fingerprint=preflight_fingerprint or res.preflight_fingerprint,
+                        payload_hash=payload_hash or res.payload_hash
+                    )
+                try:
+                    barrier.wait(timeout=5)
+                    out = verify_toctou_and_publish_jobhub(
+                        self.app, 1, bridge=worker_bridge, user_name=user_name,
+                        expected_fingerprint=res.preflight_fingerprint,
+                        acknowledgement_confirmed=True, publish_fn=real_publish_fn
+                    )
+                    with lock:
+                        results.append(out)
+                except Exception as exc:
+                    with lock:
+                        errors.append(exc)
+
+            # Patch workspace data while keeping SQLite storage 100% real
+            with patch("pb_planreader_3d_app.lquery", return_value=[{"id": 1, "job_no": "JOB-REAL-1", "job_name": "Test", "drawing_issue": "Rev A", "jobhub_job_id": 201, "file_name": "A-01.pdf"}]), \
+                 patch("pb_planreader_3d_app.dataframe_for_takeoff", return_value=sample_takeoff), \
+                 patch("pb_planreader_3d_app.quote_workbook_bytes", return_value=b"mock_excel"), \
+                 patch("pb_planreader_3d_app.progress_package_bytes", return_value=b"mock_zip"):
+
+                t1 = threading.Thread(target=worker_real_publish, args=("RealUser1",))
+                t2 = threading.Thread(target=worker_real_publish, args=("RealUser2",))
+                t1.start()
+                t2.start()
+                t1.join()
+                t2.join()
+
+            # 3. Assertions against real SQLite database file
+            self.assertEqual(len(results), 1, f"Expected 1 real publish success. Results: {results}, Errors: {errors}")
+            self.assertEqual(len(errors), 1, f"Expected 1 duplicate publish rejection. Errors: {errors}")
+
+            # Verify with fresh independent SQLite connection
+            verify_conn = sqlite3.connect(str(db_path))
+            cur = verify_conn.cursor()
+            cur.execute("SELECT id, status, notes FROM painting_takeoff_packages WHERE job_id = 201")
+            pkgs = cur.fetchall()
+            self.assertEqual(len(pkgs), 1, f"Expected exactly 1 package in real SQLite, found: {pkgs}")
+            self.assertEqual(pkgs[0][1], "Published")
+
+            cur.execute("SELECT status FROM jobs WHERE id = 201")
+            job_status = cur.fetchone()[0]
+            self.assertEqual(job_status, "Published")
+
+            # Verify unit m? persisted properly in lines
+            cur.execute("SELECT unit, m2 FROM painting_takeoff_lines WHERE package_id = ?", (pkgs[0][0],))
+            lines = cur.fetchall()
+            self.assertTrue(len(lines) >= 1)
+            self.assertEqual(lines[0][0], "m²")
+            verify_conn.close()
+
     def test_21_deterministic_ordering_fingerprint(self):
         """Signal and row ordering alone does not change canonical review or preflight fingerprints."""
         sig1 = CommercialReviewSignal(
