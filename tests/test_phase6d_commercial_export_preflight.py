@@ -121,19 +121,22 @@ def _create_mock_db() -> sqlite3.Connection:
 class MockApp:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
+        self._lock = threading.Lock()
 
     def lquery(self, sql, params=()):
-        cur = self.conn.cursor()
-        cur.execute(sql, params)
-        cols = [d[0] for d in cur.description] if cur.description else []
-        rows = cur.fetchall()
-        return [dict(zip(cols, r)) for r in rows]
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(sql, params)
+            cols = [d[0] for d in cur.description] if cur.description else []
+            rows = cur.fetchall()
+            return [dict(zip(cols, r)) for r in rows]
 
     def scale_gate_issues(self, workspace_id: int):
-        cur = self.conn.cursor()
-        cur.execute("SELECT id, page_label, px_per_m FROM pages WHERE workspace_id=? AND selected=1 AND (px_per_m IS NULL OR px_per_m <= 0 OR px_per_m = 1.0)", (workspace_id,))
-        rows = cur.fetchall()
-        return [{"page_id": r[0], "page_label": r[1] or f"Page #{r[0]}", "reason": "Uncalibrated scale"} for r in rows]
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT id, page_label, px_per_m FROM pages WHERE workspace_id=? AND selected=1 AND (px_per_m IS NULL OR px_per_m <= 0 OR px_per_m = 1.0)", (workspace_id,))
+            rows = cur.fetchall()
+            return [{"page_id": r[0], "page_label": r[1] or f"Page #{r[0]}", "reason": "Uncalibrated scale"} for r in rows]
 
 
 class MockJobHubBridge:
