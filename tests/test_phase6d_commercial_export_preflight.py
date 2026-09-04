@@ -1,4 +1,3 @@
-import threading
 """tests/test_phase6d_commercial_export_preflight.py — Phase 6D Preflight & JobHub Integrity Suite.
 
 Issue #74 Complete Pass 5 Regression Matrix:
@@ -27,6 +26,7 @@ Issue #74 Complete Pass 5 Regression Matrix:
  23. Genuine spies proving no AI/OCR/PDF/geometry rebuild entry points called during preflight
 """
 from __future__ import annotations
+import threading
 
 from contextlib import contextmanager
 import pandas as pd
