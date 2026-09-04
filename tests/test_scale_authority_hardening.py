@@ -27,7 +27,9 @@ class ScaleAuthorityHardeningTests(unittest.TestCase):
             CREATE TABLE workspaces (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 job_no TEXT,
-                job_name TEXT
+                job_name TEXT,
+                drawing_issue TEXT,
+                jobhub_job_id INTEGER
             );
             CREATE TABLE documents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,7 +61,8 @@ class ScaleAuthorityHardeningTests(unittest.TestCase):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 workspace_id INTEGER NOT NULL,
                 source_page TEXT,
-                quantity REAL
+                quantity REAL,
+                quantity_status TEXT
             );
             """
         )
@@ -351,3 +354,243 @@ class ScaleAuthorityHardeningTests(unittest.TestCase):
             self.assertFalse(t2.is_alive())
             self.assertEqual(len(worker_error), 1)
             self.assertIn("locked", str(worker_error[0]).lower())
+
+    def test_section13_a_provisional_title_block_scale_blocks_commercial_authority(self):
+        """Section 13.A: Title-block-only provisional scale cannot silently become final commercial authority."""
+        conn = self._create_production_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO workspaces (id, job_no, job_name) VALUES (1, 'JOB-TB', 'Title Block Project')")
+        cur.execute("INSERT INTO documents (id, workspace_id, file_name) VALUES (10, 1, 'Plans.pdf')")
+        cur.execute("INSERT INTO pages (id, workspace_id, document_id, page_no, page_label, selected, px_per_m, scale_text) VALUES (101, 1, 10, 1, 'A-01', 1, 0.0, '1:100')")
+        conn.commit()
+
+        auth = derive_workspace_scale_authority(conn, 1)
+        rec = auth._by_id[101]
+        self.assertEqual(rec.scale_status, "PROVISIONAL_AUTO")
+        self.assertEqual(rec.calibration_method, "TITLE_BLOCK_TEXT")
+        self.assertGreater(rec.px_per_m, 0.0)
+
+        # MUST be blocked for commercial authority
+        self.assertTrue(auth.is_blocked())
+        issues = auth.get_issues()
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["page_id"], 101)
+        self.assertEqual(issues[0]["issue_type"], "PROVISIONAL_TITLE_BLOCK_SCALE")
+        self.assertIn("provisional", issues[0]["description"].lower())
+
+    def test_section13_b_provisional_inherited_scale_blocks_commercial_authority(self):
+        """Section 13.B: Inherited provisional scale cannot silently become final commercial authority."""
+        conn = self._create_production_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO workspaces (id, job_no, job_name) VALUES (1, 'JOB-INH', 'Inherited Project')")
+        cur.execute("INSERT INTO documents (id, workspace_id, file_name) VALUES (10, 1, 'Plans.pdf')")
+        cur.execute("INSERT INTO pages (id, workspace_id, document_id, page_no, page_label, selected, px_per_m, scale_text) VALUES (101, 1, 10, 1, 'A-01', 1, 100.0, '1:100')")
+        cur.execute("INSERT INTO pages (id, workspace_id, document_id, page_no, page_label, selected, px_per_m, scale_text) VALUES (102, 1, 10, 2, 'A-02', 1, 0.0, '')")
+        cur.execute("INSERT INTO takeoff_rows (id, workspace_id, source_page, quantity) VALUES (1, 1, 'A-02', 25.0)")
+        conn.commit()
+
+        auth = derive_workspace_scale_authority(conn, 1)
+        rec2 = auth._by_id[102]
+        self.assertEqual(rec2.scale_status, "PROVISIONAL_AUTO")
+        self.assertEqual(rec2.calibration_method, "INHERITED")
+        self.assertEqual(rec2.px_per_m, 100.0)
+
+        # MUST be blocked for commercial authority
+        self.assertTrue(auth.is_blocked())
+        issues = auth.get_issues()
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["page_id"], 102)
+        self.assertEqual(issues[0]["issue_type"], "PROVISIONAL_INHERITED_SCALE")
+        self.assertIn("inherited", issues[0]["description"].lower())
+
+    def test_section13_c_calibrated_scale_remains_unblocked(self):
+        """Section 13.C: CALIBRATED scale still works and is not blocked."""
+        conn = self._create_production_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO workspaces (id, job_no, job_name) VALUES (1, 'JOB-CAL', 'Calibrated')")
+        cur.execute("INSERT INTO documents (id, workspace_id, file_name) VALUES (10, 1, 'Plans.pdf')")
+        cur.execute("INSERT INTO pages (id, workspace_id, document_id, page_no, page_label, selected, px_per_m) VALUES (101, 1, 10, 1, 'A-01', 1, 100.0)")
+        cur.execute("INSERT INTO measurement_lines (id, workspace_id, page_id, line_type, length_m) VALUES (1, 1, 101, 'wall', 10.0)")
+        cur.execute("INSERT INTO takeoff_rows (id, workspace_id, source_page, quantity) VALUES (1, 1, 'A-01', 50.0)")
+        conn.commit()
+
+        auth = derive_workspace_scale_authority(conn, 1)
+        self.assertFalse(auth.is_blocked())
+        self.assertEqual(len(auth.get_issues()), 0)
+
+    def test_section13_d_not_required_pages_do_not_create_false_blockers(self):
+        """Section 13.D: NOT_REQUIRED pages do not create false blockers."""
+        conn = self._create_production_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO workspaces (id, job_no, job_name) VALUES (1, 'JOB-NR', 'Not Required')")
+        cur.execute("INSERT INTO documents (id, workspace_id, file_name) VALUES (10, 1, 'Plans.pdf')")
+        cur.execute("INSERT INTO pages (id, workspace_id, document_id, page_no, page_label, page_type, selected, px_per_m) VALUES (101, 1, 10, 1, 'Cover Sheet', 'cover', 1, 0.0)")
+        cur.execute("INSERT INTO pages (id, workspace_id, document_id, page_no, page_label, page_type, selected, px_per_m) VALUES (102, 1, 10, 2, 'Drawing Register', 'index', 1, 0.0)")
+        cur.execute("INSERT INTO pages (id, workspace_id, document_id, page_no, page_label, page_type, selected, px_per_m) VALUES (103, 1, 10, 3, 'Floor Plan', 'plan', 1, 100.0)")
+        conn.commit()
+
+        auth = derive_workspace_scale_authority(conn, 1)
+        self.assertEqual(auth._by_id[101].scale_status, "NOT_REQUIRED")
+        self.assertEqual(auth._by_id[102].scale_status, "NOT_REQUIRED")
+        self.assertEqual(auth._by_id[103].scale_status, "CALIBRATED")
+        self.assertFalse(auth.is_blocked())
+        self.assertEqual(len(auth.get_issues()), 0)
+
+    def test_section13_e_missing_page_no_does_not_substitute_primary_key(self):
+        """Section 13.E: Missing page_no/page_number does not gain authority through arbitrary primary key substitution."""
+        conn = sqlite3.connect(":memory:")
+        cur = conn.cursor()
+        cur.executescript(
+            """
+            CREATE TABLE pages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace_id INTEGER NOT NULL,
+                page_label TEXT,
+                page_type TEXT DEFAULT 'drawing',
+                scale_text TEXT,
+                px_per_m REAL,
+                selected INTEGER DEFAULT 1
+            );
+            CREATE TABLE measurement_lines (id INTEGER PRIMARY KEY, workspace_id INT, page_id INT);
+            CREATE TABLE takeoff_rows (id INTEGER PRIMARY KEY, workspace_id INT, source_page TEXT);
+            """
+        )
+        cur.execute("INSERT INTO pages (id, workspace_id, page_label, px_per_m, selected) VALUES (999, 1, NULL, 100.0, 1)")
+        conn.commit()
+
+        auth = derive_workspace_scale_authority(conn, 1)
+        rec = auth.records[0]
+        # Label must not pretend primary key 999 is drawing sequence 'Page 999'
+        self.assertEqual(rec.page_label, "Page [ID:999]")
+
+    def test_section13_f_real_production_db_initialization(self):
+        """Section 13.F: Real production DB initialization is exercised in tests."""
+        from pathlib import Path
+        from pb_planreader_3d_app import init_local_db
+        import pb_planreader_3d_app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_data_dir = pb_planreader_3d_app.DATA_DIR
+            orig_db_path = pb_planreader_3d_app.DB_PATH
+            try:
+                temp_dir = Path(tmpdir)
+                pb_planreader_3d_app.DATA_DIR = temp_dir
+                pb_planreader_3d_app.DB_PATH = temp_dir / "planreader.db"
+
+                # Run real production schema initialization
+                init_local_db()
+
+                # Verify table creation and canonical pages.page_no presence
+                conn = pb_planreader_3d_app.local_connect()
+                cur = conn.cursor()
+                cur.execute("PRAGMA table_info(pages)")
+                cols = {r[1] for r in cur.fetchall()}
+                self.assertIn("page_no", cols)
+                self.assertNotIn("page_number", cols)
+
+                cur.execute("PRAGMA table_info(measurement_lines)")
+                m_cols = {r[1] for r in cur.fetchall()}
+                self.assertIn("page_id", m_cols)
+
+                cur.execute("PRAGMA table_info(takeoff_rows)")
+                t_cols = {r[1] for r in cur.fetchall()}
+                self.assertIn("source_page", t_cols)
+
+                # Insert workspace and test derivation on real production db
+                cur.execute("INSERT INTO workspaces (id, job_no, job_name) VALUES (1, 'PROD-1', 'Real DB')")
+                cur.execute("INSERT INTO documents (id, workspace_id, file_name) VALUES (1, 1, 'Doc.pdf')")
+                cur.execute("INSERT INTO pages (id, workspace_id, document_id, page_no, page_label, selected, px_per_m) VALUES (10, 1, 1, 1, 'P-01', 1, 100.0)")
+                conn.commit()
+
+                auth = derive_workspace_scale_authority(conn, 1)
+                self.assertEqual(len(auth.records), 1)
+                self.assertEqual(auth.records[0].scale_status, "CALIBRATED")
+                self.assertFalse(auth.is_blocked())
+                conn.close()
+            finally:
+                pb_planreader_3d_app.DATA_DIR = orig_data_dir
+                pb_planreader_3d_app.DB_PATH = orig_db_path
+
+    def test_section13_g_missing_required_schema_fails_closed(self):
+        """Section 13.G: Missing required schema cannot silently become safe empty evidence."""
+        conn = sqlite3.connect(":memory:")
+        cur = conn.cursor()
+        cur.executescript(
+            """
+            CREATE TABLE pages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace_id INTEGER NOT NULL,
+                page_no INTEGER,
+                page_label TEXT,
+                page_type TEXT DEFAULT 'drawing',
+                px_per_m REAL,
+                scale_text TEXT,
+                selected INTEGER DEFAULT 1
+            );
+            """
+        )
+        cur.execute("INSERT INTO pages (id, workspace_id, page_no, page_label, px_per_m, selected) VALUES (1, 1, 1, 'A-01', 100.0, 1)")
+        conn.commit()
+
+        auth = derive_workspace_scale_authority(conn, 1)
+        self.assertTrue(auth.is_blocked())
+        issues = auth.get_issues()
+        issue_types = [iss["issue_type"] for iss in issues]
+        self.assertIn("MISSING_REQUIRED_SCHEMA", issue_types)
+
+        sigs, cov = collect_scale_review_signals(conn, 1)
+        self.assertEqual(cov, "AVAILABLE")
+        self.assertTrue(any(s.severity == "BLOCKER" for s in sigs))
+        self.assertTrue(any("schema" in s.summary.lower() for s in sigs))
+
+    def test_section13_i_commercial_description_and_title_survive_to_review_ui(self):
+        """Section 13.I: Commercial reason/description and informative title survive to review UI."""
+        conn = self._create_production_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO workspaces (id, job_no, job_name) VALUES (1, 'JOB-DESC', 'Desc')")
+        cur.execute("INSERT INTO documents (id, workspace_id, file_name) VALUES (10, 1, 'Plans.pdf')")
+        cur.execute("INSERT INTO pages (id, workspace_id, document_id, page_no, page_label, selected, px_per_m, scale_text) VALUES (101, 1, 10, 1, 'A-101', 1, 0.0, '1:50')")
+        conn.commit()
+
+        sigs, cov = collect_scale_review_signals(conn, 1)
+        self.assertEqual(cov, "AVAILABLE")
+        self.assertEqual(len(sigs), 1)
+        sig = sigs[0]
+        self.assertEqual(sig.severity, "BLOCKER")
+        self.assertIn("Provisional Title-Block Scale", sig.title)
+        self.assertIn("1:50", sig.summary)
+        self.assertIn("explicit calibration", sig.summary.lower())
+
+    def test_section13_j_phase6b_and_phase6d_identical_scale_policy(self):
+        """Section 13.J: Phase 6B and Phase 6D reflect the same scale policy."""
+        from pb_commercial_export_preflight_v163 import derive_export_preflight
+        from pb_commercial_review_v161 import collect_commercial_review_signals
+
+        conn = self._create_production_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO workspaces (id, job_no, job_name, drawing_issue) VALUES (1, 'JOB-J', 'Policy Test', 'Rev 1')")
+        cur.execute("INSERT INTO documents (id, workspace_id, file_name) VALUES (10, 1, 'Plans.pdf')")
+        cur.execute("INSERT INTO pages (id, workspace_id, document_id, page_no, page_label, selected, px_per_m, scale_text) VALUES (101, 1, 10, 1, 'A-101', 1, 0.0, '1:100')")
+        cur.execute("INSERT INTO takeoff_rows (id, workspace_id, source_page, quantity, quantity_status) VALUES (1, 1, 'A-101', 10.0, 'Measured')")
+        conn.commit()
+
+        class AppWrap:
+            def __init__(self, c):
+                self.conn = c
+            def execute(self, *a, **kw):
+                return self.conn.execute(*a, **kw)
+            def cursor(self):
+                return self.conn.cursor()
+
+        app = AppWrap(conn)
+        ws_dict = {"id": 1, "job_no": "JOB-J", "job_name": "Policy Test", "drawing_issue": "Rev 1"}
+
+        rev_res = collect_commercial_review_signals(app, ws_dict)
+        self.assertGreater(rev_res.blocker_count, 0)
+        scale_blockers = [s for s in rev_res.signals if s.source_family == "scale" and s.severity == "BLOCKER"]
+        self.assertEqual(len(scale_blockers), 1)
+
+        preflight = derive_export_preflight(conn, 1, bridge_available=True)
+        self.assertEqual(preflight.preflight_status, "BLOCKED")
+        self.assertGreater(preflight.blocker_count, 0)
+        self.assertTrue(any("scale" in r.lower() or "calibration" in r.lower() for r in preflight.blocking_reasons))
