@@ -695,6 +695,7 @@ _DOCUMENT_BLOB_COLUMNS = (
 class JobHubBridge:
     kind: str
     source: str
+    timeout: float = 5.0
 
     @contextmanager
     def connect(self):
@@ -707,7 +708,7 @@ class JobHubBridge:
             finally:
                 conn.close()
         else:
-            conn = sqlite3.connect(self.source)
+            conn = sqlite3.connect(self.source, timeout=self.timeout)
             conn.row_factory = sqlite3.Row
             try:
                 yield conn
@@ -4715,8 +4716,18 @@ def publish_job_to_jobhub(workspace_id: int, bridge: JobHubBridge, created_by: s
         elif bridge.kind == "sqlite":
             try:
                 cur.execute("BEGIN IMMEDIATE")
-            except Exception:
-                pass
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+                err_str = str(exc).lower()
+                if "locked" in err_str or "busy" in err_str:
+                    raise RuntimeError(f"JobHub SQLite database lock acquisition failed: {exc}") from exc
+                if "cannot start a transaction" not in err_str:
+                    raise
+            except Exception as exc:
+                err_str = str(exc).lower()
+                if "locked" in err_str or "busy" in err_str:
+                    raise RuntimeError(f"JobHub SQLite database lock acquisition failed: {exc}") from exc
+                if "cannot start a transaction" not in err_str:
+                    raise
 
         # 2. Duplicate Check within locked transaction
         query_sql = "SELECT id, status, notes FROM painting_takeoff_packages WHERE job_id=? AND (takeoff_no=? OR notes LIKE ?) ORDER BY id DESC"
