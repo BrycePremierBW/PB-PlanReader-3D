@@ -31,7 +31,9 @@ _EXCLUDED_SCOPE_VALUES = {"exclude", "excluded", "exclusion"}
 
 
 def _text(value: Any) -> str:
-    return str(value or "").strip()
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return ""
+    return str(value).strip()
 
 
 def _normalised(value: Any) -> str:
@@ -40,10 +42,23 @@ def _normalised(value: Any) -> str:
 
 def is_model_surface_row(row: Mapping[str, Any]) -> bool:
     role_matches = _normalised(row.get("row_role")) == MODEL_SURFACE_ROLE
-    source_matches = _text(row.get("source_reference")).lower().startswith(
-        MODEL_SURFACE_SOURCE_PREFIX
+    norm_source = _normalised(row.get("source_reference"))
+    source_matches = (
+        norm_source.startswith("pb_3d_surface_editor")
+        or _text(row.get("source_reference")).lower().startswith(MODEL_SURFACE_SOURCE_PREFIX)
+        or "3d_surface_editor" in norm_source
     )
-    return role_matches or source_matches
+    page_matches = _normalised(row.get("source_page")) in {"3d_model", "3d", "model_surface"}
+    # Sticky provenance: once a row carries model authority provenance or fingerprint,
+    # it cannot be laundered into an ordinary row by mutating or erasing row_role.
+    # Sentinels ('nan', 'none', 'null', '') do not count as authority markers.
+    sentinels = {"", "nan", "none", "null"}
+    authority_markers = bool(
+        (_text(row.get(AUTHORITY_FINGERPRINT_FIELD)).lower() not in sentinels)
+        or (_text(row.get(AUTHORITY_SOURCE_FIELD)).lower() not in sentinels)
+        or (_normalised(row.get(AUTHORITY_STATUS_FIELD)) == AUTHORITY_APPROVED.lower())
+    )
+    return role_matches or source_matches or page_matches or authority_markers
 
 
 def is_floor_reference_row(row: Mapping[str, Any]) -> bool:
@@ -119,7 +134,15 @@ def approve_model_surface_row(
     source_text = _text(source)
     reviewer_text = _text(reviewed_by)
     reviewed_at_text = _text(reviewed_at)
-    if not source_text or not reviewer_text or not reviewed_at_text:
+    sentinels = {"nan", "none", "null"}
+    if (
+        not source_text
+        or _normalised(source_text) in sentinels
+        or not reviewer_text
+        or _normalised(reviewer_text) in sentinels
+        or not reviewed_at_text
+        or _normalised(reviewed_at_text) in sentinels
+    ):
         raise ValueError("Source evidence, reviewer identity, and review timestamp are required.")
     approved = dict(row)
     approved["workspace_id"] = int(workspace_id)
@@ -141,14 +164,39 @@ def model_surface_authority(row: Mapping[str, Any]) -> Tuple[bool, str]:
     """
     if not is_model_surface_row(row):
         return True, "NOT_MODEL_SURFACE"
-    if _normalised(row.get(AUTHORITY_STATUS_FIELD)) != AUTHORITY_APPROVED.lower():
+
+    # Status must be a string strictly matching 'APPROVED' (case-insensitive, whitespace-trimmed)
+    raw_status = row.get(AUTHORITY_STATUS_FIELD)
+    if not isinstance(raw_status, str):
         return False, "3D model surface has not received commercial approval"
-    if not _text(row.get(AUTHORITY_SOURCE_FIELD)):
+    if raw_status.strip().upper() != AUTHORITY_APPROVED:
+        return False, "3D model surface has not received commercial approval"
+
+    # Workspace binding: row must carry a valid positive workspace identity
+    workspace_id = row.get("workspace_id")
+    if isinstance(workspace_id, bool):
+        return False, "3D model surface approval requires a positive workspace identity"
+    try:
+        valid_workspace_id = int(workspace_id) > 0
+    except (TypeError, ValueError, OverflowError):
+        valid_workspace_id = False
+    if not valid_workspace_id:
+        return False, "3D model surface approval requires a positive workspace identity"
+
+    # Provenance fields must be non-empty and not sentinel strings
+    sentinels = {"nan", "none", "null"}
+    source_val = _text(row.get(AUTHORITY_SOURCE_FIELD))
+    if not source_val or _normalised(source_val) in sentinels:
         return False, "3D model surface approval has no source evidence reference"
-    if not _text(row.get(AUTHORITY_REVIEWED_BY_FIELD)):
+
+    reviewer_val = _text(row.get(AUTHORITY_REVIEWED_BY_FIELD))
+    if not reviewer_val or _normalised(reviewer_val) in sentinels:
         return False, "3D model surface approval has no reviewer identity"
-    if not _text(row.get(AUTHORITY_REVIEWED_AT_FIELD)):
+
+    reviewed_at_val = _text(row.get(AUTHORITY_REVIEWED_AT_FIELD))
+    if not reviewed_at_val or _normalised(reviewed_at_val) in sentinels:
         return False, "3D model surface approval has no review timestamp"
+
     fingerprint = _text(row.get(AUTHORITY_FINGERPRINT_FIELD))
     expected = compute_model_surface_authority_fingerprint(row)
     if not fingerprint or not hmac.compare_digest(fingerprint, expected):

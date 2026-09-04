@@ -5548,7 +5548,8 @@ def subscription_takeoff_page(workspace: Dict[str, Any], session_api_key: str, a
                     "row_role": row_role,
                     **authority,
                 }
-                if row_role == "model_surface" and authority.get(AUTHORITY_STATUS_FIELD) == AUTHORITY_APPROVED:
+                status_norm = str(authority.get(AUTHORITY_STATUS_FIELD) or "").strip().upper()
+                if row_role == "model_surface" and status_norm == AUTHORITY_APPROVED:
                     approval_still_matches, _ = model_surface_authority(candidate)
                     if not approval_still_matches:
                         authority[AUTHORITY_STATUS_FIELD]=AUTHORITY_REVIEW_REQUIRED
