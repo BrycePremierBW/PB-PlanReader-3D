@@ -109,6 +109,8 @@ class Provenance:
     producer_module: Optional[str] = None
     producer_version: Optional[str] = None
     contributing_evidence: List[str] = field(default_factory=list)
+    is_superseded: bool = False
+    is_stale: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -127,6 +129,8 @@ class Provenance:
             "producer_module": self.producer_module,
             "producer_version": self.producer_version,
             "contributing_evidence": list(self.contributing_evidence),
+            "is_superseded": self.is_superseded,
+            "is_stale": self.is_stale,
         }
 
     @classmethod
@@ -149,6 +153,8 @@ class Provenance:
             producer_module=data.get("producer_module"),
             producer_version=data.get("producer_version"),
             contributing_evidence=list(data.get("contributing_evidence", []) or []) if isinstance(data.get("contributing_evidence"), list) else [],
+            is_superseded=parse_strict_bool(data.get("is_superseded", False)),
+            is_stale=parse_strict_bool(data.get("is_stale", False)),
         )
 
 
