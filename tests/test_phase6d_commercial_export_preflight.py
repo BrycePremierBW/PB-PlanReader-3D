@@ -899,3 +899,93 @@ class Phase6DPreflightTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_25_internal_typeerror_never_invokes_publisher_twice(self):
+        """Finding B: Internal TypeError inside publish_fn must not trigger double invocation."""
+        call_records = []
+
+        def broken_publisher(workspace_id, bridge, user_name, preflight_fingerprint="", payload_hash=""):
+            call_records.append("called")
+            # Raise an internal TypeError during execution
+            raise TypeError("simulated internal bug inside publisher")
+
+        # Create valid preflight test environment
+        conn = self._create_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO workspaces (id, job_no, job_name) VALUES (1, 'JOB-TB', 'TypeError Test')")
+        cur.execute("INSERT INTO documents (id, workspace_id, file_name) VALUES (10, 1, 'Doc.pdf')")
+        cur.execute("INSERT INTO pages (id, workspace_id, document_id, page_no, page_label, selected, px_per_m) VALUES (101, 1, 10, 1, 'P1', 1, 100.0)")
+        cur.execute("""
+            INSERT INTO takeoff_rows (
+                id, workspace_id, section, element, quantity, unit,
+                rate, value_ex_gst, inclusion_status, authority_source, review_status, approval_status
+            ) VALUES (1, 1, 'Wall', 'Paint', 10.0, 'm2', 25.0, 250.0, 'included', 'manual_takeoff', 'VERIFIED', 'APPROVED')
+        """)
+        conn.commit()
+
+        mock_bridge = MagicMock()
+        mock_bridge.query.return_value = []
+
+        preflight = derive_export_preflight(conn, 1, bridge_available=True)
+        self.assertEqual(preflight.final_publish_state, "AVAILABLE")
+
+        with self.assertRaises(TypeError) as ctx:
+            verify_toctou_and_publish_jobhub(
+                conn_or_app=conn,
+                workspace_id=1,
+                bridge=mock_bridge,
+                user_name="Tester",
+                expected_fingerprint=preflight.preflight_fingerprint,
+                acknowledgement_confirmed=True,
+                publish_fn=broken_publisher
+            )
+
+        self.assertIn("simulated internal bug inside publisher", str(ctx.exception))
+        # MUST be invoked exactly once, never twice!
+        self.assertEqual(len(call_records), 1)
+
+    def test_26_legacy_three_arg_publisher_supported_and_invoked_once(self):
+        """Finding B: Legacy three-argument publisher receives legacy signature exactly once."""
+        call_records = []
+
+        def legacy_publisher(workspace_id, bridge, user_name):
+            call_records.append((workspace_id, user_name))
+            return {
+                "published": True,
+                "package_id": 123,
+                "job_id": 1,
+                "package_lines": 5,
+                "quotation": "Q-1",
+                "progress_marker": "PM-1"
+            }
+
+        conn = self._create_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO workspaces (id, job_no, job_name) VALUES (2, 'JOB-LEG', 'Legacy Test')")
+        cur.execute("INSERT INTO documents (id, workspace_id, file_name) VALUES (20, 2, 'Doc.pdf')")
+        cur.execute("INSERT INTO pages (id, workspace_id, document_id, page_no, page_label, selected, px_per_m) VALUES (201, 2, 20, 1, 'P1', 1, 100.0)")
+        cur.execute("""
+            INSERT INTO takeoff_rows (
+                id, workspace_id, section, element, quantity, unit,
+                rate, value_ex_gst, inclusion_status, authority_source, review_status, approval_status
+            ) VALUES (2, 2, 'Wall', 'Paint', 10.0, 'm2', 25.0, 250.0, 'included', 'manual_takeoff', 'VERIFIED', 'APPROVED')
+        """)
+        conn.commit()
+
+        mock_bridge = MagicMock()
+        mock_bridge.query.return_value = []
+
+        preflight = derive_export_preflight(conn, 2, bridge_available=True)
+        res = verify_toctou_and_publish_jobhub(
+            conn_or_app=conn,
+            workspace_id=2,
+            bridge=mock_bridge,
+            user_name="LegacyUser",
+            expected_fingerprint=preflight.preflight_fingerprint,
+            acknowledgement_confirmed=True,
+            publish_fn=legacy_publisher
+        )
+
+        self.assertEqual(len(call_records), 1)
+        self.assertEqual(call_records[0], (2, "LegacyUser"))
+        self.assertEqual(res["package_id"], 123)

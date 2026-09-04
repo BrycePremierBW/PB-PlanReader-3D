@@ -14,6 +14,7 @@ Phase 6D Authority:
   - Server-Level Duplicate Guard: Checks existing JobHub package receipts for matching preflight fingerprint.
 """
 from __future__ import annotations
+import inspect
 
 import dataclasses
 import hashlib
@@ -424,8 +425,18 @@ def verify_toctou_and_publish_jobhub(
         except Exception as exc:
             raise RuntimeError(f"Duplicate verification failed closed: unable to query existing JobHub packages ({exc}).")
 
-    # Execute downstream publish function with explicit fingerprint/hash parameters
+    # Safely determine signature BEFORE invocation to prevent double-invocation on internal TypeError
+    supports_kwargs = True
     try:
+        sig = inspect.signature(publish_fn)
+        params = sig.parameters
+        has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        supports_kwargs = has_var_keyword or ("preflight_fingerprint" in params and "payload_hash" in params)
+    except (ValueError, TypeError):
+        # Fall back to modern call if signature cannot be inspected (e.g. built-in/extension)
+        supports_kwargs = True
+
+    if supports_kwargs:
         result = publish_fn(
             workspace_id,
             bridge,
@@ -433,7 +444,7 @@ def verify_toctou_and_publish_jobhub(
             preflight_fingerprint=preflight.preflight_fingerprint,
             payload_hash=preflight.payload_hash
         )
-    except TypeError:
+    else:
         result = publish_fn(workspace_id, bridge, user_name)
     if not isinstance(result, dict) or not result.get("package_id"):
         raise RuntimeError("Downstream final publish failed to generate a valid JobHub package receipt.")
