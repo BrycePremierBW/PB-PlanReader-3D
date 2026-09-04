@@ -18,7 +18,10 @@ Pipeline: B1 (detection) → physical dedup → B2 (schedule) → B3 (elevation)
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from pb_canonical_building import parse_strict_bool
 
 from pb_opening_evidence_v170 import (
     DEDUCTION_AUTO_ELIGIBLE,
@@ -238,6 +241,54 @@ def _record_physical_conflict(
     b.source_observations = list(b.source_observations) + [conflict_obs_b]
 
 
+_SENTINEL_STRINGS = frozenset({
+    "", "none", "nan", "null", "undefined", "unknown", "unassigned",
+    "unassigned wall", "0", "-", "- ", "n/a", "na", "false", "true",
+})
+
+
+def _clean_str_id(value: Any) -> str:
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, float) and not math.isfinite(value):
+        return ""
+    s = str(value).strip()
+    if s.lower() in _SENTINEL_STRINGS:
+        return ""
+    return s
+
+
+def _is_valid_positive_int(value: Any) -> bool:
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, int):
+        return value > 0
+    if isinstance(value, float):
+        return math.isfinite(value) and value.is_integer() and int(value) > 0
+    if isinstance(value, str):
+        s = value.strip()
+        if s.lower() in _SENTINEL_STRINGS:
+            return False
+        try:
+            val = int(s)
+            return val > 0
+        except (ValueError, TypeError):
+            return False
+    return False
+
+
+def _clean_confidence(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        val = float(value)
+        if math.isfinite(val) and 0.0 <= val <= 1.0:
+            return val
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Eligibility gate — all criteria must pass
 # ---------------------------------------------------------------------------
@@ -245,22 +296,25 @@ def passes_eligibility_gate(inst: OpeningEvidence) -> bool:
     """Check all eligibility criteria before a deduction is applied.
 
     Returns True ONLY when ALL of the following hold:
-      1. reconciliation_complete is True
+      1. reconciliation_complete is strict bool True
          (B4 must have run; no bypassing reconciliation)
       2. deduction_status is auto_eligible or derived_eligible
          (B4 may force review if conflicts exist)
-      3. width_m and height_m both present and > 0
+      3. width_m and height_m both present, finite, and > 0
          (rough-opening dims required for wall-void area)
       4. dimension_basis == "rough_opening"
          (other bases are not eligible for wall deduction)
-      5. minimum(geometry, dimension, association) >= 0.70
+      5. minimum(geometry, dimension, association) >= 0.70, all finite in [0.0, 1.0]
          (derived_eligible or better; review/none gate)
-      6. wall_ref is non-empty
+      6. wall_ref is a valid assigned host wall (non-empty, non-sentinel)
          (physical location must be anchored to a wall)
-      7. area_m2 is computable (width * height > 0)
+      7. area_m2 is computable (width * height > 0, finite)
+      8. opening_instance_id is valid (non-empty, non-sentinel)
+      9. workspace_id and page_no / page_id (if present) are positive integers
+      10. dimension_source is non-empty, non-sentinel
     """
-    # 1. Reconciliation gate — B4 must have run
-    if not inst.reconciliation_complete:
+    # 1. Reconciliation gate — B4 must have run with strict bool True
+    if not parse_strict_bool(inst.reconciliation_complete):
         return False
 
     # 2. Status check
@@ -269,8 +323,14 @@ def passes_eligibility_gate(inst: OpeningEvidence) -> bool:
     ):
         return False
 
-    # 3. Dimension presence
+    # 3. Dimension presence and finiteness
     if inst.width_m is None or inst.height_m is None:
+        return False
+    if isinstance(inst.width_m, bool) or isinstance(inst.height_m, bool):
+        return False
+    if not (isinstance(inst.width_m, (int, float)) and isinstance(inst.height_m, (int, float))):
+        return False
+    if not (math.isfinite(inst.width_m) and math.isfinite(inst.height_m)):
         return False
     if inst.width_m <= 0 or inst.height_m <= 0:
         return False
@@ -279,21 +339,47 @@ def passes_eligibility_gate(inst: OpeningEvidence) -> bool:
     if inst.dimension_basis != DIMENSION_BASIS_ROUGH_OPENING:
         return False
 
-    # 5. Confidence check
-    min_conf = min(
-        inst.geometry_confidence,
-        inst.dimension_confidence,
-        inst.association_confidence,
-    )
-    if min_conf < CONFIDENCE_DERIVED_DEDUCT:
+    # 5. Confidence check — all 3 must be finite, in [0.0, 1.0], min >= 0.70
+    conf_g = _clean_confidence(inst.geometry_confidence)
+    conf_d = _clean_confidence(inst.dimension_confidence)
+    conf_a = _clean_confidence(inst.association_confidence)
+    if conf_g is None or conf_d is None or conf_a is None:
+        return False
+    if min(conf_g, conf_d, conf_a) < CONFIDENCE_DERIVED_DEDUCT:
         return False
 
-    # 6. Wall reference
-    if not inst.wall_ref:
+    # 6. Host wall reference
+    wall = _clean_str_id(inst.wall_ref)
+    if not wall:
         return False
 
     # 7. Area
-    if inst.area_m2 is None or inst.area_m2 <= 0:
+    if inst.area_m2 is None:
+        return False
+    if isinstance(inst.area_m2, bool) or not isinstance(inst.area_m2, (int, float)):
+        return False
+    if not math.isfinite(inst.area_m2) or inst.area_m2 <= 0:
+        return False
+
+    # 8. Opening instance identity
+    op_id = _clean_str_id(inst.opening_instance_id)
+    if not op_id:
+        return False
+
+    # 9. Workspace & page validation (if provided)
+    if inst.workspace_id is not None and inst.workspace_id != 0:
+        if not _is_valid_positive_int(inst.workspace_id):
+            return False
+    if inst.page_no is not None:
+        if not _is_valid_positive_int(inst.page_no):
+            return False
+    if inst.page_id is not None:
+        if not _is_valid_positive_int(inst.page_id):
+            return False
+
+    # 10. Dimension source validation
+    src = _clean_str_id(inst.dimension_source)
+    if not src:
         return False
 
     return True
@@ -364,31 +450,40 @@ def net_wall_area_after_deductions(
     """
     wall_instances = [
         i for i in instances
-        if i.wall_ref == wall_ref and i.deduct and i.area_m2 is not None
+        if i.wall_ref == wall_ref
+        and parse_strict_bool(i.deduct)
+        and i.area_m2 is not None
+        and not isinstance(i.area_m2, bool)
+        and math.isfinite(i.area_m2)
+        and i.area_m2 > 0
     ]
     d_area = sum(i.area_m2 for i in wall_instances)
     d_area = round(d_area, 4)
-    excess = d_area - _num(gross_wall_m2) - tolerance
+    gross_val = _num(gross_wall_m2)
+    excess = d_area - gross_val - tolerance
     if excess > 0:
         return {
             "net_area_m2": 0.0,
             "valid": False,
             "error": (
                 f"Deducted area ({d_area:.4f} m²) exceeds gross wall area "
-                f"({gross_wall_m2:.4f} m²) for wall '{wall_ref}' — possible "
+                f"({gross_val:.4f} m²) for wall '{wall_ref}' — possible "
                 f"duplicate detection, wall-association, or dimension error"
             ),
         }
     return {
-        "net_area_m2": round(max(0.0, _num(gross_wall_m2) - d_area), 4),
+        "net_area_m2": round(max(0.0, gross_val - d_area), 4),
         "valid": True,
         "error": "",
     }
 
 
 def _num(v: Any, default: float = 0.0) -> float:
+    if isinstance(v, bool):
+        return default
     try:
-        return float(v)
+        x = float(v)
+        return x if math.isfinite(x) else default
     except (TypeError, ValueError):
         return default
 

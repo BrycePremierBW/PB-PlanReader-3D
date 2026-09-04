@@ -44,9 +44,12 @@ B3 diagnostics / explainability (ADDITIVE — see ``decision_reasons``):
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from pb_canonical_building import parse_strict_bool
 
 VERSION = "1.7.0"
 SETTING_KEY = "opening_evidence_v170"
@@ -132,9 +135,11 @@ NON_INSTANCE_SOURCES = {"schedule_parse", "manual"}
 
 
 def _num(v: Any, default: float = 0.0) -> float:
+    if isinstance(v, bool):
+        return default
     try:
         x = float(v)
-        return x if x == x else default  # NaN check
+        return x if math.isfinite(x) else default
     except (TypeError, ValueError):
         return default
 
@@ -811,7 +816,11 @@ def deducted_area_m2(openings: Sequence[OpeningEvidence]) -> float:
         sum(
             o.area_m2
             for o in openings
-            if o.deduct and o.area_m2 is not None
+            if parse_strict_bool(o.deduct)
+            and o.area_m2 is not None
+            and not isinstance(o.area_m2, bool)
+            and math.isfinite(o.area_m2)
+            and o.area_m2 > 0
         ),
         4,
     )
