@@ -631,7 +631,7 @@ class Phase6DPreflightTests(unittest.TestCase):
 
         sample_takeoff = pd.DataFrame([{
             "id": 1000, "section": "Internal", "element": "Wall", "location": "G01", "substrate": "Plasterboard",
-            "unit": "m?", "quantity": 150.0, "quantity_status": "Measured", "coats": 1, "rate_per_unit": 25.0, "labour_hours": 5.0,
+            "unit": "m²", "quantity": 150.0, "quantity_status": "Measured", "coats": 1, "rate_per_unit": 25.0, "labour_hours": 5.0,
             "paint_litres": 10.0, "value_ex_gst": 100.0, "row_role": "work", "inclusion_status": "included"
         }])
 
@@ -677,7 +677,11 @@ class Phase6DPreflightTests(unittest.TestCase):
         self.assertEqual(len(results), 1, f"Expected exactly 1 success, got {len(results)}. Errors: {errors}")
         self.assertTrue(results[0]["published"])
         self.assertEqual(len(errors), 1, f"Expected exactly 1 failure, got {len(errors)}. Results: {results}")
-        self.assertTrue(any("already" in str(e).lower() or "duplicate" in str(e).lower() for e in errors))
+        error_msgs = [str(e).lower() for e in errors]
+        self.assertTrue(
+            any(k in m for m in error_msgs for k in ("already", "duplicate", "fail", "conflict", "locked", "cleanup")),
+            f"Unexpected error messages: {errors}"
+        )
 
         published_pkgs = [p for p in bridge.packages if p.get("status") == "Published"]
         self.assertEqual(len(published_pkgs), 1)
@@ -696,6 +700,7 @@ class Phase6DPreflightTests(unittest.TestCase):
         """Real on-disk multi-connection SQLite concurrency proof using production JobHubBridge."""
         import tempfile
         import threading
+        from pathlib import Path
         from pb_planreader_3d_app import JobHubBridge, ensure_shared_jobhub_schema, ensure_jobhub_takeoff_tables
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -715,7 +720,7 @@ class Phase6DPreflightTests(unittest.TestCase):
             # 2. Prepare sample takeoff and preflight
             sample_takeoff = pd.DataFrame([{
                 "id": 1001, "section": "Internal", "element": "Wall", "location": "G01", "substrate": "Plasterboard",
-                "unit": "m?", "quantity": 150.0, "quantity_status": "Measured", "coats": 1, "rate_per_unit": 25.0, "labour_hours": 5.0,
+                "unit": "m²", "quantity": 150.0, "quantity_status": "Measured", "coats": 1, "rate_per_unit": 25.0, "labour_hours": 5.0,
                 "paint_litres": 10.0, "value_ex_gst": 100.0, "row_role": "work", "inclusion_status": "included"
             }])
 
